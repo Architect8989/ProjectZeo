@@ -1,96 +1,87 @@
 """
 Self-Operating Computer - Deterministic Control Kernel
-Entry Point: Enterprise-Grade Edition
+Entry Point: Enterprise-Grade Edition (Kernel-Aligned)
 """
+
 import argparse
 import sys
 import json
 from operate.utils.style import ANSI_BRIGHT_MAGENTA
-from self_operating_computer.operating_system.main import OperatingSystem
-from self_operating_computer.models.gpt_4_vision import format_prompt, parse_model_response
+from self_operating_computer.operating_system.main import OperatingSystem, StepResult
+from self_operating_computer.models.gpt_4_vision import format_prompt
 
-# Mock for model interface - replace with actual API client in production
-def call_llm(prompt, model_name):
-    # This must return a raw JSON string from the model provider
-    pass
+
+# Production model interface must return RAW JSON STRING
+def call_llm(prompt: str, model_name: str) -> str:
+    """
+    This function must synchronously return a JSON string:
+    {"node_id": "...", "action": "...", "text": "..."}
+    """
+    raise NotImplementedError("Model provider not wired")
+
 
 def main_entry():
     parser = argparse.ArgumentParser(
-        description="Run the deterministic self-operating-computer."
+        description="Run the deterministic self-operating-computer kernel."
     )
     parser.add_argument(
         "-m",
         "--model",
-        help="Specify the model (must support JSON output)",
-        required=False,
         default="gpt-4-vision-preview",
+        help="Model name (must support strict JSON output)",
     )
     parser.add_argument(
         "--prompt",
-        help="Directly input the objective prompt",
         type=str,
-        required=False,
+        required=True,
+        help="Objective prompt (required)",
     )
 
     args = parser.parse_args()
-    
-    # 1. Initialize Control Kernel
-    # Automatically initializes: Backend, Policy Engine, and Action Journal
-    try:
-        os_controller = OperatingSystem()
-    except Exception as e:
-        print(f"Failed to initialize Control Kernel: {e}")
-        sys.exit(1)
 
-    if not args.prompt:
-        print(f"{ANSI_BRIGHT_MAGENTA}Error: Objective prompt required for deterministic execution.")
+    # 1. Initialize Kernel (Authority Holder)
+    try:
+        os_controller = OperatingSystem(max_steps=50)
+    except Exception as e:
+        print(f"Kernel initialization failure: {e}")
         sys.exit(1)
 
     objective = args.prompt
-    print(f"{ANSI_BRIGHT_MAGENTA}Objective: {objective}")
+    print(f"{ANSI_BRIGHT_MAGENTA}Objective:{ANSI_BRIGHT_MAGENTA} {objective}")
 
     try:
         while True:
-            # 2. Stabilized UI Snapshot
-            # backend.get_nodes() is called within get_state_summary() 
-            # and enforces stabilization via wait_for_ui_stabilization()
-            ui_summary = os_controller.get_state_summary() 
-            
-            # 3. Model Reasoning
+            # 2. Kernel-Owned State Snapshot
+            ui_summary = os_controller.get_state_summary()
+
+            # 3. Model Proposal (NO authority)
             prompt = format_prompt(ui_summary, objective)
-            
-            # Simulated model call - In production, this receives the model's JSON
-            raw_response = call_llm(prompt, args.model)
-            
-            # 4. Deterministic Execution
-            # This method now performs:
-            # - Poison check (coordinate scanning)
-            # - Policy v1 validation (ACL/Regex/Role checking)
-            # - Action journaling (Pre-action)
-            # - Semantic OS interaction (No synthetic fallbacks)
-            # - State-Diff Enforcement (Termination if pre_sig == post_sig)
-            os_controller.execute_deterministic_action(raw_response)
-            
-            print(f"{ANSI_BRIGHT_MAGENTA}Step successful. State mutation verified and journaled.")
-            
+            raw_json = call_llm(prompt, args.model)
+
+            # 4. Single Kernel Step
+            signal = os_controller.step(raw_json)
+
+            if signal == StepResult.FAIL:
+                print(f"{ANSI_BRIGHT_MAGENTA}Kernel violation detected. Execution terminated.")
+                os_controller.shutdown("FAIL")
+                sys.exit(1)
+
+            # CONTINUE means verified mutation, bounded by kernel
+            print(f"{ANSI_BRIGHT_MAGENTA}Step {os_controller.step_count} verified.")
+
     except KeyboardInterrupt:
-        os_controller.shutdown()
-        print(f"\n{ANSI_BRIGHT_MAGENTA}Manual Interruption. Journal Sealed. Exiting...")
-    except SystemExit:
-        # sys.exit(1) is called by OperatingSystem for Policy/State/Poison violations
-        # Journal is already sealed at the point of violation.
-        pass
+        os_controller.shutdown("INTERRUPTED")
+        print(f"\n{ANSI_BRIGHT_MAGENTA}Manual interruption. Journal sealed.")
     except Exception as e:
-        # Final safety net for unexpected kernel panic
-        if hasattr(os_controller, 'journal'):
+        if hasattr(os_controller, "journal"):
             os_controller.journal.record({
-                "outcome": "CRITICAL_FATAL", 
+                "outcome": "CRITICAL_FATAL",
                 "error": str(e),
-                "trace": "main_loop_panic"
+                "trace": "main_entry_panic"
             })
-            os_controller.shutdown()
-        print(f"Fatal Kernel Error: {e}")
-        sys.exit(1)
+            os_controller.shutdown("CRITICAL_FATAL")
+        raise
+
 
 if __name__ == "__main__":
     main_entry()
