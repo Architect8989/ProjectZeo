@@ -5,7 +5,6 @@ Entry Point: Enterprise-Grade Edition (Kernel-Aligned)
 
 import argparse
 import sys
-import json
 from operate.utils.style import ANSI_BRIGHT_MAGENTA
 from self_operating_computer.operating_system.main import OperatingSystem, StepResult
 from self_operating_computer.models.gpt_4_vision import format_prompt
@@ -14,7 +13,7 @@ from self_operating_computer.models.gpt_4_vision import format_prompt
 # Production model interface must return RAW JSON STRING
 def call_llm(prompt: str, model_name: str) -> str:
     """
-    This function must synchronously return a JSON string:
+    Must synchronously return a JSON string:
     {"node_id": "...", "action": "...", "text": "..."}
     """
     raise NotImplementedError("Model provider not wired")
@@ -39,7 +38,7 @@ def main_entry():
 
     args = parser.parse_args()
 
-    # 1. Initialize Kernel (Authority Holder)
+    # 1. Initialize Kernel (single authority)
     try:
         os_controller = OperatingSystem(max_steps=50)
     except Exception as e:
@@ -52,13 +51,14 @@ def main_entry():
     try:
         while True:
             # 2. Kernel-Owned State Snapshot
-            ui_summary = os_controller.get_state_summary()
+            # NOTE: This is now ESS-serialized state (opaque to entrypoint)
+            ui_state = os_controller.get_state_summary()
 
-            # 3. Model Proposal (NO authority)
-            prompt = format_prompt(ui_summary, objective)
+            # 3. Model Proposal (NO authority, NO assumptions)
+            prompt = format_prompt(ui_state, objective)
             raw_json = call_llm(prompt, args.model)
 
-            # 4. Single Kernel Step
+            # 4. Single Kernel Step (sole execution authority)
             signal = os_controller.step(raw_json)
 
             if signal == StepResult.FAIL:
@@ -66,7 +66,7 @@ def main_entry():
                 os_controller.shutdown("FAIL")
                 sys.exit(1)
 
-            # CONTINUE means verified mutation, bounded by kernel
+            # CONTINUE = mutation verified, still bounded by kernel
             print(f"{ANSI_BRIGHT_MAGENTA}Step {os_controller.step_count} verified.")
 
     except KeyboardInterrupt:
