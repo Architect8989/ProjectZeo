@@ -3,6 +3,7 @@ import time
 import os
 import sys
 
+
 class ActionJournal:
     def __init__(self, path="action_audit.jsonl"):
         self.path = path
@@ -13,30 +14,34 @@ class ActionJournal:
         try:
             with open(self.path, "a") as f:
                 f.write(f"\n--- SESSION START: {time.ctime()} ---\n")
+                f.flush()
+                os.fsync(f.fileno())
         except Exception as e:
-            print(f"[CRITICAL AUDIT FAILURE] Journal initialization failed: {e}")
+            print(f"[CRITICAL AUDIT FAILURE] init failed: {e}")
             sys.exit(1)
 
     def record(self, entry: dict):
         self.index += 1
-        record_payload = {
+        payload = {
             "index": self.index,
             "wall_time": time.time(),
             "monotonic_time": time.monotonic(),
-            **entry
+            **entry,
         }
         try:
             with open(self.path, "a") as f:
-                f.write(json.dumps(record_payload) + "\n")
+                f.write(json.dumps(payload) + "\n")
                 f.flush()
-                os.fsync(f.fileno()) # Guarantee physical persistence
+                os.fsync(f.fileno())
         except Exception as e:
-            print(f"[CRITICAL AUDIT FAILURE] Journal write failed: {e}")
+            print(f"[CRITICAL AUDIT FAILURE] write failed: {e}")
             sys.exit(1)
 
     def seal(self, reason="NORMAL"):
         try:
             with open(self.path, "a") as f:
                 f.write(f"--- SESSION SEALED ({reason}): {time.ctime()} ---\n")
-        except:
+                f.flush()
+                os.fsync(f.fileno())
+        except Exception:
             pass
