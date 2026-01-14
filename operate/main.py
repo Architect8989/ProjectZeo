@@ -1,12 +1,18 @@
 """
 Self-Operating Computer - Deterministic Control Kernel
-Entry Point
+Entry Point: Enterprise-Grade Edition
 """
 import argparse
 import sys
+import json
 from operate.utils.style import ANSI_BRIGHT_MAGENTA
 from self_operating_computer.operating_system.main import OperatingSystem
 from self_operating_computer.models.gpt_4_vision import format_prompt, parse_model_response
+
+# Mock for model interface - replace with actual API client in production
+def call_llm(prompt, model_name):
+    # This must return a raw JSON string from the model provider
+    pass
 
 def main_entry():
     parser = argparse.ArgumentParser(
@@ -17,7 +23,7 @@ def main_entry():
         "--model",
         help="Specify the model (must support JSON output)",
         required=False,
-        default="gpt-4",
+        default="gpt-4-vision-preview",
     )
     parser.add_argument(
         "--prompt",
@@ -28,9 +34,13 @@ def main_entry():
 
     args = parser.parse_args()
     
-    # Initialize the OS Controller (Backend + Journal)
-    # This also initializes the ActionJournal and verifies write-access
-    os_controller = OperatingSystem()
+    # 1. Initialize Control Kernel
+    # Automatically initializes: Backend, Policy Engine, and Action Journal
+    try:
+        os_controller = OperatingSystem()
+    except Exception as e:
+        print(f"Failed to initialize Control Kernel: {e}")
+        sys.exit(1)
 
     if not args.prompt:
         print(f"{ANSI_BRIGHT_MAGENTA}Error: Objective prompt required for deterministic execution.")
@@ -41,36 +51,45 @@ def main_entry():
 
     try:
         while True:
-            # 1. Capture semantic UI state (Stabilized Snapshot)
-            ui_state = os_controller.backend.get_nodes()
-            
-            # 2. Convert state to minified JSON for the model
+            # 2. Stabilized UI Snapshot
+            # backend.get_nodes() is called within get_state_summary() 
+            # and enforces stabilization via wait_for_ui_stabilization()
             ui_summary = os_controller.get_state_summary() 
             
-            # 3. Model Request (Logic handled in gpt_4_vision wrapper)
-            # In a real impl, you'd pass 'objective' and 'ui_summary' to your model provider
-            # Here we assume a call to your model's generate function
+            # 3. Model Reasoning
             prompt = format_prompt(ui_summary, objective)
             
-            # Placeholder for model call
-            # response = model.generate(prompt)
-            # action_json = parse_model_response(response)
+            # Simulated model call - In production, this receives the model's JSON
+            raw_response = call_llm(prompt, args.model)
             
-            # 4. Deterministic execution with journaling and poison checks
-            # os_controller.execute_deterministic_action(action_json)
+            # 4. Deterministic Execution
+            # This method now performs:
+            # - Poison check (coordinate scanning)
+            # - Policy v1 validation (ACL/Regex/Role checking)
+            # - Action journaling (Pre-action)
+            # - Semantic OS interaction (No synthetic fallbacks)
+            # - State-Diff Enforcement (Termination if pre_sig == post_sig)
+            os_controller.execute_deterministic_action(raw_response)
             
-            print(f"{ANSI_BRIGHT_MAGENTA}Action executed and journaled.")
-            
-            # Implementation Note: In enterprise grade, we typically pause 
-            # to prevent runaway loops if the UI doesn't mutate.
+            print(f"{ANSI_BRIGHT_MAGENTA}Step successful. State mutation verified and journaled.")
             
     except KeyboardInterrupt:
         os_controller.shutdown()
-        print(f"\n{ANSI_BRIGHT_MAGENTA}Journal Sealed. Exiting...")
+        print(f"\n{ANSI_BRIGHT_MAGENTA}Manual Interruption. Journal Sealed. Exiting...")
+    except SystemExit:
+        # sys.exit(1) is called by OperatingSystem for Policy/State/Poison violations
+        # Journal is already sealed at the point of violation.
+        pass
     except Exception as e:
-        # Any unhandled exception must be recorded before death
-        os_controller.journal.record({"outcome": "CRITICAL_FATAL", "error": str(e)})
-        os_controller.shutdown()
+        # Final safety net for unexpected kernel panic
+        if hasattr(os_controller, 'journal'):
+            os_controller.journal.record({
+                "outcome": "CRITICAL_FATAL", 
+                "error": str(e),
+                "trace": "main_loop_panic"
+            })
+            os_controller.shutdown()
+        print(f"Fatal Kernel Error: {e}")
         sys.exit(1)
 
 if __name__ == "__main__":
