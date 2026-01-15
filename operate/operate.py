@@ -24,17 +24,21 @@ from operate.utils.style import (
 from operate.utils.operating_system import OperatingSystem
 from operate.models.apis import get_next_action
 
-# NEW: execution instrument (inert unless explicitly used)
+# Execution instrument
 from utils.accessibility import AccessibilityBackend
+
+# Cryptographic execution ledger
+from audit.journal import ActionJournal
 
 # Load configuration
 config = Config()
 operating_system = OperatingSystem()
 
-# Instantiate once (instrument, not controller)
+# Instantiate once (instruments, not controllers)
 accessibility_backend = AccessibilityBackend()
+journal = ActionJournal()
 
-# Temporary execution mode flag (will be formalized later)
+# Execution mode (will later be lifecycle-driven)
 EXECUTION_MODE = "ACTIVE"  # or "OBSERVER"
 
 
@@ -99,8 +103,8 @@ def main(model, terminal_prompt, voice_mode=False, verbose_mode=False):
     loop_count = 0
     session_id = None
 
-    while True:
-        try:
+    try:
+        while True:
             operations, session_id = asyncio.run(
                 get_next_action(model, messages, objective, session_id)
             )
@@ -113,26 +117,26 @@ def main(model, terminal_prompt, voice_mode=False, verbose_mode=False):
             if loop_count > 10:
                 break
 
-        except ModelNotRecognizedException as e:
-            print(
-                f"{ANSI_GREEN}[Self-Operating Computer]"
-                f"{ANSI_RED}[Error] -> {e}{ANSI_RESET}"
-            )
-            break
-        except Exception as e:
-            print(
-                f"{ANSI_GREEN}[Self-Operating Computer]"
-                f"{ANSI_RED}[Error] -> {e}{ANSI_RESET}"
-            )
-            break
+    except ModelNotRecognizedException as e:
+        print(
+            f"{ANSI_GREEN}[Self-Operating Computer]"
+            f"{ANSI_RED}[Error] -> {e}{ANSI_RESET}"
+        )
+    except Exception as e:
+        print(
+            f"{ANSI_GREEN}[Self-Operating Computer]"
+            f"{ANSI_RED}[Error] -> {e}{ANSI_RESET}"
+        )
+    finally:
+        # Seal audit ledger at task boundary
+        journal.seal(reason="OBJECTIVE_COMPLETE")
 
 
 def operate(operations, model):
     """
     Core SOC operation loop.
-    NOTE:
-    - Legacy execution paths remain unchanged.
-    - AccessibilityBackend is available but not yet mandatory.
+    Legacy execution preserved.
+    Journal is wired but only used when AccessibilityBackend executes.
     """
 
     for operation in operations:
@@ -160,9 +164,14 @@ def operate(operations, model):
             operating_system.mouse(operate_detail)
 
             # NOTE:
-            # Future: this branch will optionally route through
-            # accessibility_backend.execute(...)
-            # once node-based planning is enabled.
+            # Node-based execution will later replace this path:
+            # accessibility_backend.execute(
+            #     mode=EXECUTION_MODE,
+            #     policy_engine=policy_engine,
+            #     audit_callback=journal.record,
+            #     node=node,
+            #     action_type="click"
+            # )
 
         elif operate_type == "done":
             summary = operation.get("summary")
