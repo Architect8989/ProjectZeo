@@ -2,40 +2,83 @@ import re
 
 
 class PolicyEngine:
+    """
+    PURE POLICY ORACLE.
+    Decides permission only. Never executes. Never prompts.
+    """
+
+    ALLOW = "ALLOW"
+    DENY = "DENY"
+    REQUIRE_HUMAN_CONFIRMATION = "REQUIRE_HUMAN_CONFIRMATION"
+
     def __init__(self):
-        self.denied_roles = {"terminal", "password text", "alert", "dialog"}
-        self.denied_names = [
+        # Roles that should never be interacted with automatically
+        self.denied_roles = {
+            "terminal",
+            "password text",
+            "alert",
+            "dialog",
+        }
+
+        # Names that imply destructive or privileged intent
+        self.high_risk_name_patterns = [
             re.compile(r"delete", re.IGNORECASE),
+            re.compile(r"remove", re.IGNORECASE),
             re.compile(r"format", re.IGNORECASE),
             re.compile(r"sudo", re.IGNORECASE),
-            re.compile(r"remove", re.IGNORECASE),
+            re.compile(r"erase", re.IGNORECASE),
         ]
-        self.allowed_apps = {"google-chrome", "firefox", "libreoffice", "gedit"}
+
+        # Apps allowed for autonomous interaction
+        self.allowed_apps = {
+            "google-chrome",
+            "firefox",
+            "libreoffice",
+            "gedit",
+        }
 
     def validate(self, node, action: str):
+        """
+        Returns one of:
+        - ALLOW
+        - DENY
+        - REQUIRE_HUMAN_CONFIRMATION
+        """
+
         try:
             role = (node.getRoleName() or "unknown").lower()
             name = (node.name or "").lower()
 
             app_obj = node.getApplication()
-            app = app_obj.name.lower() if app_obj else "unknown"
+            app = app_obj.name.lower() if app_obj and app_obj.name else "unknown"
 
-            if not app or app == "unknown":
-                return False, "Application identity unavailable"
+            # Hard deny: cannot identify application
+            if app == "unknown":
+                return self.DENY, "Application identity unavailable"
 
+            # Hard deny: app not allow-listed
             if app not in self.allowed_apps:
-                return False, f"Unauthorized Application: {app}"
+                return self.DENY, f"Unauthorized application: {app}"
 
+            # Hard deny: forbidden UI role
             if role in self.denied_roles:
-                return False, f"Unauthorized Role: {role}"
+                return self.DENY, f"Forbidden role: {role}"
 
+            # Semantic misuse: typing into non-text elements
             if action == "type" and ("text" not in role and "entry" not in role):
-                return False, f"Semantic abuse: type into role '{role}'"
+                return self.DENY, f"Semantic violation: type into role '{role}'"
 
-            for pat in self.denied_names:
+            # High-risk intent → require human confirmation
+            for pat in self.high_risk_name_patterns:
                 if pat.search(name):
-                    return False, f"Destructive label blocked: {pat.pattern}"
+                    return (
+                        self.REQUIRE_HUMAN_CONFIRMATION,
+                        f"High-risk label detected: {pat.pattern}",
+                    )
 
-            return True, None
+            # Otherwise safe
+            return self.ALLOW, None
+
         except Exception as e:
-            return False, f"Policy internal error: {e}"
+            # Policy must fail closed
+            return self.DENY, f"Policy internal error: {e}"
