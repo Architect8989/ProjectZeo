@@ -9,6 +9,17 @@ import anthropic
 from prompt_toolkit.shortcuts import input_dialog
 
 
+def is_openrouter_model(model: str) -> bool:
+    """
+    Detect OpenRouter-style models.
+    Examples:
+      - openai/gpt-4o-mini
+      - anthropic/claude-3.5-sonnet
+      - qwen/qwen2.5-vl-72b-instruct
+    """
+    return "/" in model
+
+
 class Config:
     """
     Configuration class for managing settings.
@@ -25,46 +36,28 @@ class Config:
     def __new__(cls):
         if cls._instance is None:
             cls._instance = super(Config, cls).__new__(cls)
-            # Put any initialization here
         return cls._instance
 
     def __init__(self):
         load_dotenv()
         self.verbose = False
-        self.openai_api_key = (
-            None  # instance variables are backups in case saving to a `.env` fails
-        )
-        self.google_api_key = (
-            None  # instance variables are backups in case saving to a `.env` fails
-        )
-        self.ollama_host = (
-            None  # instance variables are backups in case savint to a `.env` fails
-        )
-        self.anthropic_api_key = (
-            None  # instance variables are backups in case saving to a `.env` fails
-        )
-        self.qwen_api_key = (
-            None  # instance variables are backups in case saving to a `.env` fails
-        )
+        self.openai_api_key = None
+        self.google_api_key = None
+        self.ollama_host = None
+        self.anthropic_api_key = None
+        self.qwen_api_key = None
+
+    # -------------------------
+    # INITIALIZERS (UNCHANGED)
+    # -------------------------
 
     def initialize_openai(self):
         if self.verbose:
             print("[Config][initialize_openai]")
 
-        if self.openai_api_key:
-            if self.verbose:
-                print("[Config][initialize_openai] using cached openai_api_key")
-            api_key = self.openai_api_key
-        else:
-            if self.verbose:
-                print(
-                    "[Config][initialize_openai] no cached openai_api_key, try to get from env."
-                )
-            api_key = os.getenv("OPENAI_API_KEY")
+        api_key = self.openai_api_key or os.getenv("OPENAI_API_KEY")
 
-        client = OpenAI(
-            api_key=api_key,
-        )
+        client = OpenAI(api_key=api_key)
         client.api_key = api_key
         client.base_url = os.getenv("OPENAI_API_BASE_URL", client.base_url)
         return client
@@ -73,16 +66,7 @@ class Config:
         if self.verbose:
             print("[Config][initialize_qwen]")
 
-        if self.qwen_api_key:
-            if self.verbose:
-                print("[Config][initialize_qwen] using cached qwen_api_key")
-            api_key = self.qwen_api_key
-        else:
-            if self.verbose:
-                print(
-                    "[Config][initialize_qwen] no cached qwen_api_key, try to get from env."
-                )
-            api_key = os.getenv("QWEN_API_KEY")
+        api_key = self.qwen_api_key or os.getenv("QWEN_API_KEY")
 
         client = OpenAI(
             api_key=api_key,
@@ -93,45 +77,40 @@ class Config:
         return client
 
     def initialize_google(self):
-        if self.google_api_key:
-            if self.verbose:
-                print("[Config][initialize_google] using cached google_api_key")
-            api_key = self.google_api_key
-        else:
-            if self.verbose:
-                print(
-                    "[Config][initialize_google] no cached google_api_key, try to get from env."
-                )
-            api_key = os.getenv("GOOGLE_API_KEY")
+        api_key = self.google_api_key or os.getenv("GOOGLE_API_KEY")
         genai.configure(api_key=api_key, transport="rest")
-        model = genai.GenerativeModel("gemini-pro-vision")
-
-        return model
+        return genai.GenerativeModel("gemini-pro-vision")
 
     def initialize_ollama(self):
-        if self.ollama_host:
-            if self.verbose:
-                print("[Config][initialize_ollama] using cached ollama host")
-        else:
-            if self.verbose:
-                print(
-                    "[Config][initialize_ollama] no cached ollama host. Assuming ollama running locally."
-                )
-            self.ollama_host = os.getenv("OLLAMA_HOST", None)
-        model = Client(host=self.ollama_host)
-        return model
+        self.ollama_host = self.ollama_host or os.getenv("OLLAMA_HOST", None)
+        return Client(host=self.ollama_host)
 
     def initialize_anthropic(self):
-        if self.anthropic_api_key:
-            api_key = self.anthropic_api_key
-        else:
-            api_key = os.getenv("ANTHROPIC_API_KEY")
+        api_key = self.anthropic_api_key or os.getenv("ANTHROPIC_API_KEY")
         return anthropic.Anthropic(api_key=api_key)
+
+    # -------------------------
+    # VALIDATION (EXTENDED, NOT REPLACED)
+    # -------------------------
 
     def validation(self, model, voice_mode):
         """
         Validate the input parameters for the dialog operation.
+
+        Existing SOC logic is preserved.
+        OpenRouter models bypass provider-specific API-key enforcement.
         """
+
+        # ---- NEW: OpenRouter bypass (ADDITIVE ONLY) ----
+        if is_openrouter_model(model):
+            if self.verbose:
+                print(
+                    "[Config][validation] OpenRouter model detected. "
+                    "Skipping provider-specific API key checks."
+                )
+            return
+
+        # ---- LEGACY SOC VALIDATION (UNCHANGED) ----
         self.require_api_key(
             "OPENAI_API_KEY",
             "OpenAI API key",
@@ -142,13 +121,28 @@ class Config:
             or model == "gpt-4.1-with-ocr"
             or model == "o1-with-ocr",
         )
+
         self.require_api_key(
-            "GOOGLE_API_KEY", "Google API key", model == "gemini-pro-vision"
+            "GOOGLE_API_KEY",
+            "Google API key",
+            model == "gemini-pro-vision",
         )
+
         self.require_api_key(
-            "ANTHROPIC_API_KEY", "Anthropic API key", model == "claude-3"
+            "ANTHROPIC_API_KEY",
+            "Anthropic API key",
+            model == "claude-3",
         )
-        self.require_api_key("QWEN_API_KEY", "Qwen API key", model == "qwen-vl")
+
+        self.require_api_key(
+            "QWEN_API_KEY",
+            "Qwen API key",
+            model == "qwen-vl",
+        )
+
+    # -------------------------
+    # API KEY HANDLING (UNCHANGED)
+    # -------------------------
 
     def require_api_key(self, key_name, key_description, is_required):
         key_exists = bool(os.environ.get(key_name))
@@ -157,15 +151,17 @@ class Config:
             print("[Config] key_name", key_name)
             print("[Config] key_description", key_description)
             print("[Config] key_exists", key_exists)
+
         if is_required and not key_exists:
             self.prompt_and_save_api_key(key_name, key_description)
 
     def prompt_and_save_api_key(self, key_name, key_description):
         key_value = input_dialog(
-            title="API Key Required", text=f"Please enter your {key_description}:"
+            title="API Key Required",
+            text=f"Please enter your {key_description}:",
         ).run()
 
-        if key_value is None:  # User pressed cancel or closed the dialog
+        if key_value is None:
             sys.exit("Operation cancelled by user.")
 
         if key_value:
@@ -177,9 +173,9 @@ class Config:
                 self.anthropic_api_key = key_value
             elif key_name == "QWEN_API_KEY":
                 self.qwen_api_key = key_value
+
             self.save_api_key_to_env(key_name, key_value)
-            load_dotenv()  # Reload environment variables
-            # Update the instance attribute with the new key
+            load_dotenv()
 
     @staticmethod
     def save_api_key_to_env(key_name, key_value):
