@@ -20,7 +20,7 @@ from operate.utils.style import (
     style,
 )
 from operate.utils.operating_system import OperatingSystem
-from operate.models.apis import get_next_action
+from operate.models.apis_openrouter import get_next_action
 
 # Execution / control layers (frozen, non-sovereign)
 from utils.accessibility import AccessibilityBackend
