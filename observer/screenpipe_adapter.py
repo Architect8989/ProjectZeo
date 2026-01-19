@@ -1,4 +1,5 @@
 import time
+import hashlib
 from typing import Dict, Optional
 
 
@@ -6,58 +7,76 @@ class ScreenpipeAdapter:
     """
     Read-only adapter for Screenpipe outputs.
 
-    This class NEVER:
-    - starts Screenpipe
-    - controls Screenpipe
-    - interacts with the OS
-    - blocks the main loop
-
-    It only attempts to read observation data if available.
+    HARD GUARANTEES:
+    - Never starts Screenpipe
+    - Never controls Screenpipe
+    - Never touches OS input
+    - Never blocks the main loop
+    - Never raises to caller
     """
+
+    STALE_AFTER_SECONDS = 5.0
 
     def __init__(self):
         self.last_read_ts: Optional[float] = None
+        self.last_frame_ts: Optional[float] = None
 
-        # Normalized observation structure (stable contract)
         self.state: Dict[str, object] = {
-            "screen_text": None,
-            "screen_text_hash": None,
-            "frame_ts": None,
             "available": False,
+            "frame_ts": None,
+            "screen_text_hash": None,
+            "stale": True,
         }
 
-        print("[SCREENPIPE] Adapter initialized (passive)")
+        print("[SCREENPIPE] Adapter initialized (read-only)")
+
+    def _hash_text(self, text: str) -> str:
+        return hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()
 
     def read(self) -> Dict[str, object]:
         """
-        Attempt to read latest observation from Screenpipe.
+        Read latest observation snapshot.
 
-        Safe behavior:
-        - If Screenpipe is not running or no data exists,
-          returns a stable empty state.
-        - Never raises exceptions to caller.
+        NOTE:
+        Real Screenpipe integration will replace the placeholder section.
         """
         try:
-            # Placeholder for future Screenpipe integration
-            # Example (later):
-            # data = self._read_from_screenpipe_api()
+            now = time.time()
 
-            # For now: no data source
+            # ---- PLACEHOLDER (Phase-2 compliant) ----
+            # No live Screenpipe feed yet; this simulates "no data"
+            text = ""
+            frame_ts = None
+            # -----------------------------------------
+
+            if frame_ts is None:
+                self.state.update(
+                    {
+                        "available": False,
+                        "frame_ts": None,
+                        "screen_text_hash": None,
+                        "stale": True,
+                    }
+                )
+            else:
+                self.state.update(
+                    {
+                        "available": True,
+                        "frame_ts": frame_ts,
+                        "screen_text_hash": self._hash_text(text),
+                        "stale": (now - frame_ts) > self.STALE_AFTER_SECONDS,
+                    }
+                )
+
+            self.last_read_ts = now
+            self.last_frame_ts = frame_ts
+
+        except Exception:
+            # Absolute containment: observer must survive everything
             self.state["available"] = False
-            self.state["frame_ts"] = None
-            self.state["screen_text"] = None
-            self.state["screen_text_hash"] = None
-
-            self.last_read_ts = time.time()
-
-        except Exception as e:
-            # Absolute safety: observer must never crash
-            self.state["available"] = False
+            self.state["stale"] = True
 
         return dict(self.state)
 
     def is_available(self) -> bool:
-        """
-        Indicates whether Screenpipe data is currently available.
-        """
         return bool(self.state.get("available", False))
