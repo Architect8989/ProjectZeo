@@ -5,35 +5,35 @@ from observer.observer_core import ObserverCore
 from observer.screenpipe_adapter import ScreenpipeAdapter
 
 
+HEARTBEAT_INTERVAL = 2.0
+
+
 def main():
     print("[BOOT] System starting")
 
-    # Authority + subsystems
     mode = ModeController()
     observer = ObserverCore()
     screenpipe = ScreenpipeAdapter()
 
-    print(f"[STATE] Mode = {mode.mode}")
-    print("[OBSERVER] Idle observer running (read-only)")
+    print(f"[STATE] Mode = {mode.mode.value}")
+    print("[OBSERVER] Live observation enabled (no execution)")
 
     while True:
-        # Tick observer (witness)
         observer_state = observer.tick()
-
-        # Poll screenpipe adapter (safe, may be unavailable)
         screen_state = screenpipe.read()
 
-        # Structured heartbeat (single source of truth)
+        observer.attach_screen_state(screen_state)
+
         heartbeat = {
-            "mode": mode.mode,
-            "uptime_seconds": observer_state.get("uptime_seconds"),
-            "tick_count": observer_state.get("tick_count"),
-            "screenpipe_available": screen_state.get("available"),
+            "mode": mode.mode.value,
+            "uptime": observer_state["uptime_seconds"],
+            "ticks": observer_state["tick_count"],
+            "screen_available": screen_state["available"],
+            "screen_stale": screen_state.get("stale"),
         }
 
         print(f"[HEARTBEAT] {heartbeat}")
-
-        time.sleep(2)
+        time.sleep(HEARTBEAT_INTERVAL)
 
 
 if __name__ == "__main__":
