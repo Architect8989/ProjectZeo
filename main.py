@@ -1,42 +1,34 @@
 import time
-import os
 
 from core.mode_controller import ModeController
+from core.intent_listener import IntentListener
+
 from observer.observer_core import ObserverCore
 from observer.screenpipe_adapter import ScreenpipeAdapter
 from observer.perception_engine import PerceptionEngine
 
 
 HEARTBEAT_INTERVAL = 2.0
-INTENT_FILE = "/tmp/arm_system.intent"
-
-
-def check_for_intent(mode: ModeController):
-    if not os.path.exists(INTENT_FILE):
-        return
-
-    try:
-        with open(INTENT_FILE, "r") as f:
-            reason = f.read().strip() or "explicit user intent"
-
-        if mode.mode.value == "OBSERVER":
-            mode.arm(reason=reason)
-            print("[INTENT] System armed")
-
-    except Exception as e:
-        print(f"[INTENT] Error reading intent: {e}")
 
 
 def main():
     print("[BOOT] System starting")
 
+    # Authority core
     mode = ModeController()
+
+    # Intent input (CLI)
+    intent_listener = IntentListener(mode)
+    intent_listener.start()
+
+    # Observer + perception stack
     observer = ObserverCore()
     screenpipe = ScreenpipeAdapter()
     perception = PerceptionEngine()
 
     print(f"[STATE] Mode = {mode.mode.value}")
     print("[OBSERVER] Live observation + understanding (no execution)")
+    print("[INTENT] Type intent and press Enter to arm system")
 
     while True:
         # 1. Witness time
@@ -52,10 +44,7 @@ def main():
         observer.attach_screen_state(screen_state)
         observer.attach_ui_snapshot(ui_snapshot)
 
-        # 5. Check explicit human intent (arming only)
-        check_for_intent(mode)
-
-        # 6. Structured heartbeat
+        # 5. Structured heartbeat (truth only)
         heartbeat = {
             "mode": mode.mode.value,
             "uptime": observer_state["uptime_seconds"],
