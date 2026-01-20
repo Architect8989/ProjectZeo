@@ -1,5 +1,5 @@
 import time
-from typing import Dict, Deque
+from typing import Dict, Deque, Optional
 from collections import deque
 
 
@@ -18,7 +18,7 @@ class ObserverCore:
     def __init__(self):
         self.start_time = time.monotonic()
         self.tick_count = 0
-        self.last_tick_ts = None
+        self.last_tick_ts: Optional[float] = None
 
         self.state: Dict[str, object] = {
             "uptime_seconds": 0.0,
@@ -27,6 +27,7 @@ class ObserverCore:
             "screen_available": False,
             "screen_text_hash": None,
             "screen_frame_ts": None,
+            "ui_snapshot": None,
         }
 
         self.history: Deque[Dict[str, object]] = deque(maxlen=self.MAX_HISTORY)
@@ -60,6 +61,12 @@ class ObserverCore:
                 "screen_frame_ts": screen_state.get("frame_ts"),
             }
         )
+
+    def attach_ui_snapshot(self, ui_snapshot) -> None:
+        """
+        Phase-2B hook: semantic UI understanding (read-only).
+        """
+        self.state["ui_snapshot"] = ui_snapshot
 
     def get_state(self) -> Dict[str, object]:
         return dict(self.state)
