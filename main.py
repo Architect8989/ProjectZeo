@@ -2,6 +2,7 @@ import time
 
 from core.mode_controller import ModeController
 from core.intent_listener import IntentListener
+from core.environment_fingerprint import collect_environment_fingerprint
 
 from observer.observer_core import ObserverCore
 from observer.screenpipe_adapter import ScreenpipeAdapter
@@ -14,14 +15,20 @@ HEARTBEAT_INTERVAL = 2.0
 def main():
     print("[BOOT] System starting")
 
-    # Authority core
+    # --- Phase 0: Environment fingerprint (one-time, read-only) ---
+    env_fingerprint = collect_environment_fingerprint()
+    print("[ENV] Fingerprint collected")
+    for k, v in env_fingerprint.items():
+        print(f"[ENV] {k}: {v}")
+
+    # --- Authority core ---
     mode = ModeController()
 
-    # Intent input (CLI)
+    # --- Intent input (CLI) ---
     intent_listener = IntentListener(mode)
     intent_listener.start()
 
-    # Observer + perception stack
+    # --- Observer + perception stack ---
     observer = ObserverCore()
     screenpipe = ScreenpipeAdapter()
     perception = PerceptionEngine()
@@ -34,7 +41,7 @@ def main():
         # 1. Witness time
         observer_state = observer.tick()
 
-        # 2. Read raw screen feed
+        # 2. Read raw screen feed (read-only)
         screen_state = screenpipe.read()
 
         # 3. Phase 2B: derive semantic understanding (read-only)
