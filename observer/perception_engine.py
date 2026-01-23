@@ -22,12 +22,8 @@ class PerceptionEngine:
         dialogs = []
         progress = []
 
-        # Phase 2B rule:
-        # We describe only what Screenpipe already provides.
-        # No guessing. No planning.
-
+        # Phase 2B rule: Describe only what Screenpipe already provides
         if available:
-            # Placeholder mapping — real OCR/UI extraction stays in Screenpipe
             elements.append(
                 UIElement(
                     type="text",
@@ -52,4 +48,8 @@ class PerceptionEngine:
             dialogs=dialogs,
             progress=progress,
             stable=stable,
-                )
+        )
+
+    def verify_task_completion(self, pre_state: Dict[str, object], post_state: Dict[str, object]) -> bool:
+        """Verify if SOC task completed successfully by comparing pre and post states."""
+        return pre_state == post_state
