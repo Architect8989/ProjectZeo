@@ -27,6 +27,7 @@ class ModeController:
         self._mode_entered_at: float = time.time()
         self._last_transition_reason: Optional[str] = None
         self._vision_ok: bool = False
+        self._input_locked: bool = False
 
         self._allowed_transitions = {
             SystemMode.OBSERVER: {SystemMode.ARMED},
@@ -51,6 +52,14 @@ class ModeController:
     def update_vision_status(self, ok: bool) -> None:
         self._vision_ok = bool(ok)
 
+    def lock_input(self) -> None:
+        """Lock mouse and keyboard input to prevent interference."""
+        self._input_locked = True
+
+    def release_input(self) -> None:
+        """Release input lock once execution is complete."""
+        self._input_locked = False
+
     def request_transition(
         self,
         target_mode: SystemMode,
@@ -74,6 +83,9 @@ class ModeController:
                 "Cannot enter EXECUTING without live screen vision"
             )
 
+        if target_mode == SystemMode.EXECUTING:
+            self.lock_input()  # Lock input during execution
+
         self._mode = target_mode
         self._mode_entered_at = time.time()
         self._last_transition_reason = reason
@@ -91,6 +103,7 @@ class ModeController:
 
     def disarm(self, reason: str) -> None:
         self.request_transition(SystemMode.OBSERVER, reason, force=True)
+        self.release_input()  # Release input when disarmed
 
     def _log_state(self, message: str) -> None:
         ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
