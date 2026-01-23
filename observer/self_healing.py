@@ -1,7 +1,6 @@
 import time
 from typing import Optional
 
-
 class PerceptionHealth:
     """
     Tracks perception quality and recovers understanding,
@@ -35,3 +34,8 @@ class PerceptionHealth:
 
     def degraded(self) -> bool:
         return self.unstable_count >= self.UNSTABLE_LIMIT
+
+    def reset(self) -> None:
+        """Reset the health check state."""
+        self.last_good_ts = None
+        self.unstable_count = 0
