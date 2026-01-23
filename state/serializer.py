@@ -1,13 +1,5 @@
-"""
-Encapsulated State Serialization (ESS)
-Enterprise-Grade, Deterministic, Fail-Safe
-
-Purpose:
-- Compress OS accessibility state into a compact semantic structure
-- Preserve all authority-relevant information
-- Remove non-interactive and redundant noise
-"""
-
+import time
+import uuid
 from typing import Dict, Any, List
 
 
@@ -47,17 +39,10 @@ def _allowed_actions(role: str) -> List[str]:
 
 
 def serialize(nodes: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Deterministically serializes accessibility nodes into
-    a compact, hierarchical, enterprise-safe state object.
-    """
-
     apps: Dict[str, Dict] = {}
 
-    # Stable iteration order
     for node_id in sorted(nodes.keys()):
         node = nodes[node_id]
-
         try:
             if not _is_interactive(node):
                 continue
@@ -82,11 +67,11 @@ def serialize(nodes: Dict[str, Any]) -> Dict[str, Any]:
             })
 
         except Exception:
-            # Fail-closed: corrupted nodes are ignored, not guessed
             continue
 
-    # Final deterministic structure
     return {
         "version": "ESS-1.0",
+        "snapshot_id": str(uuid.uuid4()),
+        "timestamp": time.time(),
         "applications": list(apps.values()),
-  }
+    }
