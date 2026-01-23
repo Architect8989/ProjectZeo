@@ -38,7 +38,7 @@ def _allowed_actions(role: str) -> List[str]:
     return ["click"]
 
 
-def serialize(nodes: Dict[str, Any]) -> Dict[str, Any]:
+def serialize(nodes: Dict[str, Any], snapshot_id: str = None, timestamp: float = None) -> Dict[str, Any]:
     apps: Dict[str, Dict] = {}
 
     for node_id in sorted(nodes.keys()):
@@ -71,7 +71,7 @@ def serialize(nodes: Dict[str, Any]) -> Dict[str, Any]:
 
     return {
         "version": "ESS-1.0",
-        "snapshot_id": str(uuid.uuid4()),
-        "timestamp": time.time(),
+        "snapshot_id": snapshot_id or str(uuid.uuid4()),
+        "timestamp": timestamp or time.time(),
         "applications": list(apps.values()),
-    }
+              }
