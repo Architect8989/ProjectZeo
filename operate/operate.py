@@ -4,6 +4,7 @@ import time
 import asyncio
 import platform
 import uuid
+import signal
 
 from prompt_toolkit.shortcuts import message_dialog
 from prompt_toolkit import prompt
@@ -32,7 +33,7 @@ from policy.engine import PolicyEngine
 from authority.input_arbitrator import InputArbitrator
 from authority.authority_policy import AuthorityDecision
 
-# NEW: Restoration system (isolated, sovereign)
+# Restoration system (isolated, sovereign)
 from restoration.snapshot_provider import SnapshotProvider
 from restoration.restore_provider import RestoreProvider
 from restoration.restore_verifier import RestoreVerifier
@@ -101,7 +102,7 @@ def main(model, terminal_prompt, voice_mode=False, verbose_mode=False):
     journal.open(session_id=execution_id, reason="OBJECTIVE_START")
 
     # --------------------------------------------------
-    # NEW: Pre-hijack snapshot (HARD GATE)
+    # Pre-hijack snapshot (HARD GATE)
     # --------------------------------------------------
 
     snapshot = None
@@ -124,6 +125,9 @@ def main(model, terminal_prompt, voice_mode=False, verbose_mode=False):
         )
         journal.seal(reason="SNAPSHOT_FAILURE")
         raise
+
+    # NEW: mark automation lifecycle start (additive)
+    operating_system.mark_automation_active()
 
     session_id = None
 
@@ -150,8 +154,13 @@ def main(model, terminal_prompt, voice_mode=False, verbose_mode=False):
 
     finally:
         # --------------------------------------------------
-        # NEW: Guaranteed restoration + verification
+        # Guaranteed restoration + verification (TERMINAL)
         # --------------------------------------------------
+        try:
+            operating_system.mark_automation_inactive()
+        except Exception:
+            pass
+
         if snapshot is not None:
             try:
                 restore_provider.restore(snapshot)
@@ -161,11 +170,15 @@ def main(model, terminal_prompt, voice_mode=False, verbose_mode=False):
                     execution_id=execution_id,
                 )
             except Exception as e:
+                # Verification failure is terminal by design
                 journal.record(
                     event="restoration_failed",
                     execution_id=execution_id,
                     error=str(e),
                 )
+                journal.seal(reason="RESTORATION_VERIFICATION_FAILED")
+                # Absolute halt: no further execution allowed
+                raise
 
         journal.seal(reason="OBJECTIVE_COMPLETE")
 
@@ -179,6 +192,12 @@ def operate(operations, model, execution_id: str):
 
     for operation in operations:
         time.sleep(1)
+
+        # NEW: heartbeat to prove executor liveness (additive)
+        try:
+            operating_system.heartbeat()
+        except Exception:
+            pass
 
         op_type = operation.get("operation", "").lower()
         thought = operation.get("thought")
