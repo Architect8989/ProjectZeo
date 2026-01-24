@@ -168,9 +168,6 @@ Repeated attempts MUST NOT degrade workspace state.
   "timestamp": "epoch_ms"
 }
 
-
----
-
 🧩 13. State Transition Diagram
 
 [ OBSERVER ]
@@ -189,9 +186,6 @@ Repeated attempts MUST NOT degrade workspace state.
 
 No other transitions are allowed.
 
-
----
-
 🚫 14. Non-Goals
 
 This system does NOT aim to:
@@ -204,10 +198,6 @@ Enforce pixel-perfect layouts
 
 Bypass OS security boundaries
 
-
-
----
-
 🔒 15. Contract Status
 
 This document is frozen.
@@ -219,6 +209,5 @@ Version bump
 Backward compatibility review
 
 Re-verification of all implementations
-
 
 No code may violate this contract.
