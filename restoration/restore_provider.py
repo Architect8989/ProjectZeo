@@ -1,18 +1,3 @@
-"""
-Restoration Provider
-
-Performs workspace restoration according to the Restoration Contract.
-
-This module is invoked after execution termination, regardless of cause.
-
-Responsibilities:
-- Cease all automated input
-- Restore OS state from a RestorationSnapshot
-- Never fight human control
-- Be idempotent
-- Fail loudly if verification cannot be satisfied
-"""
-
 from __future__ import annotations
 
 import time
@@ -46,6 +31,7 @@ class RestoreProvider:
           - set_execution_mode(mode: str) -> None
         """
         self._os = os_backend
+        self._restore_completed = False  # NEW: idempotency guard
 
     # -------------------------------------------------
     # Public API
@@ -58,6 +44,18 @@ class RestoreProvider:
         This method must never throw partial success.
         Either restoration completes to contract or fails loudly.
         """
+
+        # NEW: idempotency guarantee
+        if self._restore_completed:
+            return
+
+        # 0. Absolute safety: reassert user dominance
+        try:
+            # If available, this is stronger than stop_automated_input
+            if hasattr(self._os, "force_release_all"):
+                self._os.force_release_all()
+        except Exception:
+            pass
 
         # 1. Cease all automated control immediately
         try:
@@ -117,6 +115,9 @@ class RestoreProvider:
         # 7. Final verification (minimal, contract-bound)
         self._verify_post_restore(snapshot)
 
+        # NEW: mark restoration complete
+        self._restore_completed = True
+
     # -------------------------------------------------
     # Internal Verification
     # -------------------------------------------------
@@ -147,4 +148,4 @@ class RestoreProvider:
         if (x, y) != (snapshot.cursor.x, snapshot.cursor.y):
             raise RestorationError(
                 "Cursor position verification failed"
-      )
+        )
