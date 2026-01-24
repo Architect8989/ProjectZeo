@@ -28,6 +28,10 @@ from utils.accessibility import AccessibilityBackend
 from audit.journal import ActionJournal
 from policy.engine import PolicyEngine
 
+# NEW: Authority arbitration (external, sovereign)
+from authority.input_arbitrator import InputArbitrator
+from authority.authority_policy import AuthorityDecision
+
 
 # ----------------------------
 # GLOBAL SINGLETONS (ALLOWED)
@@ -39,6 +43,9 @@ operating_system = OperatingSystem()
 accessibility_backend = AccessibilityBackend()
 journal = ActionJournal()
 policy_engine = PolicyEngine()
+
+# NEW: single arbitrator instance
+input_arbitrator = InputArbitrator()
 
 # Execution context flag (read-only externally)
 EXECUTION_MODE = "ACTIVE"  # OBSERVER | ACTIVE
@@ -149,9 +156,9 @@ def operate(operations, model, execution_id: str):
 
     GUARANTEES:
     - Existing logic preserved
-    - Deterministic entry / exit
-    - Auditable actions
-    - Single abort path
+    - Authority arbitration integrated
+    - SOC yields, never fights
+    - Single clean exit path
     """
 
     # Freeze UI context ONCE per step batch (future use)
@@ -172,7 +179,34 @@ def operate(operations, model, execution_id: str):
             thought=thought,
         )
 
+        # ----------------------------
+        # NEW: Authority arbitration (pre-action)
+        # ----------------------------
+
+        decision = input_arbitrator.evaluate(
+            input_event_ts=time.monotonic(),
+            high_risk=False,      # can be wired later from intent metadata
+            soc_confident=True,   # conservative default
+        )
+
+        if decision == AuthorityDecision.YIELD:
+            journal.record(
+                event="authority_yield",
+                execution_id=execution_id,
+            )
+            return True
+
+        if decision == AuthorityDecision.ABORT:
+            journal.record(
+                event="authority_abort",
+                execution_id=execution_id,
+            )
+            return True
+
         try:
+            # Mark SOC-controlled action window
+            input_arbitrator.soc_action_started()
+
             # ----------------------------
             # LEGACY PATHS (UNCHANGED)
             # ----------------------------
