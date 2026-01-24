@@ -1,13 +1,3 @@
-"""
-Restoration Verifier
-
-This module performs post-restoration verification according to the
-Restoration Contract.
-
-Verification is explicit, minimal, and authoritative.
-If verification fails, restoration is considered failed.
-"""
-
 from __future__ import annotations
 
 from typing import Tuple
@@ -56,6 +46,9 @@ class RestoreVerifier:
         self._verify_execution_mode()
         self._verify_cursor(snapshot)
         self._verify_focus(snapshot)
+
+        # NEW: explicit success path
+        return
 
     # -------------------------------------------------
     # Verification Steps
