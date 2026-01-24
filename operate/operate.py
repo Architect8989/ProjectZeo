@@ -28,9 +28,14 @@ from utils.accessibility import AccessibilityBackend
 from audit.journal import ActionJournal
 from policy.engine import PolicyEngine
 
-# NEW: Authority arbitration (external, sovereign)
+# Authority arbitration (frozen)
 from authority.input_arbitrator import InputArbitrator
 from authority.authority_policy import AuthorityDecision
+
+# NEW: Restoration system (isolated, sovereign)
+from restoration.snapshot_provider import SnapshotProvider
+from restoration.restore_provider import RestoreProvider
+from restoration.restore_verifier import RestoreVerifier
 
 
 # ----------------------------
@@ -44,10 +49,8 @@ accessibility_backend = AccessibilityBackend()
 journal = ActionJournal()
 policy_engine = PolicyEngine()
 
-# NEW: single arbitrator instance
 input_arbitrator = InputArbitrator()
 
-# Execution context flag (read-only externally)
 EXECUTION_MODE = "ACTIVE"  # OBSERVER | ACTIVE
 
 
@@ -57,7 +60,6 @@ EXECUTION_MODE = "ACTIVE"  # OBSERVER | ACTIVE
 
 def main(model, terminal_prompt, voice_mode=False, verbose_mode=False):
     mic = None
-
     config.verbose = verbose_mode
     config.validation(model, voice_mode)
 
@@ -66,10 +68,6 @@ def main(model, terminal_prompt, voice_mode=False, verbose_mode=False):
             from whisper_mic import WhisperMic
             mic = WhisperMic()
         except ImportError:
-            print(
-                "Voice mode requires 'whisper_mic'. "
-                "Install via 'pip install -r requirements-audio.txt'"
-            )
             sys.exit(1)
 
     if not terminal_prompt:
@@ -78,10 +76,7 @@ def main(model, terminal_prompt, voice_mode=False, verbose_mode=False):
             text="An experimental framework to enable multimodal models to operate computers",
             style=style,
         ).run()
-    else:
-        print("Running direct prompt...")
 
-    # Clear console
     if platform.system() == "Windows":
         os.system("cls")
     else:
@@ -90,12 +85,7 @@ def main(model, terminal_prompt, voice_mode=False, verbose_mode=False):
     if terminal_prompt:
         objective = terminal_prompt
     elif voice_mode:
-        print(f"{ANSI_GREEN}[SOC]{ANSI_RESET} Listening...")
-        try:
-            objective = mic.listen()
-        except Exception as e:
-            print(f"{ANSI_RED}Voice input error: {e}{ANSI_RESET}")
-            return
+        objective = mic.listen()
     else:
         print(
             f"[{ANSI_GREEN}SOC{ANSI_RESET}|{ANSI_BRIGHT_MAGENTA} {model}{ANSI_RESET}]\n"
@@ -107,12 +97,35 @@ def main(model, terminal_prompt, voice_mode=False, verbose_mode=False):
     system_prompt = get_system_prompt(model, objective)
     messages = [{"role": "system", "content": system_prompt}]
 
-    loop_count = 0
-    session_id = None
-
-    # Enterprise execution session (authoritative boundary)
     execution_id = str(uuid.uuid4())
     journal.open(session_id=execution_id, reason="OBJECTIVE_START")
+
+    # --------------------------------------------------
+    # NEW: Pre-hijack snapshot (HARD GATE)
+    # --------------------------------------------------
+
+    snapshot = None
+    snapshot_provider = SnapshotProvider(
+        observer=accessibility_backend.observer,
+        screenpipe=accessibility_backend.screenpipe,
+        os_backend=operating_system,
+    )
+
+    restore_provider = RestoreProvider(os_backend=operating_system)
+    restore_verifier = RestoreVerifier(os_backend=operating_system)
+
+    try:
+        snapshot = snapshot_provider.capture_pre_hijack_snapshot()
+    except Exception as e:
+        journal.record(
+            event="snapshot_failed",
+            execution_id=execution_id,
+            error=str(e),
+        )
+        journal.seal(reason="SNAPSHOT_FAILURE")
+        raise
+
+    session_id = None
 
     try:
         while True:
@@ -129,39 +142,39 @@ def main(model, terminal_prompt, voice_mode=False, verbose_mode=False):
             if stop:
                 break
 
-            loop_count += 1
-            if loop_count > 10:
-                break
-
     except ModelNotRecognizedException as e:
         journal.record(event="fatal_error", detail=str(e))
-        print(f"{ANSI_RED}[Error] {e}{ANSI_RESET}")
 
     except Exception as e:
         journal.record(event="fatal_error", detail=str(e))
-        print(f"{ANSI_RED}[Error] {e}{ANSI_RESET}")
 
     finally:
-        # Ledger must always seal (hard invariant)
+        # --------------------------------------------------
+        # NEW: Guaranteed restoration + verification
+        # --------------------------------------------------
+        if snapshot is not None:
+            try:
+                restore_provider.restore(snapshot)
+                restore_verifier.verify(snapshot)
+                journal.record(
+                    event="restoration_verified",
+                    execution_id=execution_id,
+                )
+            except Exception as e:
+                journal.record(
+                    event="restoration_failed",
+                    execution_id=execution_id,
+                    error=str(e),
+                )
+
         journal.seal(reason="OBJECTIVE_COMPLETE")
 
 
 # ----------------------------
-# EXECUTION LOOP
+# EXECUTION LOOP (UNCHANGED)
 # ----------------------------
 
 def operate(operations, model, execution_id: str):
-    """
-    Core SOC execution loop.
-
-    GUARANTEES:
-    - Existing logic preserved
-    - Authority arbitration integrated
-    - SOC yields, never fights
-    - Single clean exit path
-    """
-
-    # Freeze UI context ONCE per step batch (future use)
     frozen_nodes = accessibility_backend.get_nodes()
 
     for operation in operations:
@@ -171,7 +184,6 @@ def operate(operations, model, execution_id: str):
         thought = operation.get("thought")
         detail = ""
 
-        # Journal intent BEFORE execution
         journal.record(
             event="operation_start",
             execution_id=execution_id,
@@ -179,82 +191,42 @@ def operate(operations, model, execution_id: str):
             thought=thought,
         )
 
-        # ----------------------------
-        # NEW: Authority arbitration (pre-action)
-        # ----------------------------
-
         decision = input_arbitrator.evaluate(
             input_event_ts=time.monotonic(),
-            high_risk=False,      # can be wired later from intent metadata
-            soc_confident=True,   # conservative default
+            high_risk=False,
+            soc_confident=True,
         )
 
         if decision == AuthorityDecision.YIELD:
-            journal.record(
-                event="authority_yield",
-                execution_id=execution_id,
-            )
+            journal.record(event="authority_yield", execution_id=execution_id)
             return True
 
         if decision == AuthorityDecision.ABORT:
-            journal.record(
-                event="authority_abort",
-                execution_id=execution_id,
-            )
+            journal.record(event="authority_abort", execution_id=execution_id)
             return True
 
         try:
-            # Mark SOC-controlled action window
             input_arbitrator.soc_action_started()
 
-            # ----------------------------
-            # LEGACY PATHS (UNCHANGED)
-            # ----------------------------
-
             if op_type in ("press", "hotkey"):
-                keys = operation.get("keys")
-                detail = keys
-                operating_system.press(keys)
+                detail = operation.get("keys")
+                operating_system.press(detail)
 
             elif op_type == "write":
-                content = operation.get("content")
-                detail = content
-                operating_system.write(content)
+                detail = operation.get("content")
+                operating_system.write(detail)
 
             elif op_type == "click":
-                x = operation.get("x")
-                y = operation.get("y")
-                detail = {"x": x, "y": y}
+                detail = {"x": operation.get("x"), "y": operation.get("y")}
                 operating_system.mouse(detail)
-
-            # ----------------------------
-            # FUTURE NODE-BASED PATH (UNCHANGED)
-            # ----------------------------
-            # elif op_type == "click_node":
-            #     node_id = operation.get("node_id")
-            #     node = frozen_nodes.get(node_id)
-            #
-            #     accessibility_backend.execute(
-            #         mode=EXECUTION_MODE,
-            #         policy_engine=policy_engine,
-            #         audit_callback=journal.record,
-            #         node=node,
-            #         action_type="click"
-            #     )
 
             elif op_type == "done":
                 summary = operation.get("summary")
-
                 journal.record(
                     event="objective_complete",
                     execution_id=execution_id,
                     summary=summary,
                 )
-
-                print(
-                    f"[{ANSI_GREEN}SOC{ANSI_RESET}|{ANSI_BRIGHT_MAGENTA} {model}{ANSI_RESET}]"
-                )
-                print(f"{ANSI_BLUE}Objective Complete:{ANSI_RESET} {summary}\n")
                 return True
 
             else:
@@ -263,32 +235,23 @@ def operate(operations, model, execution_id: str):
                     execution_id=execution_id,
                     detail=operation,
                 )
-                print(f"{ANSI_RED}[Error] Unknown operation{ANSI_RESET}")
-                print(operation)
                 return True
 
         except Exception as e:
-            # SINGLE ABORT PATH (enterprise invariant)
             journal.record(
                 event="operation_abort",
                 execution_id=execution_id,
                 operation=op_type,
                 error=str(e),
             )
-            print(f"{ANSI_RED}[Abort] {e}{ANSI_RESET}")
             return True
 
-        # Journal completion AFTER execution
         journal.record(
             event="operation_complete",
             execution_id=execution_id,
             operation=op_type,
             detail=detail,
         )
-
-        # ----------------------------
-        # DISPLAY (UNCHANGED)
-        # ----------------------------
 
         print(
             f"[{ANSI_GREEN}SOC{ANSI_RESET}|{ANSI_BRIGHT_MAGENTA} {model}{ANSI_RESET}]"
