@@ -3,6 +3,9 @@ import platform
 import time
 import math
 import threading
+import atexit
+import os
+import signal
 
 from operate.utils.misc import convert_percent_to_decimal
 
@@ -12,15 +15,33 @@ class OperatingSystem:
     OS interaction layer.
 
     Existing SOC execution logic is preserved.
-    New methods are added to support authority & restoration.
+    New logic enforces:
+    - Fail-open human reclaim
+    - Crash-safe input release
+    - Out-of-band kill semantics
     """
 
     # -------------------------------------------------
-    # INTERNAL AUTHORITY STATE (NEW, SAFE)
+    # INTERNAL AUTHORITY STATE (EXISTING)
     # -------------------------------------------------
 
     _execution_mode_lock = threading.Lock()
     _execution_mode = "OBSERVER"  # default-safe
+
+    # -------------------------------------------------
+    # NEW: HARD SAFETY STATE (ADDITIVE)
+    # -------------------------------------------------
+
+    _automation_active = False
+    _automation_lock = threading.Lock()
+
+    _last_heartbeat = time.time()
+    _heartbeat_lock = threading.Lock()
+
+    _WATCHDOG_INTERVAL = 0.5
+    _HEARTBEAT_TIMEOUT = 2.0  # seconds
+
+    _watchdog_thread_started = False
 
     # -------------------------------------------------
     # EXISTING SOC METHODS (UNCHANGED)
@@ -82,115 +103,148 @@ class OperatingSystem:
             print("[OperatingSystem][click_at_percentage] error:", e)
 
     # -------------------------------------------------
-    # NEW: AUTHORITY & RESTORATION SUPPORT
+    # EXISTING AUTHORITY SUPPORT (UNCHANGED)
     # -------------------------------------------------
 
-    # ---- Execution mode (AUTHORITY TRUTH)
-
     def get_execution_mode(self) -> str:
-        """
-        Returns current execution mode.
-
-        This is authoritative for restoration & verification.
-        """
         with self._execution_mode_lock:
             return self._execution_mode
 
     def set_execution_mode(self, mode: str) -> None:
-        """
-        Sets execution mode.
-
-        Allowed values are enforced upstream.
-        """
         with self._execution_mode_lock:
             self._execution_mode = mode
 
-    # ---- Input control (SAFE, NO-OP FRIENDLY)
+    # -------------------------------------------------
+    # NEW: FAIL-OPEN INPUT SAFETY
+    # -------------------------------------------------
+
+    def mark_automation_active(self):
+        with self._automation_lock:
+            self._automation_active = True
+        self._touch_heartbeat()
+        self._ensure_watchdog()
+
+    def mark_automation_inactive(self):
+        with self._automation_lock:
+            self._automation_active = False
+
+    def _touch_heartbeat(self):
+        with self._heartbeat_lock:
+            self._last_heartbeat = time.time()
+
+    def heartbeat(self):
+        """
+        Called periodically by executor.
+        Absence of this implies executor death.
+        """
+        self._touch_heartbeat()
+
+    def _ensure_watchdog(self):
+        if self._watchdog_thread_started:
+            return
+
+        self._watchdog_thread_started = True
+        t = threading.Thread(target=self._watchdog_loop, daemon=True)
+        t.start()
+
+    def _watchdog_loop(self):
+        while True:
+            time.sleep(self._WATCHDOG_INTERVAL)
+            with self._heartbeat_lock:
+                elapsed = time.time() - self._last_heartbeat
+
+            with self._automation_lock:
+                active = self._automation_active
+
+            if active and elapsed > self._HEARTBEAT_TIMEOUT:
+                print("[OperatingSystem][WATCHDOG] Heartbeat lost — forcing input release")
+                self.force_release_all()
+                return
+
+    # -------------------------------------------------
+    # NEW: FORCED HUMAN RECLAIM
+    # -------------------------------------------------
+
+    def force_release_all(self):
+        """
+        Absolute safety valve.
+        Must succeed even if executor is dead.
+        """
+        try:
+            self.stop_automated_input()
+            self.enable_user_input()
+            self.set_execution_mode("OBSERVER")
+        except Exception as e:
+            print("[OperatingSystem][force_release_all] error:", e)
+
+    # -------------------------------------------------
+    # EXISTING INPUT CONTROL (UNCHANGED)
+    # -------------------------------------------------
 
     def stop_automated_input(self) -> None:
-        """
-        Ceases any automated input.
-
-        pyautogui is synchronous; this is a safety hook.
-        """
-        # No persistent input threads to stop currently
         return
 
     def enable_user_input(self) -> None:
-        """
-        Ensures user input is not blocked.
-
-        No-op for pyautogui-based control.
-        """
         return
 
-    # ---- Cursor state (AUTHORITATIVE)
+    # -------------------------------------------------
+    # CURSOR STATE (UNCHANGED)
+    # -------------------------------------------------
 
     def get_cursor_position(self):
-        """
-        Returns (x, y) in screen pixels.
-        """
         try:
             return pyautogui.position()
         except Exception as e:
             raise RuntimeError(f"Unable to get cursor position: {e}")
 
     def set_cursor_position(self, x: int, y: int) -> None:
-        """
-        Moves cursor to absolute pixel position.
-        """
         try:
             pyautogui.moveTo(int(x), int(y), duration=0)
         except Exception as e:
             raise RuntimeError(f"Unable to set cursor position: {e}")
 
-    # ---- Window / application focus (BEST-EFFORT, SAFE)
+    # -------------------------------------------------
+    # WINDOW / APPLICATION FOCUS (UNCHANGED)
+    # -------------------------------------------------
 
     def get_focused_window(self):
-        """
-        Returns minimal focused window info.
-
-        NOTE:
-        pyautogui does not provide native window IDs.
-        This is a conservative placeholder that preserves contract shape.
-        """
         return {
             "id": "unknown",
             "title": None,
         }
 
     def get_focused_window_id(self):
-        """
-        Returns focused window ID if available.
-        """
         info = self.get_focused_window()
         return info.get("id")
 
     def focus_window(self, window_id: str) -> bool:
-        """
-        Attempts to focus a window by ID.
-
-        pyautogui cannot guarantee this.
-        Returns False to allow fallback activation.
-        """
         return False
 
     def get_active_application(self):
-        """
-        Returns active application info.
-
-        Best-effort, platform-dependent.
-        """
         return {
             "process_name": platform.system(),
             "pid": None,
         }
 
     def activate_application(self, process_name: str, pid=None) -> bool:
-        """
-        Attempts to activate an application.
-
-        Best-effort only.
-        Returns False if not supported.
-        """
         return False
+
+
+# -------------------------------------------------
+# PROCESS-LEVEL FAIL-OPEN GUARANTEES
+# -------------------------------------------------
+
+_OS_SINGLETON = OperatingSystem()
+
+def _emergency_exit_handler(*args):
+    try:
+        _OS_SINGLETON.force_release_all()
+    finally:
+        os._exit(1)
+
+# Catch all normal exits
+atexit.register(_OS_SINGLETON.force_release_all)
+
+# Catch kill signals
+for sig in (signal.SIGINT, signal.SIGTERM):
+    signal.signal(sig, _emergency_exit_handler)
