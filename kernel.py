@@ -5,24 +5,16 @@ import time
 import subprocess
 from datetime import datetime
 
-# ------------------------
-# IMPORT REAL MODULES
-# ------------------------
-
 from observer.screenpipe_adapter import capture_frame
 from observer.perception_engine import PerceptionEngine
-
-from audit.journal import Journal
 
 from restoration.snapshot_provider import take_snapshot
 from restoration.restore_provider import restore_snapshot
 
-# ------------------------
-# CONFIG
-# ------------------------
+from audit.journal import Journal
 
 FRAMES_DIR = "frames"
-INTENT_PREFIX = "[INTENT]"
+SOC_TRIGGER_TEXT = "SOC READY"   # text visible on screen when user wants SOC
 
 os.makedirs(FRAMES_DIR, exist_ok=True)
 
@@ -32,15 +24,7 @@ perception = PerceptionEngine()
 print("[KERNEL] Booted")
 print("[KERNEL] Observer mode")
 
-# ------------------------
-# MAIN LOOP
-# ------------------------
-
 while True:
-
-    # ------------------------
-    # OBSERVER MODE
-    # ------------------------
 
     frame = capture_frame()
 
@@ -52,88 +36,31 @@ while True:
     frame_path = os.path.join(FRAMES_DIR, f"{ts}.png")
     frame.save(frame_path)
 
-    journal.write({
-        "component": "observer",
-        "frame": frame_path
-    })
-
-    # ------------------------
-    # PERCEPTION (INTENT)
-    # ------------------------
-
     state = perception.extract(frame_path)
     texts = state.get("text_blocks", [])
 
-    intent = None
+    trigger = False
     for t in texts:
-        if t.startswith(INTENT_PREFIX):
-            intent = t.replace(INTENT_PREFIX, "").strip()
+        if SOC_TRIGGER_TEXT in t:
+            trigger = True
             break
 
-    # ------------------------
-    # EXECUTOR MODE
-    # ------------------------
+    if trigger:
 
-    if intent:
-
-        print("[KERNEL] Intent detected:", intent)
-
-        journal.write({
-            "component": "kernel",
-            "event": "intent_detected",
-            "task": intent
-        })
-
-        # ------------------------
-        # SNAPSHOT
-        # ------------------------
+        journal.write({"event": "soc_triggered"})
 
         snapshot_id = take_snapshot()
 
-        journal.write({
-            "component": "kernel",
-            "event": "snapshot_taken",
-            "snapshot_id": snapshot_id
-        })
-
-        # ------------------------
-        # RUN SOC
-        # ------------------------
-
-        print("[KERNEL] Launching SOC")
-
         soc = subprocess.Popen(
-            [
-                "python",
-                "operate/main.py",
-                "--task",
-                intent,
-                "--screenshot",
-                frame_path
-            ]
+            ["python", "operate/main.py"]
         )
 
         soc.wait()
 
-        journal.write({
-            "component": "kernel",
-            "event": "soc_finished"
-        })
-
-        # ------------------------
-        # RESTORE
-        # ------------------------
-
-        print("[KERNEL] Restoring screen")
-
         restore_snapshot(snapshot_id)
 
-        journal.write({
-            "component": "kernel",
-            "event": "restored",
-            "snapshot_id": snapshot_id
-        })
+        journal.write({"event": "soc_finished"})
 
-        print("[KERNEL] Back to observer mode")
+        print("[KERNEL] Returned to observer")
 
     time.sleep(1)
