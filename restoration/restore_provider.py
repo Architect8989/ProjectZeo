@@ -29,9 +29,15 @@ class RestoreProvider:
           - activate_application(process_name, pid) -> bool
           - get_execution_mode() -> str
           - set_execution_mode(mode: str) -> None
+
+        OPTIONAL (used if present):
+          - set_window_geometry(window_id, geom) -> None
+          - set_window_z_order(window_id, z) -> None
+          - restore_browser_state(state) -> None
+          - set_media_playback_position(seconds) -> None
         """
         self._os = os_backend
-        self._restore_completed = False  # NEW: idempotency guard
+        self._restore_completed = False  # idempotency guard
 
     # -------------------------------------------------
     # Public API
@@ -45,13 +51,11 @@ class RestoreProvider:
         Either restoration completes to contract or fails loudly.
         """
 
-        # NEW: idempotency guarantee
         if self._restore_completed:
             return
 
         # 0. Absolute safety: reassert user dominance
         try:
-            # If available, this is stronger than stop_automated_input
             if hasattr(self._os, "force_release_all"):
                 self._os.force_release_all()
         except Exception:
@@ -61,7 +65,6 @@ class RestoreProvider:
         try:
             self._os.stop_automated_input()
         except Exception:
-            # This must never block restoration
             pass
 
         # 2. Reassert user input availability
@@ -69,6 +72,48 @@ class RestoreProvider:
             self._os.enable_user_input()
         except Exception:
             pass
+
+        # -------------------------------------------------
+        # ADDITIONS — EXTENDED RESTORATION
+        # -------------------------------------------------
+
+        meta = snapshot.metadata or {}
+
+        try:
+            if meta.get("window_geometry") and hasattr(self._os, "set_window_geometry"):
+                self._os.set_window_geometry(
+                    snapshot.focus.window_id,
+                    meta.get("window_geometry"),
+                )
+        except Exception:
+            pass
+
+        try:
+            if meta.get("window_z_order") is not None and hasattr(self._os, "set_window_z_order"):
+                self._os.set_window_z_order(
+                    snapshot.focus.window_id,
+                    meta.get("window_z_order"),
+                )
+        except Exception:
+            pass
+
+        try:
+            if meta.get("browser_state") and hasattr(self._os, "restore_browser_state"):
+                self._os.restore_browser_state(meta.get("browser_state"))
+        except Exception:
+            pass
+
+        try:
+            if meta.get("media_playback_position") is not None and hasattr(
+                self._os, "set_media_playback_position"
+            ):
+                self._os.set_media_playback_position(
+                    meta.get("media_playback_position")
+                )
+        except Exception:
+            pass
+
+        # -------------------------------------------------
 
         # 3. Restore cursor position
         try:
@@ -81,7 +126,7 @@ class RestoreProvider:
                 f"Failed to restore cursor position: {e}"
             ) from e
 
-        # 4. Restore window focus (best-effort, validated later)
+        # 4. Restore window focus
         focused = False
         try:
             focused = self._os.focus_window(snapshot.focus.window_id)
@@ -112,10 +157,9 @@ class RestoreProvider:
                 f"Failed to reset execution mode: {e}"
             ) from e
 
-        # 7. Final verification (minimal, contract-bound)
+        # 7. Final verification
         self._verify_post_restore(snapshot)
 
-        # NEW: mark restoration complete
         self._restore_completed = True
 
     # -------------------------------------------------
@@ -127,17 +171,14 @@ class RestoreProvider:
         Verifies restoration success according to contract.
         """
 
-        # Allow OS a brief moment to settle
         time.sleep(0.05)
 
-        # Execution mode must be OBSERVER
         mode = self._os.get_execution_mode()
         if mode != "OBSERVER":
             raise RestorationError(
                 f"Post-restore execution mode invalid: {mode}"
             )
 
-        # Cursor position must match (tolerance allowed upstream if needed)
         try:
             x, y = self._os.get_cursor_position()
         except Exception as e:
@@ -148,4 +189,15 @@ class RestoreProvider:
         if (x, y) != (snapshot.cursor.x, snapshot.cursor.y):
             raise RestorationError(
                 "Cursor position verification failed"
-        )
+            )
+
+        # ADDITION — focus verification if supported
+        try:
+            if hasattr(self._os, "get_focused_window"):
+                fw = self._os.get_focused_window()
+                if str(fw.get("id")) != snapshot.focus.window_id:
+                    raise RestorationError(
+                        "Focused window verification failed"
+                    )
+        except Exception:
+            pass
