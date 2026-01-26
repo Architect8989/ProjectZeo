@@ -165,7 +165,94 @@ async def call_qwen_vl_with_ocr(messages, objective, model):
         compress_screenshot(raw_screenshot_filename, screenshot_filename)
 
         with open(screenshot_filename, "rb") as img_file:
+async def call_qwen_vl_with_ocr(messages, objective, model):
+    if config.verbose:
+        print("[call_qwen_vl_with_ocr][LOCAL QWEN-VL]")
+
+    try:
+        import ollama
+        time.sleep(1)
+
+        confirm_system_prompt(messages, objective, model)
+
+        screenshots_dir = "screenshots"
+        if not os.path.exists(screenshots_dir):
+            os.makedirs(screenshots_dir)
+
+        # Capture screen with cursor
+        raw_screenshot_filename = os.path.join(screenshots_dir, "raw_screenshot.png")
+        capture_screen_with_cursor(raw_screenshot_filename)
+
+        # Compress screenshot
+        screenshot_filename = os.path.join(screenshots_dir, "screenshot.jpeg")
+        compress_screenshot(raw_screenshot_filename, screenshot_filename)
+
+        with open(screenshot_filename, "rb") as img_file:
             img_base64 = base64.b64encode(img_file.read()).decode("utf-8")
+
+        if len(messages) == 1:
+            user_prompt = get_user_first_message_prompt()
+        else:
+            user_prompt = get_user_prompt()
+
+        # -------- LOCAL QWEN-VL CALL ----------
+        response = ollama.chat(
+            model="qwen2.5-vl:7b-instruct",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": f"{user_prompt}\nONLY return JSON. No explanation."
+                        },
+                        {
+                            "type": "image",
+                            "image": img_base64
+                        }
+                    ]
+                }
+            ]
+        )
+
+        content = response["message"]["content"]
+        content = clean_json(content)
+        content_str = content
+        content = json.loads(content)
+        # --------------------------------------
+
+        processed_content = []
+
+        for operation in content:
+            if operation.get("operation") == "click":
+                text_to_click = operation.get("text")
+
+                reader = easyocr.Reader(["en"])
+                result = reader.readtext(screenshot_filename)
+
+                text_element_index = get_text_element(
+                    result, text_to_click, screenshot_filename
+                )
+                coordinates = get_text_coordinates(
+                    result, text_element_index, screenshot_filename
+                )
+
+                operation["x"] = coordinates["x"]
+                operation["y"] = coordinates["y"]
+
+                processed_content.append(operation)
+            else:
+                processed_content.append(operation)
+
+        assistant_message = {"role": "assistant", "content": content_str}
+        messages.append(assistant_message)
+
+        return processed_content
+
+    except Exception as e:
+        print("[call_qwen_vl_with_ocr] error:", e)
+        traceback.print_exc()
+        return gpt_4_fallback(messages, objective, model)            img_base64 = base64.b64encode(img_file.read()).decode("utf-8")
 
         if len(messages) == 1:
             user_prompt = get_user_first_message_prompt()
@@ -190,74 +277,6 @@ async def call_qwen_vl_with_ocr(messages, objective, model):
             messages=messages,
         )
 
-        content = response.choices[0].message.content
-
-        content = clean_json(content)
-
-        # used later for the messages
-        content_str = content
-
-        content = json.loads(content)
-
-        processed_content = []
-
-        for operation in content:
-            if operation.get("operation") == "click":
-                text_to_click = operation.get("text")
-                if config.verbose:
-                    print(
-                        "[call_qwen_vl_with_ocr][click] text_to_click",
-                        text_to_click,
-                    )
-                # Initialize EasyOCR Reader
-                reader = easyocr.Reader(["en"])
-
-                # Read the screenshot
-                result = reader.readtext(screenshot_filename)
-
-                text_element_index = get_text_element(
-                    result, text_to_click, screenshot_filename
-                )
-                coordinates = get_text_coordinates(
-                    result, text_element_index, screenshot_filename
-                )
-
-                # add `coordinates`` to `content`
-                operation["x"] = coordinates["x"]
-                operation["y"] = coordinates["y"]
-
-                if config.verbose:
-                    print(
-                        "[call_qwen_vl_with_ocr][click] text_element_index",
-                        text_element_index,
-                    )
-                    print(
-                        "[call_qwen_vl_with_ocr][click] coordinates",
-                        coordinates,
-                    )
-                    print(
-                        "[call_qwen_vl_with_ocr][click] final operation",
-                        operation,
-                    )
-                processed_content.append(operation)
-
-            else:
-                processed_content.append(operation)
-
-        # wait to append the assistant message so that if the `processed_content` step fails we don't append a message and mess up message history
-        assistant_message = {"role": "assistant", "content": content_str}
-        messages.append(assistant_message)
-
-        return processed_content
-
-    except Exception as e:
-        print(
-            f"{ANSI_GREEN}[Self-Operating Computer]{ANSI_BRIGHT_MAGENTA}[{model}] That did not work. Trying another method {ANSI_RESET}"
-        )
-        if config.verbose:
-            print("[Self-Operating Computer][Operate] error", e)
-            traceback.print_exc()
-        return gpt_4_fallback(messages, objective, model)
 
 def call_gemini_pro_vision(messages, objective):
     """
