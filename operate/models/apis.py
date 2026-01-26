@@ -132,6 +132,7 @@ def call_gpt_4o(messages):
     print("[call_gpt_4o] error:", e)
     traceback.print_exc()
     return gpt_4_fallback(messages, None, "gpt-4")
+
   async def call_qwen_vl_with_ocr(messages, objective, model):
     if config.verbose:
         print("[call_qwen_vl_with_ocr][LOCAL QWEN-VL]")
