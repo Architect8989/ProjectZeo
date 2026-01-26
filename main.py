@@ -11,20 +11,24 @@ from observer.observer_core import ObserverCore
 from observer.screenpipe_adapter import ScreenpipeAdapter
 from observer.perception_engine import PerceptionEngine
 
-# NEW: crash-proof authority state
+# Crash-proof authority state
 from state.serializer import AuthorityStateSerializer
 
-# NEW: OS safety backend
+# OS safety backend
 from operate.utils.operating_system import OperatingSystem
 
-# NEW: SOC entrypoint (transactional execution)
+# SOC entrypoint
 from operate.main import main as soc_execute_main
+
+# 🔥 RESTORATION (NEW WIRES)
+from restoration.snapshot_provider import take_snapshot
+from restoration.restore_provider import restore_snapshot
 
 
 HEARTBEAT_INTERVAL = 2.0
 
 # --------------------------------------------------
-# GLOBAL SINGLETONS (ROOT OWNS THESE)
+# GLOBAL SINGLETONS
 # --------------------------------------------------
 
 OS_BACKEND = OperatingSystem()
@@ -33,14 +37,10 @@ AUTH_STATE = AuthorityStateSerializer(STATE_PATH)
 
 
 # --------------------------------------------------
-# PROCESS-LEVEL SAFETY
+# PROCESS SAFETY
 # --------------------------------------------------
 
 def _force_safe_shutdown(reason: str):
-    """
-    Absolute last-resort safety.
-    Must be safe to call multiple times.
-    """
     try:
         OS_BACKEND.force_release_all()
     except Exception:
@@ -59,7 +59,6 @@ def _signal_handler(signum, frame):
     os._exit(1)
 
 
-# Register safety hooks
 atexit.register(_force_safe_shutdown, "atexit")
 signal.signal(signal.SIGINT, _signal_handler)
 signal.signal(signal.SIGTERM, _signal_handler)
@@ -73,63 +72,62 @@ signal.signal(signal.SIGQUIT, _signal_handler)
 def main():
     print("[BOOT] System starting")
 
-    # --- Phase 0: Environment fingerprint (one-time, read-only) ---
+    # ---- ENVIRONMENT FINGERPRINT ----
     env_fingerprint = collect_environment_fingerprint()
     print("[ENV] Fingerprint collected")
     for k, v in env_fingerprint.items():
         print(f"[ENV] {k}: {v}")
 
-    # --- Load crash-proof authority state ---
+    # ---- LOAD AUTH STATE ----
     persisted = AUTH_STATE.load()
 
     if persisted.get("dirty") or persisted.get("restore_required"):
         print("[RECOVERY] Unsafe prior shutdown detected")
-        # Force pessimistic state immediately
         OS_BACKEND.force_release_all()
         AUTH_STATE.force_safe_state()
 
-    # --- Authority core ---
+    # ---- MODE CONTROLLER ----
     mode = ModeController()
 
-    # Force OBSERVER if coming from recovery
     if persisted.get("dirty"):
         try:
             mode.force_observer()
         except Exception:
             pass
 
-    # --- Intent input (CLI) ---
+    # ---- INTENT LISTENER ----
     intent_listener = IntentListener(mode)
     intent_listener.start()
 
-    # --- Observer + perception stack ---
+    # ---- OBSERVER STACK ----
     observer = ObserverCore()
     screenpipe = ScreenpipeAdapter()
     perception = PerceptionEngine()
 
     print(f"[STATE] Mode = {mode.mode.value}")
-    print("[OBSERVER] Live observation + understanding (no execution)")
-    print("[INTENT] Type intent and press Enter to arm system")
+    print("[OBSERVER] Watching screen (read-only)")
+    print("[INTENT] Type intent and press Enter")
 
     # --------------------------------------------------
-    # MAIN OBSERVER LOOP (DAEMON)
+    # MAIN LOOP
     # --------------------------------------------------
 
     while True:
-        # 1. Witness time
+
+        # 1. Observer heartbeat
         observer_state = observer.tick()
 
-        # 2. Read raw screen feed (read-only)
+        # 2. Screen feed
         screen_state = screenpipe.read()
 
-        # 3. Derive semantic understanding (read-only)
+        # 3. Perception
         ui_snapshot = perception.process(screen_state)
 
-        # 4. Attach perception to observer truth
+        # 4. Attach to observer
         observer.attach_screen_state(screen_state)
         observer.attach_ui_snapshot(ui_snapshot)
 
-        # 5. Structured heartbeat (truth only)
+        # 5. Heartbeat log
         heartbeat = {
             "mode": mode.mode.value,
             "uptime": observer_state["uptime_seconds"],
@@ -144,22 +142,26 @@ def main():
         print(f"[HEARTBEAT] {heartbeat}")
 
         # --------------------------------------------------
-        # EXECUTION HANDOFF (ROOT → SOC)
+        # EXECUTION TRANSACTION
         # --------------------------------------------------
 
         if mode.is_armed():
-            print("[EXECUTION] Intent armed — invoking SOC")
+            print("[EXECUTION] Intent armed — snapshotting")
 
-            # Persist authority transition BEFORE execution
+            # ---- SNAPSHOT BEFORE HIJACK ----
+            snapshot_id = take_snapshot()
+
             AUTH_STATE.persist(
                 execution_mode="EXECUTING",
                 automation_active=True,
                 restore_required=True,
-                last_snapshot_id=None,
+                last_snapshot_id=snapshot_id,
                 dirty=True,
             )
 
             try:
+                print("[EXECUTION] Launching SOC")
+
                 soc_execute_main(
                     model=None,
                     terminal_prompt=mode.consume_intent(),
@@ -167,7 +169,10 @@ def main():
                     verbose_mode=False,
                 )
 
-                # Successful completion → safe state
+                print("[EXECUTION] SOC finished — restoring")
+
+                restore_snapshot(snapshot_id)
+
                 AUTH_STATE.persist(
                     execution_mode="OBSERVER",
                     automation_active=False,
@@ -181,8 +186,13 @@ def main():
                 AUTH_STATE.force_safe_state()
                 OS_BACKEND.force_release_all()
 
+                # Best effort restore
+                try:
+                    restore_snapshot(snapshot_id)
+                except Exception:
+                    pass
+
             finally:
-                # Always return to OBSERVER
                 try:
                     mode.force_observer()
                 except Exception:
