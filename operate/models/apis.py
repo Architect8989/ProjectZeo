@@ -223,18 +223,7 @@ def call_gpt_4o(messages):
         print("[call_qwen_vl_with_ocr] error:", e)
         traceback.print_exc()
         return gpt_4_fallback(messages, objective, model)      
-        print(
-            f"{ANSI_GREEN}[Self-Operating Computer]{ANSI_BRIGHT_MAGENTA}[Operate] That did not work. Trying again {ANSI_RESET}",
-            e,
-        )
-        print(
-            f"{ANSI_GREEN}[Self-Operating Computer]{ANSI_RED}[Error] AI response was {ANSI_RESET}",
-            content,
-        )
-        if config.verbose:
-            traceback.print_exc()
-        return call_gpt_4o(messages)
-
+        
 def call_gemini_pro_vision(messages, objective):
     """
     Get the next action for Self-Operating Computer using Gemini Pro Vision
