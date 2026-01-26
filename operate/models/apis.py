@@ -30,7 +30,6 @@ from operate.utils.style import ANSI_BRIGHT_MAGENTA, ANSI_GREEN, ANSI_RED, ANSI_
 # Load configuration
 config = Config()
 
-
 async def get_next_action(model, messages, objective, session_id):
     if config.verbose:
         print("[Self-Operating Computer][get_next_action]")
@@ -129,11 +128,11 @@ def call_gpt_4o(messages):
         return content
 
     except Exception as e:
-    print("[call_gpt_4o] error:", e)
-    traceback.print_exc()
-    return gpt_4_fallback(messages, None, "gpt-4")
+        print("[call_gpt_4o] error:", e)
+        traceback.print_exc()
+        return gpt_4_fallback(messages, None, "gpt-4")
 
-  async def call_qwen_vl_with_ocr(messages, objective, model):
+async def call_qwen_vl_with_ocr(messages, objective, model):
     if config.verbose:
         print("[call_qwen_vl_with_ocr][LOCAL QWEN-VL]")
 
