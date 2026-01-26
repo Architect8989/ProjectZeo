@@ -159,7 +159,79 @@ async def call_qwen_vl_with_ocr(messages, objective, model):
         # Call the function to capture the screen with the cursor
         raw_screenshot_filename = os.path.join(screenshots_dir, "raw_screenshot.png")
         capture_screen_with_cursor(raw_screenshot_filename)
+async def call_qwen_vl_with_ocr(messages, objective, model):
+    if config.verbose:
+        print("[call_qwen_vl_with_ocr][LOCAL QWEN-VL]")
 
+    try:
+        import ollama
+        time.sleep(1)
+
+        confirm_system_prompt(messages, objective, model)
+
+        screenshots_dir = "screenshots"
+        os.makedirs(screenshots_dir, exist_ok=True)
+
+        raw = os.path.join(screenshots_dir, "raw_screenshot.png")
+        capture_screen_with_cursor(raw)
+
+        shot = os.path.join(screenshots_dir, "screenshot.jpeg")
+        compress_screenshot(raw, shot)
+
+        with open(shot, "rb") as f:
+            img_base64 = base64.b64encode(f.read()).decode("utf-8")
+
+        if len(messages) == 1:
+            user_prompt = get_user_first_message_prompt()
+        else:
+            user_prompt = get_user_prompt()
+
+        response = ollama.chat(
+            model="qwen2.5-vl:7b-instruct",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": f"{user_prompt}\nONLY return valid JSON."
+                        },
+                        {
+                            "type": "image",
+                            "image": img_base64
+                        }
+                    ]
+                }
+            ]
+        )
+
+        content = response["message"]["content"]
+        content = clean_json(content)
+        content_str = content
+        content = json.loads(content)
+
+        processed = []
+
+        for op in content:
+            if op.get("operation") == "click":
+                reader = easyocr.Reader(["en"])
+                result = reader.readtext(shot)
+
+                idx = get_text_element(result, op.get("text"), shot)
+                coords = get_text_coordinates(result, idx, shot)
+
+                op["x"] = coords["x"]
+                op["y"] = coords["y"]
+
+            processed.append(op)
+
+        messages.append({"role": "assistant", "content": content_str})
+        return processed
+
+    except Exception as e:
+        print("[call_qwen_vl_with_ocr] error:", e)
+        traceback.print_exc()
+        return gpt_4_fallback(messages, objective, model)
         # Compress screenshot image to make size be smaller
         screenshot_filename = os.path.join(screenshots_dir, "screenshot.jpeg")
         compress_screenshot(raw_screenshot_filename, screenshot_filename)
@@ -184,80 +256,6 @@ async def call_qwen_vl_with_ocr(messages, objective, model):
             ],
         }
         messages.append(vision_message)
-
-        response = client.chat.completions.create(
-            model="qwen2.5-vl-72b-instruct",
-            messages=messages,
-        )
-
-        content = response.choices[0].message.content
-
-        content = clean_json(content)
-
-        # used later for the messages
-        content_str = content
-
-        content = json.loads(content)
-
-        processed_content = []
-
-        for operation in content:
-            if operation.get("operation") == "click":
-                text_to_click = operation.get("text")
-                if config.verbose:
-                    print(
-                        "[call_qwen_vl_with_ocr][click] text_to_click",
-                        text_to_click,
-                    )
-                # Initialize EasyOCR Reader
-                reader = easyocr.Reader(["en"])
-
-                # Read the screenshot
-                result = reader.readtext(screenshot_filename)
-
-                text_element_index = get_text_element(
-                    result, text_to_click, screenshot_filename
-                )
-                coordinates = get_text_coordinates(
-                    result, text_element_index, screenshot_filename
-                )
-
-                # add `coordinates`` to `content`
-                operation["x"] = coordinates["x"]
-                operation["y"] = coordinates["y"]
-
-                if config.verbose:
-                    print(
-                        "[call_qwen_vl_with_ocr][click] text_element_index",
-                        text_element_index,
-                    )
-                    print(
-                        "[call_qwen_vl_with_ocr][click] coordinates",
-                        coordinates,
-                    )
-                    print(
-                        "[call_qwen_vl_with_ocr][click] final operation",
-                        operation,
-                    )
-                processed_content.append(operation)
-
-            else:
-                processed_content.append(operation)
-
-        # wait to append the assistant message so that if the `processed_content` step fails we don't append a message and mess up message history
-        assistant_message = {"role": "assistant", "content": content_str}
-        messages.append(assistant_message)
-
-        return processed_content
-
-    except Exception as e:
-        print(
-            f"{ANSI_GREEN}[Self-Operating Computer]{ANSI_BRIGHT_MAGENTA}[{model}] That did not work. Trying another method {ANSI_RESET}"
-        )
-        if config.verbose:
-            print("[Self-Operating Computer][Operate] error", e)
-            traceback.print_exc()
-        return gpt_4_fallback(messages, objective, model)
 
 def call_gemini_pro_vision(messages, objective):
     """
