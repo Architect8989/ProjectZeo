@@ -44,7 +44,6 @@ def main_entry():
     try:
         args = parser.parse_args()
 
-        # Preserve existing configuration flow
         config = {
             "model": args.model,
             "terminal_prompt": args.prompt,
@@ -52,7 +51,6 @@ def main_entry():
             "verbose_mode": args.verbose,
         }
 
-        # Kernel becomes single authority
         kernel = KernelController(
             config=config,
             operate_entry=operate_main
