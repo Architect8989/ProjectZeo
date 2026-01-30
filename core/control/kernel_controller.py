@@ -36,6 +36,13 @@ class KernelController:
         self.current_intent: Optional[str] = None
         self.current_plan: Optional[Any] = None
 
+        # Safety budgets
+        self.retry_count = 0
+        self.max_retries = 5
+
+        self.step_count = 0
+        self.max_steps = 200
+
     # -----------------------
     # Public Entry
     # -----------------------
@@ -95,7 +102,6 @@ class KernelController:
     def _planning(self):
         self.current_plan = main.generate_plan(self.current_intent)
 
-        # SCHEMA ENFORCEMENT
         if not validate_actions(self.current_plan):
             print("[KERNEL] Invalid plan schema. Replanning.")
             self._transition(KernelState.PLANNING)
@@ -104,7 +110,13 @@ class KernelController:
         self._transition(KernelState.EXECUTING)
 
     def _executing(self):
-        # RE-VALIDATE BEFORE EXECUTION
+        # Step budget
+        self.step_count += 1
+        if self.step_count > self.max_steps:
+            print("[KERNEL] Step limit exceeded.")
+            self._transition(KernelState.ERROR)
+            return
+
         if not validate_actions(self.current_plan):
             print("[KERNEL] Plan corrupted before execution. Replanning.")
             self._transition(KernelState.PLANNING)
@@ -124,6 +136,13 @@ class KernelController:
         if success:
             self._transition(KernelState.RESTORING)
         else:
+            self.retry_count += 1
+
+            if self.retry_count > self.max_retries:
+                print("[KERNEL] Retry limit exceeded.")
+                self._transition(KernelState.ERROR)
+                return
+
             print("[KERNEL] Verification failed. Retrying execution.")
             self._transition(KernelState.EXECUTING)
 
@@ -131,12 +150,20 @@ class KernelController:
         main.restore_screen()
         self.current_intent = None
         self.current_plan = None
+
+        self.retry_count = 0
+        self.step_count = 0
+
         self._transition(KernelState.OBSERVER)
 
     def _error(self):
         main.restore_screen()
         self.current_intent = None
         self.current_plan = None
+
+        self.retry_count = 0
+        self.step_count = 0
+
         self._transition(KernelState.OBSERVER)
 
     # -----------------------
