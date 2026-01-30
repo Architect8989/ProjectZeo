@@ -1,9 +1,13 @@
 """
 Self-Operating Computer
 """
+
 import argparse
 from operate.utils.style import ANSI_BRIGHT_MAGENTA
-from operate.operate import main
+from operate.operate import main as operate_main
+
+# NEW
+from core.control.kernel_controller import KernelController
 
 
 def main_entry():
@@ -18,21 +22,18 @@ def main_entry():
         default="gpt-4-with-ocr",
     )
 
-    # Add a voice flag
     parser.add_argument(
         "--voice",
         help="Use voice input mode",
         action="store_true",
     )
     
-    # Add a flag for verbose mode
     parser.add_argument(
         "--verbose",
         help="Run operate in verbose mode",
         action="store_true",
     )
     
-    # Allow for direct input of prompt
     parser.add_argument(
         "--prompt",
         help="Directly input the objective prompt",
@@ -42,12 +43,18 @@ def main_entry():
 
     try:
         args = parser.parse_args()
-        main(
-            args.model,
-            terminal_prompt=args.prompt,
-            voice_mode=args.voice,
-            verbose_mode=args.verbose
-        )
+
+        # EXISTING CONFIG FLOW PRESERVED
+        config = {
+            "model": args.model,
+            "terminal_prompt": args.prompt,
+            "voice_mode": args.voice,
+            "verbose_mode": args.verbose,
+        }
+
+        # NEW: kernel becomes entrypoint
+        KernelController(config=config, operate_entry=operate_main).start()
+
     except KeyboardInterrupt:
         print(f"\n{ANSI_BRIGHT_MAGENTA}Exiting...")
 
