@@ -4,7 +4,9 @@ from enum import Enum, auto
 import time
 from typing import Optional, Any
 
-import main  # existing main.py
+import operate.main as main  # runtime surface
+
+from core.schemas.action_schema import validate_actions
 
 
 class KernelState(Enum):
@@ -22,7 +24,7 @@ class KernelController:
     Governing state machine for the entire system.
 
     - Owns all state transitions
-    - Calls into existing main.py entrypoints
+    - Calls into existing operate.main entrypoints
     - No business logic inside kernel
     """
 
@@ -91,9 +93,22 @@ class KernelController:
 
     def _planning(self):
         self.current_plan = main.generate_plan(self.current_intent)
+
+        # SCHEMA ENFORCEMENT
+        if not validate_actions(self.current_plan):
+            print("[KERNEL] Invalid plan schema. Replanning.")
+            self._transition(KernelState.PLANNING)
+            return
+
         self._transition(KernelState.EXECUTING)
 
     def _executing(self):
+        # RE-VALIDATE BEFORE EXECUTION
+        if not validate_actions(self.current_plan):
+            print("[KERNEL] Plan corrupted before execution. Replanning.")
+            self._transition(KernelState.PLANNING)
+            return
+
         main.run_soc(self.current_plan)
         self._transition(KernelState.VERIFYING)
 
