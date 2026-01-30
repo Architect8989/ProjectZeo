@@ -7,6 +7,7 @@ from typing import Optional, Any
 import operate.main as main  # runtime surface
 
 from core.schemas.action_schema import validate_actions
+from core.verification.screen_verifier import verify_execution
 
 
 class KernelState(Enum):
@@ -113,11 +114,17 @@ class KernelController:
         self._transition(KernelState.VERIFYING)
 
     def _verifying(self):
-        success = main.verify_task()
+        screenshot = main.get_latest_screenshot()
+
+        success = verify_execution(
+            self.current_plan,
+            screenshot
+        )
 
         if success:
             self._transition(KernelState.RESTORING)
         else:
+            print("[KERNEL] Verification failed. Retrying execution.")
             self._transition(KernelState.EXECUTING)
 
     def _restoring(self):
