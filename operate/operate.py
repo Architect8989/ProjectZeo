@@ -38,6 +38,12 @@ from restoration.snapshot_provider import SnapshotProvider
 from restoration.restore_provider import RestoreProvider
 from restoration.restore_verifier import RestoreVerifier
 
+# ----------------------------
+# ADDITIVE SAFETY IMPORTS
+# ----------------------------
+
+from core.safety.action_timeout import action_timeout, ActionTimeout
+from core.telemetry.logger import log_warn
 
 # ----------------------------
 # GLOBAL SINGLETONS (ALLOWED)
@@ -126,7 +132,6 @@ def main(model, terminal_prompt, voice_mode=False, verbose_mode=False):
         journal.seal(reason="SNAPSHOT_FAILURE")
         raise
 
-    # NEW: mark automation lifecycle start (additive)
     operating_system.mark_automation_active()
 
     session_id = None
@@ -153,9 +158,6 @@ def main(model, terminal_prompt, voice_mode=False, verbose_mode=False):
         journal.record(event="fatal_error", detail=str(e))
 
     finally:
-        # --------------------------------------------------
-        # Guaranteed restoration + verification (TERMINAL)
-        # --------------------------------------------------
         try:
             operating_system.mark_automation_inactive()
         except Exception:
@@ -170,21 +172,19 @@ def main(model, terminal_prompt, voice_mode=False, verbose_mode=False):
                     execution_id=execution_id,
                 )
             except Exception as e:
-                # Verification failure is terminal by design
                 journal.record(
                     event="restoration_failed",
                     execution_id=execution_id,
                     error=str(e),
                 )
                 journal.seal(reason="RESTORATION_VERIFICATION_FAILED")
-                # Absolute halt: no further execution allowed
                 raise
 
         journal.seal(reason="OBJECTIVE_COMPLETE")
 
 
 # ----------------------------
-# EXECUTION LOOP (UNCHANGED)
+# EXECUTION LOOP (PATCHED)
 # ----------------------------
 
 def operate(operations, model, execution_id: str):
@@ -193,7 +193,6 @@ def operate(operations, model, execution_id: str):
     for operation in operations:
         time.sleep(1)
 
-        # NEW: heartbeat to prove executor liveness (additive)
         try:
             operating_system.heartbeat()
         except Exception:
@@ -227,32 +226,44 @@ def operate(operations, model, execution_id: str):
         try:
             input_arbitrator.soc_action_started()
 
-            if op_type in ("press", "hotkey"):
-                detail = operation.get("keys")
-                operating_system.press(detail)
+            try:
+                with action_timeout(5):
 
-            elif op_type == "write":
-                detail = operation.get("content")
-                operating_system.write(detail)
+                    if op_type in ("press", "hotkey"):
+                        detail = operation.get("keys")
+                        operating_system.press(detail)
 
-            elif op_type == "click":
-                detail = {"x": operation.get("x"), "y": operation.get("y")}
-                operating_system.mouse(detail)
+                    elif op_type == "write":
+                        detail = operation.get("content")
+                        operating_system.write(detail)
 
-            elif op_type == "done":
-                summary = operation.get("summary")
+                    elif op_type == "click":
+                        detail = {"x": operation.get("x"), "y": operation.get("y")}
+                        operating_system.mouse(detail)
+
+                    elif op_type == "done":
+                        summary = operation.get("summary")
+                        journal.record(
+                            event="objective_complete",
+                            execution_id=execution_id,
+                            summary=summary,
+                        )
+                        return True
+
+                    else:
+                        journal.record(
+                            event="unknown_operation",
+                            execution_id=execution_id,
+                            detail=operation,
+                        )
+                        return True
+
+            except ActionTimeout:
+                log_warn(f"[SOC] Action timeout: {operation}")
                 journal.record(
-                    event="objective_complete",
+                    event="action_timeout",
                     execution_id=execution_id,
-                    summary=summary,
-                )
-                return True
-
-            else:
-                journal.record(
-                    event="unknown_operation",
-                    execution_id=execution_id,
-                    detail=operation,
+                    operation=op_type,
                 )
                 return True
 
