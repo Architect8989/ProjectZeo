@@ -29,6 +29,26 @@ class SnapshotProvider:
 
     SNAPSHOT_SCHEMA_VERSION = "1.1"
 
+    # -------------------------------------------------
+    # SNAPSHOT REGISTRY (AUTHORITATIVE)
+    # -------------------------------------------------
+
+    _snapshots: Dict[str, RestorationSnapshot] = {}
+
+    @classmethod
+    def store_snapshot(cls, snapshot: RestorationSnapshot) -> str:
+        snapshot_id = snapshot.snapshot_id
+        cls._snapshots[snapshot_id] = snapshot
+        return snapshot_id
+
+    @classmethod
+    def get_snapshot(cls, snapshot_id: str) -> Optional[RestorationSnapshot]:
+        return cls._snapshots.get(snapshot_id)
+
+    # -------------------------------------------------
+    # INSTANCE
+    # -------------------------------------------------
+
     def __init__(
         self,
         *,
@@ -51,10 +71,10 @@ class SnapshotProvider:
         Returns snapshot_id.
         """
         snapshot = self.capture_pre_hijack_snapshot()
-        return snapshot.snapshot_id
+        return self.store_snapshot(snapshot)
 
     # -------------------------------------------------
-    # INTERNAL SNAPSHOT LOGIC (UNCHANGED)
+    # INTERNAL SNAPSHOT LOGIC
     # -------------------------------------------------
 
     def capture_pre_hijack_snapshot(self) -> RestorationSnapshot:
@@ -176,10 +196,9 @@ class SnapshotProvider:
             metadata=metadata,
         )
 
-        # 7. Notify observer (FIXED: pass OBJECT, not dict)
-        try:
-            self._observer.attach_ui_snapshot(snapshot)
-        except Exception:
-            pass
+        # IMPORTANT:
+        # Do NOT attach snapshot to observer.
+        # Observer expects UISnapshot, not RestorationSnapshot.
+        # Attaching here caused type corruption and was removed intentionally.
 
         return snapshot
