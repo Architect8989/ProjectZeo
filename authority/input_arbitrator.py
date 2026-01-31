@@ -12,7 +12,8 @@ class InputArbitrator:
     SOC NEVER fights the human.
     """
 
-    EMERGENCY_RECLAIM_TIMEOUT_SECONDS = 3.0
+    # MUST exceed action_timeout (5s)
+    EMERGENCY_RECLAIM_TIMEOUT_SECONDS = 8.0
 
     def __init__(self):
         self.tracker = InputTracker()
@@ -32,7 +33,6 @@ class InputArbitrator:
     def soc_action_started(self):
         self.tracker.mark_soc_action()
 
-        # ADDITION
         with self._lock:
             self._last_soc_action_ts = time.time()
 
@@ -46,7 +46,6 @@ class InputArbitrator:
 
         source = self.tracker.classify_input(input_event_ts)
 
-        # ADDITION: forced reclaim
         if self._forced_release:
             return AuthorityDecision.RELEASE
 
@@ -108,4 +107,4 @@ class InputArbitrator:
                 "forced_release": self._forced_release,
                 "last_soc_action_ts": self._last_soc_action_ts,
                 "timeout_seconds": self.EMERGENCY_RECLAIM_TIMEOUT_SECONDS,
-    }
+        }
