@@ -3,6 +3,7 @@ Self-Operating Computer
 """
 
 import argparse
+import sys
 
 from operate.utils.style import ANSI_BRIGHT_MAGENTA
 from operate.operate import main as operate_main
@@ -65,10 +66,11 @@ def main_entry():
     except KeyboardInterrupt:
         log_info("[SYSTEM] Keyboard interrupt received")
         print(f"\n{ANSI_BRIGHT_MAGENTA}Exiting...")
+        sys.exit(0)
 
     except Exception as e:
         log_error(f"[SYSTEM] Fatal startup error: {e}")
-        raise
+        sys.exit(1)
 
 
 if __name__ == "__main__":
