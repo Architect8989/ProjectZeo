@@ -2,6 +2,8 @@ from enum import Enum, auto
 import time
 from typing import Optional, Any, List
 import gc
+import json
+import asyncio
 
 import operate.main as main  # runtime surface
 
@@ -19,6 +21,10 @@ from core.safety.checkpoint_store import (
 from core.planner.task_decomposer import TaskDecomposer, DecompositionError
 from operate.models.apis_openrouter import get_next_action
 
+from core.safety.restart_guard import (
+    record_restart,
+    restart_allowed,
+)
 
 # -----------------------------------------------------
 # Kernel States
@@ -35,17 +41,36 @@ class KernelState(Enum):
 
 
 # -----------------------------------------------------
+# Planner Adapter
+# -----------------------------------------------------
+
+def planner_llm_call(prompt: str) -> str:
+    """
+    Synchronous adapter.
+    Returns raw text response.
+    """
+
+    async def _call():
+        ops, _ = await get_next_action(
+            model="openai/gpt-4o-mini",
+            messages=[{"role": "system", "content": prompt}],
+            objective="planner",
+        )
+
+        # We expect OpenRouter to return raw JSON string in content.
+        # get_next_action parses JSON already → we re-encode.
+        return json.dumps({"steps": ops})
+
+    return asyncio.run(_call())
+
+
+# -----------------------------------------------------
 # Kernel Controller
 # -----------------------------------------------------
 
 class KernelController:
     """
     Sovereign governing state machine.
-
-    - Owns transitions
-    - Owns persistence
-    - Owns recovery
-    - No business logic
     """
 
     TICK_INTERVAL = 0.05
@@ -59,6 +84,12 @@ class KernelController:
     # -------------------------------------------------
 
     def __init__(self):
+
+        # ---- Restart Guard ----
+        if not restart_allowed():
+            raise SystemExit("RESTART_GUARD_LOCKED")
+        record_restart()
+
         self.state = KernelState.OBSERVER
 
         self.current_intent: Optional[str] = None
@@ -76,11 +107,7 @@ class KernelController:
         self.state_enter_time = time.time()
 
         self.decomposer = TaskDecomposer(
-            llm_call=lambda prompt: get_next_action(
-                model="openai/gpt-4o-mini",
-                messages=[{"role": "system", "content": prompt}],
-                objective="planner",
-            )[0]
+            llm_call=planner_llm_call
         )
 
         # ----------------------------
@@ -173,8 +200,6 @@ class KernelController:
     def _armed(self):
         main.arm_system()
         self._transition(KernelState.PLANNING)
-
-    # -------------------------------------------------
 
     def _planning(self):
 
