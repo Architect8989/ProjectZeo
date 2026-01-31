@@ -31,7 +31,8 @@ class ObserverCore:
         self.blind_reason: Optional[str] = None
         self.first_frame_seen_mono: Optional[float] = None
 
-        self._lock = threading.Lock()
+        # FIX: re-entrant lock to prevent self-deadlock
+        self._lock = threading.RLock()
 
         self.state: Dict[str, object] = {
             "uptime_seconds": 0.0,
