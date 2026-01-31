@@ -17,10 +17,10 @@ from state.serializer import AuthorityStateSerializer
 # OS safety backend
 from operate.utils.operating_system import OperatingSystem
 
-# SOC entrypoint (FIXED: main_entry → main)
+# SOC entrypoint
 from operate.main import main_entry as soc_execute_main
 
-# RESTORATION (FIXED: provide real callable functions)
+# RESTORATION
 from restoration.snapshot_provider import SnapshotProvider
 from restoration.restore_provider import RestoreProvider
 
@@ -35,12 +35,13 @@ OS_BACKEND = OperatingSystem()
 STATE_PATH = os.path.join(os.getcwd(), ".authority_state.json")
 AUTH_STATE = AuthorityStateSerializer(STATE_PATH)
 
-# Snapshot / Restore providers (REAL OBJECTS)
+# Snapshot / Restore providers (CORRECTLY WIRED)
 SNAPSHOT_PROVIDER = SnapshotProvider(
     observer=None,        # wired later
-    screenpipe=None
+    screenpipe=None,
+    os_backend=OS_BACKEND,
 )
-RESTORE_PROVIDER = RestoreProvider(OS_BACKEND)
+RESTORE_PROVIDER = RestoreProvider(os_backend=OS_BACKEND)
 
 
 # --------------------------------------------------
@@ -111,7 +112,7 @@ def main():
     screenpipe = ScreenpipeAdapter()
     perception = PerceptionEngine()
 
-    # 🔧 Wire snapshot provider dependencies (FIXED)
+    # Wire snapshot provider dependencies
     SNAPSHOT_PROVIDER._observer = observer
     SNAPSHOT_PROVIDER._screenpipe = screenpipe
 
@@ -120,25 +121,24 @@ def main():
     print("[INTENT] Type intent and press Enter")
 
     # --------------------------------------------------
-    # MAIN LOOP (FIXED ORDER + EXCEPTION SAFETY)
+    # MAIN LOOP
     # --------------------------------------------------
 
     while True:
         try:
-            # 1. Screen feed FIRST (FIXED ORDER)
+            # 1. Screen feed FIRST
             screen_state = screenpipe.read()
 
             # 2. Perception
             ui_snapshot = perception.process(screen_state)
 
-            # 3. Attach before tick (CRITICAL FIX)
+            # 3. Attach before tick
             observer.attach_screen_state(screen_state)
             observer.attach_ui_snapshot(ui_snapshot)
 
-            # 4. Observer heartbeat (NO FIRST-TICK CRASH)
+            # 4. Observer heartbeat
             observer_state = observer.tick()
 
-            # 5. Heartbeat log
             heartbeat = {
                 "mode": mode.mode.value,
                 "uptime": observer_state["uptime_seconds"],
@@ -159,7 +159,6 @@ def main():
             if mode.is_armed():
                 print("[EXECUTION] Intent armed — snapshotting")
 
-                # ---- SNAPSHOT BEFORE HIJACK (REAL FUNCTION) ----
                 snapshot_id = SNAPSHOT_PROVIDER.take_snapshot()
 
                 AUTH_STATE.persist(
@@ -197,7 +196,6 @@ def main():
                     AUTH_STATE.force_safe_state()
                     OS_BACKEND.force_release_all()
 
-                    # Best effort restore
                     try:
                         RESTORE_PROVIDER.restore_snapshot(snapshot_id)
                     except Exception:
@@ -210,7 +208,11 @@ def main():
                         pass
 
         except ObserverBlindnessError:
-            print("[OBSERVER] Blind — skipping tick")
+            # FAIL-CLOSED: blindness is fatal
+            print("[FATAL] Observer blindness detected — shutting down")
+            _force_safe_shutdown("observer-blindness")
+            os._exit(1)
+
         except Exception as fatal:
             print(f"[FATAL] Main loop error: {fatal}")
             _force_safe_shutdown("main-loop-failure")
