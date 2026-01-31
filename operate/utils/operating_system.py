@@ -140,6 +140,15 @@ class OperatingSystem:
         with self._automation_lock:
             self._automation_active = False
 
+    # 🔴 TIER-1 REQUIRED METHOD
+    def is_automation_active(self) -> bool:
+        """
+        REQUIRED by restoration verifier.
+        Must be truthful and side-effect free.
+        """
+        with self._automation_lock:
+            return bool(self._automation_active)
+
     def _touch_heartbeat(self):
         with self._heartbeat_lock:
             self._last_heartbeat = time.time()
@@ -171,6 +180,8 @@ class OperatingSystem:
 
             if active and elapsed > self._HEARTBEAT_TIMEOUT:
                 print("[OperatingSystem] Heartbeat lost — forcing release")
+                # 🔴 IMPORTANT: do not lie about automation state
+                self.mark_automation_inactive()
                 self.force_release_all()
                 return
 
@@ -192,25 +203,19 @@ class OperatingSystem:
             pass
 
     def stop_automated_input(self) -> None:
-        """
-        Physically release everything.
-        """
         try:
-            # Modifiers
             for key in ["shift", "ctrl", "alt", "win", "command", "esc"]:
                 try:
                     pyautogui.keyUp(key)
                 except Exception:
                     pass
 
-            # Letters
             for c in "abcdefghijklmnopqrstuvwxyz":
                 try:
                     pyautogui.keyUp(c)
                 except Exception:
                     pass
 
-            # Mouse
             for btn in ["left", "right", "middle"]:
                 try:
                     pyautogui.mouseUp(button=btn)
