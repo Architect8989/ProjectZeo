@@ -9,6 +9,12 @@ import signal
 
 from operate.utils.misc import convert_percent_to_decimal
 
+# ---------------------------
+# GLOBAL HARD SAFETY
+# ---------------------------
+
+pyautogui.FAILSAFE = True   # moving mouse to corner aborts
+
 
 class OperatingSystem:
     """
@@ -29,7 +35,7 @@ class OperatingSystem:
     _execution_mode = "OBSERVER"  # default-safe
 
     # -------------------------------------------------
-    # NEW: HARD SAFETY STATE (ADDITIVE)
+    # HARD SAFETY STATE
     # -------------------------------------------------
 
     _automation_active = False
@@ -44,7 +50,7 @@ class OperatingSystem:
     _watchdog_thread_started = False
 
     # -------------------------------------------------
-    # EXISTING SOC METHODS (UNCHANGED)
+    # SOC ACTIONS
     # -------------------------------------------------
 
     def write(self, content):
@@ -54,6 +60,7 @@ class OperatingSystem:
                 pyautogui.write(char)
         except Exception as e:
             print("[OperatingSystem][write] error:", e)
+            raise
 
     def press(self, keys):
         try:
@@ -64,6 +71,7 @@ class OperatingSystem:
                 pyautogui.keyUp(key)
         except Exception as e:
             print("[OperatingSystem][press] error:", e)
+            raise
 
     def mouse(self, click_detail):
         try:
@@ -72,9 +80,11 @@ class OperatingSystem:
 
             if click_detail and isinstance(x, float) and isinstance(y, float):
                 self.click_at_percentage(x, y)
-
+            else:
+                raise ValueError("Invalid click coordinates")
         except Exception as e:
             print("[OperatingSystem][mouse] error:", e)
+            raise
 
     def click_at_percentage(
         self,
@@ -101,9 +111,10 @@ class OperatingSystem:
             pyautogui.click(x_pixel, y_pixel)
         except Exception as e:
             print("[OperatingSystem][click_at_percentage] error:", e)
+            raise
 
     # -------------------------------------------------
-    # EXISTING AUTHORITY SUPPORT (UNCHANGED)
+    # AUTHORITY SUPPORT
     # -------------------------------------------------
 
     def get_execution_mode(self) -> str:
@@ -115,7 +126,7 @@ class OperatingSystem:
             self._execution_mode = mode
 
     # -------------------------------------------------
-    # NEW: FAIL-OPEN INPUT SAFETY
+    # AUTOMATION LIFECYCLE
     # -------------------------------------------------
 
     def mark_automation_active(self):
@@ -128,16 +139,20 @@ class OperatingSystem:
         with self._automation_lock:
             self._automation_active = False
 
+    def is_automation_active(self):
+        with self._automation_lock:
+            return self._automation_active
+
     def _touch_heartbeat(self):
         with self._heartbeat_lock:
             self._last_heartbeat = time.time()
 
     def heartbeat(self):
-        """
-        Called periodically by executor.
-        Absence of this implies executor death.
-        """
         self._touch_heartbeat()
+
+    # -------------------------------------------------
+    # WATCHDOG
+    # -------------------------------------------------
 
     def _ensure_watchdog(self):
         if self._watchdog_thread_started:
@@ -150,6 +165,7 @@ class OperatingSystem:
     def _watchdog_loop(self):
         while True:
             time.sleep(self._WATCHDOG_INTERVAL)
+
             with self._heartbeat_lock:
                 elapsed = time.time() - self._last_heartbeat
 
@@ -162,14 +178,10 @@ class OperatingSystem:
                 return
 
     # -------------------------------------------------
-    # NEW: FORCED HUMAN RECLAIM
+    # FORCED HUMAN RECLAIM
     # -------------------------------------------------
 
     def force_release_all(self):
-        """
-        Absolute safety valve.
-        Must succeed even if executor is dead.
-        """
         try:
             self.stop_automated_input()
             self.enable_user_input()
@@ -178,17 +190,23 @@ class OperatingSystem:
             print("[OperatingSystem][force_release_all] error:", e)
 
     # -------------------------------------------------
-    # EXISTING INPUT CONTROL (UNCHANGED)
+    # REAL INPUT RELEASE (FIXED)
     # -------------------------------------------------
 
     def stop_automated_input(self) -> None:
-        return
+        try:
+            pyautogui.keyUp("shift")
+            pyautogui.keyUp("ctrl")
+            pyautogui.keyUp("alt")
+            pyautogui.mouseUp()
+        except Exception:
+            pass
 
     def enable_user_input(self) -> None:
-        return
+        self.stop_automated_input()
 
     # -------------------------------------------------
-    # CURSOR STATE (UNCHANGED)
+    # CURSOR STATE
     # -------------------------------------------------
 
     def get_cursor_position(self):
@@ -204,7 +222,7 @@ class OperatingSystem:
             raise RuntimeError(f"Unable to set cursor position: {e}")
 
     # -------------------------------------------------
-    # WINDOW / APPLICATION FOCUS (UNCHANGED)
+    # WINDOW / APPLICATION FOCUS (STUBS)
     # -------------------------------------------------
 
     def get_focused_window(self):
@@ -242,9 +260,7 @@ def _emergency_exit_handler(*args):
     finally:
         os._exit(1)
 
-# Catch all normal exits
 atexit.register(_OS_SINGLETON.force_release_all)
 
-# Catch kill signals
 for sig in (signal.SIGINT, signal.SIGTERM):
     signal.signal(sig, _emergency_exit_handler)
