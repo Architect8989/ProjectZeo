@@ -50,8 +50,11 @@ class ObserverCore:
     # -------------------------------------------------
 
     def _mark_blind(self, reason: str) -> None:
-        self.observer_healthy = False
-        self.blind_reason = reason
+        with self._lock:
+            if not self.observer_healthy:
+                return
+            self.observer_healthy = False
+            self.blind_reason = reason
 
     # -------------------------------------------------
 
@@ -122,26 +125,27 @@ class ObserverCore:
     # -------------------------------------------------
 
     def is_healthy(self) -> bool:
-        return self.observer_healthy
+        with self._lock:
+            return bool(self.observer_healthy)
 
     def get_health_snapshot(self) -> Dict[str, object]:
         """
         Forensic-grade observer health snapshot.
         No side effects.
         """
-        now = time.monotonic()
+        with self._lock:
+            now = time.monotonic()
+            last_seen = self.last_frame_seen_mono
 
-        return {
-            "observer_healthy": self.observer_healthy,
-            "blind_reason": self.blind_reason,
-            "uptime_seconds": round(now - self.start_time, 2),
-            "ticks": self.tick_count,
-            "last_tick_ts": self.last_tick_ts,
-            "last_frame_seen_age": (
-                now - self.last_frame_seen_mono
-                if self.last_frame_seen_mono
-                else None
-            ),
-            "first_frame_seen": self.first_frame_seen_mono is not None,
-            "history_depth": len(self.history),
+            return {
+                "observer_healthy": self.observer_healthy,
+                "blind_reason": self.blind_reason,
+                "uptime_seconds": round(now - self.start_time, 2),
+                "ticks": self.tick_count,
+                "last_tick_ts": self.last_tick_ts,
+                "last_frame_seen_age": (
+                    now - last_seen if last_seen else None
+                ),
+                "first_frame_seen": self.first_frame_seen_mono is not None,
+                "history_depth": len(self.history),
         }
