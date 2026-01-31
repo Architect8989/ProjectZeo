@@ -12,6 +12,11 @@ from core.verification.screen_verifier import verify_execution
 from core.memory.playbook_store import load_playbook, save_playbook
 from core.safety.runtime_watchdog import RuntimeWatchdog
 from core.telemetry.logger import log_info, log_warn, log_error
+from core.safety.checkpoint_store import (
+    save_checkpoint,
+    load_checkpoint,
+    clear_checkpoint
+)
 
 
 class KernelState(Enum):
@@ -55,6 +60,16 @@ class KernelController:
         self.watchdog = RuntimeWatchdog()
         self.state_enter_time = time.time()
 
+        # ---------- LOAD CHECKPOINT ----------
+        ckpt = load_checkpoint()
+        if ckpt:
+            log_warn("[KERNEL] Restoring from checkpoint.")
+            self.state = KernelState[ckpt["state"]]
+            self.current_intent = ckpt["current_intent"]
+            self.current_plan = ckpt["current_plan"]
+            self.retry_count = ckpt["retry_count"]
+            self.step_count = ckpt["step_count"]
+
     # -----------------------
     # Public Entry
     # -----------------------
@@ -75,7 +90,17 @@ class KernelController:
 
     def _step(self):
 
+        # Global resource guard
         self.watchdog.check()
+
+        # ---------- SAVE CHECKPOINT ----------
+        save_checkpoint({
+            "state": self.state.name,
+            "current_intent": self.current_intent,
+            "current_plan": self.current_plan,
+            "retry_count": self.retry_count,
+            "step_count": self.step_count,
+        })
 
         timeout = self.STATE_TIMEOUTS.get(self.state)
         if timeout:
@@ -180,12 +205,14 @@ class KernelController:
     def _restoring(self):
 
         main.restore_screen()
+        clear_checkpoint()
         self._reset()
         self._transition(KernelState.OBSERVER)
 
     def _error(self):
 
         main.restore_screen()
+        clear_checkpoint()
         self._reset()
         self._transition(KernelState.OBSERVER)
 
