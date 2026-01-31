@@ -178,7 +178,6 @@ class OperatingSystem:
                 print("[OperatingSystem] Heartbeat lost — forcing release")
                 self.mark_automation_inactive()
                 self.force_release_all()
-                # DO NOT EXIT — watchdog must persist
 
     # -------------------------------------------------
     # HARD FAIL-OPEN SAFETY
@@ -197,33 +196,44 @@ class OperatingSystem:
             pass
 
     def stop_automated_input(self) -> None:
+        """
+        Release *all* possible keys and mouse buttons.
+        Safe to call repeatedly.
+        """
         try:
-            # Modifiers + control keys
-            for key in [
-                "shift", "ctrl", "alt", "win", "command", "esc",
+            # --- Modifiers & system keys ---
+            modifier_keys = [
+                "shift", "ctrl", "alt", "win", "command",
+                "esc", "capslock"
+            ]
+
+            # --- Editing / navigation ---
+            navigation_keys = [
                 "tab", "enter", "space", "backspace", "delete",
-                "up", "down", "left", "right"
-            ]:
+                "up", "down", "left", "right",
+                "home", "end", "pageup", "pagedown", "insert"
+            ]
+
+            # --- Function keys ---
+            function_keys = [f"f{i}" for i in range(1, 25)]
+
+            # --- Alphanumeric ---
+            letters = list("abcdefghijklmnopqrstuvwxyz")
+            numbers = list("0123456789")
+
+            for key in (
+                modifier_keys
+                + navigation_keys
+                + function_keys
+                + letters
+                + numbers
+            ):
                 try:
                     pyautogui.keyUp(key)
                 except Exception:
                     pass
 
-            # Function keys
-            for i in range(1, 25):
-                try:
-                    pyautogui.keyUp(f"f{i}")
-                except Exception:
-                    pass
-
-            # Letters
-            for c in "abcdefghijklmnopqrstuvwxyz":
-                try:
-                    pyautogui.keyUp(c)
-                except Exception:
-                    pass
-
-            # Mouse buttons
+            # --- Mouse buttons ---
             for btn in ["left", "right", "middle"]:
                 try:
                     pyautogui.mouseUp(button=btn)
