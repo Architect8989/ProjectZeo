@@ -9,33 +9,30 @@ import signal
 
 from operate.utils.misc import convert_percent_to_decimal
 
-# ---------------------------
-# GLOBAL HARD SAFETY
-# ---------------------------
 
-pyautogui.FAILSAFE = True   # moving mouse to corner aborts
+# HARD FAILSAFE
+pyautogui.FAILSAFE = True
 
 
 class OperatingSystem:
     """
     OS interaction layer.
 
-    Existing SOC execution logic is preserved.
-    New logic enforces:
+    Enforces:
     - Fail-open human reclaim
     - Crash-safe input release
-    - Out-of-band kill semantics
+    - Heartbeat watchdog
     """
 
     # -------------------------------------------------
-    # INTERNAL AUTHORITY STATE (EXISTING)
+    # INTERNAL AUTHORITY STATE
     # -------------------------------------------------
 
     _execution_mode_lock = threading.Lock()
     _execution_mode = "OBSERVER"  # default-safe
 
     # -------------------------------------------------
-    # HARD SAFETY STATE
+    # AUTOMATION STATE
     # -------------------------------------------------
 
     _automation_active = False
@@ -45,54 +42,58 @@ class OperatingSystem:
     _heartbeat_lock = threading.Lock()
 
     _WATCHDOG_INTERVAL = 0.5
-    _HEARTBEAT_TIMEOUT = 2.0  # seconds
+    _HEARTBEAT_TIMEOUT = 2.0
 
     _watchdog_thread_started = False
 
     # -------------------------------------------------
-    # SOC ACTIONS
+    # WRITE / PRESS / CLICK
     # -------------------------------------------------
 
     def write(self, content):
+        if not isinstance(content, str):
+            raise RuntimeError("write(): content must be string")
+
         try:
             content = content.replace("\\n", "\n")
             for char in content:
                 pyautogui.write(char)
         except Exception as e:
-            print("[OperatingSystem][write] error:", e)
-            raise
+            raise RuntimeError(f"[OperatingSystem][write] {e}")
 
     def press(self, keys):
+        if not isinstance(keys, list):
+            raise RuntimeError("press(): keys must be list")
+
         try:
             for key in keys:
                 pyautogui.keyDown(key)
-            time.sleep(0.1)
+            time.sleep(0.05)
             for key in keys:
                 pyautogui.keyUp(key)
         except Exception as e:
-            print("[OperatingSystem][press] error:", e)
-            raise
+            raise RuntimeError(f"[OperatingSystem][press] {e}")
 
     def mouse(self, click_detail):
         try:
             x = convert_percent_to_decimal(click_detail.get("x"))
             y = convert_percent_to_decimal(click_detail.get("y"))
 
-            if click_detail and isinstance(x, float) and isinstance(y, float):
-                self.click_at_percentage(x, y)
-            else:
-                raise ValueError("Invalid click coordinates")
+            if not isinstance(x, float) or not isinstance(y, float):
+                raise RuntimeError("Invalid click coordinates")
+
+            self.click_at_percentage(x, y)
+
         except Exception as e:
-            print("[OperatingSystem][mouse] error:", e)
-            raise
+            raise RuntimeError(f"[OperatingSystem][mouse] {e}")
 
     def click_at_percentage(
         self,
         x_percentage,
         y_percentage,
         duration=0.2,
-        circle_radius=50,
-        circle_duration=0.5,
+        circle_radius=30,
+        circle_duration=0.4,
     ):
         try:
             screen_width, screen_height = pyautogui.size()
@@ -101,20 +102,20 @@ class OperatingSystem:
 
             pyautogui.moveTo(x_pixel, y_pixel, duration=duration)
 
-            start_time = time.time()
-            while time.time() - start_time < circle_duration:
-                angle = ((time.time() - start_time) / circle_duration) * 2 * math.pi
+            start = time.time()
+            while time.time() - start < circle_duration:
+                angle = ((time.time() - start) / circle_duration) * 2 * math.pi
                 x = x_pixel + math.cos(angle) * circle_radius
                 y = y_pixel + math.sin(angle) * circle_radius
-                pyautogui.moveTo(x, y, duration=0.1)
+                pyautogui.moveTo(x, y, duration=0.05)
 
             pyautogui.click(x_pixel, y_pixel)
+
         except Exception as e:
-            print("[OperatingSystem][click_at_percentage] error:", e)
-            raise
+            raise RuntimeError(f"[OperatingSystem][click] {e}")
 
     # -------------------------------------------------
-    # AUTHORITY SUPPORT
+    # EXECUTION MODE
     # -------------------------------------------------
 
     def get_execution_mode(self) -> str:
@@ -126,7 +127,7 @@ class OperatingSystem:
             self._execution_mode = mode
 
     # -------------------------------------------------
-    # AUTOMATION LIFECYCLE
+    # AUTOMATION MARKERS
     # -------------------------------------------------
 
     def mark_automation_active(self):
@@ -139,10 +140,6 @@ class OperatingSystem:
         with self._automation_lock:
             self._automation_active = False
 
-    def is_automation_active(self):
-        with self._automation_lock:
-            return self._automation_active
-
     def _touch_heartbeat(self):
         with self._heartbeat_lock:
             self._last_heartbeat = time.time()
@@ -151,7 +148,7 @@ class OperatingSystem:
         self._touch_heartbeat()
 
     # -------------------------------------------------
-    # WATCHDOG
+    # WATCHDOG THREAD
     # -------------------------------------------------
 
     def _ensure_watchdog(self):
@@ -173,92 +170,111 @@ class OperatingSystem:
                 active = self._automation_active
 
             if active and elapsed > self._HEARTBEAT_TIMEOUT:
-                print("[OperatingSystem][WATCHDOG] Heartbeat lost — forcing input release")
+                print("[OperatingSystem] Heartbeat lost — forcing release")
                 self.force_release_all()
                 return
 
     # -------------------------------------------------
-    # FORCED HUMAN RECLAIM
+    # HARD FAIL-OPEN SAFETY
     # -------------------------------------------------
 
     def force_release_all(self):
+        """
+        Absolute safety valve.
+        Physically releases all keys and mouse buttons.
+        Never raises.
+        """
         try:
             self.stop_automated_input()
             self.enable_user_input()
             self.set_execution_mode("OBSERVER")
-        except Exception as e:
-            print("[OperatingSystem][force_release_all] error:", e)
-
-    # -------------------------------------------------
-    # REAL INPUT RELEASE (FIXED)
-    # -------------------------------------------------
+        except Exception:
+            pass
 
     def stop_automated_input(self) -> None:
+        """
+        Physically release everything.
+        """
         try:
-            pyautogui.keyUp("shift")
-            pyautogui.keyUp("ctrl")
-            pyautogui.keyUp("alt")
-            pyautogui.mouseUp()
+            # Modifiers
+            for key in ["shift", "ctrl", "alt", "win", "command", "esc"]:
+                try:
+                    pyautogui.keyUp(key)
+                except Exception:
+                    pass
+
+            # Letters
+            for c in "abcdefghijklmnopqrstuvwxyz":
+                try:
+                    pyautogui.keyUp(c)
+                except Exception:
+                    pass
+
+            # Mouse
+            for btn in ["left", "right", "middle"]:
+                try:
+                    pyautogui.mouseUp(button=btn)
+                except Exception:
+                    pass
+
         except Exception:
             pass
 
     def enable_user_input(self) -> None:
-        self.stop_automated_input()
+        try:
+            self.stop_automated_input()
+        except Exception:
+            pass
 
     # -------------------------------------------------
-    # CURSOR STATE
+    # CURSOR
     # -------------------------------------------------
 
     def get_cursor_position(self):
         try:
             return pyautogui.position()
         except Exception as e:
-            raise RuntimeError(f"Unable to get cursor position: {e}")
+            raise RuntimeError(e)
 
     def set_cursor_position(self, x: int, y: int) -> None:
         try:
             pyautogui.moveTo(int(x), int(y), duration=0)
         except Exception as e:
-            raise RuntimeError(f"Unable to set cursor position: {e}")
+            raise RuntimeError(e)
 
     # -------------------------------------------------
-    # WINDOW / APPLICATION FOCUS (STUBS)
+    # WINDOW / APPLICATION (STUBS)
     # -------------------------------------------------
 
     def get_focused_window(self):
-        return {
-            "id": "unknown",
-            "title": None,
-        }
+        return {"id": "unknown", "title": None}
 
     def get_focused_window_id(self):
-        info = self.get_focused_window()
-        return info.get("id")
+        return self.get_focused_window().get("id")
 
     def focus_window(self, window_id: str) -> bool:
         return False
 
     def get_active_application(self):
-        return {
-            "process_name": platform.system(),
-            "pid": None,
-        }
+        return {"process_name": platform.system(), "pid": None}
 
     def activate_application(self, process_name: str, pid=None) -> bool:
         return False
 
 
 # -------------------------------------------------
-# PROCESS-LEVEL FAIL-OPEN GUARANTEES
+# PROCESS-LEVEL FAIL-OPEN
 # -------------------------------------------------
 
 _OS_SINGLETON = OperatingSystem()
+
 
 def _emergency_exit_handler(*args):
     try:
         _OS_SINGLETON.force_release_all()
     finally:
         os._exit(1)
+
 
 atexit.register(_OS_SINGLETON.force_release_all)
 
