@@ -1,5 +1,3 @@
-# core/control/kernel_controller.py
-
 from enum import Enum, auto
 import time
 from typing import Optional, Any
@@ -15,7 +13,7 @@ from core.telemetry.logger import log_info, log_warn, log_error
 from core.safety.checkpoint_store import (
     save_checkpoint,
     load_checkpoint,
-    clear_checkpoint
+    clear_checkpoint,
 )
 
 
@@ -31,14 +29,15 @@ class KernelState(Enum):
 
 class KernelController:
     """
-    Governing state machine for the entire system.
+    Sovereign governing state machine.
 
     - Owns all state transitions
-    - Calls into existing operate.main entrypoints
-    - No business logic inside kernel
+    - Owns recovery
+    - Owns persistence
+    - Zero business logic
     """
 
-    TICK_INTERVAL = 0.05  # 20Hz control loop
+    TICK_INTERVAL = 0.05  # 20Hz
 
     STATE_TIMEOUTS = {
         KernelState.PLANNING: 600,
@@ -60,40 +59,43 @@ class KernelController:
         self.watchdog = RuntimeWatchdog()
         self.state_enter_time = time.time()
 
-        # ---------- LOAD CHECKPOINT ----------
+        # -------- Restore from checkpoint if present --------
         ckpt = load_checkpoint()
         if ckpt:
-            log_warn("[KERNEL] Restoring from checkpoint.")
+            log_warn("[KERNEL] Restoring from checkpoint")
             self.state = KernelState[ckpt["state"]]
             self.current_intent = ckpt["current_intent"]
             self.current_plan = ckpt["current_plan"]
             self.retry_count = ckpt["retry_count"]
             self.step_count = ckpt["step_count"]
 
-    # -----------------------
-    # Public Entry
-    # -----------------------
+    # ----------------------------------------------------
+    # PUBLIC
+    # ----------------------------------------------------
 
     def start(self):
         while True:
             try:
                 self._step()
+            except SystemExit:
+                # Raised by watchdog -> fall into recovery
+                self._transition(KernelState.ERROR)
             except Exception as e:
-                log_error(f"[KERNEL] Unhandled error: {e}")
+                log_error(f"[KERNEL] Unhandled exception: {e}")
                 self._transition(KernelState.ERROR)
 
             time.sleep(self.TICK_INTERVAL)
 
-    # -----------------------
-    # Core Loop
-    # -----------------------
+    # ----------------------------------------------------
+    # CORE LOOP
+    # ----------------------------------------------------
 
     def _step(self):
 
-        # Global resource guard
+        # Hard resource guard
         self.watchdog.check()
 
-        # ---------- SAVE CHECKPOINT ----------
+        # Persist checkpoint every tick
         save_checkpoint({
             "state": self.state.name,
             "current_intent": self.current_intent,
@@ -111,28 +113,22 @@ class KernelController:
 
         if self.state == KernelState.OBSERVER:
             self._observer()
-
         elif self.state == KernelState.ARMED:
             self._armed()
-
         elif self.state == KernelState.PLANNING:
             self._planning()
-
         elif self.state == KernelState.EXECUTING:
             self._executing()
-
         elif self.state == KernelState.VERIFYING:
             self._verifying()
-
         elif self.state == KernelState.RESTORING:
             self._restoring()
-
         elif self.state == KernelState.ERROR:
             self._error()
 
-    # -----------------------
-    # State Handlers
-    # -----------------------
+    # ----------------------------------------------------
+    # STATES
+    # ----------------------------------------------------
 
     def _observer(self):
         main.start_observer()
@@ -150,7 +146,7 @@ class KernelController:
 
         cached = load_playbook(self.current_intent)
         if cached:
-            log_info("[KERNEL] Loaded playbook from memory.")
+            log_info("[KERNEL] Loaded cached playbook")
             self.current_plan = cached
             self._transition(KernelState.EXECUTING)
             return
@@ -158,7 +154,7 @@ class KernelController:
         self.current_plan = main.generate_plan(self.current_intent)
 
         if not validate_actions(self.current_plan):
-            log_warn("[KERNEL] Invalid plan schema. Replanning.")
+            log_warn("[KERNEL] Invalid plan schema")
             return
 
         self._transition(KernelState.EXECUTING)
@@ -167,12 +163,12 @@ class KernelController:
 
         self.step_count += 1
         if self.step_count > self.max_steps:
-            log_warn("[KERNEL] Step limit exceeded.")
+            log_warn("[KERNEL] Step limit exceeded")
             self._transition(KernelState.ERROR)
             return
 
         if not validate_actions(self.current_plan):
-            log_warn("[KERNEL] Plan corrupted before execution.")
+            log_warn("[KERNEL] Plan corrupted")
             self._transition(KernelState.PLANNING)
             return
 
@@ -195,30 +191,27 @@ class KernelController:
             self.retry_count += 1
 
             if self.retry_count > self.max_retries:
-                log_warn("[KERNEL] Retry limit exceeded.")
+                log_warn("[KERNEL] Retry limit exceeded")
                 self._transition(KernelState.ERROR)
                 return
 
-            log_warn("[KERNEL] Verification failed. Retrying execution.")
             self._transition(KernelState.EXECUTING)
 
     def _restoring(self):
-
         main.restore_screen()
         clear_checkpoint()
         self._reset()
         self._transition(KernelState.OBSERVER)
 
     def _error(self):
-
         main.restore_screen()
         clear_checkpoint()
         self._reset()
         self._transition(KernelState.OBSERVER)
 
-    # -----------------------
-    # Internal Helpers
-    # -----------------------
+    # ----------------------------------------------------
+    # HELPERS
+    # ----------------------------------------------------
 
     def _reset(self):
         self.current_intent = None
@@ -226,10 +219,6 @@ class KernelController:
         self.retry_count = 0
         self.step_count = 0
         gc.collect()
-
-    # -----------------------
-    # Transition Guard
-    # -----------------------
 
     def _transition(self, new_state: KernelState):
         log_info(f"[KERNEL] {self.state.name} -> {new_state.name}")
