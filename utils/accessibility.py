@@ -1,11 +1,15 @@
 import pyatspi
 import hashlib
 
+from policy.engine import PolicyEngine
+
+
 class AccessibilityBackend:
     """
     STRICT EXECUTION INSTRUMENT.
     Zero sovereignty. Zero discovery during execution. Double-bind audit.
     """
+
     def __init__(self):
         self.registry = pyatspi.Registry
 
@@ -21,7 +25,7 @@ class AccessibilityBackend:
 
     def get_nodes(self, max_depth=5):
         """
-        Passive discovery only. 
+        Passive discovery only.
         Sovereignty constraint: Used by controller to 'freeze' state before execution.
         """
         nodes = {}
@@ -44,39 +48,46 @@ class AccessibilityBackend:
         """
         HARD EXECUTION GATE.
         1. Mode check (Active vs Observer)
-        2. Policy evaluation (bool, reason)
+        2. Policy evaluation (PolicyEngine.ALLOW | DENY, reason)
         3. Fail-hard audit (Intent -> Action -> Effect)
         4. Context lock: Operates only on the provided node reference.
         """
+
         # 1. Mode Guard
         if mode != "ACTIVE":
-            raise PermissionError("NON_SOVEREIGN_VIOLATION: Execution blocked in OBSERVER mode.")
+            raise PermissionError(
+                "NON_SOVEREIGN_VIOLATION: Execution blocked in OBSERVER mode."
+            )
 
-        # 2. Policy Guard: Contract aligned with (bool, reason)
-        allowed, reason = policy_engine.validate(node, action_type)
-        if not allowed:
+        # 2. Policy Guard (FIXED CONTRACT)
+        decision, reason = policy_engine.validate(node, action_type)
+
+        if decision != PolicyEngine.ALLOW:
             raise PermissionError(f"POLICY_VIOLATION: {reason}")
 
         # 3. Audit Phase 1: Intent
-        # Must fail-hard; no boolean interpretation.
         audit_callback("INTENT", node, action_type)
 
-        # 4. Hardware Execution: No retries, no stabilization.
+        # 4. Hardware Execution (fail closed)
         try:
             if action_type == "click":
                 node.queryAction().doAction(0)
+
             elif action_type == "type":
                 if text is None:
                     raise ValueError("Type action requires text input.")
                 editable = node.queryEditableText()
-                editable.insertText(editable.getCharacterCount(), text, len(text))
+                editable.insertText(
+                    editable.getCharacterCount(),
+                    text,
+                    len(text),
+                )
+
             else:
                 raise NotImplementedError(f"Unsupported action: {action_type}")
-                
+
         except Exception as e:
-            # No recovery. Fail closed.
             raise RuntimeError(f"HARDWARE_EXECUTION_FAILURE: {str(e)}")
 
         # 5. Audit Phase 2: Effect
-        # Final evidence-binding; must fail-hard.
         audit_callback("EFFECT", node, action_type)
