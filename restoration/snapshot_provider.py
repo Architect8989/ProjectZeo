@@ -32,16 +32,29 @@ class SnapshotProvider:
     def __init__(
         self,
         *,
-        observer: ObserverCore,
-        screenpipe: ScreenpipeAdapter,
+        observer: Optional[ObserverCore],
+        screenpipe: Optional[ScreenpipeAdapter],
         os_backend,
     ):
+        # Allow late wiring (Tier-1 requirement)
         self._observer = observer
         self._screenpipe = screenpipe
         self._os = os_backend
 
     # -------------------------------------------------
-    # Public API
+    # TIER-1 PUBLIC API (REQUIRED)
+    # -------------------------------------------------
+
+    def take_snapshot(self) -> str:
+        """
+        Public entrypoint expected by main/kernel.
+        Returns snapshot_id.
+        """
+        snapshot = self.capture_pre_hijack_snapshot()
+        return snapshot.snapshot_id
+
+    # -------------------------------------------------
+    # INTERNAL SNAPSHOT LOGIC (UNCHANGED)
     # -------------------------------------------------
 
     def capture_pre_hijack_snapshot(self) -> RestorationSnapshot:
@@ -51,6 +64,11 @@ class SnapshotProvider:
         Hard gate.
         Any exception aborts execution.
         """
+
+        if self._observer is None or self._screenpipe is None:
+            raise SnapshotProviderError(
+                "SnapshotProvider not fully wired (observer/screenpipe missing)"
+            )
 
         # 1. Enforce execution mode
         execution_mode = self._os.get_execution_mode()
@@ -134,7 +152,7 @@ class SnapshotProvider:
         except Exception:
             pass
 
-        # 5. Bind metadata (NO snapshot_id duplication)
+        # 5. Bind metadata
         metadata: Dict[str, Any] = {
             "schema_version": self.SNAPSHOT_SCHEMA_VERSION,
             "screenpipe": {
@@ -149,7 +167,7 @@ class SnapshotProvider:
             "os_signature": os_signature,
         }
 
-        # 6. Create immutable snapshot (single authority)
+        # 6. Create immutable snapshot
         snapshot = RestorationSnapshot.create(
             cursor=cursor_state,
             focus=focus_state,
@@ -158,9 +176,9 @@ class SnapshotProvider:
             metadata=metadata,
         )
 
-        # 7. Notify observer (witness continuity)
+        # 7. Notify observer (FIXED: pass OBJECT, not dict)
         try:
-            self._observer.attach_ui_snapshot(snapshot.to_dict())
+            self._observer.attach_ui_snapshot(snapshot)
         except Exception:
             pass
 
