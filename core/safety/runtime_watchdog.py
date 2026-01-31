@@ -4,16 +4,28 @@ import psutil
 import time
 import os
 
+
 MAX_RUNTIME_SECONDS = 3600          # 1 hour per task
-MAX_MEMORY_MB = 4096                # 4GB
-MAX_CPU_PERCENT = 90                # sustained
+MAX_MEMORY_MB = 4096                # 4GB resident set
+MAX_CPU_PERCENT = 90                # sustained CPU
+
+
+class WatchdogViolation(RuntimeError):
+    """
+    Raised when a runtime safety budget is violated.
+    Kernel must catch and transition to ERROR.
+    """
+    pass
+
 
 class RuntimeWatchdog:
     """
     Hard runtime guard.
 
-    Never performs hard process kill.
-    Always raises exception so kernel + restoration can run.
+    - Never kills process
+    - Never exits Python
+    - Raises deterministic exception
+    - Allows restoration path to run
     """
 
     def __init__(self):
@@ -27,14 +39,15 @@ class RuntimeWatchdog:
         cpu = self.process.cpu_percent(interval=0.1)
 
         if elapsed > MAX_RUNTIME_SECONDS:
-            self._terminate("TIME_LIMIT")
+            self._violate("TIME_LIMIT")
 
         if mem_mb > MAX_MEMORY_MB:
-            self._terminate("MEMORY_LIMIT")
+            self._violate("MEMORY_LIMIT")
 
         if cpu > MAX_CPU_PERCENT:
-            self._terminate("CPU_LIMIT")
+            self._violate("CPU_LIMIT")
 
-    def _terminate(self, reason: str):
-        print(f"[WATCHDOG] LIMIT EXCEEDED: {reason}")
-        raise SystemExit(f"WATCHDOG_LIMIT_EXCEEDED:{reason}")
+    def _violate(self, reason: str):
+        msg = f"WATCHDOG_LIMIT_EXCEEDED:{reason}"
+        print(f"[WATCHDOG] {msg}")
+        raise WatchdogViolation(msg)
