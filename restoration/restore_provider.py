@@ -31,6 +31,23 @@ class RestoreProvider:
     # Public API
     # -------------------------------------------------
 
+    def restore_snapshot(self, snapshot_id: str) -> None:
+        """
+        Restore workspace state from snapshot ID.
+
+        This is the only ID-based entrypoint.
+        Resolution responsibility is explicit.
+        """
+        from restoration.snapshot_provider import SnapshotProvider
+
+        snapshot = SnapshotProvider.get_snapshot(snapshot_id)
+        if snapshot is None:
+            raise RestorationError(
+                f"Snapshot not found for restoration: {snapshot_id}"
+            )
+
+        self.restore(snapshot)
+
     def restore(self, snapshot: RestorationSnapshot) -> None:
         """
         Restore workspace state from snapshot.
@@ -87,7 +104,9 @@ class RestoreProvider:
             pass
 
         try:
-            if meta.get("window_z_order") is not None and hasattr(self._os, "set_window_z_order"):
+            if meta.get("window_z_order") is not None and hasattr(
+                self._os, "set_window_z_order"
+            ):
                 self._os.set_window_z_order(
                     snapshot.focus.window_id,
                     meta["window_z_order"],
@@ -96,7 +115,9 @@ class RestoreProvider:
             pass
 
         try:
-            if meta.get("browser_state") and hasattr(self._os, "restore_browser_state"):
+            if meta.get("browser_state") and hasattr(
+                self._os, "restore_browser_state"
+            ):
                 self._os.restore_browser_state(meta["browser_state"])
         except Exception:
             pass
