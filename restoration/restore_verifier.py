@@ -23,6 +23,7 @@ class RestoreVerifier:
           - get_cursor_position() -> (x, y)
           - get_focused_window_id() -> str | None
           - get_execution_mode() -> str
+          - is_automation_active() -> bool   (NEW REQUIRED)
 
         OPTIONAL (used if present):
           - get_window_geometry(window_id) -> {x,y,width,height}
@@ -50,10 +51,10 @@ class RestoreVerifier:
         """
 
         self._verify_execution_mode()
+        self._verify_input_released()          # NEW HARD GATE
         self._verify_cursor(snapshot)
         self._verify_focus(snapshot)
 
-        # ADDITIONS
         self._verify_window_geometry(snapshot)
         self._verify_window_z_order(snapshot)
         self._verify_browser_state(snapshot)
@@ -71,6 +72,22 @@ class RestoreVerifier:
         if mode != "OBSERVER":
             raise RestorationVerificationError(
                 f"Execution mode verification failed: {mode}"
+            )
+
+    def _verify_input_released(self) -> None:
+        """
+        Absolute requirement: automation must be inactive.
+        """
+        try:
+            active = self._os.is_automation_active()
+        except Exception as e:
+            raise RestorationVerificationError(
+                f"Unable to determine automation state: {e}"
+            ) from e
+
+        if active:
+            raise RestorationVerificationError(
+                "Input still locked after restoration"
             )
 
     def _verify_cursor(self, snapshot: RestorationSnapshot) -> None:
