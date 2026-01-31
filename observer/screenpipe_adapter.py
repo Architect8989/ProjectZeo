@@ -18,6 +18,7 @@ class ScreenpipeAdapter:
     - Never installs Screenpipe
     - Never controls OS input
     - Never blocks the main loop
+    - Never returns malformed state
     """
 
     SCREENPIPE_URL = "http://127.0.0.1:3030/latest"
@@ -26,8 +27,6 @@ class ScreenpipeAdapter:
     MAX_FRAME_AGE_SECONDS = 0.5
     MAX_SAME_HASH_FRAMES = 10
 
-    # === ADDITIONS (industry-grade invariants) ===
-    MAX_MONOTONIC_DRIFT_SECONDS = 2.0
     MAX_HASH_STALL_SECONDS = 1.5
 
     def __init__(self):
@@ -35,13 +34,14 @@ class ScreenpipeAdapter:
         self.last_frame_ts: Optional[float] = None
         self.last_hash: Optional[str] = None
         self.same_hash_count = 0
-        self.blind = False
 
-        # === ADDITIONS ===
         self.first_seen_mono: Optional[float] = None
         self.last_change_mono: Optional[float] = None
-        self.frame_counter: int = 0
+        self.frame_counter = 0
+
+        self.blind = False
         self.blind_reason: Optional[str] = None
+
         self._lock = threading.Lock()
 
         self.state: Dict[str, object] = {
@@ -54,27 +54,29 @@ class ScreenpipeAdapter:
 
         print("[SCREENPIPE] Adapter initialized (read-only)")
 
+    # -------------------------------------------------
+
     def _hash_text(self, text: str) -> str:
         return hashlib.sha256(
             text.encode("utf-8", errors="ignore")
         ).hexdigest()
 
-    # === ADDITION ===
-    def _mark_blind(self, reason: str):
+    def _mark_blind(self, reason: str) -> None:
         self.blind = True
         self.blind_reason = reason
-        self.state.update(
-            {
-                "available": False,
-                "frame_ts": None,
-                "screen_text_hash": None,
-                "stale": True,
-                "blind": True,
-            }
-        )
+        self.state = {
+            "available": False,
+            "frame_ts": None,
+            "screen_text_hash": None,
+            "stale": True,
+            "blind": True,
+        }
+
+    # -------------------------------------------------
 
     def read(self) -> Dict[str, object]:
         with self._lock:
+
             if self.blind:
                 raise ScreenpipeBlindnessError(
                     f"Screenpipe marked blind: {self.blind_reason}"
@@ -101,11 +103,10 @@ class ScreenpipeAdapter:
                 if frame_ts is None:
                     raise RuntimeError("Missing frame timestamp")
 
-                # === ADDITION: monotonic sanity ===
                 if self.first_seen_mono is None:
                     self.first_seen_mono = now_mono
 
-                age = now_wall - frame_ts
+                age = now_wall - float(frame_ts)
                 if age > self.MAX_FRAME_AGE_SECONDS:
                     raise ScreenpipeBlindnessError("Frame too old")
 
@@ -113,13 +114,14 @@ class ScreenpipeAdapter:
 
                 if text_hash == self.last_hash:
                     self.same_hash_count += 1
+
                     if self.last_change_mono is None:
                         self.last_change_mono = now_mono
 
-                    stall_duration = now_mono - self.last_change_mono
+                    stall = now_mono - self.last_change_mono
                     if (
                         self.same_hash_count >= self.MAX_SAME_HASH_FRAMES
-                        or stall_duration >= self.MAX_HASH_STALL_SECONDS
+                        or stall >= self.MAX_HASH_STALL_SECONDS
                     ):
                         raise ScreenpipeBlindnessError("Frozen screen detected")
                 else:
@@ -130,43 +132,35 @@ class ScreenpipeAdapter:
                 self.last_frame_ts = frame_ts
                 self.frame_counter += 1
 
-                self.state.update(
-                    {
-                        "available": True,
-                        "frame_ts": frame_ts,
-                        "screen_text_hash": text_hash,
-                        "stale": False,
-                        "blind": False,
-                    }
-                )
+                self.state = {
+                    "available": True,
+                    "frame_ts": frame_ts,
+                    "screen_text_hash": text_hash,
+                    "stale": False,
+                    "blind": False,
+                }
 
             except ScreenpipeBlindnessError as e:
                 self._mark_blind(str(e))
                 raise
 
             except Exception:
-                self.state.update(
-                    {
-                        "available": False,
-                        "frame_ts": None,
-                        "screen_text_hash": None,
-                        "stale": True,
-                        "blind": False,
-                    }
-                )
+                self.state = {
+                    "available": False,
+                    "frame_ts": None,
+                    "screen_text_hash": None,
+                    "stale": True,
+                    "blind": False,
+                }
 
-            # === ADDITION: defensive copy ===
             return dict(self.state)
 
-    def is_available(self) -> bool:
-        return bool(self.state.get("available", False))
+    # -------------------------------------------------
 
-    # === ADDITIONS (public, non-invasive) ===
+    def is_available(self) -> bool:
+        return bool(self.state.get("available"))
+
     def get_health_snapshot(self) -> Dict[str, object]:
-        """
-        Returns a forensic-grade health snapshot.
-        No side effects.
-        """
         return {
             "blind": self.blind,
             "blind_reason": self.blind_reason,
@@ -182,10 +176,6 @@ class ScreenpipeAdapter:
         }
 
     def self_test(self) -> bool:
-        """
-        Non-blocking sanity check.
-        Does not throw.
-        """
         try:
             _ = self.read()
             return True
