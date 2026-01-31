@@ -5,6 +5,7 @@ class AuthorityDecision(str, Enum):
     CONTINUE = "CONTINUE"
     YIELD = "YIELD"
     ABORT = "ABORT"
+    RELEASE = "RELEASE"   # NEW: compatibility alias
 
 
 class AuthorityPolicy:
