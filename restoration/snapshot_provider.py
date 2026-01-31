@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import time
-import hashlib
 from typing import Dict, Any, Optional
 
 from restoration.snapshot_types import (
@@ -37,20 +36,6 @@ class SnapshotProvider:
         screenpipe: ScreenpipeAdapter,
         os_backend,
     ):
-        """
-        os_backend MUST provide:
-          - get_cursor_position() -> (x, y)
-          - get_focused_window() -> dict {id, title}
-          - get_active_application() -> dict {process_name, pid}
-          - get_execution_mode() -> str
-
-        OPTIONAL (used if present):
-          - get_window_geometry(window_id) -> {x,y,width,height}
-          - get_window_z_order(window_id) -> int
-          - get_browser_state() -> {url, tab_index}
-          - get_media_playback_position() -> float (seconds)
-          - get_os_signature() -> {os, version, wm}
-        """
         self._observer = observer
         self._screenpipe = screenpipe
         self._os = os_backend
@@ -63,8 +48,8 @@ class SnapshotProvider:
         """
         Capture and validate pre-hijack snapshot.
 
-        This method is a hard gate.
-        Any exception here must abort execution.
+        Hard gate.
+        Any exception aborts execution.
         """
 
         # 1. Enforce execution mode
@@ -93,10 +78,7 @@ class SnapshotProvider:
             ) from e
 
         # 4. Build state objects
-        cursor_state = CursorState(
-            x=int(cursor_x),
-            y=int(cursor_y),
-        )
+        cursor_state = CursorState(x=int(cursor_x), y=int(cursor_y))
 
         focus_state = FocusState(
             window_id=str(focused_window.get("id")),
@@ -109,7 +91,7 @@ class SnapshotProvider:
         )
 
         # -------------------------------------------------
-        # ADDITIONS — EXTENDED SNAPSHOT DATA
+        # EXTENDED SNAPSHOT DATA (BEST EFFORT)
         # -------------------------------------------------
 
         window_geometry: Optional[Dict[str, int]] = None
@@ -152,10 +134,9 @@ class SnapshotProvider:
         except Exception:
             pass
 
-        # 5. Bind visual evidence
+        # 5. Bind metadata (NO snapshot_id duplication)
         metadata: Dict[str, Any] = {
             "schema_version": self.SNAPSHOT_SCHEMA_VERSION,
-            "snapshot_id": self._generate_snapshot_id(),
             "screenpipe": {
                 "frame_ts": screen_state.get("frame_ts"),
                 "screen_text_hash": screen_state.get("screen_text_hash"),
@@ -168,7 +149,7 @@ class SnapshotProvider:
             "os_signature": os_signature,
         }
 
-        # 6. Create immutable snapshot
+        # 6. Create immutable snapshot (single authority)
         snapshot = RestorationSnapshot.create(
             cursor=cursor_state,
             focus=focus_state,
@@ -184,11 +165,3 @@ class SnapshotProvider:
             pass
 
         return snapshot
-
-    # -------------------------------------------------
-    # ADDITIONS — INTERNAL HELPERS
-    # -------------------------------------------------
-
-    def _generate_snapshot_id(self) -> str:
-        base = f"{time.time_ns()}-{id(self)}"
-        return hashlib.sha256(base.encode()).hexdigest()
