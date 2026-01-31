@@ -11,6 +11,7 @@ from core.schemas.action_schema import validate_actions
 from core.verification.screen_verifier import verify_execution
 from core.memory.playbook_store import load_playbook, save_playbook
 from core.safety.runtime_watchdog import RuntimeWatchdog
+from core.telemetry.logger import log_info, log_warn, log_error
 
 
 class KernelState(Enum):
@@ -34,7 +35,6 @@ class KernelController:
 
     TICK_INTERVAL = 0.05  # 20Hz control loop
 
-    # Per-state hard timeouts (seconds)
     STATE_TIMEOUTS = {
         KernelState.PLANNING: 600,
         KernelState.EXECUTING: 1800,
@@ -46,17 +46,13 @@ class KernelController:
         self.current_intent: Optional[str] = None
         self.current_plan: Optional[Any] = None
 
-        # Safety budgets
         self.retry_count = 0
         self.max_retries = 5
 
         self.step_count = 0
         self.max_steps = 200
 
-        # Runtime watchdog
         self.watchdog = RuntimeWatchdog()
-
-        # State timer
         self.state_enter_time = time.time()
 
     # -----------------------
@@ -68,7 +64,7 @@ class KernelController:
             try:
                 self._step()
             except Exception as e:
-                print("[KERNEL] Unhandled error:", e)
+                log_error(f"[KERNEL] Unhandled error: {e}")
                 self._transition(KernelState.ERROR)
 
             time.sleep(self.TICK_INTERVAL)
@@ -79,14 +75,12 @@ class KernelController:
 
     def _step(self):
 
-        # Global resource guard
         self.watchdog.check()
 
-        # State timeout guard
         timeout = self.STATE_TIMEOUTS.get(self.state)
         if timeout:
             if time.time() - self.state_enter_time > timeout:
-                print("[KERNEL] State timeout:", self.state.name)
+                log_warn(f"[KERNEL] State timeout: {self.state.name}")
                 self._transition(KernelState.ERROR)
                 return
 
@@ -131,7 +125,7 @@ class KernelController:
 
         cached = load_playbook(self.current_intent)
         if cached:
-            print("[KERNEL] Loaded playbook from memory.")
+            log_info("[KERNEL] Loaded playbook from memory.")
             self.current_plan = cached
             self._transition(KernelState.EXECUTING)
             return
@@ -139,7 +133,7 @@ class KernelController:
         self.current_plan = main.generate_plan(self.current_intent)
 
         if not validate_actions(self.current_plan):
-            print("[KERNEL] Invalid plan schema. Replanning.")
+            log_warn("[KERNEL] Invalid plan schema. Replanning.")
             return
 
         self._transition(KernelState.EXECUTING)
@@ -148,12 +142,12 @@ class KernelController:
 
         self.step_count += 1
         if self.step_count > self.max_steps:
-            print("[KERNEL] Step limit exceeded.")
+            log_warn("[KERNEL] Step limit exceeded.")
             self._transition(KernelState.ERROR)
             return
 
         if not validate_actions(self.current_plan):
-            print("[KERNEL] Plan corrupted before execution.")
+            log_warn("[KERNEL] Plan corrupted before execution.")
             self._transition(KernelState.PLANNING)
             return
 
@@ -176,11 +170,11 @@ class KernelController:
             self.retry_count += 1
 
             if self.retry_count > self.max_retries:
-                print("[KERNEL] Retry limit exceeded.")
+                log_warn("[KERNEL] Retry limit exceeded.")
                 self._transition(KernelState.ERROR)
                 return
 
-            print("[KERNEL] Verification failed. Retrying execution.")
+            log_warn("[KERNEL] Verification failed. Retrying execution.")
             self._transition(KernelState.EXECUTING)
 
     def _restoring(self):
@@ -204,7 +198,6 @@ class KernelController:
         self.current_plan = None
         self.retry_count = 0
         self.step_count = 0
-
         gc.collect()
 
     # -----------------------
@@ -212,6 +205,6 @@ class KernelController:
     # -----------------------
 
     def _transition(self, new_state: KernelState):
-        print(f"[KERNEL] {self.state.name} -> {new_state.name}")
+        log_info(f"[KERNEL] {self.state.name} -> {new_state.name}")
         self.state = new_state
         self.state_enter_time = time.time()
