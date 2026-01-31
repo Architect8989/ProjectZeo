@@ -59,15 +59,23 @@ class KernelController:
         self.watchdog = RuntimeWatchdog()
         self.state_enter_time = time.time()
 
-        # -------- Restore from checkpoint if present --------
+        # ----------------------------
+        # Restore from checkpoint
+        # ----------------------------
+
         ckpt = load_checkpoint()
         if ckpt:
             log_warn("[KERNEL] Restoring from checkpoint")
-            self.state = KernelState[ckpt["state"]]
-            self.current_intent = ckpt["current_intent"]
-            self.current_plan = ckpt["current_plan"]
-            self.retry_count = ckpt["retry_count"]
-            self.step_count = ckpt["step_count"]
+
+            try:
+                self.state = KernelState[ckpt["state"]]
+                self.current_intent = ckpt["current_intent"]
+                self.current_plan = ckpt["current_plan"]
+                self.retry_count = ckpt["retry_count"]
+                self.step_count = ckpt["step_count"]
+            except Exception:
+                log_error("[KERNEL] Corrupt checkpoint — discarding")
+                clear_checkpoint()
 
     # ----------------------------------------------------
     # PUBLIC
@@ -78,7 +86,7 @@ class KernelController:
             try:
                 self._step()
             except SystemExit:
-                # Raised by watchdog -> fall into recovery
+                # Raised by RuntimeWatchdog
                 self._transition(KernelState.ERROR)
             except Exception as e:
                 log_error(f"[KERNEL] Unhandled exception: {e}")
@@ -92,7 +100,7 @@ class KernelController:
 
     def _step(self):
 
-        # Hard resource guard
+        # Global resource guard
         self.watchdog.check()
 
         # Persist checkpoint every tick
@@ -113,16 +121,22 @@ class KernelController:
 
         if self.state == KernelState.OBSERVER:
             self._observer()
+
         elif self.state == KernelState.ARMED:
             self._armed()
+
         elif self.state == KernelState.PLANNING:
             self._planning()
+
         elif self.state == KernelState.EXECUTING:
             self._executing()
+
         elif self.state == KernelState.VERIFYING:
             self._verifying()
+
         elif self.state == KernelState.RESTORING:
             self._restoring()
+
         elif self.state == KernelState.ERROR:
             self._error()
 
