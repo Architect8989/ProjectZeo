@@ -1,6 +1,6 @@
 from enum import Enum, auto
 import time
-from typing import Optional, Any
+from typing import Optional, Any, List
 import gc
 
 import operate.main as main  # runtime surface
@@ -16,6 +16,13 @@ from core.safety.checkpoint_store import (
     clear_checkpoint,
 )
 
+from core.planner.task_decomposer import TaskDecomposer, DecompositionError
+from operate.models.apis_openrouter import get_next_action
+
+
+# -----------------------------------------------------
+# Kernel States
+# -----------------------------------------------------
 
 class KernelState(Enum):
     OBSERVER = auto()
@@ -27,17 +34,21 @@ class KernelState(Enum):
     ERROR = auto()
 
 
+# -----------------------------------------------------
+# Kernel Controller
+# -----------------------------------------------------
+
 class KernelController:
     """
     Sovereign governing state machine.
 
-    - Owns all state transitions
-    - Owns recovery
+    - Owns transitions
     - Owns persistence
-    - Zero business logic
+    - Owns recovery
+    - No business logic
     """
 
-    TICK_INTERVAL = 0.05  # 20Hz
+    TICK_INTERVAL = 0.05
 
     STATE_TIMEOUTS = {
         KernelState.PLANNING: 600,
@@ -45,22 +56,35 @@ class KernelController:
         KernelState.VERIFYING: 300,
     }
 
+    # -------------------------------------------------
+
     def __init__(self):
-        self.state: KernelState = KernelState.OBSERVER
+        self.state = KernelState.OBSERVER
+
         self.current_intent: Optional[str] = None
+        self.steps: Optional[List[dict]] = None
+        self.step_index: int = 0
         self.current_plan: Optional[Any] = None
 
         self.retry_count = 0
         self.max_retries = 5
 
         self.step_count = 0
-        self.max_steps = 200
+        self.max_steps = 500
 
         self.watchdog = RuntimeWatchdog()
         self.state_enter_time = time.time()
 
+        self.decomposer = TaskDecomposer(
+            llm_call=lambda prompt: get_next_action(
+                model="openai/gpt-4o-mini",
+                messages=[{"role": "system", "content": prompt}],
+                objective="planner",
+            )[0]
+        )
+
         # ----------------------------
-        # Restore from checkpoint
+        # Restore checkpoint
         # ----------------------------
 
         ckpt = load_checkpoint()
@@ -70,23 +94,24 @@ class KernelController:
             try:
                 self.state = KernelState[ckpt["state"]]
                 self.current_intent = ckpt["current_intent"]
+                self.steps = ckpt["steps"]
+                self.step_index = ckpt["step_index"]
                 self.current_plan = ckpt["current_plan"]
                 self.retry_count = ckpt["retry_count"]
                 self.step_count = ckpt["step_count"]
             except Exception:
-                log_error("[KERNEL] Corrupt checkpoint — discarding")
+                log_error("[KERNEL] Corrupt checkpoint discarded")
                 clear_checkpoint()
 
-    # ----------------------------------------------------
-    # PUBLIC
-    # ----------------------------------------------------
+    # -------------------------------------------------
+    # Public
+    # -------------------------------------------------
 
     def start(self):
         while True:
             try:
                 self._step()
             except SystemExit:
-                # Raised by RuntimeWatchdog
                 self._transition(KernelState.ERROR)
             except Exception as e:
                 log_error(f"[KERNEL] Unhandled exception: {e}")
@@ -94,60 +119,53 @@ class KernelController:
 
             time.sleep(self.TICK_INTERVAL)
 
-    # ----------------------------------------------------
-    # CORE LOOP
-    # ----------------------------------------------------
+    # -------------------------------------------------
+    # Core Loop
+    # -------------------------------------------------
 
     def _step(self):
 
-        # Global resource guard
         self.watchdog.check()
 
-        # Persist checkpoint every tick
         save_checkpoint({
             "state": self.state.name,
             "current_intent": self.current_intent,
+            "steps": self.steps,
+            "step_index": self.step_index,
             "current_plan": self.current_plan,
             "retry_count": self.retry_count,
             "step_count": self.step_count,
         })
 
         timeout = self.STATE_TIMEOUTS.get(self.state)
-        if timeout:
-            if time.time() - self.state_enter_time > timeout:
-                log_warn(f"[KERNEL] State timeout: {self.state.name}")
-                self._transition(KernelState.ERROR)
-                return
+        if timeout and (time.time() - self.state_enter_time > timeout):
+            log_warn(f"[KERNEL] State timeout: {self.state.name}")
+            self._transition(KernelState.ERROR)
+            return
 
         if self.state == KernelState.OBSERVER:
             self._observer()
-
         elif self.state == KernelState.ARMED:
             self._armed()
-
         elif self.state == KernelState.PLANNING:
             self._planning()
-
         elif self.state == KernelState.EXECUTING:
             self._executing()
-
         elif self.state == KernelState.VERIFYING:
             self._verifying()
-
         elif self.state == KernelState.RESTORING:
             self._restoring()
-
         elif self.state == KernelState.ERROR:
             self._error()
 
-    # ----------------------------------------------------
-    # STATES
-    # ----------------------------------------------------
+    # -------------------------------------------------
+    # States
+    # -------------------------------------------------
 
     def _observer(self):
         main.start_observer()
-
         intent = main.check_for_user_intent()
+
         if intent:
             self.current_intent = intent
             self._transition(KernelState.ARMED)
@@ -156,38 +174,44 @@ class KernelController:
         main.arm_system()
         self._transition(KernelState.PLANNING)
 
+    # -------------------------------------------------
+
     def _planning(self):
 
-        cached = load_playbook(self.current_intent)
-        if cached:
-            log_info("[KERNEL] Loaded cached playbook")
-            self.current_plan = cached
-            self._transition(KernelState.EXECUTING)
-            return
-
-        self.current_plan = main.generate_plan(self.current_intent)
-
-        if not validate_actions(self.current_plan):
-            log_warn("[KERNEL] Invalid plan schema")
+        try:
+            self.steps = self.decomposer.decompose(self.current_intent)
+            self.step_index = 0
+        except DecompositionError as e:
+            log_warn(f"[KERNEL] Decomposition failed: {e}")
             return
 
         self._transition(KernelState.EXECUTING)
 
+    # -------------------------------------------------
+
     def _executing(self):
 
-        self.step_count += 1
-        if self.step_count > self.max_steps:
-            log_warn("[KERNEL] Step limit exceeded")
-            self._transition(KernelState.ERROR)
+        if self.step_index >= len(self.steps):
+            self._transition(KernelState.RESTORING)
             return
 
+        step_goal = self.steps[self.step_index]["goal"]
+
+        cached = load_playbook(step_goal)
+        if cached:
+            self.current_plan = cached
+        else:
+            self.current_plan = main.generate_plan(step_goal)
+
         if not validate_actions(self.current_plan):
-            log_warn("[KERNEL] Plan corrupted")
-            self._transition(KernelState.PLANNING)
+            log_warn("[KERNEL] Invalid plan schema")
+            self._transition(KernelState.ERROR)
             return
 
         main.run_soc(self.current_plan)
         self._transition(KernelState.VERIFYING)
+
+    # -------------------------------------------------
 
     def _verifying(self):
 
@@ -199,8 +223,13 @@ class KernelController:
         )
 
         if success:
-            save_playbook(self.current_intent, self.current_plan)
-            self._transition(KernelState.RESTORING)
+            save_playbook(
+                self.steps[self.step_index]["goal"],
+                self.current_plan,
+            )
+            self.step_index += 1
+            self.retry_count = 0
+            self._transition(KernelState.EXECUTING)
         else:
             self.retry_count += 1
 
@@ -210,6 +239,8 @@ class KernelController:
                 return
 
             self._transition(KernelState.EXECUTING)
+
+    # -------------------------------------------------
 
     def _restoring(self):
         main.restore_screen()
@@ -223,12 +254,14 @@ class KernelController:
         self._reset()
         self._transition(KernelState.OBSERVER)
 
-    # ----------------------------------------------------
-    # HELPERS
-    # ----------------------------------------------------
+    # -------------------------------------------------
+    # Helpers
+    # -------------------------------------------------
 
     def _reset(self):
         self.current_intent = None
+        self.steps = None
+        self.step_index = 0
         self.current_plan = None
         self.retry_count = 0
         self.step_count = 0
