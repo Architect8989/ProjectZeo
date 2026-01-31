@@ -70,14 +70,14 @@ class ScreenpipeAdapter:
     # -------------------------------------------------
 
     def read(self) -> Dict[str, object]:
-        # ---- fast pre-check (locked) ----
+        # ---- fast pre-check ----
         with self._lock:
             if self.blind:
                 raise ScreenpipeBlindnessError(
                     f"Screenpipe marked blind: {self.blind_reason}"
                 )
 
-        # ---- network call OUTSIDE lock ----
+        # ---- network call (NO LOCK) ----
         try:
             resp = requests.get(
                 self.SCREENPIPE_URL,
@@ -94,7 +94,7 @@ class ScreenpipeAdapter:
                 }
                 return dict(self.state)
 
-        # ---- processing & mutation ----
+        # ---- response processing ----
         try:
             if resp.status_code != 200:
                 raise RuntimeError("Screenpipe HTTP failure")
@@ -131,7 +131,9 @@ class ScreenpipeAdapter:
                         self.same_hash_count >= self.MAX_SAME_HASH_FRAMES
                         or stall >= self.MAX_HASH_STALL_SECONDS
                     ):
-                        raise ScreenpipeBlindnessError("Frozen screen detected")
+                        raise ScreenpipeBlindnessError(
+                            "Frozen screen detected"
+                        )
                 else:
                     self.same_hash_count = 0
                     self.last_change_mono = now_mono
