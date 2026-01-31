@@ -8,6 +8,7 @@ import operate.main as main  # runtime surface
 
 from core.schemas.action_schema import validate_actions
 from core.verification.screen_verifier import verify_execution
+from core.memory.playbook_store import load_playbook, save_playbook
 
 
 class KernelState(Enum):
@@ -100,6 +101,15 @@ class KernelController:
         self._transition(KernelState.PLANNING)
 
     def _planning(self):
+
+        # MEMORY LOOKUP
+        cached = load_playbook(self.current_intent)
+        if cached:
+            print("[KERNEL] Loaded playbook from memory.")
+            self.current_plan = cached
+            self._transition(KernelState.EXECUTING)
+            return
+
         self.current_plan = main.generate_plan(self.current_intent)
 
         if not validate_actions(self.current_plan):
@@ -134,6 +144,8 @@ class KernelController:
         )
 
         if success:
+            # SAVE MEMORY
+            save_playbook(self.current_intent, self.current_plan)
             self._transition(KernelState.RESTORING)
         else:
             self.retry_count += 1
