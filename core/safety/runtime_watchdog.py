@@ -3,13 +3,18 @@
 import psutil
 import time
 import os
-import signal
 
 MAX_RUNTIME_SECONDS = 3600          # 1 hour per task
 MAX_MEMORY_MB = 4096                # 4GB
 MAX_CPU_PERCENT = 90                # sustained
 
 class RuntimeWatchdog:
+    """
+    Hard runtime guard.
+
+    Never performs hard process kill.
+    Always raises exception so kernel + restoration can run.
+    """
 
     def __init__(self):
         self.start_time = time.time()
@@ -22,14 +27,14 @@ class RuntimeWatchdog:
         cpu = self.process.cpu_percent(interval=0.1)
 
         if elapsed > MAX_RUNTIME_SECONDS:
-            self._kill("TIME_LIMIT")
+            self._terminate("TIME_LIMIT")
 
         if mem_mb > MAX_MEMORY_MB:
-            self._kill("MEMORY_LIMIT")
+            self._terminate("MEMORY_LIMIT")
 
         if cpu > MAX_CPU_PERCENT:
-            self._kill("CPU_LIMIT")
+            self._terminate("CPU_LIMIT")
 
-    def _kill(self, reason):
-        print(f"[WATCHDOG] TERMINATING: {reason}")
-        os.kill(os.getpid(), signal.SIGKILL)
+    def _terminate(self, reason: str):
+        print(f"[WATCHDOG] LIMIT EXCEEDED: {reason}")
+        raise SystemExit(f"WATCHDOG_LIMIT_EXCEEDED:{reason}")
