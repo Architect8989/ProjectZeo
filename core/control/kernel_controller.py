@@ -3,12 +3,14 @@
 from enum import Enum, auto
 import time
 from typing import Optional, Any
+import gc
 
 import operate.main as main  # runtime surface
 
 from core.schemas.action_schema import validate_actions
 from core.verification.screen_verifier import verify_execution
 from core.memory.playbook_store import load_playbook, save_playbook
+from core.safety.runtime_watchdog import RuntimeWatchdog
 
 
 class KernelState(Enum):
@@ -32,6 +34,13 @@ class KernelController:
 
     TICK_INTERVAL = 0.05  # 20Hz control loop
 
+    # Per-state hard timeouts (seconds)
+    STATE_TIMEOUTS = {
+        KernelState.PLANNING: 600,
+        KernelState.EXECUTING: 1800,
+        KernelState.VERIFYING: 300,
+    }
+
     def __init__(self):
         self.state: KernelState = KernelState.OBSERVER
         self.current_intent: Optional[str] = None
@@ -43,6 +52,12 @@ class KernelController:
 
         self.step_count = 0
         self.max_steps = 200
+
+        # Runtime watchdog
+        self.watchdog = RuntimeWatchdog()
+
+        # State timer
+        self.state_enter_time = time.time()
 
     # -----------------------
     # Public Entry
@@ -63,6 +78,18 @@ class KernelController:
     # -----------------------
 
     def _step(self):
+
+        # Global resource guard
+        self.watchdog.check()
+
+        # State timeout guard
+        timeout = self.STATE_TIMEOUTS.get(self.state)
+        if timeout:
+            if time.time() - self.state_enter_time > timeout:
+                print("[KERNEL] State timeout:", self.state.name)
+                self._transition(KernelState.ERROR)
+                return
+
         if self.state == KernelState.OBSERVER:
             self._observer()
 
@@ -102,7 +129,6 @@ class KernelController:
 
     def _planning(self):
 
-        # MEMORY LOOKUP
         cached = load_playbook(self.current_intent)
         if cached:
             print("[KERNEL] Loaded playbook from memory.")
@@ -114,13 +140,12 @@ class KernelController:
 
         if not validate_actions(self.current_plan):
             print("[KERNEL] Invalid plan schema. Replanning.")
-            self._transition(KernelState.PLANNING)
             return
 
         self._transition(KernelState.EXECUTING)
 
     def _executing(self):
-        # Step budget
+
         self.step_count += 1
         if self.step_count > self.max_steps:
             print("[KERNEL] Step limit exceeded.")
@@ -128,7 +153,7 @@ class KernelController:
             return
 
         if not validate_actions(self.current_plan):
-            print("[KERNEL] Plan corrupted before execution. Replanning.")
+            print("[KERNEL] Plan corrupted before execution.")
             self._transition(KernelState.PLANNING)
             return
 
@@ -136,6 +161,7 @@ class KernelController:
         self._transition(KernelState.VERIFYING)
 
     def _verifying(self):
+
         screenshot = main.get_latest_screenshot()
 
         success = verify_execution(
@@ -144,7 +170,6 @@ class KernelController:
         )
 
         if success:
-            # SAVE MEMORY
             save_playbook(self.current_intent, self.current_plan)
             self._transition(KernelState.RESTORING)
         else:
@@ -159,24 +184,28 @@ class KernelController:
             self._transition(KernelState.EXECUTING)
 
     def _restoring(self):
+
         main.restore_screen()
-        self.current_intent = None
-        self.current_plan = None
-
-        self.retry_count = 0
-        self.step_count = 0
-
+        self._reset()
         self._transition(KernelState.OBSERVER)
 
     def _error(self):
+
         main.restore_screen()
+        self._reset()
+        self._transition(KernelState.OBSERVER)
+
+    # -----------------------
+    # Internal Helpers
+    # -----------------------
+
+    def _reset(self):
         self.current_intent = None
         self.current_plan = None
-
         self.retry_count = 0
         self.step_count = 0
 
-        self._transition(KernelState.OBSERVER)
+        gc.collect()
 
     # -----------------------
     # Transition Guard
@@ -185,3 +214,4 @@ class KernelController:
     def _transition(self, new_state: KernelState):
         print(f"[KERNEL] {self.state.name} -> {new_state.name}")
         self.state = new_state
+        self.state_enter_time = time.time()
