@@ -1,5 +1,6 @@
 import threading
 
+
 class IntentListener:
     def __init__(self, mode_controller):
         self.mode = mode_controller
@@ -16,11 +17,10 @@ class IntentListener:
                 if not raw:
                     continue
 
-                if self.mode.mode.value == "OBSERVER":
-                    self.mode.arm(reason=raw)
-                    print(f"[INTENT] Armed via CLI: {raw}")
-                else:
-                    print("[INTENT] Ignored (already armed)")
+                # 🔴 SINGLE AUTHORITY CALL — NO TOCTOU
+                self.mode.arm(reason=raw)
+                print(f"[INTENT] Armed via CLI: {raw}")
 
             except Exception as e:
-                print(f"[INTENT] CLI error: {e}")
+                # Includes illegal transitions, vision errors, etc.
+                print(f"[INTENT] Rejected: {e}")
