@@ -3,10 +3,12 @@ Self-Operating Computer
 """
 
 import argparse
+
 from operate.utils.style import ANSI_BRIGHT_MAGENTA
 from operate.operate import main as operate_main
 
 from core.control.kernel_controller import KernelController
+from core.telemetry.logger import log_info, log_error
 
 
 def main_entry():
@@ -51,6 +53,8 @@ def main_entry():
             "verbose_mode": args.verbose,
         }
 
+        log_info("[SYSTEM] Booting kernel")
+
         kernel = KernelController(
             config=config,
             operate_entry=operate_main
@@ -59,7 +63,12 @@ def main_entry():
         kernel.start()
 
     except KeyboardInterrupt:
+        log_info("[SYSTEM] Keyboard interrupt received")
         print(f"\n{ANSI_BRIGHT_MAGENTA}Exiting...")
+
+    except Exception as e:
+        log_error(f"[SYSTEM] Fatal startup error: {e}")
+        raise
 
 
 if __name__ == "__main__":
