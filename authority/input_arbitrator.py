@@ -19,7 +19,6 @@ class InputArbitrator:
         self.tracker = InputTracker()
         self.policy = AuthorityPolicy()
 
-        # === ADDITIONS ===
         self._last_soc_action_ts: Optional[float] = None
         self._forced_release: bool = False
         self._lock = threading.Lock()
@@ -30,9 +29,8 @@ class InputArbitrator:
     # Existing API
     # -------------------------------------------------
 
-    def soc_action_started(self):
+    def soc_action_started(self) -> None:
         self.tracker.mark_soc_action()
-
         with self._lock:
             self._last_soc_action_ts = time.time()
 
@@ -43,10 +41,18 @@ class InputArbitrator:
         high_risk: bool,
         soc_confident: bool,
     ) -> AuthorityDecision:
+        """
+        Decide whether SOC continues or releases control.
+        Thread-safe and fail-closed.
+        """
 
         source = self.tracker.classify_input(input_event_ts)
 
-        if self._forced_release:
+        # ---- snapshot forced state atomically ----
+        with self._lock:
+            forced_release = self._forced_release
+
+        if forced_release:
             return AuthorityDecision.RELEASE
 
         if source == InputSource.HUMAN:
@@ -59,7 +65,7 @@ class InputArbitrator:
         return AuthorityDecision.CONTINUE
 
     # -------------------------------------------------
-    # ADDITIONS — FAILSAFE MECHANISMS
+    # FAILSAFE MECHANISMS
     # -------------------------------------------------
 
     def emergency_reclaim(self) -> None:
@@ -73,6 +79,10 @@ class InputArbitrator:
     def clear_emergency_reclaim(self) -> None:
         with self._lock:
             self._forced_release = False
+
+    # -------------------------------------------------
+    # WATCHDOG
+    # -------------------------------------------------
 
     def _start_watchdog(self) -> None:
         t = threading.Thread(
@@ -97,6 +107,10 @@ class InputArbitrator:
                 idle = time.time() - self._last_soc_action_ts
                 if idle > self.EMERGENCY_RECLAIM_TIMEOUT_SECONDS:
                     self._forced_release = True
+
+    # -------------------------------------------------
+    # FORENSICS
+    # -------------------------------------------------
 
     def get_authority_snapshot(self) -> Dict[str, object]:
         """
