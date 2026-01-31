@@ -38,15 +38,12 @@ from restoration.snapshot_provider import SnapshotProvider
 from restoration.restore_provider import RestoreProvider
 from restoration.restore_verifier import RestoreVerifier
 
-# ----------------------------
-# ADDITIVE SAFETY IMPORTS
-# ----------------------------
-
+# Additive safety
 from core.safety.action_timeout import action_timeout, ActionTimeout
 from core.telemetry.logger import log_warn
 
 # ----------------------------
-# GLOBAL SINGLETONS (ALLOWED)
+# GLOBAL SINGLETONS
 # ----------------------------
 
 config = Config()
@@ -55,10 +52,9 @@ operating_system = OperatingSystem()
 accessibility_backend = AccessibilityBackend()
 journal = ActionJournal()
 policy_engine = PolicyEngine()
-
 input_arbitrator = InputArbitrator()
 
-EXECUTION_MODE = "ACTIVE"  # OBSERVER | ACTIVE
+EXECUTION_MODE = "ACTIVE"
 
 
 # ----------------------------
@@ -66,6 +62,7 @@ EXECUTION_MODE = "ACTIVE"  # OBSERVER | ACTIVE
 # ----------------------------
 
 def main(model, terminal_prompt, voice_mode=False, verbose_mode=False):
+
     mic = None
     config.verbose = verbose_mode
     config.validation(model, voice_mode)
@@ -107,11 +104,12 @@ def main(model, terminal_prompt, voice_mode=False, verbose_mode=False):
     execution_id = str(uuid.uuid4())
     journal.open(session_id=execution_id, reason="OBJECTIVE_START")
 
-    # --------------------------------------------------
-    # Pre-hijack snapshot (HARD GATE)
-    # --------------------------------------------------
+    # ----------------------------
+    # SNAPSHOT
+    # ----------------------------
 
     snapshot = None
+
     snapshot_provider = SnapshotProvider(
         observer=accessibility_backend.observer,
         screenpipe=accessibility_backend.screenpipe,
@@ -124,20 +122,23 @@ def main(model, terminal_prompt, voice_mode=False, verbose_mode=False):
     try:
         snapshot = snapshot_provider.capture_pre_hijack_snapshot()
     except Exception as e:
-        journal.record(
-            event="snapshot_failed",
-            execution_id=execution_id,
-            error=str(e),
-        )
+        journal.record(event="snapshot_failed", execution_id=execution_id, error=str(e))
         journal.seal(reason="SNAPSHOT_FAILURE")
         raise
 
     operating_system.mark_automation_active()
 
     session_id = None
+    max_iterations = 500
+    iteration = 0
 
     try:
         while True:
+
+            iteration += 1
+            if iteration > max_iterations:
+                raise RuntimeError("Iteration budget exceeded")
+
             operations, session_id = asyncio.run(
                 get_next_action(model, messages, objective, session_id)
             )
@@ -158,6 +159,7 @@ def main(model, terminal_prompt, voice_mode=False, verbose_mode=False):
         journal.record(event="fatal_error", detail=str(e))
 
     finally:
+
         try:
             operating_system.mark_automation_inactive()
         except Exception:
@@ -167,10 +169,7 @@ def main(model, terminal_prompt, voice_mode=False, verbose_mode=False):
             try:
                 restore_provider.restore(snapshot)
                 restore_verifier.verify(snapshot)
-                journal.record(
-                    event="restoration_verified",
-                    execution_id=execution_id,
-                )
+                journal.record(event="restoration_verified", execution_id=execution_id)
             except Exception as e:
                 journal.record(
                     event="restoration_failed",
@@ -184,13 +183,20 @@ def main(model, terminal_prompt, voice_mode=False, verbose_mode=False):
 
 
 # ----------------------------
-# EXECUTION LOOP (PATCHED)
+# EXECUTION LOOP
 # ----------------------------
 
 def operate(operations, model, execution_id: str):
+
+    # HARD GUARD
+    if not operations:
+        journal.record(event="no_operations", execution_id=execution_id)
+        return True
+
     frozen_nodes = accessibility_backend.get_nodes()
 
     for operation in operations:
+
         time.sleep(1)
 
         try:
@@ -201,6 +207,22 @@ def operate(operations, model, execution_id: str):
         op_type = operation.get("operation", "").lower()
         thought = operation.get("thought")
         detail = ""
+
+        # ----------------------------
+        # OPERATION VALIDATION
+        # ----------------------------
+
+        if op_type in ("press", "hotkey"):
+            if not operation.get("keys"):
+                raise ValueError("Missing keys")
+
+        if op_type == "write":
+            if operation.get("content") is None:
+                raise ValueError("Missing content")
+
+        if op_type == "click":
+            if operation.get("x") is None or operation.get("y") is None:
+                raise ValueError("Missing coordinates")
 
         journal.record(
             event="operation_start",
