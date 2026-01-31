@@ -21,7 +21,7 @@ class OperatingSystem:
     Enforces:
     - Fail-open human reclaim
     - Crash-safe input release
-    - Heartbeat watchdog
+    - Heartbeat watchdog (non-terminating)
     """
 
     # -------------------------------------------------
@@ -45,6 +45,7 @@ class OperatingSystem:
     _HEARTBEAT_TIMEOUT = 2.0
 
     _watchdog_thread_started = False
+    _watchdog_lock = threading.Lock()
 
     # -------------------------------------------------
     # WRITE / PRESS / CLICK
@@ -140,12 +141,7 @@ class OperatingSystem:
         with self._automation_lock:
             self._automation_active = False
 
-    # 🔴 TIER-1 REQUIRED METHOD
     def is_automation_active(self) -> bool:
-        """
-        REQUIRED by restoration verifier.
-        Must be truthful and side-effect free.
-        """
         with self._automation_lock:
             return bool(self._automation_active)
 
@@ -157,16 +153,16 @@ class OperatingSystem:
         self._touch_heartbeat()
 
     # -------------------------------------------------
-    # WATCHDOG THREAD
+    # WATCHDOG THREAD (NON-TERMINATING)
     # -------------------------------------------------
 
     def _ensure_watchdog(self):
-        if self._watchdog_thread_started:
-            return
-
-        self._watchdog_thread_started = True
-        t = threading.Thread(target=self._watchdog_loop, daemon=True)
-        t.start()
+        with self._watchdog_lock:
+            if self._watchdog_thread_started:
+                return
+            self._watchdog_thread_started = True
+            t = threading.Thread(target=self._watchdog_loop, daemon=True)
+            t.start()
 
     def _watchdog_loop(self):
         while True:
@@ -180,10 +176,9 @@ class OperatingSystem:
 
             if active and elapsed > self._HEARTBEAT_TIMEOUT:
                 print("[OperatingSystem] Heartbeat lost — forcing release")
-                # 🔴 IMPORTANT: do not lie about automation state
                 self.mark_automation_inactive()
                 self.force_release_all()
-                return
+                # DO NOT EXIT — watchdog must persist
 
     # -------------------------------------------------
     # HARD FAIL-OPEN SAFETY
@@ -192,8 +187,7 @@ class OperatingSystem:
     def force_release_all(self):
         """
         Absolute safety valve.
-        Physically releases all keys and mouse buttons.
-        Never raises.
+        Never raises. Always yields control to human.
         """
         try:
             self.stop_automated_input()
@@ -204,18 +198,32 @@ class OperatingSystem:
 
     def stop_automated_input(self) -> None:
         try:
-            for key in ["shift", "ctrl", "alt", "win", "command", "esc"]:
+            # Modifiers + control keys
+            for key in [
+                "shift", "ctrl", "alt", "win", "command", "esc",
+                "tab", "enter", "space", "backspace", "delete",
+                "up", "down", "left", "right"
+            ]:
                 try:
                     pyautogui.keyUp(key)
                 except Exception:
                     pass
 
+            # Function keys
+            for i in range(1, 25):
+                try:
+                    pyautogui.keyUp(f"f{i}")
+                except Exception:
+                    pass
+
+            # Letters
             for c in "abcdefghijklmnopqrstuvwxyz":
                 try:
                     pyautogui.keyUp(c)
                 except Exception:
                     pass
 
+            # Mouse buttons
             for btn in ["left", "right", "middle"]:
                 try:
                     pyautogui.mouseUp(button=btn)
@@ -248,7 +256,7 @@ class OperatingSystem:
             raise RuntimeError(e)
 
     # -------------------------------------------------
-    # WINDOW / APPLICATION (STUBS)
+    # WINDOW / APPLICATION (STUB-SAFE)
     # -------------------------------------------------
 
     def get_focused_window(self):
