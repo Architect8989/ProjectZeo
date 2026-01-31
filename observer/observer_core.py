@@ -27,10 +27,10 @@ class ObserverCore:
         self.last_tick_ts: Optional[float] = None
         self.last_frame_seen_mono: Optional[float] = None
 
-        # === ADDITIONS ===
         self.observer_healthy: bool = True
         self.blind_reason: Optional[str] = None
         self.first_frame_seen_mono: Optional[float] = None
+
         self._lock = threading.Lock()
 
         self.state: Dict[str, object] = {
@@ -47,13 +47,17 @@ class ObserverCore:
 
         print("[OBSERVER] Initialized (witness mode)")
 
-    # === ADDITION ===
-    def _mark_blind(self, reason: str):
+    # -------------------------------------------------
+
+    def _mark_blind(self, reason: str) -> None:
         self.observer_healthy = False
         self.blind_reason = reason
 
+    # -------------------------------------------------
+
     def tick(self) -> Dict[str, object]:
         with self._lock:
+
             if not self.observer_healthy:
                 raise ObserverBlindnessError(
                     f"Observer permanently blind: {self.blind_reason}"
@@ -75,41 +79,48 @@ class ObserverCore:
             self.tick_count += 1
             self.last_tick_ts = now
 
-            self.state.update(
-                {
-                    "uptime_seconds": round(now - self.start_time, 2),
-                    "tick_count": self.tick_count,
-                    "last_tick_ts": now,
-                }
-            )
+            self.state = {
+                "uptime_seconds": round(now - self.start_time, 2),
+                "tick_count": self.tick_count,
+                "last_tick_ts": now,
+                "screen_available": self.state["screen_available"],
+                "screen_text_hash": self.state["screen_text_hash"],
+                "screen_frame_ts": self.state["screen_frame_ts"],
+                "ui_snapshot": self.state["ui_snapshot"],
+            }
 
             self.history.append(dict(self.state))
             return dict(self.state)
 
+    # -------------------------------------------------
+
     def attach_screen_state(self, screen_state: Dict[str, object]) -> None:
         with self._lock:
+
             if screen_state.get("available"):
                 now = time.monotonic()
                 self.last_frame_seen_mono = now
                 if self.first_frame_seen_mono is None:
                     self.first_frame_seen_mono = now
 
-            self.state.update(
-                {
-                    "screen_available": screen_state.get("available"),
-                    "screen_text_hash": screen_state.get("screen_text_hash"),
-                    "screen_frame_ts": screen_state.get("frame_ts"),
-                }
+            self.state["screen_available"] = bool(
+                screen_state.get("available")
             )
+            self.state["screen_text_hash"] = screen_state.get("screen_text_hash")
+            self.state["screen_frame_ts"] = screen_state.get("frame_ts")
 
     def attach_ui_snapshot(self, ui_snapshot) -> None:
         with self._lock:
             self.state["ui_snapshot"] = ui_snapshot
 
-    def get_state(self) -> Dict[str, object]:
-        return dict(self.state)
+    # -------------------------------------------------
 
-    # === ADDITIONS (public, non-invasive) ===
+    def get_state(self) -> Dict[str, object]:
+        with self._lock:
+            return dict(self.state)
+
+    # -------------------------------------------------
+
     def is_healthy(self) -> bool:
         return self.observer_healthy
 
@@ -119,6 +130,7 @@ class ObserverCore:
         No side effects.
         """
         now = time.monotonic()
+
         return {
             "observer_healthy": self.observer_healthy,
             "blind_reason": self.blind_reason,
