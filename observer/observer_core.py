@@ -21,15 +21,19 @@ class ObserverCore:
     MAX_HISTORY = 1000
     MAX_NO_FRAME_SECONDS = 0.5
 
+    # ---- NEW: cold-start tolerance ----
+    STARTUP_GRACE_TICKS = 5          # number of ticks allowed with no frames
+    STARTUP_GRACE_SECONDS = 2.0      # absolute wall-time grace
+
     def __init__(self):
         self.start_time = time.monotonic()
         self.tick_count = 0
         self.last_tick_ts: Optional[float] = None
         self.last_frame_seen_mono: Optional[float] = None
+        self.first_frame_seen_mono: Optional[float] = None
 
         self.observer_healthy: bool = True
         self.blind_reason: Optional[str] = None
-        self.first_frame_seen_mono: Optional[float] = None
 
         # FIX: re-entrant lock to prevent self-deadlock
         self._lock = threading.RLock()
@@ -51,6 +55,10 @@ class ObserverCore:
     # -------------------------------------------------
 
     def _mark_blind(self, reason: str) -> None:
+        """
+        Monotonic blindness transition.
+        Once blind, never recovers.
+        """
         with self._lock:
             if not self.observer_healthy:
                 return
@@ -69,17 +77,37 @@ class ObserverCore:
 
             now = time.monotonic()
 
-            try:
-                if self.last_frame_seen_mono is None:
-                    raise ObserverBlindnessError("Observer has never seen a frame")
+            # ---- COLD START HANDLING ----
+            if self.last_frame_seen_mono is None:
+                grace_ticks_ok = self.tick_count < self.STARTUP_GRACE_TICKS
+                grace_time_ok = (now - self.start_time) < self.STARTUP_GRACE_SECONDS
 
-                if now - self.last_frame_seen_mono > self.MAX_NO_FRAME_SECONDS:
-                    raise ObserverBlindnessError("Observer lost vision")
+                if grace_ticks_ok or grace_time_ok:
+                    # Not blind yet — observer warming up
+                    self.tick_count += 1
+                    self.last_tick_ts = now
 
-            except ObserverBlindnessError as e:
-                self._mark_blind(str(e))
-                raise
+                    self.state["uptime_seconds"] = round(
+                        now - self.start_time, 2
+                    )
+                    self.state["tick_count"] = self.tick_count
+                    self.state["last_tick_ts"] = now
 
+                    self.history.append(dict(self.state))
+                    return dict(self.state)
+
+                # Grace exhausted → true blindness
+                self._mark_blind("Observer never received initial frame")
+                raise ObserverBlindnessError(
+                    "Observer permanently blind: no initial frame"
+                )
+
+            # ---- POST-STARTUP BLINDNESS CHECK ----
+            if now - self.last_frame_seen_mono > self.MAX_NO_FRAME_SECONDS:
+                self._mark_blind("Observer lost vision")
+                raise ObserverBlindnessError("Observer lost vision")
+
+            # ---- NORMAL TICK ----
             self.tick_count += 1
             self.last_tick_ts = now
 
@@ -100,7 +128,6 @@ class ObserverCore:
 
     def attach_screen_state(self, screen_state: Dict[str, object]) -> None:
         with self._lock:
-
             if screen_state.get("available"):
                 now = time.monotonic()
                 self.last_frame_seen_mono = now
@@ -132,7 +159,6 @@ class ObserverCore:
     def get_health_snapshot(self) -> Dict[str, object]:
         """
         Forensic-grade observer health snapshot.
-        No side effects.
         """
         with self._lock:
             now = time.monotonic()
