@@ -1,5 +1,3 @@
-# core/safety/restart_guard.py
-
 import os
 import time
 import json
@@ -30,19 +28,22 @@ def _now():
 
 def record_restart():
     """
-    Call at kernel boot.
+    Record a kernel restart attempt.
+    Does NOT enforce policy.
     """
 
     _ensure_dir()
 
-    data = load_restart_state() or {
-        "first_ts": _now(),
-        "count": 0,
-    }
-
     now = _now()
+    data = load_restart_state()
 
-    # Reset window
+    if not data:
+        data = {
+            "first_ts": now,
+            "count": 0,
+        }
+
+    # Reset window if expired
     if now - data["first_ts"] > WINDOW_SECONDS:
         data = {
             "first_ts": now,
@@ -51,8 +52,7 @@ def record_restart():
 
     data["count"] += 1
 
-    with open(RESTART_FILE, "w") as f:
-        json.dump(data, f)
+    _atomic_write(data)
 
 
 def load_restart_state() -> Optional[dict]:
@@ -60,13 +60,16 @@ def load_restart_state() -> Optional[dict]:
         return None
 
     try:
-        with open(RESTART_FILE) as f:
+        with open(RESTART_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
         return None
 
 
 def clear_restart_state():
+    """
+    Explicit reset (used after successful stable run).
+    """
     try:
         if os.path.exists(RESTART_FILE):
             os.remove(RESTART_FILE)
@@ -75,8 +78,51 @@ def clear_restart_state():
 
 
 def restart_allowed() -> bool:
+    """
+    Authoritative restart gate.
+
+    Rules:
+    - No state → allowed
+    - Window expired → auto-clear → allowed
+    - Count <= MAX → allowed
+    - Count exceeded inside window → blocked
+    """
+
     data = load_restart_state()
     if not data:
         return True
 
-    return data.get("count", 0) <= MAX_RESTARTS
+    now = _now()
+    first_ts = data.get("first_ts")
+    count = data.get("count", 0)
+
+    if not first_ts:
+        clear_restart_state()
+        return True
+
+    # Window expired → auto-recover
+    if now - first_ts > WINDOW_SECONDS:
+        clear_restart_state()
+        return True
+
+    return count <= MAX_RESTARTS
+
+
+# -------------------------------------------------
+# INTERNAL — SAFE WRITE
+# -------------------------------------------------
+
+def _atomic_write(data: dict):
+    """
+    Crash-safe atomic write.
+    """
+    _ensure_dir()
+
+    tmp_path = f"{RESTART_FILE}.{os.getpid()}.{int(time.time_ns())}.tmp"
+
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+
+    os.replace(tmp_path, RESTART_FILE)
