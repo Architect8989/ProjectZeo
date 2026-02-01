@@ -5,8 +5,6 @@ import gc
 import json
 import asyncio
 
-import operate.main as main  # runtime surface
-
 from core.schemas.action_schema import validate_actions
 from core.verification.screen_verifier import verify_execution
 from core.memory.playbook_store import load_playbook, save_playbook
@@ -47,7 +45,7 @@ class KernelState(Enum):
 def planner_llm_call(prompt: str) -> str:
     """
     Synchronous adapter.
-    Returns raw text response.
+    Returns raw JSON string.
     """
 
     async def _call():
@@ -56,9 +54,6 @@ def planner_llm_call(prompt: str) -> str:
             messages=[{"role": "system", "content": prompt}],
             objective="planner",
         )
-
-        # We expect OpenRouter to return raw JSON string in content.
-        # get_next_action parses JSON already → we re-encode.
         return json.dumps({"steps": ops})
 
     return asyncio.run(_call())
@@ -71,6 +66,11 @@ def planner_llm_call(prompt: str) -> str:
 class KernelController:
     """
     Sovereign governing state machine.
+
+    HARD GUARANTEES:
+    - Single execution surface
+    - No phantom wiring
+    - Honest timeout semantics
     """
 
     TICK_INTERVAL = 0.05
@@ -83,14 +83,22 @@ class KernelController:
 
     # -------------------------------------------------
 
-    def __init__(self):
-
+    def __init__(self, *, config: Optional[dict] = None, operate_entry=None):
         # ---- Restart Guard ----
         if not restart_allowed():
             raise SystemExit("RESTART_GUARD_LOCKED")
         record_restart()
 
+        if operate_entry is None or not callable(operate_entry):
+            raise RuntimeError(
+                "KernelController requires a callable operate_entry"
+            )
+
+        self.config = config or {}
+        self.operate_entry = operate_entry
+
         self.state = KernelState.OBSERVER
+        self.state_enter_time = time.time()
 
         self.current_intent: Optional[str] = None
         self.steps: Optional[List[dict]] = None
@@ -104,7 +112,6 @@ class KernelController:
         self.max_steps = 500
 
         self.watchdog = RuntimeWatchdog()
-        self.state_enter_time = time.time()
 
         self.decomposer = TaskDecomposer(
             llm_call=planner_llm_call
@@ -126,6 +133,7 @@ class KernelController:
                 self.current_plan = ckpt["current_plan"]
                 self.retry_count = ckpt["retry_count"]
                 self.step_count = ckpt["step_count"]
+                self.state_enter_time = time.time()
             except Exception:
                 log_error("[KERNEL] Corrupt checkpoint discarded")
                 clear_checkpoint()
@@ -152,6 +160,7 @@ class KernelController:
 
     def _step(self):
 
+        # Best-effort watchdog (cannot interrupt blocking ops)
         self.watchdog.check()
 
         save_checkpoint({
@@ -190,19 +199,14 @@ class KernelController:
     # -------------------------------------------------
 
     def _observer(self):
-        main.start_observer()
-        intent = main.check_for_user_intent()
-
-        if intent:
-            self.current_intent = intent
+        # Intent must be injected externally
+        if self.current_intent:
             self._transition(KernelState.ARMED)
 
     def _armed(self):
-        main.arm_system()
         self._transition(KernelState.PLANNING)
 
     def _planning(self):
-
         try:
             self.steps = self.decomposer.decompose(self.current_intent)
             self.step_index = 0
@@ -220,32 +224,35 @@ class KernelController:
             self._transition(KernelState.RESTORING)
             return
 
+        if self.step_count >= self.max_steps:
+            log_warn("[KERNEL] Step budget exceeded")
+            self._transition(KernelState.ERROR)
+            return
+
         step_goal = self.steps[self.step_index]["goal"]
 
         cached = load_playbook(step_goal)
         if cached:
             self.current_plan = cached
         else:
-            self.current_plan = main.generate_plan(step_goal)
+            self.current_plan = self.operate_entry(
+                intent=self.current_intent,
+                goal=step_goal,
+            )
 
         if not validate_actions(self.current_plan):
             log_warn("[KERNEL] Invalid plan schema")
             self._transition(KernelState.ERROR)
             return
 
-        main.run_soc(self.current_plan)
+        self.step_count += 1
         self._transition(KernelState.VERIFYING)
 
     # -------------------------------------------------
 
     def _verifying(self):
 
-        screenshot = main.get_latest_screenshot()
-
-        success = verify_execution(
-            self.current_plan,
-            screenshot
-        )
+        success = verify_execution(self.current_plan)
 
         if success:
             save_playbook(
@@ -268,13 +275,11 @@ class KernelController:
     # -------------------------------------------------
 
     def _restoring(self):
-        main.restore_screen()
         clear_checkpoint()
         self._reset()
         self._transition(KernelState.OBSERVER)
 
     def _error(self):
-        main.restore_screen()
         clear_checkpoint()
         self._reset()
         self._transition(KernelState.OBSERVER)
