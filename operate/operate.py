@@ -42,6 +42,10 @@ from restoration.restore_verifier import RestoreVerifier
 from core.safety.action_timeout import action_timeout, ActionTimeout
 from core.telemetry.logger import log_warn
 
+# 🔧 AUDIT FIX IMPORTS
+from observer.observer_core import ObserverCore
+from observer.screenpipe_adapter import ScreenpipeAdapter
+
 # ----------------------------
 # GLOBAL SINGLETONS
 # ----------------------------
@@ -50,6 +54,11 @@ config = Config()
 operating_system = OperatingSystem()
 
 accessibility_backend = AccessibilityBackend()
+
+# 🔧 AUDIT FIX: HARD WIRING REQUIRED FOR SNAPSHOT SYSTEM
+accessibility_backend.observer = ObserverCore()
+accessibility_backend.screenpipe = ScreenpipeAdapter()
+
 journal = ActionJournal()
 policy_engine = PolicyEngine()
 input_arbitrator = InputArbitrator()
