@@ -1,5 +1,6 @@
 import pyatspi
 import hashlib
+from typing import Optional
 
 from policy.engine import PolicyEngine
 
@@ -7,11 +8,37 @@ from policy.engine import PolicyEngine
 class AccessibilityBackend:
     """
     STRICT EXECUTION INSTRUMENT.
-    Zero sovereignty. Zero discovery during execution. Double-bind audit.
+
+    ROLE:
+    - Executes concrete UI actions on pre-selected nodes
+    - Performs NO discovery during execution
+    - Owns NO orchestration logic
+
+    CONTRACT:
+    - observer and screenpipe are OPTIONAL, late-bound references
+    - If accessed without wiring → FAIL CLOSED
     """
 
     def __init__(self):
         self.registry = pyatspi.Registry
+
+        # ---- Late-bound system interfaces (REQUIRED BY KERNEL PATHS) ----
+        self.observer: Optional[object] = None
+        self.screenpipe: Optional[object] = None
+
+    # -------------------------------------------------
+    # Internal helpers
+    # -------------------------------------------------
+
+    def _require_wired(self):
+        """
+        Fail-closed if system interfaces are accessed without wiring.
+        """
+        if self.observer is None or self.screenpipe is None:
+            raise RuntimeError(
+                "ACCESSIBILITY_BACKEND_NOT_WIRED: "
+                "observer/screenpipe must be explicitly injected"
+            )
 
     def _get_stable_id(self, obj):
         """Deterministic ID generation for external tracking."""
@@ -23,10 +50,18 @@ class AccessibilityBackend:
         except Exception:
             raise RuntimeError("FAIL_CLOSED: ID_GENERATION_FAILURE")
 
+    # -------------------------------------------------
+    # Passive Discovery (Observer-only)
+    # -------------------------------------------------
+
     def get_nodes(self, max_depth=5):
         """
         Passive discovery only.
-        Sovereignty constraint: Used by controller to 'freeze' state before execution.
+
+        Sovereignty constraint:
+        - Must only be used in OBSERVER mode
+        - No mutation
+        - No execution
         """
         nodes = {}
         visited = set()
@@ -44,13 +79,29 @@ class AccessibilityBackend:
         walk(desktop, 0)
         return nodes
 
-    def execute(self, mode, policy_engine, audit_callback, node, action_type, text=None):
+    # -------------------------------------------------
+    # HARD EXECUTION GATE
+    # -------------------------------------------------
+
+    def execute(
+        self,
+        *,
+        mode: str,
+        policy_engine: PolicyEngine,
+        audit_callback,
+        node,
+        action_type: str,
+        text: Optional[str] = None,
+    ):
         """
         HARD EXECUTION GATE.
-        1. Mode check (Active vs Observer)
-        2. Policy evaluation (PolicyEngine.ALLOW | DENY, reason)
-        3. Fail-hard audit (Intent -> Action -> Effect)
-        4. Context lock: Operates only on the provided node reference.
+
+        ENFORCEMENT ORDER:
+        1. Mode check
+        2. Policy validation
+        3. Audit (intent)
+        4. Hardware execution (fail-closed)
+        5. Audit (effect)
         """
 
         # 1. Mode Guard
@@ -59,16 +110,15 @@ class AccessibilityBackend:
                 "NON_SOVEREIGN_VIOLATION: Execution blocked in OBSERVER mode."
             )
 
-        # 2. Policy Guard (FIXED CONTRACT)
+        # 2. Policy Guard
         decision, reason = policy_engine.validate(node, action_type)
-
         if decision != PolicyEngine.ALLOW:
             raise PermissionError(f"POLICY_VIOLATION: {reason}")
 
         # 3. Audit Phase 1: Intent
         audit_callback("INTENT", node, action_type)
 
-        # 4. Hardware Execution (fail closed)
+        # 4. Hardware Execution (FAIL CLOSED)
         try:
             if action_type == "click":
                 node.queryAction().doAction(0)
@@ -84,10 +134,14 @@ class AccessibilityBackend:
                 )
 
             else:
-                raise NotImplementedError(f"Unsupported action: {action_type}")
+                raise NotImplementedError(
+                    f"Unsupported action: {action_type}"
+                )
 
         except Exception as e:
-            raise RuntimeError(f"HARDWARE_EXECUTION_FAILURE: {str(e)}")
+            raise RuntimeError(
+                f"HARDWARE_EXECUTION_FAILURE: {str(e)}"
+            )
 
         # 5. Audit Phase 2: Effect
         audit_callback("EFFECT", node, action_type)
