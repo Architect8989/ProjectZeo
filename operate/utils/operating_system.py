@@ -38,7 +38,7 @@ class OperatingSystem:
     _automation_active = False
     _automation_lock = threading.Lock()
 
-    _last_heartbeat = time.time()
+    _last_heartbeat = None
     _heartbeat_lock = threading.Lock()
 
     _WATCHDOG_INTERVAL = 0.5
@@ -153,7 +153,7 @@ class OperatingSystem:
         self._touch_heartbeat()
 
     # -------------------------------------------------
-    # WATCHDOG THREAD (NON-TERMINATING)
+    # WATCHDOG THREAD (FIXED)
     # -------------------------------------------------
 
     def _ensure_watchdog(self):
@@ -168,15 +168,22 @@ class OperatingSystem:
         while True:
             time.sleep(self._WATCHDOG_INTERVAL)
 
-            with self._heartbeat_lock:
+            timed_out = False
+
+            with self._heartbeat_lock, self._automation_lock:
+                if not self._automation_active:
+                    continue
+
+                if self._last_heartbeat is None:
+                    continue
+
                 elapsed = time.time() - self._last_heartbeat
+                if elapsed > self._HEARTBEAT_TIMEOUT:
+                    self._automation_active = False
+                    timed_out = True
 
-            with self._automation_lock:
-                active = self._automation_active
-
-            if active and elapsed > self._HEARTBEAT_TIMEOUT:
+            if timed_out:
                 print("[OperatingSystem] Heartbeat lost — forcing release")
-                self.mark_automation_inactive()
                 self.force_release_all()
 
     # -------------------------------------------------
@@ -201,23 +208,18 @@ class OperatingSystem:
         Safe to call repeatedly.
         """
         try:
-            # --- Modifiers & system keys ---
             modifier_keys = [
                 "shift", "ctrl", "alt", "win", "command",
                 "esc", "capslock"
             ]
 
-            # --- Editing / navigation ---
             navigation_keys = [
                 "tab", "enter", "space", "backspace", "delete",
                 "up", "down", "left", "right",
                 "home", "end", "pageup", "pagedown", "insert"
             ]
 
-            # --- Function keys ---
             function_keys = [f"f{i}" for i in range(1, 25)]
-
-            # --- Alphanumeric ---
             letters = list("abcdefghijklmnopqrstuvwxyz")
             numbers = list("0123456789")
 
@@ -233,7 +235,6 @@ class OperatingSystem:
                 except Exception:
                     pass
 
-            # --- Mouse buttons ---
             for btn in ["left", "right", "middle"]:
                 try:
                     pyautogui.mouseUp(button=btn)
