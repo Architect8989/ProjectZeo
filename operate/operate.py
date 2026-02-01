@@ -49,7 +49,6 @@ from core.telemetry.logger import log_warn
 config = Config()
 operating_system = OperatingSystem()
 
-# NOTE: observer + screenpipe are injected — NOT created here
 accessibility_backend = AccessibilityBackend()
 
 journal = ActionJournal()
@@ -123,7 +122,7 @@ def main(
     journal.open(session_id=execution_id, reason="OBJECTIVE_START")
 
     # ----------------------------
-    # SNAPSHOT (SINGLE AUTHORITY)
+    # SNAPSHOT
     # ----------------------------
 
     snapshot_provider = SnapshotProvider(
@@ -148,11 +147,11 @@ def main(
         raise
 
     # ----------------------------
-    # ACTIVATE AUTOMATION (FIXED)
+    # ACTIVATE AUTOMATION
     # ----------------------------
 
     operating_system.mark_automation_active()
-    operating_system.heartbeat()  # 🔧 AUDIT FIX: initial heartbeat
+    operating_system.heartbeat()
 
     session_id = None
     max_iterations = 500
@@ -161,7 +160,7 @@ def main(
     try:
         while True:
 
-            operating_system.heartbeat()  # 🔧 AUDIT FIX: before LLM call
+            operating_system.heartbeat()  # before LLM
 
             iteration += 1
             if iteration > max_iterations:
@@ -170,6 +169,8 @@ def main(
             operations, session_id = asyncio.run(
                 get_next_action(model, messages, objective, session_id)
             )
+
+            operating_system.heartbeat()  # 🔧 FIX: after LLM
 
             stop = operate(
                 operations=operations,
@@ -323,6 +324,12 @@ def operate(operations, model, execution_id: str):
                 error=str(e),
             )
             return True
+
+        # 🔧 FIX: heartbeat after OS action
+        try:
+            operating_system.heartbeat()
+        except Exception:
+            pass
 
         journal.record(
             event="operation_complete",
