@@ -37,7 +37,6 @@ class ModeController:
         self._vision_failed_permanently: bool = False
         self._failure_reason: Optional[str] = None
 
-        # FIX: re-entrant lock prevents self-deadlock
         self._lock = threading.RLock()
 
         # Intent storage
@@ -54,22 +53,6 @@ class ModeController:
         }
 
         self._log_state("[MODE] Initialized")
-
-    # --------------------------------------------------
-    # PROPERTIES
-    # --------------------------------------------------
-
-    @property
-    def mode(self) -> SystemMode:
-        return self._mode
-
-    @property
-    def mode_uptime_seconds(self) -> float:
-        return round(time.time() - self._mode_entered_at, 2)
-
-    @property
-    def last_transition_reason(self) -> Optional[str]:
-        return self._last_transition_reason
 
     # --------------------------------------------------
     # HEALTH SIGNALS
@@ -90,22 +73,12 @@ class ModeController:
                     )
 
     def update_vision_status(self, ok: bool) -> None:
+        """
+        Vision availability can recover.
+        Permanent failure is reserved for observer blindness only.
+        """
         with self._lock:
-            if not ok:
-                self._vision_failed_permanently = True
-            self._vision_ok = bool(ok) and not self._vision_failed_permanently
-
-    # --------------------------------------------------
-    # INPUT CONTROL
-    # --------------------------------------------------
-
-    def lock_input(self) -> None:
-        with self._lock:
-            self._input_locked = True
-
-    def release_input(self) -> None:
-        with self._lock:
-            self._input_locked = False
+            self._vision_ok = bool(ok)
 
     # --------------------------------------------------
     # TRANSITIONS
@@ -165,9 +138,16 @@ class ModeController:
     # --------------------------------------------------
 
     def arm(self, reason: str) -> None:
+        """
+        Arm ONLY if transition is valid.
+        Prevents silent intent overwrite while already ARMED.
+        """
+        # Validate transition first
+        self.request_transition(SystemMode.ARMED, reason)
+
+        # Store intent only after successful transition
         with self._lock:
             self._intent = reason
-        self.request_transition(SystemMode.ARMED, reason)
 
     def execute(self, reason: str) -> None:
         self.request_transition(SystemMode.EXECUTING, reason)
