@@ -124,12 +124,17 @@ def main():
 
     while True:
         try:
+            # ---- SCREEN + PERCEPTION ----
             screen_state = screenpipe.read()
             ui_snapshot = perception.process(screen_state)
 
             observer.attach_screen_state(screen_state)
             observer.attach_ui_snapshot(ui_snapshot)
             observer_state = observer.tick()
+
+            # 🔧 FIX (NEW-002): update authority health + vision
+            mode.update_vision_status(screen_state.get("available", False))
+            mode.update_observer_health(observer.is_healthy())
 
             heartbeat = {
                 "mode": mode.mode.value,
@@ -153,6 +158,9 @@ def main():
                     # 🔒 AUTHORITATIVE MODE TRANSITION
                     mode.execute("root-main-execution")
 
+                    # 🔧 FIX (NEW-003): consume intent immediately
+                    current_intent = mode.consume_intent()
+
                 except ModeTransitionError as e:
                     print(f"[EXECUTION] Transition blocked: {e}")
                     mode.force_observer()
@@ -175,7 +183,7 @@ def main():
 
                     soc_execute_main(
                         model=None,
-                        terminal_prompt=mode.consume_intent(),
+                        terminal_prompt=current_intent,
                         voice_mode=False,
                         verbose_mode=False,
                     )
