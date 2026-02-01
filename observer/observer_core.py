@@ -21,21 +21,31 @@ class ObserverCore:
     MAX_HISTORY = 1000
     MAX_NO_FRAME_SECONDS = 0.5
 
-    # ---- NEW: cold-start tolerance ----
-    STARTUP_GRACE_TICKS = 5          # number of ticks allowed with no frames
-    STARTUP_GRACE_SECONDS = 2.0      # absolute wall-time grace
+    # ---- cold-start tolerance ----
+    STARTUP_GRACE_TICKS = 5
+    STARTUP_GRACE_SECONDS = 2.0
 
     def __init__(self):
-        self.start_time = time.monotonic()
+        # -------------------------------------------------
+        # CLOCK SELECTION (CRITICAL FIX)
+        # -------------------------------------------------
+        try:
+            self._clock = time.monotonic
+            self.using_monotonic = True
+        except Exception:
+            self._clock = time.time
+            self.using_monotonic = False
+
+        self.start_time = self._clock()
         self.tick_count = 0
         self.last_tick_ts: Optional[float] = None
-        self.last_frame_seen_mono: Optional[float] = None
-        self.first_frame_seen_mono: Optional[float] = None
+        self.last_frame_seen: Optional[float] = None
+        self.first_frame_seen: Optional[float] = None
 
         self.observer_healthy: bool = True
         self.blind_reason: Optional[str] = None
 
-        # FIX: re-entrant lock to prevent self-deadlock
+        # Re-entrant to avoid self-deadlock
         self._lock = threading.RLock()
 
         self.state: Dict[str, object] = {
@@ -48,9 +58,14 @@ class ObserverCore:
             "ui_snapshot": None,
         }
 
-        self.history: Deque[Dict[str, object]] = deque(maxlen=self.MAX_HISTORY)
+        self.history: Deque[Dict[str, object]] = deque(
+            maxlen=self.MAX_HISTORY
+        )
 
-        print("[OBSERVER] Initialized (witness mode)")
+        print(
+            "[OBSERVER] Initialized "
+            f"(clock={'monotonic' if self.using_monotonic else 'wall'})"
+        )
 
     # -------------------------------------------------
 
@@ -75,15 +90,14 @@ class ObserverCore:
                     f"Observer permanently blind: {self.blind_reason}"
                 )
 
-            now = time.monotonic()
+            now = self._clock()
 
             # ---- COLD START HANDLING ----
-            if self.last_frame_seen_mono is None:
+            if self.last_frame_seen is None:
                 grace_ticks_ok = self.tick_count < self.STARTUP_GRACE_TICKS
                 grace_time_ok = (now - self.start_time) < self.STARTUP_GRACE_SECONDS
 
                 if grace_ticks_ok or grace_time_ok:
-                    # Not blind yet — observer warming up
                     self.tick_count += 1
                     self.last_tick_ts = now
 
@@ -96,14 +110,13 @@ class ObserverCore:
                     self.history.append(dict(self.state))
                     return dict(self.state)
 
-                # Grace exhausted → true blindness
                 self._mark_blind("Observer never received initial frame")
                 raise ObserverBlindnessError(
                     "Observer permanently blind: no initial frame"
                 )
 
             # ---- POST-STARTUP BLINDNESS CHECK ----
-            if now - self.last_frame_seen_mono > self.MAX_NO_FRAME_SECONDS:
+            if now - self.last_frame_seen > self.MAX_NO_FRAME_SECONDS:
                 self._mark_blind("Observer lost vision")
                 raise ObserverBlindnessError("Observer lost vision")
 
@@ -129,10 +142,10 @@ class ObserverCore:
     def attach_screen_state(self, screen_state: Dict[str, object]) -> None:
         with self._lock:
             if screen_state.get("available"):
-                now = time.monotonic()
-                self.last_frame_seen_mono = now
-                if self.first_frame_seen_mono is None:
-                    self.first_frame_seen_mono = now
+                now = self._clock()
+                self.last_frame_seen = now
+                if self.first_frame_seen is None:
+                    self.first_frame_seen = now
 
             self.state["screen_available"] = bool(
                 screen_state.get("available")
@@ -161,8 +174,8 @@ class ObserverCore:
         Forensic-grade observer health snapshot.
         """
         with self._lock:
-            now = time.monotonic()
-            last_seen = self.last_frame_seen_mono
+            now = self._clock()
+            last_seen = self.last_frame_seen
 
             return {
                 "observer_healthy": self.observer_healthy,
@@ -173,6 +186,6 @@ class ObserverCore:
                 "last_frame_seen_age": (
                     now - last_seen if last_seen else None
                 ),
-                "first_frame_seen": self.first_frame_seen_mono is not None,
+                "first_frame_seen": self.first_frame_seen is not None,
                 "history_depth": len(self.history),
         }
