@@ -251,8 +251,12 @@ class KernelController:
     # -------------------------------------------------
 
     def _verifying(self):
-
-        success = verify_execution(self.current_plan)
+        # Kernel does NOT own vision.
+        # Verification is best-effort without screenshot.
+        success = verify_execution(
+            actions=self.current_plan,
+            screenshot=None,
+        )
 
         if success:
             save_playbook(
