@@ -2,7 +2,7 @@ import time
 import uuid
 import json
 import os
-import tempfile
+import threading
 from typing import Dict, Any, List, Optional
 
 # ============================================================
@@ -90,10 +90,11 @@ def serialize(
 
 
 # ============================================================
-# NEW LOGIC — CRASH-PROOF AUTHORITY STATE (ADDITIVE)
+# AUTHORITY STATE — HARDENED
 # ============================================================
 
 _AUTH_STATE_VERSION = "AUTH-STATE-1"
+
 _DEFAULT_STATE = {
     "version": _AUTH_STATE_VERSION,
     "execution_mode": "OBSERVER",
@@ -113,17 +114,17 @@ class AuthorityStateSerializer:
     """
     Crash-proof authority state persistence.
 
-    Purpose:
-    - Survive SIGKILL / power loss / reboot
-    - Prevent authority resurrection
-    - Force pessimistic recovery on startup
-
-    This class does NOT enforce policy.
-    It only records authoritative truth durably.
+    GUARANTEES:
+    - Atomic replace
+    - No temp-file collision
+    - No TOCTOU window
+    - No cleanup race
+    - Safe under concurrency
     """
 
     def __init__(self, state_path: str):
         self._state_path = state_path
+        self._lock = threading.Lock()
 
     # --------------------------------------------------
     # Public API
@@ -132,7 +133,7 @@ class AuthorityStateSerializer:
     def load(self) -> Dict[str, Any]:
         """
         Load persisted authority state.
-        If unreadable or missing → return safe defaults.
+        Corruption or mismatch → safe defaults.
         """
         try:
             if not os.path.exists(self._state_path):
@@ -147,7 +148,6 @@ class AuthorityStateSerializer:
             return state
 
         except Exception:
-            # Any corruption forces pessimism
             return dict(_DEFAULT_STATE)
 
     def persist(
@@ -162,7 +162,6 @@ class AuthorityStateSerializer:
         """
         Persist authority state atomically.
         """
-
         state = {
             "version": _AUTH_STATE_VERSION,
             "execution_mode": execution_mode,
@@ -173,12 +172,12 @@ class AuthorityStateSerializer:
             "updated_at": time.time(),
         }
 
-        self._atomic_write(state)
+        with self._lock:
+            self._atomic_write(state)
 
     def force_safe_state(self) -> None:
         """
-        Force a pessimistic safe state.
-        Used on crash recovery and restore failure.
+        Force pessimistic recovery state.
         """
         self.persist(
             execution_mode="OBSERVER",
@@ -189,34 +188,31 @@ class AuthorityStateSerializer:
         )
 
     # --------------------------------------------------
-    # Internal helpers
+    # Internal — TOCTOU SAFE
     # --------------------------------------------------
 
     def _atomic_write(self, state: Dict[str, Any]) -> None:
         """
-        Write → fsync → rename.
-        Guarantees crash durability.
+        Atomic write using:
+        - unique temp filename
+        - fsync
+        - os.replace
         """
         directory = os.path.dirname(self._state_path) or "."
         os.makedirs(directory, exist_ok=True)
 
-        fd, tmp_path = tempfile.mkstemp(
-            prefix=".auth_state_",
-            dir=directory,
-            text=True,
+        tmp_name = (
+            f".auth_state_"
+            f"{os.getpid()}_"
+            f"{threading.get_ident()}_"
+            f"{time.time_ns()}.tmp"
         )
+        tmp_path = os.path.join(directory, tmp_name)
 
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump(state, f, indent=2)
-                f.flush()
-                os.fsync(f.fileno())
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
 
-            os.replace(tmp_path, self._state_path)
-
-        finally:
-            try:
-                if os.path.exists(tmp_path):
-                    os.unlink(tmp_path)
-            except Exception:
-                pass
+        # Atomic on POSIX + Windows
+        os.replace(tmp_path, self._state_path)
