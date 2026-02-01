@@ -12,53 +12,86 @@ from core.control.kernel_controller import KernelController
 from core.telemetry.logger import log_info, log_error
 
 
-def main_entry():
-    parser = argparse.ArgumentParser(
-        description="Run the self-operating-computer with a specified model."
-    )
+def main_entry(
+    *,
+    model: str = None,
+    terminal_prompt: str = None,
+    voice_mode: bool = False,
+    verbose_mode: bool = False,
+):
+    """
+    Entry point for both:
+    - CLI execution (argparse)
+    - Programmatic invocation (kernel / main.py)
 
-    parser.add_argument(
-        "-m",
-        "--model",
-        help="Specify the model to use",
-        required=False,
-        default="gpt-4-with-ocr",
-    )
-
-    parser.add_argument(
-        "--voice",
-        help="Use voice input mode",
-        action="store_true",
-    )
-
-    parser.add_argument(
-        "--verbose",
-        help="Run operate in verbose mode",
-        action="store_true",
-    )
-
-    parser.add_argument(
-        "--prompt",
-        help="Directly input the objective prompt",
-        type=str,
-        required=False,
-    )
+    If terminal_prompt is provided, argparse is skipped.
+    """
 
     try:
-        args = parser.parse_args()
+        # ----------------------------
+        # PROGRAMMATIC INVOCATION PATH
+        # ----------------------------
+        if terminal_prompt is not None:
+            config = {
+                "model": model or "gpt-4-with-ocr",
+                "terminal_prompt": terminal_prompt,
+                "voice_mode": bool(voice_mode),
+                "verbose_mode": bool(verbose_mode),
+            }
 
-        config = {
-            "model": args.model,
-            "terminal_prompt": args.prompt,
-            "voice_mode": args.voice,
-            "verbose_mode": args.verbose,
-        }
+        # ----------------------------
+        # CLI INVOCATION PATH
+        # ----------------------------
+        else:
+            parser = argparse.ArgumentParser(
+                description="Run the self-operating-computer with a specified model."
+            )
+
+            parser.add_argument(
+                "-m",
+                "--model",
+                help="Specify the model to use",
+                required=False,
+                default="gpt-4-with-ocr",
+            )
+
+            parser.add_argument(
+                "--voice",
+                help="Use voice input mode",
+                action="store_true",
+            )
+
+            parser.add_argument(
+                "--verbose",
+                help="Run operate in verbose mode",
+                action="store_true",
+            )
+
+            parser.add_argument(
+                "--prompt",
+                help="Directly input the objective prompt",
+                type=str,
+                required=False,
+            )
+
+            args = parser.parse_args()
+
+            config = {
+                "model": args.model,
+                "terminal_prompt": args.prompt,
+                "voice_mode": args.voice,
+                "verbose_mode": args.verbose,
+            }
+
+        # ----------------------------
+        # BOOT KERNEL
+        # ----------------------------
 
         log_info("[SYSTEM] Booting kernel")
 
         kernel = KernelController(
             config=config,
-            operate_entry=operate_main
+            operate_entry=operate_main,
         )
 
         kernel.start()
