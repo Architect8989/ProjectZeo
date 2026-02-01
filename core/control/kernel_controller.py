@@ -199,7 +199,6 @@ class KernelController:
     # -------------------------------------------------
 
     def _observer(self):
-        # Intent must be injected externally
         if self.current_intent:
             self._transition(KernelState.ARMED)
 
@@ -235,9 +234,12 @@ class KernelController:
         if cached:
             self.current_plan = cached
         else:
+            # ✅ FIX: call operate_entry with REAL signature
             self.current_plan = self.operate_entry(
-                intent=self.current_intent,
-                goal=step_goal,
+                model=self.config.get("model"),
+                terminal_prompt=step_goal,
+                voice_mode=False,
+                verbose_mode=self.config.get("verbose_mode", False),
             )
 
         if not validate_actions(self.current_plan):
@@ -251,8 +253,7 @@ class KernelController:
     # -------------------------------------------------
 
     def _verifying(self):
-        # Kernel does NOT own vision.
-        # Verification is best-effort without screenshot.
+        # Kernel does not own vision — verification is best-effort
         success = verify_execution(
             actions=self.current_plan,
             screenshot=None,
