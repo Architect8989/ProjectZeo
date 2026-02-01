@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+import threading
 from typing import Optional
 
 from restoration.snapshot_types import RestorationSnapshot
@@ -17,7 +18,7 @@ class RestoreProvider:
     Contract:
     - Snapshot captured in OBSERVER mode
     - Snapshot invariants already validated
-    - Restoration is idempotent per snapshot (NOT per instance)
+    - Restoration is idempotent per snapshot
     - Fail-closed: never claims success on partial restore
     """
 
@@ -26,6 +27,7 @@ class RestoreProvider:
     def __init__(self, *, os_backend):
         self._os = os_backend
         self._completed_snapshot_id: Optional[str] = None
+        self._lock = threading.Lock()  # 🔒 CRITICAL FIX
 
     # -------------------------------------------------
     # Public API
@@ -34,9 +36,6 @@ class RestoreProvider:
     def restore_snapshot(self, snapshot_id: str) -> None:
         """
         Restore workspace state from snapshot ID.
-
-        This is the only ID-based entrypoint.
-        Resolution responsibility is explicit.
         """
         from restoration.snapshot_provider import SnapshotProvider
 
@@ -58,9 +57,14 @@ class RestoreProvider:
 
         snapshot_id = snapshot.snapshot_id
 
-        # Idempotency is SNAPSHOT-SCOPED, not instance-scoped
-        if self._completed_snapshot_id == snapshot_id:
-            return
+        # -------------------------------------------------
+        # PHASE -1 — ATOMIC IDEMPOTENCY GATE
+        # -------------------------------------------------
+        with self._lock:
+            if self._completed_snapshot_id == snapshot_id:
+                return
+            # Mark intent (do NOT mark completed yet)
+            in_progress_id = snapshot_id
 
         # -------------------------------------------------
         # PHASE 0 — HARD SAFETY
@@ -152,7 +156,6 @@ class RestoreProvider:
         except Exception:
             focused = False
 
-        # Fallback activation is OPTIONAL — do not hard-fail on stub backends
         if not focused:
             try:
                 if hasattr(self._os, "activate_application"):
@@ -180,7 +183,11 @@ class RestoreProvider:
 
         self._verify_post_restore(snapshot)
 
-        self._completed_snapshot_id = snapshot_id
+        # -------------------------------------------------
+        # PHASE 5 — COMMIT COMPLETION (ATOMIC)
+        # -------------------------------------------------
+        with self._lock:
+            self._completed_snapshot_id = snapshot_id
 
     # -------------------------------------------------
     # Internal Verification
@@ -219,7 +226,6 @@ class RestoreProvider:
             if hasattr(self._os, "get_focused_window"):
                 fw = self._os.get_focused_window()
                 if fw and str(fw.get("id")) != snapshot.focus.window_id:
-                    # Non-fatal on stub backends
-                    pass
+                    pass  # non-fatal on stub backends
         except Exception:
             pass
