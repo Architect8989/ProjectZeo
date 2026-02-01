@@ -22,15 +22,15 @@ def main_entry(
     """
     Entry point for both:
     - CLI execution (argparse)
-    - Programmatic invocation (kernel / main.py)
+    - Programmatic invocation (kernel / root main.py)
 
     If terminal_prompt is provided, argparse is skipped.
     """
 
     try:
-        # ----------------------------
-        # PROGRAMMATIC INVOCATION PATH
-        # ----------------------------
+        # --------------------------------------------------
+        # PROGRAMMATIC INVOCATION (NO ARGPARSE)
+        # --------------------------------------------------
         if terminal_prompt is not None:
             config = {
                 "model": model or "gpt-4-with-ocr",
@@ -39,9 +39,9 @@ def main_entry(
                 "verbose_mode": bool(verbose_mode),
             }
 
-        # ----------------------------
-        # CLI INVOCATION PATH
-        # ----------------------------
+        # --------------------------------------------------
+        # CLI INVOCATION
+        # --------------------------------------------------
         else:
             parser = argparse.ArgumentParser(
                 description="Run the self-operating-computer with a specified model."
@@ -83,9 +83,9 @@ def main_entry(
                 "verbose_mode": args.verbose,
             }
 
-        # ----------------------------
+        # --------------------------------------------------
         # BOOT KERNEL
-        # ----------------------------
+        # --------------------------------------------------
 
         log_info("[SYSTEM] Booting kernel")
 
