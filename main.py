@@ -2,6 +2,7 @@ import time
 import os
 import signal
 import atexit
+import sys
 
 from core.mode_controller import ModeController, ModeTransitionError
 from core.intent_listener import IntentListener
@@ -35,7 +36,6 @@ OS_BACKEND = OperatingSystem()
 STATE_PATH = os.path.join(os.getcwd(), ".authority_state.json")
 AUTH_STATE = AuthorityStateSerializer(STATE_PATH)
 
-# Observer stack — SINGLE AUTHORITY
 observer = ObserverCore()
 screenpipe = ScreenpipeAdapter()
 perception = PerceptionEngine()
@@ -49,26 +49,39 @@ RESTORE_PROVIDER = RestoreProvider(os_backend=OS_BACKEND)
 
 
 # --------------------------------------------------
-# PROCESS SAFETY
+# PROCESS SAFETY (FIXED)
 # --------------------------------------------------
 
 def _force_safe_shutdown(reason: str, *args, **kwargs):
     try:
         OS_BACKEND.force_release_all()
-    except Exception:
-        pass
+    except Exception as e:
+        print(
+            f"[CRITICAL] force_release_all failed: {e}",
+            file=sys.stderr,
+        )
 
     try:
         AUTH_STATE.force_safe_state()
-    except Exception:
-        pass
+    except Exception as e:
+        print(
+            f"[CRITICAL] force_safe_state failed: {e}",
+            file=sys.stderr,
+        )
 
     print(f"[SAFE-SHUTDOWN] {reason}")
 
 
 def _signal_handler(signum, frame):
-    _force_safe_shutdown(f"signal:{signum}")
-    os._exit(1)
+    try:
+        _force_safe_shutdown(f"signal:{signum}")
+    finally:
+        # Absolute last-resort release
+        try:
+            OS_BACKEND.force_release_all()
+        except Exception:
+            pass
+        os._exit(1)
 
 
 atexit.register(_force_safe_shutdown, "atexit")
@@ -129,7 +142,6 @@ def main():
             observer.attach_ui_snapshot(ui_snapshot)
             observer_state = observer.tick()
 
-            # Vision + observer health
             mode.update_vision_status(screen_state.get("available", False))
             mode.update_observer_health(observer.is_healthy())
 
@@ -159,8 +171,6 @@ def main():
                     mode.force_observer()
                     continue
 
-                print("[EXECUTION] Intent authorized — snapshotting")
-
                 snapshot_id = SNAPSHOT_PROVIDER.take_snapshot()
 
                 AUTH_STATE.persist(
@@ -172,8 +182,6 @@ def main():
                 )
 
                 try:
-                    print("[EXECUTION] Launching SOC")
-
                     soc_execute_main(
                         model=None,
                         terminal_prompt=current_intent,
@@ -182,8 +190,6 @@ def main():
                         observer=observer,
                         screenpipe=screenpipe,
                     )
-
-                    print("[EXECUTION] SOC finished — restoring")
 
                     RESTORE_PROVIDER.restore_snapshot(snapshot_id)
 
@@ -211,7 +217,8 @@ def main():
                     except Exception:
                         pass
 
-        except ObserverBlindnessError:
+        except ObserverBlindnessError as e:
+            mode.update_observer_health(False, reason=str(e))
             print("[FATAL] Observer blindness detected — shutting down")
             _force_safe_shutdown("observer-blindness")
             os._exit(1)
