@@ -234,7 +234,7 @@ class KernelController:
         if cached:
             self.current_plan = cached
         else:
-            # ✅ FIX: call operate_entry with REAL signature
+            # FIX: call operate_entry with its REAL signature
             self.current_plan = self.operate_entry(
                 model=self.config.get("model"),
                 terminal_prompt=step_goal,
@@ -253,7 +253,6 @@ class KernelController:
     # -------------------------------------------------
 
     def _verifying(self):
-        # Kernel does not own vision — verification is best-effort
         success = verify_execution(
             actions=self.current_plan,
             screenshot=None,
