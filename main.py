@@ -35,9 +35,14 @@ OS_BACKEND = OperatingSystem()
 STATE_PATH = os.path.join(os.getcwd(), ".authority_state.json")
 AUTH_STATE = AuthorityStateSerializer(STATE_PATH)
 
+# Observer stack — SINGLE AUTHORITY
+observer = ObserverCore()
+screenpipe = ScreenpipeAdapter()
+perception = PerceptionEngine()
+
 SNAPSHOT_PROVIDER = SnapshotProvider(
-    observer=None,
-    screenpipe=None,
+    observer=observer,
+    screenpipe=screenpipe,
     os_backend=OS_BACKEND,
 )
 RESTORE_PROVIDER = RestoreProvider(os_backend=OS_BACKEND)
@@ -106,14 +111,6 @@ def main():
     intent_listener = IntentListener(mode)
     intent_listener.start()
 
-    # ---- OBSERVER STACK ----
-    observer = ObserverCore()
-    screenpipe = ScreenpipeAdapter()
-    perception = PerceptionEngine()
-
-    SNAPSHOT_PROVIDER._observer = observer
-    SNAPSHOT_PROVIDER._screenpipe = screenpipe
-
     print(f"[STATE] Mode = {mode.mode.value}")
     print("[OBSERVER] Watching screen (read-only)")
     print("[INTENT] Type intent and press Enter")
@@ -132,7 +129,7 @@ def main():
             observer.attach_ui_snapshot(ui_snapshot)
             observer_state = observer.tick()
 
-            # 🔧 FIX (NEW-002): update authority health + vision
+            # Vision + observer health
             mode.update_vision_status(screen_state.get("available", False))
             mode.update_observer_health(observer.is_healthy())
 
@@ -150,17 +147,13 @@ def main():
             print(f"[HEARTBEAT] {heartbeat}")
 
             # --------------------------------------------------
-            # EXECUTION TRANSACTION (AUTHORITATIVE)
+            # EXECUTION TRANSACTION
             # --------------------------------------------------
 
             if mode.is_armed():
                 try:
-                    # 🔒 AUTHORITATIVE MODE TRANSITION
                     mode.execute("root-main-execution")
-
-                    # 🔧 FIX (NEW-003): consume intent immediately
                     current_intent = mode.consume_intent()
-
                 except ModeTransitionError as e:
                     print(f"[EXECUTION] Transition blocked: {e}")
                     mode.force_observer()
@@ -186,6 +179,8 @@ def main():
                         terminal_prompt=current_intent,
                         voice_mode=False,
                         verbose_mode=False,
+                        observer=observer,
+                        screenpipe=screenpipe,
                     )
 
                     print("[EXECUTION] SOC finished — restoring")
