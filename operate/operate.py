@@ -4,7 +4,6 @@ import time
 import asyncio
 import platform
 import uuid
-import signal
 
 from prompt_toolkit.shortcuts import message_dialog
 from prompt_toolkit import prompt
@@ -42,10 +41,6 @@ from restoration.restore_verifier import RestoreVerifier
 from core.safety.action_timeout import action_timeout, ActionTimeout
 from core.telemetry.logger import log_warn
 
-# Audit wiring
-from observer.observer_core import ObserverCore
-from observer.screenpipe_adapter import ScreenpipeAdapter
-
 
 # ----------------------------
 # GLOBAL SINGLETONS
@@ -54,22 +49,37 @@ from observer.screenpipe_adapter import ScreenpipeAdapter
 config = Config()
 operating_system = OperatingSystem()
 
+# NOTE: observer + screenpipe are injected — NOT created here
 accessibility_backend = AccessibilityBackend()
-accessibility_backend.observer = ObserverCore()
-accessibility_backend.screenpipe = ScreenpipeAdapter()
 
 journal = ActionJournal()
 policy_engine = PolicyEngine()
 input_arbitrator = InputArbitrator()
-
-EXECUTION_MODE = "ACTIVE"
 
 
 # ----------------------------
 # ENTRYPOINT
 # ----------------------------
 
-def main(model, terminal_prompt, voice_mode=False, verbose_mode=False):
+def main(
+    model,
+    terminal_prompt,
+    voice_mode=False,
+    verbose_mode=False,
+    *,
+    observer,
+    screenpipe,
+):
+    """
+    SOC execution entry.
+    Observer and screenpipe MUST be injected from main loop.
+    """
+
+    if observer is None or screenpipe is None:
+        raise RuntimeError("Observer and screenpipe must be provided")
+
+    accessibility_backend.observer = observer
+    accessibility_backend.screenpipe = screenpipe
 
     mic = None
     config.verbose = verbose_mode
@@ -113,14 +123,12 @@ def main(model, terminal_prompt, voice_mode=False, verbose_mode=False):
     journal.open(session_id=execution_id, reason="OBJECTIVE_START")
 
     # ----------------------------
-    # SNAPSHOT
+    # SNAPSHOT (SINGLE AUTHORITY)
     # ----------------------------
 
-    snapshot = None
-
     snapshot_provider = SnapshotProvider(
-        observer=accessibility_backend.observer,
-        screenpipe=accessibility_backend.screenpipe,
+        observer=observer,
+        screenpipe=screenpipe,
         os_backend=operating_system,
     )
 
@@ -136,11 +144,15 @@ def main(model, terminal_prompt, voice_mode=False, verbose_mode=False):
             error=str(e),
         )
         journal.seal(reason="SNAPSHOT_FAILURE")
-        # 🔒 AUDIT FIX: force safe OS state before abort
         operating_system.force_release_all()
         raise
 
+    # ----------------------------
+    # ACTIVATE AUTOMATION (FIXED)
+    # ----------------------------
+
     operating_system.mark_automation_active()
+    operating_system.heartbeat()  # 🔧 AUDIT FIX: initial heartbeat
 
     session_id = None
     max_iterations = 500
@@ -148,6 +160,8 @@ def main(model, terminal_prompt, voice_mode=False, verbose_mode=False):
 
     try:
         while True:
+
+            operating_system.heartbeat()  # 🔧 AUDIT FIX: before LLM call
 
             iteration += 1
             if iteration > max_iterations:
@@ -181,7 +195,6 @@ def main(model, terminal_prompt, voice_mode=False, verbose_mode=False):
 
         if snapshot is not None:
             try:
-                # 🔒 AUDIT FIX: restore + verify treated as single critical section
                 restore_provider.restore(snapshot)
                 restore_verifier.verify(snapshot)
                 journal.record(
@@ -195,7 +208,6 @@ def main(model, terminal_prompt, voice_mode=False, verbose_mode=False):
                     error=str(e),
                 )
                 journal.seal(reason="RESTORATION_VERIFICATION_FAILED")
-                # 🔒 FINAL SAFETY VALVE
                 operating_system.force_release_all()
                 raise
 
