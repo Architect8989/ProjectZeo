@@ -3,7 +3,7 @@ import os
 import signal
 import atexit
 
-from core.mode_controller import ModeController
+from core.mode_controller import ModeController, ModeTransitionError
 from core.intent_listener import IntentListener
 from core.environment_fingerprint import collect_environment_fingerprint
 
@@ -35,9 +35,8 @@ OS_BACKEND = OperatingSystem()
 STATE_PATH = os.path.join(os.getcwd(), ".authority_state.json")
 AUTH_STATE = AuthorityStateSerializer(STATE_PATH)
 
-# Snapshot / Restore providers (CORRECTLY WIRED)
 SNAPSHOT_PROVIDER = SnapshotProvider(
-    observer=None,        # wired later
+    observer=None,
     screenpipe=None,
     os_backend=OS_BACKEND,
 )
@@ -112,7 +111,6 @@ def main():
     screenpipe = ScreenpipeAdapter()
     perception = PerceptionEngine()
 
-    # Wire snapshot provider dependencies
     SNAPSHOT_PROVIDER._observer = observer
     SNAPSHOT_PROVIDER._screenpipe = screenpipe
 
@@ -126,17 +124,11 @@ def main():
 
     while True:
         try:
-            # 1. Screen feed FIRST
             screen_state = screenpipe.read()
-
-            # 2. Perception
             ui_snapshot = perception.process(screen_state)
 
-            # 3. Attach before tick
             observer.attach_screen_state(screen_state)
             observer.attach_ui_snapshot(ui_snapshot)
-
-            # 4. Observer heartbeat
             observer_state = observer.tick()
 
             heartbeat = {
@@ -153,11 +145,20 @@ def main():
             print(f"[HEARTBEAT] {heartbeat}")
 
             # --------------------------------------------------
-            # EXECUTION TRANSACTION
+            # EXECUTION TRANSACTION (FIXED)
             # --------------------------------------------------
 
             if mode.is_armed():
-                print("[EXECUTION] Intent armed — snapshotting")
+                try:
+                    # 🔒 AUTHORITATIVE MODE TRANSITION
+                    mode.execute("root-main-execution")
+
+                except ModeTransitionError as e:
+                    print(f"[EXECUTION] Transition blocked: {e}")
+                    mode.force_observer()
+                    continue
+
+                print("[EXECUTION] Intent authorized — snapshotting")
 
                 snapshot_id = SNAPSHOT_PROVIDER.take_snapshot()
 
@@ -208,7 +209,6 @@ def main():
                         pass
 
         except ObserverBlindnessError:
-            # FAIL-CLOSED: blindness is fatal
             print("[FATAL] Observer blindness detected — shutting down")
             _force_safe_shutdown("observer-blindness")
             os._exit(1)
