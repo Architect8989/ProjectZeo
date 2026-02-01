@@ -145,7 +145,7 @@ def main():
             print(f"[HEARTBEAT] {heartbeat}")
 
             # --------------------------------------------------
-            # EXECUTION TRANSACTION (FIXED)
+            # EXECUTION TRANSACTION (AUTHORITATIVE)
             # --------------------------------------------------
 
             if mode.is_armed():
