@@ -7,8 +7,6 @@ import sys
 
 from operate.utils.style import ANSI_BRIGHT_MAGENTA
 from operate.operate import main as operate_main
-
-from core.control.kernel_controller import KernelController
 from core.telemetry.logger import log_info, log_error
 
 
@@ -22,7 +20,7 @@ def main_entry(
     """
     Entry point for both:
     - CLI execution (argparse)
-    - Programmatic invocation (kernel / root main.py)
+    - Programmatic invocation (root main.py)
 
     If terminal_prompt is provided, argparse is skipped.
     """
@@ -44,7 +42,7 @@ def main_entry(
         # --------------------------------------------------
         else:
             parser = argparse.ArgumentParser(
-                description="Run the self-operating-computer with a specified model."
+                description="Run the self-operating computer."
             )
 
             parser.add_argument(
@@ -84,17 +82,17 @@ def main_entry(
             }
 
         # --------------------------------------------------
-        # BOOT KERNEL
+        # EXECUTE OPERATE DIRECTLY (NO KERNEL)
         # --------------------------------------------------
 
-        log_info("[SYSTEM] Booting kernel")
+        log_info("[SYSTEM] Executing objective")
 
-        kernel = KernelController(
-            config=config,
-            operate_entry=operate_main,
+        operate_main(
+            model=config["model"],
+            terminal_prompt=config["terminal_prompt"],
+            voice_mode=config["voice_mode"],
+            verbose_mode=config["verbose_mode"],
         )
-
-        kernel.start()
 
     except KeyboardInterrupt:
         log_info("[SYSTEM] Keyboard interrupt received")
