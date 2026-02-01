@@ -1,8 +1,18 @@
-import pyatspi
 import hashlib
 from typing import Optional
 
 from policy.engine import PolicyEngine
+
+# -------------------------------------------------
+# AT-SPI AVAILABILITY GUARD (CRITICAL FIX)
+# -------------------------------------------------
+
+try:
+    import pyatspi
+    _PYATSPI_AVAILABLE = True
+except ImportError:
+    pyatspi = None
+    _PYATSPI_AVAILABLE = False
 
 
 class AccessibilityBackend:
@@ -17,9 +27,16 @@ class AccessibilityBackend:
     CONTRACT:
     - observer and screenpipe are OPTIONAL, late-bound references
     - If accessed without wiring → FAIL CLOSED
+    - If AT-SPI unavailable → FAIL FAST
     """
 
     def __init__(self):
+        if not _PYATSPI_AVAILABLE:
+            raise RuntimeError(
+                "AT-SPI NOT AVAILABLE: "
+                "AccessibilityBackend requires Linux AT-SPI runtime"
+            )
+
         self.registry = pyatspi.Registry
 
         # ---- Late-bound system interfaces (REQUIRED BY KERNEL PATHS) ----
@@ -45,10 +62,17 @@ class AccessibilityBackend:
         try:
             app = obj.getApplication()
             app_name = app.name if app else "system"
-            raw = f"{app_name}|{obj.getRoleName()}|{obj.name}|{obj.getIndexInParent()}"
-            return hashlib.sha256(raw.encode()).hexdigest()[:16]
-        except Exception:
-            raise RuntimeError("FAIL_CLOSED: ID_GENERATION_FAILURE")
+            raw = (
+                f"{app_name}|"
+                f"{obj.getRoleName()}|"
+                f"{obj.name}|"
+                f"{obj.getIndexInParent()}"
+            )
+            return hashlib.sha256(raw.encode()).hexdigest()
+        except Exception as e:
+            raise RuntimeError(
+                f"FAIL_CLOSED: ID_GENERATION_FAILURE: {e}"
+            )
 
     # -------------------------------------------------
     # Passive Discovery (Observer-only)
@@ -63,6 +87,8 @@ class AccessibilityBackend:
         - No mutation
         - No execution
         """
+        self._require_wired()
+
         nodes = {}
         visited = set()
         desktop = self.registry.getDesktop(0)
@@ -104,6 +130,8 @@ class AccessibilityBackend:
         5. Audit (effect)
         """
 
+        self._require_wired()
+
         # 1. Mode Guard
         if mode != "ACTIVE":
             raise PermissionError(
@@ -140,7 +168,7 @@ class AccessibilityBackend:
 
         except Exception as e:
             raise RuntimeError(
-                f"HARDWARE_EXECUTION_FAILURE: {str(e)}"
+                f"HARDWARE_EXECUTION_FAILURE: {e}"
             )
 
         # 5. Audit Phase 2: Effect
