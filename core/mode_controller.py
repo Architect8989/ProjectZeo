@@ -37,7 +37,8 @@ class ModeController:
         self._vision_failed_permanently: bool = False
         self._failure_reason: Optional[str] = None
 
-        self._lock = threading.Lock()
+        # FIX: re-entrant lock prevents self-deadlock
+        self._lock = threading.RLock()
 
         # Intent storage
         self._intent: Optional[str] = None
@@ -95,7 +96,7 @@ class ModeController:
             self._vision_ok = bool(ok) and not self._vision_failed_permanently
 
     # --------------------------------------------------
-    # INPUT CONTROL (FIXED)
+    # INPUT CONTROL
     # --------------------------------------------------
 
     def lock_input(self) -> None:
