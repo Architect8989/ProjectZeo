@@ -42,9 +42,10 @@ from restoration.restore_verifier import RestoreVerifier
 from core.safety.action_timeout import action_timeout, ActionTimeout
 from core.telemetry.logger import log_warn
 
-# 🔧 AUDIT FIX IMPORTS
+# Audit wiring
 from observer.observer_core import ObserverCore
 from observer.screenpipe_adapter import ScreenpipeAdapter
+
 
 # ----------------------------
 # GLOBAL SINGLETONS
@@ -54,8 +55,6 @@ config = Config()
 operating_system = OperatingSystem()
 
 accessibility_backend = AccessibilityBackend()
-
-# 🔧 AUDIT FIX: HARD WIRING REQUIRED FOR SNAPSHOT SYSTEM
 accessibility_backend.observer = ObserverCore()
 accessibility_backend.screenpipe = ScreenpipeAdapter()
 
@@ -131,8 +130,14 @@ def main(model, terminal_prompt, voice_mode=False, verbose_mode=False):
     try:
         snapshot = snapshot_provider.capture_pre_hijack_snapshot()
     except Exception as e:
-        journal.record(event="snapshot_failed", execution_id=execution_id, error=str(e))
+        journal.record(
+            event="snapshot_failed",
+            execution_id=execution_id,
+            error=str(e),
+        )
         journal.seal(reason="SNAPSHOT_FAILURE")
+        # 🔒 AUDIT FIX: force safe OS state before abort
+        operating_system.force_release_all()
         raise
 
     operating_system.mark_automation_active()
@@ -176,9 +181,13 @@ def main(model, terminal_prompt, voice_mode=False, verbose_mode=False):
 
         if snapshot is not None:
             try:
+                # 🔒 AUDIT FIX: restore + verify treated as single critical section
                 restore_provider.restore(snapshot)
                 restore_verifier.verify(snapshot)
-                journal.record(event="restoration_verified", execution_id=execution_id)
+                journal.record(
+                    event="restoration_verified",
+                    execution_id=execution_id,
+                )
             except Exception as e:
                 journal.record(
                     event="restoration_failed",
@@ -186,6 +195,8 @@ def main(model, terminal_prompt, voice_mode=False, verbose_mode=False):
                     error=str(e),
                 )
                 journal.seal(reason="RESTORATION_VERIFICATION_FAILED")
+                # 🔒 FINAL SAFETY VALVE
+                operating_system.force_release_all()
                 raise
 
         journal.seal(reason="OBJECTIVE_COMPLETE")
@@ -197,7 +208,6 @@ def main(model, terminal_prompt, voice_mode=False, verbose_mode=False):
 
 def operate(operations, model, execution_id: str):
 
-    # HARD GUARD
     if not operations:
         journal.record(event="no_operations", execution_id=execution_id)
         return True
@@ -217,21 +227,16 @@ def operate(operations, model, execution_id: str):
         thought = operation.get("thought")
         detail = ""
 
-        # ----------------------------
-        # OPERATION VALIDATION
-        # ----------------------------
+        if op_type in ("press", "hotkey") and not operation.get("keys"):
+            raise ValueError("Missing keys")
 
-        if op_type in ("press", "hotkey"):
-            if not operation.get("keys"):
-                raise ValueError("Missing keys")
+        if op_type == "write" and operation.get("content") is None:
+            raise ValueError("Missing content")
 
-        if op_type == "write":
-            if operation.get("content") is None:
-                raise ValueError("Missing content")
-
-        if op_type == "click":
-            if operation.get("x") is None or operation.get("y") is None:
-                raise ValueError("Missing coordinates")
+        if op_type == "click" and (
+            operation.get("x") is None or operation.get("y") is None
+        ):
+            raise ValueError("Missing coordinates")
 
         journal.record(
             event="operation_start",
@@ -246,12 +251,11 @@ def operate(operations, model, execution_id: str):
             soc_confident=True,
         )
 
-        if decision == AuthorityDecision.YIELD:
-            journal.record(event="authority_yield", execution_id=execution_id)
-            return True
-
-        if decision == AuthorityDecision.ABORT:
-            journal.record(event="authority_abort", execution_id=execution_id)
+        if decision in (AuthorityDecision.YIELD, AuthorityDecision.ABORT):
+            journal.record(
+                event=f"authority_{decision.name.lower()}",
+                execution_id=execution_id,
+            )
             return True
 
         try:
@@ -259,7 +263,6 @@ def operate(operations, model, execution_id: str):
 
             try:
                 with action_timeout(5):
-
                     if op_type in ("press", "hotkey"):
                         detail = operation.get("keys")
                         operating_system.press(detail)
@@ -269,15 +272,17 @@ def operate(operations, model, execution_id: str):
                         operating_system.write(detail)
 
                     elif op_type == "click":
-                        detail = {"x": operation.get("x"), "y": operation.get("y")}
+                        detail = {
+                            "x": operation.get("x"),
+                            "y": operation.get("y"),
+                        }
                         operating_system.mouse(detail)
 
                     elif op_type == "done":
-                        summary = operation.get("summary")
                         journal.record(
                             event="objective_complete",
                             execution_id=execution_id,
-                            summary=summary,
+                            summary=operation.get("summary"),
                         )
                         return True
 
