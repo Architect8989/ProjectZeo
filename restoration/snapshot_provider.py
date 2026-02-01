@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+import threading
 from typing import Dict, Any, Optional
 
 from restoration.snapshot_types import (
@@ -30,20 +31,23 @@ class SnapshotProvider:
     SNAPSHOT_SCHEMA_VERSION = "1.1"
 
     # -------------------------------------------------
-    # SNAPSHOT REGISTRY (AUTHORITATIVE)
+    # SNAPSHOT REGISTRY (AUTHORITATIVE, THREAD-SAFE)
     # -------------------------------------------------
 
     _snapshots: Dict[str, RestorationSnapshot] = {}
+    _lock = threading.Lock()
 
     @classmethod
     def store_snapshot(cls, snapshot: RestorationSnapshot) -> str:
         snapshot_id = snapshot.snapshot_id
-        cls._snapshots[snapshot_id] = snapshot
+        with cls._lock:
+            cls._snapshots[snapshot_id] = snapshot
         return snapshot_id
 
     @classmethod
     def get_snapshot(cls, snapshot_id: str) -> Optional[RestorationSnapshot]:
-        return cls._snapshots.get(snapshot_id)
+        with cls._lock:
+            return cls._snapshots.get(snapshot_id)
 
     # -------------------------------------------------
     # INSTANCE
@@ -98,7 +102,10 @@ class SnapshotProvider:
                 "Snapshots MUST be captured in OBSERVER mode."
             )
 
-        # 2. Enforce live vision
+        # 2. Enforce live vision (pre-check blindness)
+        if getattr(self._screenpipe, "blind", False):
+            raise SnapshotProviderError("Screenpipe is blind")
+
         screen_state = self._screenpipe.read()
         if not screen_state.get("available") or screen_state.get("blind"):
             raise SnapshotProviderError(
@@ -115,8 +122,17 @@ class SnapshotProvider:
                 f"Failed to retrieve OS state: {e}"
             ) from e
 
-        # 4. Build state objects
-        cursor_state = CursorState(x=int(cursor_x), y=int(cursor_y))
+        # 4. Build state objects (VALIDATED)
+        try:
+            x = int(cursor_x)
+            y = int(cursor_y)
+            if x < 0 or y < 0:
+                raise ValueError("Cursor coordinates must be non-negative")
+            cursor_state = CursorState(x=x, y=y)
+        except (TypeError, ValueError) as e:
+            raise SnapshotProviderError(
+                f"Invalid cursor position: {e}"
+            ) from e
 
         focus_state = FocusState(
             window_id=str(focused_window.get("id")),
@@ -195,10 +211,5 @@ class SnapshotProvider:
             execution_mode=execution_mode,
             metadata=metadata,
         )
-
-        # IMPORTANT:
-        # Do NOT attach snapshot to observer.
-        # Observer expects UISnapshot, not RestorationSnapshot.
-        # Attaching here caused type corruption and was removed intentionally.
 
         return snapshot
