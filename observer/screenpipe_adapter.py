@@ -53,6 +53,19 @@ class ScreenpipeAdapter:
             text.encode("utf-8", errors="ignore")
         ).hexdigest()
 
+    def _normalize_timestamp(self, frame_ts: float) -> float:
+        """
+        Normalize timestamp to seconds since epoch.
+        Handles millisecond timestamps safely.
+        """
+        ts = float(frame_ts)
+
+        # Heuristic: > year 33658 in seconds → milliseconds
+        if ts > 1e12:
+            ts /= 1000.0
+
+        return ts
+
     def _mark_blind(self, reason: str) -> None:
         with self._lock:
             if self.blind:
@@ -100,18 +113,26 @@ class ScreenpipeAdapter:
                 raise RuntimeError("Screenpipe HTTP failure")
 
             payload = resp.json()
-            frame_ts = payload.get("timestamp")
+            raw_ts = payload.get("timestamp")
             text = payload.get("text", "")
 
-            if frame_ts is None:
+            if raw_ts is None:
                 raise RuntimeError("Missing frame timestamp")
 
             now_mono = time.monotonic()
             now_wall = time.time()
 
-            age = now_wall - float(frame_ts)
-            if age > self.MAX_FRAME_AGE_SECONDS:
-                raise ScreenpipeBlindnessError("Frame too old")
+            frame_ts = self._normalize_timestamp(raw_ts)
+            age = now_wall - frame_ts
+
+            # Reject timestamps from the future or far past
+            if (
+                age > self.MAX_FRAME_AGE_SECONDS
+                or age < -self.MAX_FRAME_AGE_SECONDS
+            ):
+                raise ScreenpipeBlindnessError(
+                    f"Invalid frame timestamp (age={age:.2f}s)"
+                )
 
             text_hash = self._hash_text(text)
 
