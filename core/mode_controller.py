@@ -55,6 +55,19 @@ class ModeController:
         self._log_state("[MODE] Initialized")
 
     # --------------------------------------------------
+    # DERIVED STATE (FIXED)
+    # --------------------------------------------------
+
+    @property
+    def mode_uptime_seconds(self) -> float:
+        with self._lock:
+            return time.time() - self._mode_entered_at
+
+    def release_input(self) -> None:
+        with self._lock:
+            self._input_locked = False
+
+    # --------------------------------------------------
     # HEALTH SIGNALS
     # --------------------------------------------------
 
@@ -142,10 +155,7 @@ class ModeController:
         Arm ONLY if transition is valid.
         Prevents silent intent overwrite while already ARMED.
         """
-        # Validate transition first
         self.request_transition(SystemMode.ARMED, reason)
-
-        # Store intent only after successful transition
         with self._lock:
             self._intent = reason
 
