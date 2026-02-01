@@ -1,6 +1,7 @@
 import time
 from typing import Optional
 
+
 class PerceptionHealth:
     """
     Tracks perception quality and recovers understanding,
@@ -11,6 +12,8 @@ class PerceptionHealth:
     UNSTABLE_LIMIT = 3
 
     def __init__(self):
+        # Use monotonic clock for all health decisions
+        self._clock = time.monotonic
         self.last_good_ts: Optional[float] = None
         self.unstable_count = 0
 
@@ -18,13 +21,14 @@ class PerceptionHealth:
         """
         Returns True if perception is considered stable.
         """
-        now = time.time()
+        now = self._clock()
 
         if not available or frame_ts is None:
             self.unstable_count += 1
             return False
 
-        if self.last_good_ts and (now - frame_ts) > self.STALE_LIMIT:
+        # frame_ts is expected to be comparable (monotonic-aligned)
+        if self.last_good_ts is not None and (now - frame_ts) > self.STALE_LIMIT:
             self.unstable_count += 1
             return False
 
