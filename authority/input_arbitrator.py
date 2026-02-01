@@ -26,13 +26,18 @@ class InputArbitrator:
         self._start_watchdog()
 
     # -------------------------------------------------
-    # Existing API
+    # EXISTING API (FIXED)
     # -------------------------------------------------
 
     def soc_action_started(self) -> None:
+        """
+        Marks SOC liveness.
+        MUST reset forced-release latch.
+        """
         self.tracker.mark_soc_action()
         with self._lock:
             self._last_soc_action_ts = time.time()
+            self._forced_release = False  # 🔧 FIX: reset latch
 
     def evaluate(
         self,
@@ -48,7 +53,6 @@ class InputArbitrator:
 
         source = self.tracker.classify_input(input_event_ts)
 
-        # ---- snapshot forced state atomically ----
         with self._lock:
             forced_release = self._forced_release
 
