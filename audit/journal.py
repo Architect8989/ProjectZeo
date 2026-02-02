@@ -16,7 +16,6 @@ class ActionJournal:
         self.last_hash = "0" * 64  # Genesis state
         self.last_intent_hash = None
 
-        # Initialize session ONLY after object is fully constructed
         try:
             self._initialize_session()
         except Exception as e:
@@ -51,21 +50,28 @@ class ActionJournal:
                 f.flush()
                 os.fsync(f.fileno())
         except Exception as e:
-            # Unrecorded execution is a security breach
             raise SystemExit(
                 f"CRITICAL_AUDIT_FAILURE: Persistence failed: {e}"
             ) from e
 
     # -------------------------------------------------
 
+    def _now(self) -> dict:
+        """
+        Returns a dual-clock timestamp.
+        Wall time for humans, monotonic for ordering.
+        """
+        return {
+            "timestamp_wall": time.time(),
+            "timestamp_mono": time.monotonic(),
+        }
+
+    # -------------------------------------------------
+
     def _initialize_session(self) -> None:
-        """
-        Starts the hash chain.
-        No chaining data accepted from callers.
-        """
         entry = {
             "type": "SESSION_START",
-            "timestamp": time.time(),
+            **self._now(),
         }
         self.record(entry)
 
@@ -84,7 +90,6 @@ class ActionJournal:
         phase = entry.get("phase")
         entry_type = entry.get("type")
 
-        # 1. No new INTENT or SEAL while EFFECT pending
         if (
             (phase == "INTENT" or entry_type == "SESSION_SEAL")
             and self.last_intent_hash
@@ -93,7 +98,6 @@ class ActionJournal:
                 "AUDIT_INTEGRITY_FAILURE: Unresolved INTENT without EFFECT."
             )
 
-        # 2. EFFECT must reference an active INTENT
         if phase == "EFFECT":
             if self.last_intent_hash is None:
                 raise RuntimeError(
@@ -102,32 +106,24 @@ class ActionJournal:
             entry["intent_ref"] = self.last_intent_hash
             self.last_intent_hash = None
 
-        # 3. Ledger owns chaining
         entry["prev_hash"] = self.last_hash
 
-        # 4. Cryptographic finalization
         current_hash = self._canonical_hash(entry)
         entry["hash"] = current_hash
 
-        # 5. Internal state update
         if phase == "INTENT":
             self.last_intent_hash = current_hash
 
         self.last_hash = current_hash
 
-        # 6. Commit (fsynced)
         self._persist(entry)
 
     # -------------------------------------------------
 
     def seal(self, reason="NORMAL") -> None:
-        """
-        Closes the ledger.
-        Cannot succeed if an intent is unresolved.
-        """
         entry = {
             "type": "SESSION_SEAL",
             "reason": reason,
-            "timestamp": time.time(),
+            **self._now(),
         }
         self.record(entry)
