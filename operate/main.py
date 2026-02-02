@@ -16,13 +16,16 @@ def main_entry(
     terminal_prompt: str = None,
     voice_mode: bool = False,
     verbose_mode: bool = False,
+    observer=None,
+    screenpipe=None,
 ):
     """
     Entry point for both:
     - CLI execution (argparse)
     - Programmatic invocation (root main.py)
 
-    If terminal_prompt is provided, argparse is skipped.
+    observer and screenpipe are OPTIONAL for CLI,
+    REQUIRED for kernel-driven execution.
     """
 
     try:
@@ -82,7 +85,7 @@ def main_entry(
             }
 
         # --------------------------------------------------
-        # EXECUTE OPERATE DIRECTLY (NO KERNEL)
+        # EXECUTE OPERATE (OBSERVER / SCREENPIPE PASSTHROUGH)
         # --------------------------------------------------
 
         log_info("[SYSTEM] Executing objective")
@@ -92,6 +95,8 @@ def main_entry(
             terminal_prompt=config["terminal_prompt"],
             voice_mode=config["voice_mode"],
             verbose_mode=config["verbose_mode"],
+            observer=observer,
+            screenpipe=screenpipe,
         )
 
     except KeyboardInterrupt:
