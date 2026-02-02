@@ -28,7 +28,6 @@ Guideline: {guideline}
 SCREENSHOT_PATH = os.path.join("screenshots", "screenshot.png")
 
 
-# Check if on a windows terminal that supports ANSI escape codes
 def supports_ansi():
     """
     Check if the terminal supports ANSI escape codes
@@ -40,21 +39,12 @@ def supports_ansi():
 
 
 if supports_ansi():
-    # Standard green text
     ANSI_GREEN = "\033[32m"
-    # Bright/bold green text
     ANSI_BRIGHT_GREEN = "\033[92m"
-    # Reset to default text color
     ANSI_RESET = "\033[0m"
-    # ANSI escape code for blue text
-    ANSI_BLUE = "\033[94m"  # This is for bright blue
-
-    # Standard yellow text
+    ANSI_BLUE = "\033[94m"
     ANSI_YELLOW = "\033[33m"
-
     ANSI_RED = "\033[31m"
-
-    # Bright magenta text
     ANSI_BRIGHT_MAGENTA = "\033[95m"
 else:
     ANSI_GREEN = ""
@@ -67,8 +57,7 @@ else:
 
 
 def format_evaluation_prompt(guideline):
-    prompt = EVALUATION_PROMPT.format(guideline=guideline)
-    return prompt
+    return EVALUATION_PROMPT.format(guideline=guideline)
 
 
 def parse_eval_content(content):
@@ -78,11 +67,12 @@ def parse_eval_content(content):
         print(res["reason"])
 
         return res["guideline_met"]
-    except:
+
+    except (json.JSONDecodeError, KeyError, TypeError) as e:
         print(
             "The model gave a bad evaluation response and it couldn't be parsed. Exiting..."
         )
-        exit(1)
+        sys.exit(1)
 
 
 def evaluate_final_screenshot(guideline):
@@ -90,47 +80,44 @@ def evaluate_final_screenshot(guideline):
     with open(SCREENSHOT_PATH, "rb") as img_file:
         img_base64 = base64.b64encode(img_file.read()).decode("utf-8")
 
-        eval_message = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": format_evaluation_prompt(guideline)},
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:image/jpeg;base64,{img_base64}"},
-                    },
-                ],
-            }
-        ]
+    eval_message = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": format_evaluation_prompt(guideline)},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/jpeg;base64,{img_base64}"},
+                },
+            ],
+        }
+    ]
 
-        response = openai.chat.completions.create(
-            model="gpt-4o",
-            messages=eval_message,
-            presence_penalty=1,
-            frequency_penalty=1,
-            temperature=0.7,
-        )
+    response = openai.chat.completions.create(
+        model="gpt-4o",
+        messages=eval_message,
+        presence_penalty=1,
+        frequency_penalty=1,
+        temperature=0.7,
+    )
 
-        eval_content = response.choices[0].message.content
+    eval_content = response.choices[0].message.content
 
-        return parse_eval_content(eval_content)
+    return parse_eval_content(eval_content)
 
 
 def run_test_case(objective, guideline, model):
-    """Returns True if the result of the test with the given prompt meets the given guideline for the given model."""
-    # Run `operate` with the model to evaluate and the test case prompt
+    """Returns True if the result of the test meets the given guideline."""
     subprocess.run(
         ["operate", "-m", model, "--prompt", f'"{objective}"'],
         stdout=subprocess.DEVNULL,
     )
 
     try:
-        result = evaluate_final_screenshot(guideline)
+        return evaluate_final_screenshot(guideline)
     except OSError:
         print("[Error] Couldn't open the screenshot for evaluation")
         return False
-
-    return result
 
 
 def get_test_model():
@@ -160,6 +147,7 @@ def main():
 
     passed = 0
     failed = 0
+
     for objective, guideline in TEST_CASES.items():
         print(f"{ANSI_BLUE}[EVALUATING]{ANSI_RESET} '{objective}'")
 
@@ -172,7 +160,9 @@ def main():
             failed += 1
 
     print(
-        f"{ANSI_BRIGHT_MAGENTA}[EVALUATION COMPLETE]{ANSI_RESET} {passed} test{'' if passed == 1 else 's'} passed, {failed} test{'' if failed == 1 else 's'} failed"
+        f"{ANSI_BRIGHT_MAGENTA}[EVALUATION COMPLETE]{ANSI_RESET} "
+        f"{passed} test{'' if passed == 1 else 's'} passed, "
+        f"{failed} test{'' if failed == 1 else 's'} failed"
     )
 
 
