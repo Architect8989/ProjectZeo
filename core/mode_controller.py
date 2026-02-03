@@ -16,31 +16,32 @@ class ModeTransitionError(Exception):
 
 
 class VisionUnavailableError(ModeTransitionError):
-    """Execution requested without verified vision."""
+    pass
 
 
 class ModeController:
     """
-    Authority firewall for the system.
+    Single authority state machine.
+    Atomic. Deterministic. Auditable.
     """
 
     MAX_TRANSITION_HISTORY = 2000
 
     def __init__(self):
-        self._mode: SystemMode = SystemMode.OBSERVER
-        self._mode_entered_at: float = time.time()
-        self._last_transition_reason: Optional[str] = None
-        self._vision_ok: bool = False
-        self._input_locked: bool = False
-
-        self._observer_healthy: bool = True
-        self._vision_failed_permanently: bool = False
-        self._failure_reason: Optional[str] = None
-
         self._lock = threading.RLock()
 
-        # Intent storage
+        self._mode: SystemMode = SystemMode.OBSERVER
         self._intent: Optional[str] = None
+
+        self._mode_entered_at = time.time()
+        self._last_transition_reason: Optional[str] = None
+
+        self._vision_ok = False
+        self._observer_healthy = True
+        self._vision_failed_permanently = False
+        self._failure_reason: Optional[str] = None
+
+        self._input_locked = False
 
         self._transition_history: Deque[Dict[str, object]] = deque(
             maxlen=self.MAX_TRANSITION_HISTORY
@@ -52,20 +53,23 @@ class ModeController:
             SystemMode.EXECUTING: {SystemMode.OBSERVER},
         }
 
-        self._log_state("[MODE] Initialized")
+    # --------------------------------------------------
+    # READS
+    # --------------------------------------------------
 
-    # --------------------------------------------------
-    # DERIVED STATE (FIXED)
-    # --------------------------------------------------
+    @property
+    def mode(self) -> SystemMode:
+        with self._lock:
+            return self._mode
 
     @property
     def mode_uptime_seconds(self) -> float:
         with self._lock:
             return time.time() - self._mode_entered_at
 
-    def release_input(self) -> None:
+    def is_armed(self) -> bool:
         with self._lock:
-            self._input_locked = False
+            return self._mode == SystemMode.ARMED
 
     # --------------------------------------------------
     # HEALTH SIGNALS
@@ -75,169 +79,123 @@ class ModeController:
         self, healthy: bool, *, reason: Optional[str] = None
     ) -> None:
         with self._lock:
-            if not healthy and self._observer_healthy:
+            if healthy:
+                return
+
+            if self._observer_healthy:
                 self._observer_healthy = False
                 self._vision_failed_permanently = True
-                self._failure_reason = reason or "observer reported blindness"
+                self._failure_reason = reason or "observer failure"
 
                 if self._mode == SystemMode.EXECUTING:
-                    self._force_abort_locked(
-                        "Observer health lost mid-execution"
+                    self._abort_locked(
+                        "observer health lost mid-execution"
                     )
 
     def update_vision_status(self, ok: bool) -> None:
-        """
-        Vision availability can recover.
-        Permanent failure is reserved for observer blindness only.
-        """
         with self._lock:
             self._vision_ok = bool(ok)
 
     # --------------------------------------------------
-    # TRANSITIONS
-    # --------------------------------------------------
-
-    def request_transition(
-        self,
-        target_mode: SystemMode,
-        reason: str,
-        *,
-        force: bool = False,
-    ) -> None:
-        with self._lock:
-            if not reason or not reason.strip():
-                raise ModeTransitionError(
-                    "Mode transition requires an explicit reason."
-                )
-
-            current = self._mode
-            if target_mode == current:
-                return
-
-            allowed = self._allowed_transitions.get(current, set())
-            if not force and target_mode not in allowed:
-                raise ModeTransitionError(
-                    f"Illegal mode transition: {current} -> {target_mode}"
-                )
-
-            if not self._observer_healthy:
-                raise VisionUnavailableError(
-                    f"Observer unhealthy: {self._failure_reason}"
-                )
-
-            if target_mode == SystemMode.EXECUTING and not self._vision_ok:
-                raise VisionUnavailableError(
-                    "Cannot enter EXECUTING without live screen vision"
-                )
-
-            if target_mode == SystemMode.EXECUTING:
-                self._input_locked = True
-
-            self._mode = target_mode
-            self._mode_entered_at = time.time()
-            self._last_transition_reason = reason
-
-            self._record_transition(
-                current, target_mode, reason, force
-            )
-
-            self._log_state(
-                f"[MODE] {current} -> {target_mode} | reason='{reason}'"
-                + (" | FORCED" if force else "")
-            )
-
-    # --------------------------------------------------
-    # HIGH-LEVEL API
+    # ATOMIC TRANSITIONS
     # --------------------------------------------------
 
     def arm(self, reason: str) -> None:
         """
-        Arm ONLY if transition is valid.
-        Prevents silent intent overwrite while already ARMED.
+        Atomically capture intent + arm.
         """
-        self.request_transition(SystemMode.ARMED, reason)
         with self._lock:
+            if self._mode != SystemMode.OBSERVER:
+                raise ModeTransitionError(
+                    "Cannot arm unless in OBSERVER"
+                )
+
             self._intent = reason
+            self._commit_transition(
+                SystemMode.ARMED, reason, forced=False
+            )
 
     def execute(self, reason: str) -> None:
-        self.request_transition(SystemMode.EXECUTING, reason)
+        with self._lock:
+            if self._mode != SystemMode.ARMED:
+                raise ModeTransitionError(
+                    "Execute requested while not ARMED"
+                )
 
-    def disarm(self, reason: str) -> None:
-        self.request_transition(
-            SystemMode.OBSERVER, reason, force=True
-        )
-        self.release_input()
+            if not self._observer_healthy:
+                raise VisionUnavailableError(self._failure_reason)
 
-    # --------------------------------------------------
-    # REQUIRED BY MAIN
-    # --------------------------------------------------
+            if not self._vision_ok:
+                raise VisionUnavailableError(
+                    "Vision not available"
+                )
 
-    def is_armed(self) -> bool:
-        return self._mode == SystemMode.ARMED
+            self._input_locked = True
+            self._commit_transition(
+                SystemMode.EXECUTING, reason, forced=False
+            )
 
     def consume_intent(self) -> str:
         with self._lock:
-            if self._intent is None:
+            if self._mode != SystemMode.EXECUTING:
                 raise ModeTransitionError(
-                    "No intent available to consume"
+                    "Intent consumed outside EXECUTING"
                 )
+
+            if self._intent is None:
+                raise ModeTransitionError("No intent present")
+
             intent = self._intent
             self._intent = None
             return intent
 
-    def force_observer(self) -> None:
-        with self._lock:
-            prev = self._mode
-            self._mode = SystemMode.OBSERVER
-            self._mode_entered_at = time.time()
-            self._last_transition_reason = "forced observer"
-            self._input_locked = False
+    # --------------------------------------------------
+    # EMERGENCY / RECOVERY
+    # --------------------------------------------------
 
-            self._record_transition(
-                prev,
+    def force_observer(self) -> None:
+        """
+        Emergency reset.
+        Still atomic. Still audited.
+        """
+        with self._lock:
+            self._intent = None
+            self._input_locked = False
+            self._commit_transition(
                 SystemMode.OBSERVER,
-                "forced observer",
+                reason="forced reset",
                 forced=True,
             )
 
-            self._log_state(
-                f"[MODE] FORCED {prev} -> OBSERVER"
-            )
-
-    # --------------------------------------------------
-    # INTERNAL ABORT (LOCKED)
-    # --------------------------------------------------
-
-    def _force_abort_locked(self, reason: str) -> None:
-        prev = self._mode
-        self._mode = SystemMode.OBSERVER
-        self._mode_entered_at = time.time()
-        self._last_transition_reason = reason
+    def _abort_locked(self, reason: str) -> None:
+        self._intent = None
         self._input_locked = False
-
-        self._record_transition(
-            prev, SystemMode.OBSERVER, reason, forced=True
-        )
-        self._log_state(
-            f"[MODE] ABORTED {prev} -> OBSERVER | reason='{reason}'"
+        self._commit_transition(
+            SystemMode.OBSERVER, reason, forced=True
         )
 
     # --------------------------------------------------
-    # FORENSICS
+    # INTERNAL COMMIT (SINGLE POINT)
     # --------------------------------------------------
 
-    def _record_transition(
+    def _commit_transition(
         self,
-        from_mode: SystemMode,
-        to_mode: SystemMode,
+        target: SystemMode,
         reason: str,
         forced: bool,
     ) -> None:
+        prev = self._mode
+        now = time.time()
+
+        self._mode = target
+        self._mode_entered_at = now
+        self._last_transition_reason = reason
+
         self._transition_history.append(
             {
-                "ts": time.time(),
-                "from": from_mode,
-                "to": to_mode,
+                "ts": now,
+                "from": prev,
+                "to": target,
                 "reason": reason,
                 "forced": forced,
                 "vision_ok": self._vision_ok,
@@ -245,10 +203,14 @@ class ModeController:
             }
         )
 
+    # --------------------------------------------------
+    # FORENSICS
+    # --------------------------------------------------
+
     def get_authority_snapshot(self) -> Dict[str, object]:
         with self._lock:
             return {
-                "mode": self._mode,
+                "mode": self._mode.value,
                 "mode_uptime_seconds": self.mode_uptime_seconds,
                 "observer_healthy": self._observer_healthy,
                 "vision_ok": self._vision_ok,
@@ -258,10 +220,4 @@ class ModeController:
                 "transition_history_depth": len(
                     self._transition_history
                 ),
-            }
-
-    def _log_state(self, message: str) -> None:
-        ts = time.strftime(
-            "%Y-%m-%d %H:%M:%S", time.localtime()
-        )
-        print(f"{ts} {message}")
+        }
