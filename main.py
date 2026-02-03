@@ -12,16 +12,10 @@ from observer.observer_core import ObserverCore, ObserverBlindnessError
 from observer.screenpipe_adapter import ScreenpipeAdapter
 from observer.perception_engine import PerceptionEngine
 
-# Crash-proof authority state
 from state.serializer import AuthorityStateSerializer
-
-# OS safety backend
 from operate.utils.operating_system import OperatingSystem
-
-# SOC entrypoint
 from operate.main import main_entry as soc_execute_main
 
-# RESTORATION
 from restoration.snapshot_provider import SnapshotProvider
 from restoration.restore_provider import RestoreProvider
 
@@ -29,10 +23,11 @@ from restoration.restore_provider import RestoreProvider
 HEARTBEAT_INTERVAL = 2.0
 
 # --------------------------------------------------
-# GLOBAL SINGLETONS
+# PROCESS AUTHORITY
 # --------------------------------------------------
 
 OS_BACKEND = OperatingSystem()
+
 STATE_PATH = os.path.join(os.getcwd(), ".authority_state.json")
 AUTH_STATE = AuthorityStateSerializer(STATE_PATH)
 
@@ -47,48 +42,40 @@ SNAPSHOT_PROVIDER = SnapshotProvider(
 )
 RESTORE_PROVIDER = RestoreProvider(os_backend=OS_BACKEND)
 
-
 # --------------------------------------------------
-# PROCESS SAFETY (FIXED)
+# SAFE SHUTDOWN (NON-SIGNAL)
 # --------------------------------------------------
 
-def _force_safe_shutdown(reason: str, *args, **kwargs):
+def _force_safe_shutdown(reason: str):
     try:
         OS_BACKEND.force_release_all()
-    except Exception as e:
-        print(
-            f"[CRITICAL] force_release_all failed: {e}",
-            file=sys.stderr,
-        )
+    except Exception:
+        pass
 
     try:
         AUTH_STATE.force_safe_state()
-    except Exception as e:
-        print(
-            f"[CRITICAL] force_safe_state failed: {e}",
-            file=sys.stderr,
-        )
+    except Exception:
+        pass
 
-    print(f"[SAFE-SHUTDOWN] {reason}")
+    print(f"[SAFE-SHUTDOWN] {reason}", file=sys.stderr)
 
+
+# --------------------------------------------------
+# SIGNAL HANDLER (LOCK-FREE)
+# --------------------------------------------------
 
 def _signal_handler(signum, frame):
     try:
-        _force_safe_shutdown(f"signal:{signum}")
-    finally:
-        # Absolute last-resort release
-        try:
-            OS_BACKEND.force_release_all()
-        except Exception:
-            pass
-        os._exit(1)
+        OS_BACKEND.force_release_all()
+    except Exception:
+        pass
+    os._exit(1)
 
 
 atexit.register(_force_safe_shutdown, "atexit")
 signal.signal(signal.SIGINT, _signal_handler)
 signal.signal(signal.SIGTERM, _signal_handler)
 signal.signal(signal.SIGQUIT, _signal_handler)
-
 
 # --------------------------------------------------
 # ROOT MAIN
@@ -97,13 +84,9 @@ signal.signal(signal.SIGQUIT, _signal_handler)
 def main():
     print("[BOOT] System starting")
 
-    # ---- ENVIRONMENT FINGERPRINT ----
     env_fingerprint = collect_environment_fingerprint()
     print("[ENV] Fingerprint collected")
-    for k, v in env_fingerprint.items():
-        print(f"[ENV] {k}: {v}")
 
-    # ---- LOAD AUTH STATE ----
     persisted = AUTH_STATE.load()
 
     if persisted.get("dirty") or persisted.get("restore_required"):
@@ -111,7 +94,6 @@ def main():
         OS_BACKEND.force_release_all()
         AUTH_STATE.force_safe_state()
 
-    # ---- MODE CONTROLLER ----
     mode = ModeController()
 
     if persisted.get("dirty"):
@@ -120,7 +102,6 @@ def main():
         except Exception:
             pass
 
-    # ---- INTENT LISTENER ----
     intent_listener = IntentListener(mode)
     intent_listener.start()
 
@@ -128,13 +109,8 @@ def main():
     print("[OBSERVER] Watching screen (read-only)")
     print("[INTENT] Type intent and press Enter")
 
-    # --------------------------------------------------
-    # MAIN LOOP
-    # --------------------------------------------------
-
     while True:
         try:
-            # ---- SCREEN + PERCEPTION ----
             screen_state = screenpipe.read()
             ui_snapshot = perception.process(screen_state)
 
@@ -145,29 +121,13 @@ def main():
             mode.update_vision_status(screen_state.get("available", False))
             mode.update_observer_health(observer.is_healthy())
 
-            heartbeat = {
-                "mode": mode.mode.value,
-                "uptime": observer_state["uptime_seconds"],
-                "ticks": observer_state["tick_count"],
-                "screen_available": screen_state.get("available"),
-                "screen_stale": screen_state.get("stale"),
-                "ui_stable": ui_snapshot.stable,
-                "ui_elements": len(ui_snapshot.elements),
-                "ui_dialogs": len(ui_snapshot.dialogs),
-            }
-
-            print(f"[HEARTBEAT] {heartbeat}")
-
-            # --------------------------------------------------
-            # EXECUTION TRANSACTION
-            # --------------------------------------------------
+            print(f"[HEARTBEAT] mode={mode.mode.value} ticks={observer_state['tick_count']}")
 
             if mode.is_armed():
                 try:
                     mode.execute("root-main-execution")
                     current_intent = mode.consume_intent()
-                except ModeTransitionError as e:
-                    print(f"[EXECUTION] Transition blocked: {e}")
+                except ModeTransitionError:
                     mode.force_observer()
                     continue
 
@@ -201,11 +161,9 @@ def main():
                         dirty=False,
                     )
 
-                except Exception as e:
-                    print(f"[EXECUTION] Fatal error: {e}")
+                except Exception:
                     AUTH_STATE.force_safe_state()
                     OS_BACKEND.force_release_all()
-
                     try:
                         RESTORE_PROVIDER.restore_snapshot(snapshot_id)
                     except Exception:
@@ -217,14 +175,11 @@ def main():
                     except Exception:
                         pass
 
-        except ObserverBlindnessError as e:
-            mode.update_observer_health(False, reason=str(e))
-            print("[FATAL] Observer blindness detected — shutting down")
+        except ObserverBlindnessError:
             _force_safe_shutdown("observer-blindness")
             os._exit(1)
 
-        except Exception as fatal:
-            print(f"[FATAL] Main loop error: {fatal}")
+        except Exception:
             _force_safe_shutdown("main-loop-failure")
             os._exit(1)
 
