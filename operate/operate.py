@@ -1,259 +1,106 @@
-import sys
-import os
 import time
 import asyncio
-import platform
-import uuid
-
-from prompt_toolkit.shortcuts import message_dialog
-from prompt_toolkit import prompt
 
 from operate.exceptions import ModelNotRecognizedException
-from operate.models.prompts import USER_QUESTION, get_system_prompt
-from operate.config import Config
-from operate.utils.style import (
-    ANSI_GREEN,
-    ANSI_RESET,
-    ANSI_YELLOW,
-    ANSI_RED,
-    ANSI_BRIGHT_MAGENTA,
-    ANSI_BLUE,
-    style,
-)
-from operate.utils.operating_system import OperatingSystem
 from operate.models.apis_openrouter import get_next_action
 
-# Execution / control layers (frozen)
-from utils.accessibility import AccessibilityBackend
-from audit.journal import ActionJournal
-from policy.engine import PolicyEngine
-
-# Authority arbitration (frozen)
-from authority.input_arbitrator import InputArbitrator
 from authority.authority_policy import AuthorityDecision
-
-# Restoration system (isolated, sovereign)
-from restoration.snapshot_provider import SnapshotProvider
-from restoration.restore_provider import RestoreProvider
-from restoration.restore_verifier import RestoreVerifier
-
-# Additive safety
 from core.safety.action_timeout import action_timeout, ActionTimeout
 from core.telemetry.logger import log_warn
 
 
-# ----------------------------
-# GLOBAL SINGLETONS
-# ----------------------------
+# --------------------------------------------------
+# PURE EXECUTION ENTRYPOINT
+# --------------------------------------------------
 
-config = Config()
-operating_system = OperatingSystem()
-
-accessibility_backend = AccessibilityBackend()
-
-journal = ActionJournal()
-policy_engine = PolicyEngine()
-input_arbitrator = InputArbitrator()
-
-
-# ----------------------------
-# ENTRYPOINT
-# ----------------------------
-
-def main(
-    model,
-    terminal_prompt,
-    voice_mode=False,
-    verbose_mode=False,
+def execute_soc(
     *,
+    model,
+    objective,
     observer,
     screenpipe,
+    os_backend,
+    accessibility_backend,
+    journal,
+    input_arbitrator,
+    max_iterations=500,
 ):
     """
-    SOC execution entry.
-    Observer and screenpipe MUST be injected from main loop.
+    SOC executor.
+
+    Responsibilities:
+    - plan
+    - act
+    - verify
+    - yield control
+
+    NO authority ownership.
+    NO lifecycle control.
     """
 
-    if observer is None or screenpipe is None:
-        raise RuntimeError("Observer and screenpipe must be provided")
-
-    accessibility_backend.observer = observer
-    accessibility_backend.screenpipe = screenpipe
-
-    mic = None
-    config.verbose = verbose_mode
-    config.validation(model, voice_mode)
-
-    if voice_mode:
-        try:
-            from whisper_mic import WhisperMic
-            mic = WhisperMic()
-        except ImportError:
-            sys.exit(1)
-
-    if not terminal_prompt:
-        message_dialog(
-            title="Self-Operating Computer",
-            text="An experimental framework to enable multimodal models to operate computers",
-            style=style,
-        ).run()
-
-    if platform.system() == "Windows":
-        os.system("cls")
-    else:
-        print("\033c", end="")
-
-    if terminal_prompt:
-        objective = terminal_prompt
-    elif voice_mode:
-        objective = mic.listen()
-    else:
-        print(
-            f"[{ANSI_GREEN}SOC{ANSI_RESET}|{ANSI_BRIGHT_MAGENTA} {model}{ANSI_RESET}]\n"
-            f"{USER_QUESTION}"
-        )
-        print(f"{ANSI_YELLOW}[User]{ANSI_RESET}")
-        objective = prompt(style=style)
-
-    system_prompt = get_system_prompt(model, objective)
-    messages = [{"role": "system", "content": system_prompt}]
-
-    execution_id = str(uuid.uuid4())
-    journal.open(session_id=execution_id, reason="OBJECTIVE_START")
-
-    # ----------------------------
-    # SNAPSHOT
-    # ----------------------------
-
-    snapshot_provider = SnapshotProvider(
-        observer=observer,
-        screenpipe=screenpipe,
-        os_backend=operating_system,
-    )
-
-    restore_provider = RestoreProvider(os_backend=operating_system)
-    restore_verifier = RestoreVerifier(os_backend=operating_system)
-
-    try:
-        snapshot = snapshot_provider.capture_pre_hijack_snapshot()
-    except Exception as e:
-        journal.record(
-            event="snapshot_failed",
-            execution_id=execution_id,
-            error=str(e),
-        )
-        journal.seal(reason="SNAPSHOT_FAILURE")
-        operating_system.force_release_all()
-        raise
-
-    # ----------------------------
-    # ACTIVATE AUTOMATION
-    # ----------------------------
-
-    operating_system.mark_automation_active()
-    operating_system.heartbeat()
-
+    messages = []
     session_id = None
-    max_iterations = 500
     iteration = 0
 
-    try:
-        while True:
+    while True:
+        os_backend.heartbeat()
 
-            operating_system.heartbeat()  # before LLM
+        iteration += 1
+        if iteration > max_iterations:
+            raise RuntimeError("Iteration budget exceeded")
 
-            iteration += 1
-            if iteration > max_iterations:
-                raise RuntimeError("Iteration budget exceeded")
+        operations, session_id = asyncio.run(
+            get_next_action(model, messages, objective, session_id)
+        )
 
-            operations, session_id = asyncio.run(
-                get_next_action(model, messages, objective, session_id)
-            )
+        os_backend.heartbeat()
 
-            operating_system.heartbeat()  # 🔧 FIX: after LLM
+        stop = _execute_operations(
+            operations=operations,
+            model=model,
+            observer=observer,
+            os_backend=os_backend,
+            accessibility_backend=accessibility_backend,
+            journal=journal,
+            input_arbitrator=input_arbitrator,
+        )
 
-            stop = operate(
-                operations=operations,
-                model=model,
-                execution_id=execution_id,
-            )
-
-            if stop:
-                break
-
-    except ModelNotRecognizedException as e:
-        journal.record(event="fatal_error", detail=str(e))
-
-    except Exception as e:
-        journal.record(event="fatal_error", detail=str(e))
-
-    finally:
-
-        try:
-            operating_system.mark_automation_inactive()
-        except Exception:
-            pass
-
-        if snapshot is not None:
-            try:
-                restore_provider.restore(snapshot)
-                restore_verifier.verify(snapshot)
-                journal.record(
-                    event="restoration_verified",
-                    execution_id=execution_id,
-                )
-            except Exception as e:
-                journal.record(
-                    event="restoration_failed",
-                    execution_id=execution_id,
-                    error=str(e),
-                )
-                journal.seal(reason="RESTORATION_VERIFICATION_FAILED")
-                operating_system.force_release_all()
-                raise
-
-        journal.seal(reason="OBJECTIVE_COMPLETE")
+        if stop:
+            return
 
 
-# ----------------------------
-# EXECUTION LOOP
-# ----------------------------
+# --------------------------------------------------
+# EXECUTION + VERIFICATION
+# --------------------------------------------------
 
-def operate(operations, model, execution_id: str):
-
+def _execute_operations(
+    *,
+    operations,
+    model,
+    observer,
+    os_backend,
+    accessibility_backend,
+    journal,
+    input_arbitrator,
+):
     if not operations:
-        journal.record(event="no_operations", execution_id=execution_id)
+        journal.record(event="no_operations")
         return True
 
+    # Snapshot perception BEFORE actions
+    pre_state = observer.get_state()
     frozen_nodes = accessibility_backend.get_nodes()
 
     for operation in operations:
-
-        time.sleep(1)
-
-        try:
-            operating_system.heartbeat()
-        except Exception:
-            pass
+        time.sleep(0.5)
+        os_backend.heartbeat()
 
         op_type = operation.get("operation", "").lower()
         thought = operation.get("thought")
-        detail = ""
-
-        if op_type in ("press", "hotkey") and not operation.get("keys"):
-            raise ValueError("Missing keys")
-
-        if op_type == "write" and operation.get("content") is None:
-            raise ValueError("Missing content")
-
-        if op_type == "click" and (
-            operation.get("x") is None or operation.get("y") is None
-        ):
-            raise ValueError("Missing coordinates")
+        detail = None
 
         journal.record(
             event="operation_start",
-            execution_id=execution_id,
             operation=op_type,
             thought=thought,
         )
@@ -265,83 +112,77 @@ def operate(operations, model, execution_id: str):
         )
 
         if decision in (AuthorityDecision.YIELD, AuthorityDecision.ABORT):
-            journal.record(
-                event=f"authority_{decision.name.lower()}",
-                execution_id=execution_id,
-            )
+            journal.record(event=f"authority_{decision.name.lower()}")
             return True
 
         try:
             input_arbitrator.soc_action_started()
 
-            try:
-                with action_timeout(5):
-                    if op_type in ("press", "hotkey"):
-                        detail = operation.get("keys")
-                        operating_system.press(detail)
+            with action_timeout(5):
+                if op_type in ("press", "hotkey"):
+                    detail = operation.get("keys")
+                    os_backend.press(detail)
 
-                    elif op_type == "write":
-                        detail = operation.get("content")
-                        operating_system.write(detail)
+                elif op_type == "write":
+                    detail = operation.get("content")
+                    os_backend.write(detail)
 
-                    elif op_type == "click":
-                        detail = {
-                            "x": operation.get("x"),
-                            "y": operation.get("y"),
-                        }
-                        operating_system.mouse(detail)
+                elif op_type == "click":
+                    detail = {
+                        "x": operation.get("x"),
+                        "y": operation.get("y"),
+                    }
+                    os_backend.mouse(detail)
 
-                    elif op_type == "done":
-                        journal.record(
-                            event="objective_complete",
-                            execution_id=execution_id,
-                            summary=operation.get("summary"),
-                        )
-                        return True
+                elif op_type == "done":
+                    journal.record(
+                        event="objective_complete",
+                        summary=operation.get("summary"),
+                    )
+                    return True
 
-                    else:
-                        journal.record(
-                            event="unknown_operation",
-                            execution_id=execution_id,
-                            detail=operation,
-                        )
-                        return True
+                else:
+                    journal.record(
+                        event="unknown_operation",
+                        detail=operation,
+                    )
+                    return True
 
-            except ActionTimeout:
-                log_warn(f"[SOC] Action timeout: {operation}")
-                journal.record(
-                    event="action_timeout",
-                    execution_id=execution_id,
-                    operation=op_type,
-                )
-                return True
+        except ActionTimeout:
+            log_warn(f"[SOC] Action timeout: {operation}")
+            journal.record(event="action_timeout", operation=op_type)
+            return True
 
         except Exception as e:
             journal.record(
                 event="operation_abort",
-                execution_id=execution_id,
                 operation=op_type,
                 error=str(e),
             )
             return True
 
-        # 🔧 FIX: heartbeat after OS action
-        try:
-            operating_system.heartbeat()
-        except Exception:
-            pass
+        os_backend.heartbeat()
+
+        # ----------------------------
+        # VERIFICATION (CRITICAL)
+        # ----------------------------
+
+        post_state = observer.get_state()
+
+        if pre_state == post_state:
+            journal.record(
+                event="verification_failed",
+                operation=op_type,
+                detail="no observable state change",
+            )
+            return True
 
         journal.record(
             event="operation_complete",
-            execution_id=execution_id,
             operation=op_type,
             detail=detail,
         )
 
-        print(
-            f"[{ANSI_GREEN}SOC{ANSI_RESET}|{ANSI_BRIGHT_MAGENTA} {model}{ANSI_RESET}]"
-        )
-        print(thought)
-        print(f"{ANSI_BLUE}Action:{ANSI_RESET} {op_type} {detail}\n")
+        pre_state = post_state
 
     return False
