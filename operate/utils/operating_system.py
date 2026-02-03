@@ -3,9 +3,7 @@ import platform
 import time
 import math
 import threading
-import atexit
 import os
-import signal
 
 from operate.utils.misc import convert_percent_to_decimal
 
@@ -22,30 +20,32 @@ class OperatingSystem:
     - Fail-open human reclaim
     - Crash-safe input release
     - Heartbeat watchdog (non-terminating)
+
+    NOTE:
+    - NO global singleton
+    - NO signal handlers
+    - NO atexit hooks
     """
 
     # -------------------------------------------------
     # INTERNAL AUTHORITY STATE
     # -------------------------------------------------
 
-    _execution_mode_lock = threading.Lock()
-    _execution_mode = "OBSERVER"  # default-safe
+    def __init__(self):
+        self._execution_mode_lock = threading.Lock()
+        self._execution_mode = "OBSERVER"
 
-    # -------------------------------------------------
-    # AUTOMATION STATE
-    # -------------------------------------------------
+        self._automation_active = False
+        self._automation_lock = threading.Lock()
 
-    _automation_active = False
-    _automation_lock = threading.Lock()
+        self._last_heartbeat = None
+        self._heartbeat_lock = threading.Lock()
 
-    _last_heartbeat = None
-    _heartbeat_lock = threading.Lock()
+        self._WATCHDOG_INTERVAL = 0.5
+        self._HEARTBEAT_TIMEOUT = 2.0
 
-    _WATCHDOG_INTERVAL = 0.5
-    _HEARTBEAT_TIMEOUT = 2.0
-
-    _watchdog_thread_started = False
-    _watchdog_lock = threading.Lock()
+        self._watchdog_thread_started = False
+        self._watchdog_lock = threading.Lock()
 
     # -------------------------------------------------
     # WRITE / PRESS / CLICK
@@ -153,7 +153,7 @@ class OperatingSystem:
         self._touch_heartbeat()
 
     # -------------------------------------------------
-    # WATCHDOG THREAD (FIXED)
+    # WATCHDOG THREAD
     # -------------------------------------------------
 
     def _ensure_watchdog(self):
@@ -168,22 +168,17 @@ class OperatingSystem:
         while True:
             time.sleep(self._WATCHDOG_INTERVAL)
 
-            timed_out = False
-
             with self._heartbeat_lock, self._automation_lock:
-                if not self._automation_active:
+                if not self._automation_active or self._last_heartbeat is None:
                     continue
 
-                if self._last_heartbeat is None:
-                    continue
-
-                elapsed = time.time() - self._last_heartbeat
-                if elapsed > self._HEARTBEAT_TIMEOUT:
+                if time.time() - self._last_heartbeat > self._HEARTBEAT_TIMEOUT:
                     self._automation_active = False
                     timed_out = True
+                else:
+                    timed_out = False
 
             if timed_out:
-                print("[OperatingSystem] Heartbeat lost — forcing release")
                 self.force_release_all()
 
     # -------------------------------------------------
@@ -191,10 +186,6 @@ class OperatingSystem:
     # -------------------------------------------------
 
     def force_release_all(self):
-        """
-        Absolute safety valve.
-        Never raises. Always yields control to human.
-        """
         try:
             self.stop_automated_input()
             self.enable_user_input()
@@ -203,33 +194,17 @@ class OperatingSystem:
             pass
 
     def stop_automated_input(self) -> None:
-        """
-        Release *all* possible keys and mouse buttons.
-        Safe to call repeatedly.
-        """
         try:
-            modifier_keys = [
-                "shift", "ctrl", "alt", "win", "command",
-                "esc", "capslock"
-            ]
+            keys = (
+                ["shift", "ctrl", "alt", "win", "command", "esc", "capslock"]
+                + ["tab", "enter", "space", "backspace", "delete",
+                   "up", "down", "left", "right",
+                   "home", "end", "pageup", "pagedown", "insert"]
+                + [f"f{i}" for i in range(1, 25)]
+                + list("abcdefghijklmnopqrstuvwxyz0123456789")
+            )
 
-            navigation_keys = [
-                "tab", "enter", "space", "backspace", "delete",
-                "up", "down", "left", "right",
-                "home", "end", "pageup", "pagedown", "insert"
-            ]
-
-            function_keys = [f"f{i}" for i in range(1, 25)]
-            letters = list("abcdefghijklmnopqrstuvwxyz")
-            numbers = list("0123456789")
-
-            for key in (
-                modifier_keys
-                + navigation_keys
-                + function_keys
-                + letters
-                + numbers
-            ):
+            for key in keys:
                 try:
                     pyautogui.keyUp(key)
                 except Exception:
@@ -240,31 +215,21 @@ class OperatingSystem:
                     pyautogui.mouseUp(button=btn)
                 except Exception:
                     pass
-
         except Exception:
             pass
 
     def enable_user_input(self) -> None:
-        try:
-            self.stop_automated_input()
-        except Exception:
-            pass
+        self.stop_automated_input()
 
     # -------------------------------------------------
     # CURSOR
     # -------------------------------------------------
 
     def get_cursor_position(self):
-        try:
-            return pyautogui.position()
-        except Exception as e:
-            raise RuntimeError(e)
+        return pyautogui.position()
 
     def set_cursor_position(self, x: int, y: int) -> None:
-        try:
-            pyautogui.moveTo(int(x), int(y), duration=0)
-        except Exception as e:
-            raise RuntimeError(e)
+        pyautogui.moveTo(int(x), int(y), duration=0)
 
     # -------------------------------------------------
     # WINDOW / APPLICATION (STUB-SAFE)
@@ -284,23 +249,3 @@ class OperatingSystem:
 
     def activate_application(self, process_name: str, pid=None) -> bool:
         return False
-
-
-# -------------------------------------------------
-# PROCESS-LEVEL FAIL-OPEN
-# -------------------------------------------------
-
-_OS_SINGLETON = OperatingSystem()
-
-
-def _emergency_exit_handler(*args):
-    try:
-        _OS_SINGLETON.force_release_all()
-    finally:
-        os._exit(1)
-
-
-atexit.register(_OS_SINGLETON.force_release_all)
-
-for sig in (signal.SIGINT, signal.SIGTERM):
-    signal.signal(sig, _emergency_exit_handler)
