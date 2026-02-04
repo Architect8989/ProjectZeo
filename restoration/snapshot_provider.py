@@ -11,9 +11,9 @@ from restoration.snapshot_types import (
     RestorationSnapshot,
 )
 
-# Existing system components (authoritative)
 from observer.screenpipe_adapter import ScreenpipeAdapter
 from observer.observer_core import ObserverCore
+from core.mode_controller import ModeController, SystemMode
 
 
 class SnapshotProviderError(RuntimeError):
@@ -24,14 +24,16 @@ class SnapshotProvider:
     """
     Concrete snapshot provider.
 
-    This is NOT optional.
-    If this fails, SOC must never run.
+    HARD CONTRACT:
+    - Snapshot MUST be taken in OBSERVER mode
+    - Vision MUST be live
+    - Any failure aborts SOC execution
     """
 
     SNAPSHOT_SCHEMA_VERSION = "1.1"
 
     # -------------------------------------------------
-    # SNAPSHOT REGISTRY (AUTHORITATIVE, THREAD-SAFE)
+    # SNAPSHOT REGISTRY (PROCESS-LOCAL, THREAD-SAFE)
     # -------------------------------------------------
 
     _snapshots: Dict[str, RestorationSnapshot] = {}
@@ -59,21 +61,18 @@ class SnapshotProvider:
         observer: Optional[ObserverCore],
         screenpipe: Optional[ScreenpipeAdapter],
         os_backend,
+        mode_controller: ModeController,
     ):
-        # Allow late wiring (Tier-1 requirement)
         self._observer = observer
         self._screenpipe = screenpipe
         self._os = os_backend
+        self._mode = mode_controller
 
     # -------------------------------------------------
-    # TIER-1 PUBLIC API (REQUIRED)
+    # PUBLIC API
     # -------------------------------------------------
 
     def take_snapshot(self) -> str:
-        """
-        Public entrypoint expected by main/kernel.
-        Returns snapshot_id.
-        """
         snapshot = self.capture_pre_hijack_snapshot()
         return self.store_snapshot(snapshot)
 
@@ -85,34 +84,39 @@ class SnapshotProvider:
         """
         Capture and validate pre-hijack snapshot.
 
-        Hard gate.
-        Any exception aborts execution.
+        Any exception here MUST abort SOC execution.
         """
 
+        # ---- wiring validation ----
         if self._observer is None or self._screenpipe is None:
             raise SnapshotProviderError(
                 "SnapshotProvider not fully wired (observer/screenpipe missing)"
             )
 
-        # 1. Enforce execution mode
-        execution_mode = self._os.get_execution_mode()
-        if execution_mode != "OBSERVER":
+        # -------------------------------------------------
+        # 1. AUTHORITY CHECK (SINGLE SOURCE OF TRUTH)
+        # -------------------------------------------------
+        if self._mode.mode != SystemMode.OBSERVER:
             raise SnapshotProviderError(
-                f"Snapshot capture attempted in mode '{execution_mode}'. "
+                f"Snapshot capture attempted in mode '{self._mode.mode.value}'. "
                 "Snapshots MUST be captured in OBSERVER mode."
             )
 
-        # 2. Enforce live vision (pre-check blindness)
+        # -------------------------------------------------
+        # 2. VISION AVAILABILITY CHECK
+        # -------------------------------------------------
         if getattr(self._screenpipe, "blind", False):
             raise SnapshotProviderError("Screenpipe is blind")
 
         screen_state = self._screenpipe.read()
         if not screen_state.get("available") or screen_state.get("blind"):
             raise SnapshotProviderError(
-                "Screenpipe vision unavailable or blind during snapshot capture"
+                "Screenpipe vision unavailable during snapshot capture"
             )
 
-        # 3. Pull OS-authoritative state
+        # -------------------------------------------------
+        # 3. OS STATE (READ-ONLY)
+        # -------------------------------------------------
         try:
             cursor_x, cursor_y = self._os.get_cursor_position()
             focused_window = self._os.get_focused_window()
@@ -122,7 +126,9 @@ class SnapshotProvider:
                 f"Failed to retrieve OS state: {e}"
             ) from e
 
-        # 4. Build state objects (VALIDATED)
+        # -------------------------------------------------
+        # 4. VALIDATE CORE STATE
+        # -------------------------------------------------
         try:
             x = int(cursor_x)
             y = int(cursor_y)
@@ -145,9 +151,8 @@ class SnapshotProvider:
         )
 
         # -------------------------------------------------
-        # EXTENDED SNAPSHOT DATA (BEST EFFORT)
+        # 5. EXTENDED STATE (BEST EFFORT)
         # -------------------------------------------------
-
         window_geometry: Optional[Dict[str, int]] = None
         window_z_order: Optional[int] = None
         browser_state: Optional[Dict[str, Any]] = None
@@ -188,7 +193,9 @@ class SnapshotProvider:
         except Exception:
             pass
 
-        # 5. Bind metadata
+        # -------------------------------------------------
+        # 6. METADATA BINDING
+        # -------------------------------------------------
         metadata: Dict[str, Any] = {
             "schema_version": self.SNAPSHOT_SCHEMA_VERSION,
             "screenpipe": {
@@ -203,12 +210,14 @@ class SnapshotProvider:
             "os_signature": os_signature,
         }
 
-        # 6. Create immutable snapshot
+        # -------------------------------------------------
+        # 7. IMMUTABLE SNAPSHOT CREATION
+        # -------------------------------------------------
         snapshot = RestorationSnapshot.create(
             cursor=cursor_state,
             focus=focus_state,
             application=application_state,
-            execution_mode=execution_mode,
+            execution_mode=self._mode.mode.value,
             metadata=metadata,
         )
 
