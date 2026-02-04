@@ -5,6 +5,7 @@ import threading
 from typing import Optional
 
 from restoration.snapshot_types import RestorationSnapshot
+from core.mode_controller import ModeController, SystemMode
 
 
 class RestorationError(RuntimeError):
@@ -24,10 +25,12 @@ class RestoreProvider:
 
     CURSOR_TOLERANCE_PX = 2  # high-DPI / compositor jitter tolerance
 
-    def __init__(self, *, os_backend):
+    def __init__(self, *, os_backend, mode_controller: ModeController):
         self._os = os_backend
+        self._mode = mode_controller
+
         self._completed_snapshot_id: Optional[str] = None
-        self._lock = threading.Lock()  # 🔒 CRITICAL FIX
+        self._lock = threading.Lock()  # 🔒 idempotency + concurrency guard
 
     # -------------------------------------------------
     # Public API
@@ -58,27 +61,23 @@ class RestoreProvider:
         snapshot_id = snapshot.snapshot_id
 
         # -------------------------------------------------
-        # PHASE -1 — ATOMIC IDEMPOTENCY GATE
+        # PHASE -1 — IDEMPOTENCY GATE
         # -------------------------------------------------
         with self._lock:
             if self._completed_snapshot_id == snapshot_id:
                 return
-            # Mark intent (do NOT mark completed yet)
-            in_progress_id = snapshot_id
 
         # -------------------------------------------------
-        # PHASE 0 — HARD SAFETY
+        # PHASE 0 — HARD SAFETY (OS ONLY)
         # -------------------------------------------------
 
         try:
-            if hasattr(self._os, "mark_automation_inactive"):
-                self._os.mark_automation_inactive()
+            self._os.mark_automation_inactive()
         except Exception:
             pass
 
         try:
-            if hasattr(self._os, "force_release_all"):
-                self._os.force_release_all()
+            self._os.force_release_all()
         except Exception:
             pass
 
@@ -99,7 +98,9 @@ class RestoreProvider:
         # -------------------------------------------------
 
         try:
-            if meta.get("window_geometry") and hasattr(self._os, "set_window_geometry"):
+            if meta.get("window_geometry") and hasattr(
+                self._os, "set_window_geometry"
+            ):
                 self._os.set_window_geometry(
                     snapshot.focus.window_id,
                     meta["window_geometry"],
@@ -158,23 +159,27 @@ class RestoreProvider:
 
         if not focused:
             try:
-                if hasattr(self._os, "activate_application"):
-                    self._os.activate_application(
-                        snapshot.application.process_name,
-                        snapshot.application.pid,
-                    )
+                self._os.activate_application(
+                    snapshot.application.process_name,
+                    snapshot.application.pid,
+                )
             except Exception:
                 pass
 
         # -------------------------------------------------
-        # PHASE 3 — MODE RESET (MANDATORY)
+        # PHASE 3 — AUTHORITY RESET (MANDATORY)
         # -------------------------------------------------
+        # 🔑 SINGLE SOURCE OF TRUTH
+        # NO os.set_execution_mode() ALLOWED
 
         try:
-            self._os.set_execution_mode("OBSERVER")
+            if self._mode.mode != SystemMode.OBSERVER:
+                self._mode.complete_execution(
+                    reason="restoration complete"
+                )
         except Exception as e:
             raise RestorationError(
-                f"Failed to reset execution mode: {e}"
+                f"ModeController reset failed: {e}"
             ) from e
 
         # -------------------------------------------------
@@ -201,12 +206,13 @@ class RestoreProvider:
 
         time.sleep(0.05)
 
-        mode = self._os.get_execution_mode()
-        if mode != "OBSERVER":
+        # ---- MODE VERIFICATION (AUTHORITATIVE) ----
+        if self._mode.mode != SystemMode.OBSERVER:
             raise RestorationError(
-                f"Post-restore execution mode invalid: {mode}"
+                f"Post-restore mode invalid: {self._mode.mode}"
             )
 
+        # ---- CURSOR VERIFICATION ----
         try:
             x, y = self._os.get_cursor_position()
         except Exception as e:
@@ -219,13 +225,13 @@ class RestoreProvider:
             or abs(y - snapshot.cursor.y) > self.CURSOR_TOLERANCE_PX
         ):
             raise RestorationError(
-                "Cursor position verification failed (outside tolerance)"
+                "Cursor position verification failed"
             )
 
+        # ---- WINDOW VERIFICATION (BEST EFFORT) ----
         try:
-            if hasattr(self._os, "get_focused_window"):
-                fw = self._os.get_focused_window()
-                if fw and str(fw.get("id")) != snapshot.focus.window_id:
-                    pass  # non-fatal on stub backends
+            fw = self._os.get_focused_window()
+            if fw and str(fw.get("id")) != snapshot.focus.window_id:
+                pass  # non-fatal on stub backends
         except Exception:
             pass
