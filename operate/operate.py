@@ -18,7 +18,7 @@ def execute_soc(
     model,
     objective,
     observer,
-    screenpipe,
+    screenpipe,               # injected, read-only, NOT controlled here
     os_backend,
     accessibility_backend,
     journal,
@@ -28,45 +28,69 @@ def execute_soc(
     """
     SOC executor.
 
-    Responsibilities:
-    - plan
-    - act
-    - verify
-    - yield control
+    HARD CONTRACT:
+    - NO mode transitions
+    - NO snapshot capture
+    - NO restoration
+    - NO lifecycle control
+    - NO authority ownership
 
-    NO authority ownership.
-    NO lifecycle control.
+    Responsibilities:
+    - Planning via LLM
+    - Deterministic execution
+    - Post-action verification
     """
 
     messages = []
     session_id = None
     iteration = 0
 
-    while True:
-        os_backend.heartbeat()
+    try:
+        while True:
+            # Heartbeat before any external call
+            os_backend.heartbeat()
 
-        iteration += 1
-        if iteration > max_iterations:
-            raise RuntimeError("Iteration budget exceeded")
+            iteration += 1
+            if iteration > max_iterations:
+                raise RuntimeError("Iteration budget exceeded")
 
-        operations, session_id = asyncio.run(
-            get_next_action(model, messages, objective, session_id)
-        )
+            # ----------------------------
+            # PLANNING (LLM ONLY)
+            # ----------------------------
+            operations, session_id = asyncio.run(
+                get_next_action(
+                    model,
+                    messages,
+                    objective,
+                    session_id,
+                )
+            )
 
-        os_backend.heartbeat()
+            # Heartbeat after LLM
+            os_backend.heartbeat()
 
-        stop = _execute_operations(
-            operations=operations,
-            model=model,
-            observer=observer,
-            os_backend=os_backend,
-            accessibility_backend=accessibility_backend,
-            journal=journal,
-            input_arbitrator=input_arbitrator,
-        )
+            # ----------------------------
+            # EXECUTION
+            # ----------------------------
+            stop = _execute_operations(
+                operations=operations,
+                observer=observer,
+                os_backend=os_backend,
+                accessibility_backend=accessibility_backend,
+                journal=journal,
+                input_arbitrator=input_arbitrator,
+            )
 
-        if stop:
-            return
+            if stop:
+                return
+
+    except ModelNotRecognizedException as e:
+        journal.record(event="fatal_error", error=str(e))
+        raise
+
+    except Exception as e:
+        journal.record(event="fatal_error", error=str(e))
+        raise
 
 
 # --------------------------------------------------
@@ -76,7 +100,6 @@ def execute_soc(
 def _execute_operations(
     *,
     operations,
-    model,
     observer,
     os_backend,
     accessibility_backend,
@@ -87,8 +110,10 @@ def _execute_operations(
         journal.record(event="no_operations")
         return True
 
-    # Snapshot perception BEFORE actions
+    # Snapshot observer state BEFORE execution batch
     pre_state = observer.get_state()
+
+    # Freeze accessibility perception for determinism
     frozen_nodes = accessibility_backend.get_nodes()
 
     for operation in operations:
@@ -105,14 +130,22 @@ def _execute_operations(
             thought=thought,
         )
 
+        # ----------------------------
+        # HUMAN AUTHORITY ARBITRATION
+        # ----------------------------
         decision = input_arbitrator.evaluate(
             input_event_ts=time.monotonic(),
             high_risk=False,
             soc_confident=True,
         )
 
-        if decision in (AuthorityDecision.YIELD, AuthorityDecision.ABORT):
-            journal.record(event=f"authority_{decision.name.lower()}")
+        if decision in (
+            AuthorityDecision.YIELD,
+            AuthorityDecision.ABORT,
+        ):
+            journal.record(
+                event=f"authority_{decision.name.lower()}"
+            )
             return True
 
         try:
@@ -150,7 +183,10 @@ def _execute_operations(
 
         except ActionTimeout:
             log_warn(f"[SOC] Action timeout: {operation}")
-            journal.record(event="action_timeout", operation=op_type)
+            journal.record(
+                event="action_timeout",
+                operation=op_type,
+            )
             return True
 
         except Exception as e:
@@ -164,7 +200,7 @@ def _execute_operations(
         os_backend.heartbeat()
 
         # ----------------------------
-        # VERIFICATION (CRITICAL)
+        # VERIFICATION (MANDATORY)
         # ----------------------------
 
         post_state = observer.get_state()
