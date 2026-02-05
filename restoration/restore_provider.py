@@ -18,6 +18,7 @@ class RestoreProvider:
 
     Guarantees:
     - Idempotent per snapshot
+    - Concurrency-safe (single global lock)
     - Fail-closed (never lies about success)
     - Single authority for mode reset
     """
@@ -65,7 +66,7 @@ class RestoreProvider:
                 self._os.stop_automated_input()
                 self._os.enable_user_input()
             except Exception:
-                # safety best-effort, never fatal
+                # Safety is best-effort, never fatal
                 pass
 
             meta = snapshot.metadata or {}
@@ -173,7 +174,7 @@ class RestoreProvider:
     # -------------------------------------------------
 
     def _verify(self, snapshot: RestorationSnapshot) -> None:
-        # settle time for compositor / input stack
+        # Allow compositor / input stack to settle
         time.sleep(0.05)
 
         if self._mode.mode != SystemMode.OBSERVER:
@@ -194,4 +195,4 @@ class RestoreProvider:
         ):
             raise RestorationError(
                 "Cursor position mismatch after restore"
-    )
+                )
