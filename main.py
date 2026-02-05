@@ -19,6 +19,8 @@ from operate.operate import operate_main
 from restoration.snapshot_provider import SnapshotProvider
 from restoration.restore_provider import RestoreProvider
 
+from core.planner.execution_planner import ExecutionPlanner
+
 HEARTBEAT_INTERVAL = 2.0
 
 # ==================================================
@@ -36,7 +38,7 @@ mode = ModeController()
 
 SNAPSHOT_PROVIDER = SnapshotProvider(
     observer=observer,
-    screenpipe=None,  # assigned after adapter init
+    screenpipe=None,
     os_backend=OS_BACKEND,
     mode_controller=mode,
 )
@@ -81,7 +83,7 @@ signal.signal(signal.SIGQUIT, _signal_handler)
 def main():
     print("[BOOT] System starting")
 
-    # ---- environment probe (non-fatal, informational) ----
+    # ---- environment probe (non-fatal) ----
     collect_environment_fingerprint()
 
     # ---- crash recovery gate ----
@@ -104,7 +106,7 @@ def main():
     while True:
         try:
             # ==================================================
-            # OBSERVER LOOP (NO ACTIONS)
+            # OBSERVER LOOP
             # ==================================================
             screen_state = screenpipe.read()
             ui_snapshot = perception.process(screen_state)
@@ -120,27 +122,21 @@ def main():
             # EXECUTION TRIGGER
             # ==================================================
             if mode.is_armed():
-                # ---- RULE: SNAPSHOT MUST OCCUR IN OBSERVER ----
+                # ---- SNAPSHOT (OBSERVER ONLY) ----
                 snapshot_id = SNAPSHOT_PROVIDER.take_snapshot()
 
                 intent = mode.consume_intent()
 
-                # ---- PLANNING PHASE (REAL OR FAIL) ----
+                # ---- PLANNING ----
                 mode.begin_planning()
 
-                execution_plan = None  # INTENTIONALLY EMPTY
+                planner = ExecutionPlanner(
+                    llm_call=lambda prompt: prompt  # placeholder; replace with real LLM call
+                )
 
-                if execution_plan is None:
-                    raise RuntimeError(
-                        "Planning phase produced no ExecutionPlan. "
-                        "Execution is forbidden."
-                    )
+                execution_plan = planner.create_plan(intent)
 
                 mode.mark_planning_complete()
-
-                # ---- EXECUTION GATE ----
-                assert mode.planning_completed
-                assert execution_plan is not None
 
                 AUTH_STATE.persist(
                     execution_mode="EXECUTING",
@@ -154,7 +150,7 @@ def main():
                     mode.execute()
 
                     operate_main(
-                        model=None,  # executor will be rewritten later
+                        model=None,
                         terminal_prompt=intent,
                         execution_plan=execution_plan,
                         observer=observer,
@@ -162,7 +158,7 @@ def main():
                     )
 
                 finally:
-                    # ---- RESTORATION (FAIL-CLOSED) ----
+                    # ---- RESTORE (FAIL-CLOSED) ----
                     try:
                         RESTORE_PROVIDER.restore_snapshot(snapshot_id)
                     except Exception:
