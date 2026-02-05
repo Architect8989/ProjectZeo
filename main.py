@@ -19,7 +19,6 @@ from operate.main import main_entry as soc_execute_main
 from restoration.snapshot_provider import SnapshotProvider
 from restoration.restore_provider import RestoreProvider
 
-
 HEARTBEAT_INTERVAL = 2.0
 
 # --------------------------------------------------
@@ -35,15 +34,22 @@ observer = ObserverCore()
 screenpipe = ScreenpipeAdapter()
 perception = PerceptionEngine()
 
+mode = ModeController()
+
 SNAPSHOT_PROVIDER = SnapshotProvider(
     observer=observer,
     screenpipe=screenpipe,
     os_backend=OS_BACKEND,
+    mode_controller=mode,
 )
-RESTORE_PROVIDER = RestoreProvider(os_backend=OS_BACKEND)
+
+RESTORE_PROVIDER = RestoreProvider(
+    os_backend=OS_BACKEND,
+    mode_controller=mode,
+)
 
 # --------------------------------------------------
-# SAFE SHUTDOWN (NON-SIGNAL)
+# SAFE SHUTDOWN
 # --------------------------------------------------
 
 def _force_safe_shutdown(reason: str):
@@ -59,18 +65,9 @@ def _force_safe_shutdown(reason: str):
 
     print(f"[SAFE-SHUTDOWN] {reason}", file=sys.stderr)
 
-
-# --------------------------------------------------
-# SIGNAL HANDLER (LOCK-FREE)
-# --------------------------------------------------
-
 def _signal_handler(signum, frame):
-    try:
-        OS_BACKEND.force_release_all()
-    except Exception:
-        pass
+    _force_safe_shutdown(f"signal-{signum}")
     os._exit(1)
-
 
 atexit.register(_force_safe_shutdown, "atexit")
 signal.signal(signal.SIGINT, _signal_handler)
@@ -84,30 +81,19 @@ signal.signal(signal.SIGQUIT, _signal_handler)
 def main():
     print("[BOOT] System starting")
 
-    env_fingerprint = collect_environment_fingerprint()
-    print("[ENV] Fingerprint collected")
+    collect_environment_fingerprint()
 
     persisted = AUTH_STATE.load()
 
     if persisted.get("dirty") or persisted.get("restore_required"):
-        print("[RECOVERY] Unsafe prior shutdown detected")
         OS_BACKEND.force_release_all()
         AUTH_STATE.force_safe_state()
-
-    mode = ModeController()
-
-    if persisted.get("dirty"):
-        try:
-            mode.force_observer()
-        except Exception:
-            pass
+        mode.force_observer()
 
     intent_listener = IntentListener(mode)
     intent_listener.start()
 
-    print(f"[STATE] Mode = {mode.mode.value}")
-    print("[OBSERVER] Watching screen (read-only)")
-    print("[INTENT] Type intent and press Enter")
+    print("[OBSERVER] Active")
 
     while True:
         try:
@@ -121,17 +107,15 @@ def main():
             mode.update_vision_status(screen_state.get("available", False))
             mode.update_observer_health(observer.is_healthy())
 
-            print(f"[HEARTBEAT] mode={mode.mode.value} ticks={observer_state['tick_count']}")
-
             if mode.is_armed():
-                try:
-                    mode.execute("root-main-execution")
-                    current_intent = mode.consume_intent()
-                except ModeTransitionError:
-                    mode.force_observer()
-                    continue
-
+                # ---- SNAPSHOT FIRST (OBSERVER MODE) ----
                 snapshot_id = SNAPSHOT_PROVIDER.take_snapshot()
+
+                # ---- LIFECYCLE: ARMED → PLANNING → EXECUTING ----
+                mode.begin_planning()
+                mode.execute()
+
+                intent = mode.consume_intent()
 
                 AUTH_STATE.persist(
                     execution_mode="EXECUTING",
@@ -142,16 +126,18 @@ def main():
                 )
 
                 try:
+                    # NOTE: this will still fail downstream until operate/main.py is fixed
                     soc_execute_main(
-                        model=None,
-                        terminal_prompt=current_intent,
-                        voice_mode=False,
-                        verbose_mode=False,
                         observer=observer,
                         screenpipe=screenpipe,
+                        objective=intent,
                     )
 
-                    RESTORE_PROVIDER.restore_snapshot(snapshot_id)
+                finally:
+                    try:
+                        RESTORE_PROVIDER.restore_snapshot(snapshot_id)
+                    except Exception:
+                        pass
 
                     AUTH_STATE.persist(
                         execution_mode="OBSERVER",
@@ -161,19 +147,7 @@ def main():
                         dirty=False,
                     )
 
-                except Exception:
-                    AUTH_STATE.force_safe_state()
-                    OS_BACKEND.force_release_all()
-                    try:
-                        RESTORE_PROVIDER.restore_snapshot(snapshot_id)
-                    except Exception:
-                        pass
-
-                finally:
-                    try:
-                        mode.force_observer()
-                    except Exception:
-                        pass
+                    mode.force_observer()
 
         except ObserverBlindnessError:
             _force_safe_shutdown("observer-blindness")
@@ -184,7 +158,6 @@ def main():
             os._exit(1)
 
         time.sleep(HEARTBEAT_INTERVAL)
-
 
 if __name__ == "__main__":
     main()
