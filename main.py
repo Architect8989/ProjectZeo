@@ -4,7 +4,7 @@ import signal
 import atexit
 import sys
 
-from core.mode_controller import ModeController, ModeTransitionError
+from core.mode_controller import ModeController
 from core.intent_listener import IntentListener
 from core.environment_fingerprint import collect_environment_fingerprint
 
@@ -14,16 +14,16 @@ from observer.perception_engine import PerceptionEngine
 
 from state.serializer import AuthorityStateSerializer
 from operate.utils.operating_system import OperatingSystem
-from operate.main import main_entry as soc_execute_main
+from operate.operate import operate_main
 
 from restoration.snapshot_provider import SnapshotProvider
 from restoration.restore_provider import RestoreProvider
 
 HEARTBEAT_INTERVAL = 2.0
 
-# --------------------------------------------------
-# PROCESS AUTHORITY
-# --------------------------------------------------
+# ==================================================
+# PROCESS AUTHORITY (SINGLETONS)
+# ==================================================
 
 OS_BACKEND = OperatingSystem()
 
@@ -48,9 +48,9 @@ RESTORE_PROVIDER = RestoreProvider(
     mode_controller=mode,
 )
 
-# --------------------------------------------------
-# SAFE SHUTDOWN
-# --------------------------------------------------
+# ==================================================
+# SAFE SHUTDOWN (FAIL-OPEN)
+# ==================================================
 
 def _force_safe_shutdown(reason: str):
     try:
@@ -65,31 +65,35 @@ def _force_safe_shutdown(reason: str):
 
     print(f"[SAFE-SHUTDOWN] {reason}", file=sys.stderr)
 
+
 def _signal_handler(signum, frame):
     _force_safe_shutdown(f"signal-{signum}")
     os._exit(1)
+
 
 atexit.register(_force_safe_shutdown, "atexit")
 signal.signal(signal.SIGINT, _signal_handler)
 signal.signal(signal.SIGTERM, _signal_handler)
 signal.signal(signal.SIGQUIT, _signal_handler)
 
-# --------------------------------------------------
-# ROOT MAIN
-# --------------------------------------------------
+# ==================================================
+# ROOT MAIN (LIFECYCLE AUTHORITY)
+# ==================================================
 
 def main():
     print("[BOOT] System starting")
 
+    # ---- environment probe (non-fatal) ----
     collect_environment_fingerprint()
 
+    # ---- crash recovery gate ----
     persisted = AUTH_STATE.load()
-
     if persisted.get("dirty") or persisted.get("restore_required"):
         OS_BACKEND.force_release_all()
         AUTH_STATE.force_safe_state()
         mode.force_observer()
 
+    # ---- intent listener ----
     intent_listener = IntentListener(mode)
     intent_listener.start()
 
@@ -97,21 +101,27 @@ def main():
 
     while True:
         try:
+            # ----------------------------
+            # OBSERVER LOOP
+            # ----------------------------
             screen_state = screenpipe.read()
             ui_snapshot = perception.process(screen_state)
 
             observer.attach_screen_state(screen_state)
             observer.attach_ui_snapshot(ui_snapshot)
-            observer_state = observer.tick()
+            observer.tick()
 
             mode.update_vision_status(screen_state.get("available", False))
             mode.update_observer_health(observer.is_healthy())
 
+            # ----------------------------
+            # EXECUTION TRIGGER
+            # ----------------------------
             if mode.is_armed():
-                # ---- SNAPSHOT FIRST (OBSERVER MODE) ----
+                # ---- HARD RULE: SNAPSHOT IN OBSERVER ONLY ----
                 snapshot_id = SNAPSHOT_PROVIDER.take_snapshot()
 
-                # ---- LIFECYCLE: ARMED → PLANNING → EXECUTING ----
+                # ---- LIFECYCLE ----
                 mode.begin_planning()
                 mode.execute()
 
@@ -126,14 +136,15 @@ def main():
                 )
 
                 try:
-                    # NOTE: this will still fail downstream until operate/main.py is fixed
-                    soc_execute_main(
+                    operate_main(
+                        model=None,
+                        terminal_prompt=intent,
                         observer=observer,
                         screenpipe=screenpipe,
-                        objective=intent,
                     )
 
                 finally:
+                    # ---- RESTORE (FAIL-CLOSED) ----
                     try:
                         RESTORE_PROVIDER.restore_snapshot(snapshot_id)
                     except Exception:
@@ -158,6 +169,7 @@ def main():
             os._exit(1)
 
         time.sleep(HEARTBEAT_INTERVAL)
+
 
 if __name__ == "__main__":
     main()
