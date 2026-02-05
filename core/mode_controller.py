@@ -282,4 +282,4 @@ class ModeController:
                 "transition_history_depth": len(
                     self._transition_history
                 ),
-        }
+    }
