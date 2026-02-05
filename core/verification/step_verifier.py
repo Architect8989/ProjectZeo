@@ -4,7 +4,7 @@ import subprocess
 from typing import Dict, Any, Optional
 
 
-class VerificationError(Exception):
+class VerificationError(RuntimeError):
     pass
 
 
@@ -12,12 +12,16 @@ class StepVerifier:
     """
     Deterministic, evidence-based verifier.
 
-    Design rules:
-    - Screen change alone is NEVER sufficient
-    - Each operation type has a concrete success predicate
-    - Vision is auxiliary, not authoritative
+    HARD RULES:
+    - Evidence > vision
+    - Vision is last-resort only
     - Absence of evidence == failure
+    - Unknown operations == failure
     """
+
+    # -------------------------------------------------
+    # Public API
+    # -------------------------------------------------
 
     def verify_step(
         self,
@@ -26,23 +30,24 @@ class StepVerifier:
         screenshot: Optional[Dict[str, Any]] = None,
         previous_screenshot: Optional[Dict[str, Any]] = None,
     ) -> bool:
-        if not action or "operation" not in action:
-            return False
+        if not isinstance(action, dict):
+            raise VerificationError("Invalid action object")
 
-        op = action["operation"]
+        op = action.get("operation")
+        if not isinstance(op, str):
+            raise VerificationError("Action missing operation field")
 
         if op == "done":
             return True
 
-        # Dispatch by operation type
         if op == "command":
             return self._verify_command(action, execution_result)
 
         if op == "file_create":
-            return self._verify_file_creation(action)
+            return self._verify_file_creation(action, must_preexist=False)
 
         if op == "file_append":
-            return self._verify_file_append(action)
+            return self._verify_file_creation(action, must_preexist=True)
 
         if op == "mkdir":
             return self._verify_directory(action)
@@ -51,10 +56,12 @@ class StepVerifier:
             return self._verify_tool(action)
 
         if op == "ui_action":
-            return self._verify_ui_change(screenshot, previous_screenshot)
+            return self._verify_ui_change(
+                screenshot=screenshot,
+                previous_screenshot=previous_screenshot,
+            )
 
-        # Unknown operations are invalid
-        return False
+        raise VerificationError(f"Unknown operation type: {op}")
 
     # -------------------------------------------------
     # COMMAND VERIFICATION
@@ -62,6 +69,9 @@ class StepVerifier:
 
     def _verify_command(self, action: Dict[str, Any], result: Any) -> bool:
         if result is None:
+            return False
+
+        if not hasattr(result, "returncode"):
             return False
 
         expected_codes = action.get("expected_return_codes", [0])
@@ -81,9 +91,20 @@ class StepVerifier:
     # FILE VERIFICATION
     # -------------------------------------------------
 
-    def _verify_file_creation(self, action: Dict[str, Any]) -> bool:
+    def _verify_file_creation(
+        self,
+        action: Dict[str, Any],
+        *,
+        must_preexist: bool,
+    ) -> bool:
         path = action.get("path")
-        if not path or not os.path.exists(path):
+        if not isinstance(path, str):
+            return False
+
+        if must_preexist and not os.path.exists(path):
+            return False
+
+        if not os.path.isfile(path):
             return False
 
         expected = action.get("content_contains")
@@ -99,13 +120,9 @@ class StepVerifier:
 
         return True
 
-    def _verify_file_append(self, action: Dict[str, Any]) -> bool:
-        # Same validation as creation, but file must pre-exist
-        return self._verify_file_creation(action)
-
     def _verify_directory(self, action: Dict[str, Any]) -> bool:
         path = action.get("path")
-        return bool(path and os.path.isdir(path))
+        return isinstance(path, str) and os.path.isdir(path)
 
     # -------------------------------------------------
     # TOOL VERIFICATION
@@ -113,10 +130,11 @@ class StepVerifier:
 
     def _verify_tool(self, action: Dict[str, Any]) -> bool:
         tool = action.get("tool")
-        if not tool:
+        if not isinstance(tool, str):
             return False
 
-        if not shutil.which(tool):
+        tool_path = shutil.which(tool)
+        if not tool_path:
             return False
 
         version_cmd = action.get("version_command")
@@ -139,11 +157,12 @@ class StepVerifier:
         return True
 
     # -------------------------------------------------
-    # UI VERIFICATION (LAST RESORT)
+    # UI VERIFICATION (LAST RESORT ONLY)
     # -------------------------------------------------
 
     def _verify_ui_change(
         self,
+        *,
         screenshot: Optional[Dict[str, Any]],
         previous_screenshot: Optional[Dict[str, Any]],
     ) -> bool:
@@ -156,11 +175,12 @@ class StepVerifier:
         curr_hash = screenshot.get("screen_text_hash")
         prev_hash = previous_screenshot.get("screen_text_hash")
 
-        curr_ts = screenshot.get("frame_ts")
-        prev_ts = previous_screenshot.get("frame_ts")
-
         if curr_hash and prev_hash and curr_hash != prev_hash:
             return True
+
+        # Timestamp alone is NOT sufficient unless explicitly advancing
+        curr_ts = screenshot.get("frame_ts")
+        prev_ts = previous_screenshot.get("frame_ts")
 
         if curr_ts and prev_ts and curr_ts > prev_ts:
             return True
