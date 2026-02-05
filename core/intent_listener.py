@@ -52,7 +52,7 @@ class IntentListener:
                     continue
 
                 # Single atomic authority call
-                self.mode.arm(reason=raw)
+                self.mode.arm(intent=raw)
                 print(f"[INTENT] Armed: {raw}")
 
             except EOFError:
