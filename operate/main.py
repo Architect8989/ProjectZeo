@@ -1,13 +1,18 @@
 """
-Self-Operating Computer
+Self-Operating Computer – Execution Wrapper
 """
 
 import argparse
 import sys
 
 from operate.utils.style import ANSI_BRIGHT_MAGENTA
-from operate.operate import main as operate_main
+from operate.operate import execute_soc
 from core.telemetry.logger import log_info, log_error
+
+from operate.utils.operating_system import OperatingSystem
+from utils.accessibility import AccessibilityBackend
+from audit.journal import AuditJournal
+from authority.input_arbitrator import InputArbitrator
 
 
 def main_entry(
@@ -20,83 +25,79 @@ def main_entry(
     screenpipe=None,
 ):
     """
-    Entry point for both:
-    - CLI execution (argparse)
-    - Programmatic invocation (root main.py)
+    Thin execution wrapper.
 
-    observer and screenpipe are OPTIONAL for CLI,
-    REQUIRED for kernel-driven execution.
+    Responsibilities:
+    - Parse CLI or accept programmatic input
+    - Construct execution dependencies
+    - Call execute_soc()
+
+    Does NOT:
+    - manage lifecycle
+    - manage snapshots
+    - manage authority state
     """
 
     try:
         # --------------------------------------------------
-        # PROGRAMMATIC INVOCATION (NO ARGPARSE)
+        # CONFIG RESOLUTION
         # --------------------------------------------------
-        if terminal_prompt is not None:
-            config = {
-                "model": model or "gpt-4-with-ocr",
-                "terminal_prompt": terminal_prompt,
-                "voice_mode": bool(voice_mode),
-                "verbose_mode": bool(verbose_mode),
-            }
-
-        # --------------------------------------------------
-        # CLI INVOCATION
-        # --------------------------------------------------
-        else:
+        if terminal_prompt is None:
             parser = argparse.ArgumentParser(
                 description="Run the self-operating computer."
             )
 
             parser.add_argument(
-                "-m",
-                "--model",
-                help="Specify the model to use",
-                required=False,
+                "-m", "--model",
                 default="gpt-4-with-ocr",
             )
 
             parser.add_argument(
-                "--voice",
-                help="Use voice input mode",
-                action="store_true",
-            )
-
-            parser.add_argument(
-                "--verbose",
-                help="Run operate in verbose mode",
-                action="store_true",
-            )
-
-            parser.add_argument(
                 "--prompt",
-                help="Directly input the objective prompt",
                 type=str,
-                required=False,
+                required=True,
             )
 
             args = parser.parse_args()
 
-            config = {
-                "model": args.model,
-                "terminal_prompt": args.prompt,
-                "voice_mode": args.voice,
-                "verbose_mode": args.verbose,
-            }
+            model = args.model
+            objective = args.prompt
+        else:
+            objective = terminal_prompt
+            model = model or "gpt-4-with-ocr"
+
+        if observer is None or screenpipe is None:
+            raise RuntimeError(
+                "observer and screenpipe are required for execution"
+            )
 
         # --------------------------------------------------
-        # EXECUTE OPERATE (OBSERVER / SCREENPIPE PASSTHROUGH)
+        # DEPENDENCY CONSTRUCTION (EXPLICIT)
         # --------------------------------------------------
+        os_backend = OperatingSystem()
 
-        log_info("[SYSTEM] Executing objective")
-
-        operate_main(
-            model=config["model"],
-            terminal_prompt=config["terminal_prompt"],
-            voice_mode=config["voice_mode"],
-            verbose_mode=config["verbose_mode"],
+        accessibility_backend = AccessibilityBackend(
             observer=observer,
             screenpipe=screenpipe,
+        )
+
+        journal = AuditJournal()
+        input_arbitrator = InputArbitrator()
+
+        log_info("[SYSTEM] Starting SOC execution")
+
+        # --------------------------------------------------
+        # EXECUTION
+        # --------------------------------------------------
+        execute_soc(
+            model=model,
+            objective=objective,
+            observer=observer,
+            screenpipe=screenpipe,
+            os_backend=os_backend,
+            accessibility_backend=accessibility_backend,
+            journal=journal,
+            input_arbitrator=input_arbitrator,
         )
 
     except KeyboardInterrupt:
