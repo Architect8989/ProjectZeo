@@ -24,11 +24,11 @@ class ModeController:
     """
     Single authoritative lifecycle controller.
 
-    Enforces:
-    - OBSERVER → ARMED → PLANNING → EXECUTING → OBSERVER
-    - Intent frozen before planning
-    - Execution only after planning
-    - Abort always returns to OBSERVER safely
+    HARD GUARANTEES:
+    - Linear lifecycle: OBSERVER → ARMED → PLANNING → EXECUTING → OBSERVER
+    - Snapshot must exist before planning (enforced externally)
+    - Execution impossible without completed plan
+    - Abort always returns to OBSERVER
     """
 
     MAX_TRANSITION_HISTORY = 2000
@@ -79,18 +79,20 @@ class ModeController:
             if healthy:
                 return
 
-            if self._observer_healthy:
-                self._observer_healthy = False
-                self._vision_failed_permanently = True
-                self._failure_reason = reason or "observer failure"
+            if not self._observer_healthy:
+                return
 
-                if self._mode in (
-                    SystemMode.PLANNING,
-                    SystemMode.EXECUTING,
-                ):
-                    self._abort_locked(
-                        "observer health lost during active task"
-                    )
+            self._observer_healthy = False
+            self._vision_failed_permanently = True
+            self._failure_reason = reason or "observer failure"
+
+            if self._mode in (
+                SystemMode.PLANNING,
+                SystemMode.EXECUTING,
+            ):
+                self._abort_locked(
+                    "observer health lost during active task"
+                )
 
     def update_vision_status(self, ok: bool) -> None:
         with self._lock:
@@ -135,6 +137,7 @@ class ModeController:
             if not self._observer_healthy:
                 raise VisionUnavailableError(self._failure_reason)
 
+            # intent becomes immutable here
             self._intent_frozen = True
 
             self._commit_transition(
@@ -144,9 +147,6 @@ class ModeController:
             )
 
     def mark_planning_complete(self) -> None:
-        """
-        Explicit signal from planner that a plan exists.
-        """
         with self._lock:
             if self._mode != SystemMode.PLANNING:
                 raise ModeTransitionError(
@@ -282,4 +282,4 @@ class ModeController:
                 "transition_history_depth": len(
                     self._transition_history
                 ),
-    }
+            }
