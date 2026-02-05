@@ -27,7 +27,8 @@ class ModeController:
     HARD GUARANTEES:
     - Linear lifecycle: OBSERVER → ARMED → PLANNING → EXECUTING → OBSERVER
     - Snapshot must exist before planning (enforced externally)
-    - Execution impossible without completed plan
+    - Planning MUST attach a plan artifact
+    - Execution impossible without completed + attached plan
     - Abort always returns to OBSERVER
     """
 
@@ -42,8 +43,13 @@ class ModeController:
 
         self._intent: Optional[str] = None
         self._intent_frozen: bool = False
-        self._planning_completed: bool = False
 
+        # ---- PLANNING CONTRACT ----
+        self._planning_completed: bool = False
+        self._execution_plan_attached: bool = False
+        self._execution_plan_id: Optional[str] = None
+
+        # ---- HEALTH ----
         self._vision_ok: bool = False
         self._observer_healthy: bool = True
         self._vision_failed_permanently: bool = False
@@ -116,7 +122,11 @@ class ModeController:
 
             self._intent = intent.strip()
             self._intent_frozen = False
+
+            # reset planning contract
             self._planning_completed = False
+            self._execution_plan_attached = False
+            self._execution_plan_id = None
 
             self._commit_transition(
                 SystemMode.ARMED,
@@ -146,11 +156,41 @@ class ModeController:
                 forced=False,
             )
 
+    # ----------------------------
+    # PLANNING CONTRACT (NEW)
+    # ----------------------------
+
+    def attach_execution_plan(self, plan_id: str) -> None:
+        """
+        Planner must call this exactly once with a stable plan identifier.
+        """
+        with self._lock:
+            if self._mode != SystemMode.PLANNING:
+                raise ModeTransitionError(
+                    "Execution plan can only be attached during PLANNING"
+                )
+
+            if not plan_id or not plan_id.strip():
+                raise ModeTransitionError("Invalid plan_id")
+
+            if self._execution_plan_attached:
+                raise ModeTransitionError(
+                    "Execution plan already attached"
+                )
+
+            self._execution_plan_attached = True
+            self._execution_plan_id = plan_id.strip()
+
     def mark_planning_complete(self) -> None:
         with self._lock:
             if self._mode != SystemMode.PLANNING:
                 raise ModeTransitionError(
                     "Planning not active"
+                )
+
+            if not self._execution_plan_attached:
+                raise ModeTransitionError(
+                    "Cannot complete planning without attached ExecutionPlan"
                 )
 
             self._planning_completed = True
@@ -167,6 +207,11 @@ class ModeController:
                     "Cannot execute without completed plan"
                 )
 
+            if not self._execution_plan_attached:
+                raise ModeTransitionError(
+                    "No ExecutionPlan attached"
+                )
+
             if not self._observer_healthy or not self._vision_ok:
                 raise VisionUnavailableError(
                     self._failure_reason or "vision unavailable"
@@ -176,7 +221,7 @@ class ModeController:
 
             self._commit_transition(
                 SystemMode.EXECUTING,
-                reason="execution started",
+                reason=f"execution started (plan={self._execution_plan_id})",
                 forced=False,
             )
 
@@ -201,7 +246,7 @@ class ModeController:
     def complete_execution(self, reason: str = "execution complete") -> None:
         with self._lock:
             if self._mode != SystemMode.EXECUTING:
-                return  # already safe
+                return
 
             self._reset_internal_state()
 
@@ -232,7 +277,11 @@ class ModeController:
     def _reset_internal_state(self) -> None:
         self._intent = None
         self._intent_frozen = False
+
         self._planning_completed = False
+        self._execution_plan_attached = False
+        self._execution_plan_id = None
+
         self._input_locked = False
 
     # --------------------------------------------------
@@ -261,6 +310,8 @@ class ModeController:
                 "forced": forced,
                 "vision_ok": self._vision_ok,
                 "observer_healthy": self._observer_healthy,
+                "plan_attached": self._execution_plan_attached,
+                "plan_id": self._execution_plan_id,
             }
         )
 
@@ -279,7 +330,9 @@ class ModeController:
                 "input_locked": self._input_locked,
                 "intent_frozen": self._intent_frozen,
                 "planning_completed": self._planning_completed,
+                "execution_plan_attached": self._execution_plan_attached,
+                "execution_plan_id": self._execution_plan_id,
                 "transition_history_depth": len(
                     self._transition_history
                 ),
-            }
+        }
