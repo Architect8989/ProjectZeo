@@ -3,8 +3,6 @@ import os
 import signal
 import atexit
 import sys
-import subprocess
-import platform
 
 from core.mode_controller import ModeController
 from core.intent_listener import IntentListener
@@ -38,7 +36,7 @@ mode = ModeController()
 
 SNAPSHOT_PROVIDER = SnapshotProvider(
     observer=observer,
-    screenpipe=None,  # Will assign later after ensuring installation
+    screenpipe=None,  # assigned after adapter init
     os_backend=OS_BACKEND,
     mode_controller=mode,
 )
@@ -49,7 +47,7 @@ RESTORE_PROVIDER = RestoreProvider(
 )
 
 # ==================================================
-# SAFE SHUTDOWN (FAIL-OPEN)
+# SAFE SHUTDOWN (FAIL-CLOSED)
 # ==================================================
 
 def _force_safe_shutdown(reason: str):
@@ -77,68 +75,13 @@ signal.signal(signal.SIGTERM, _signal_handler)
 signal.signal(signal.SIGQUIT, _signal_handler)
 
 # ==================================================
-# FUNCTION TO CHECK AND INSTALL SCREENPIPE
-# ==================================================
-
-def is_screenpipe_running():
-    """Check if Screenpipe service is running."""
-    try:
-        response = subprocess.check_output(["curl", "-s", "http://127.0.0.1:3030/latest"])
-        if "Screenpipe" in response.decode("utf-8"):
-            return True
-    except subprocess.CalledProcessError:
-        pass
-    return False
-
-def install_screenpipe():
-    """Install Screenpipe service if not running."""
-    system = platform.system().lower()
-
-    if system == 'linux':
-        install_command = "sudo apt-get install screenpipe"  # Example for Linux
-    elif system == 'darwin':  # macOS
-        install_command = "brew install screenpipe"  # Assuming Homebrew is installed
-    elif system == 'windows':
-        # Assuming Windows has a corresponding installer or script
-        install_command = "powershell -Command Install-Package Screenpipe"
-    else:
-        raise Exception("Unsupported OS")
-
-    try:
-        print("Installing Screenpipe...")
-        subprocess.check_call(install_command, shell=True)
-        print("Screenpipe installed successfully.")
-    except subprocess.CalledProcessError as e:
-        print(f"Error installing Screenpipe: {e}")
-        sys.exit(1)
-
-def start_screenpipe():
-    """Start the Screenpipe service."""
-    try:
-        print("Starting Screenpipe service...")
-        subprocess.check_call(["screenpipe", "start"])  # Adjust to the correct command to start Screenpipe
-        print("Screenpipe service started successfully.")
-    except subprocess.CalledProcessError as e:
-        print(f"Error starting Screenpipe: {e}")
-        sys.exit(1)
-
-def ensure_screenpipe_installed():
-    """Ensure Screenpipe is installed and running."""
-    if not is_screenpipe_running():
-        print("Screenpipe not running. Installing...")
-        install_screenpipe()
-        start_screenpipe()
-    else:
-        print("Screenpipe is already running.")
-
-# ==================================================
 # ROOT MAIN (LIFECYCLE AUTHORITY)
 # ==================================================
 
 def main():
     print("[BOOT] System starting")
 
-    # ---- environment probe (non-fatal) ----
+    # ---- environment probe (non-fatal, informational) ----
     collect_environment_fingerprint()
 
     # ---- crash recovery gate ----
@@ -148,11 +91,9 @@ def main():
         AUTH_STATE.force_safe_state()
         mode.force_observer()
 
-    # ---- Ensure Screenpipe is installed and running ----
-    ensure_screenpipe_installed()
-
-    # ---- Initialize Screenpipe Adapter after installation check ----
+    # ---- REQUIRED DEPENDENCY: Screenpipe must already be running ----
     screenpipe = ScreenpipeAdapter()
+    SNAPSHOT_PROVIDER.screenpipe = screenpipe
 
     # ---- intent listener ----
     intent_listener = IntentListener(mode)
@@ -162,9 +103,9 @@ def main():
 
     while True:
         try:
-            # ----------------------------
-            # OBSERVER LOOP
-            # ----------------------------
+            # ==================================================
+            # OBSERVER LOOP (NO ACTIONS)
+            # ==================================================
             screen_state = screenpipe.read()
             ui_snapshot = perception.process(screen_state)
 
@@ -175,18 +116,31 @@ def main():
             mode.update_vision_status(screen_state.get("available", False))
             mode.update_observer_health(observer.is_healthy())
 
-            # ----------------------------
+            # ==================================================
             # EXECUTION TRIGGER
-            # ----------------------------
+            # ==================================================
             if mode.is_armed():
-                # ---- HARD RULE: SNAPSHOT IN OBSERVER ONLY ----
+                # ---- RULE: SNAPSHOT MUST OCCUR IN OBSERVER ----
                 snapshot_id = SNAPSHOT_PROVIDER.take_snapshot()
 
-                # ---- LIFECYCLE ----
-                mode.begin_planning()
-                mode.execute()
-
                 intent = mode.consume_intent()
+
+                # ---- PLANNING PHASE (REAL OR FAIL) ----
+                mode.begin_planning()
+
+                execution_plan = None  # INTENTIONALLY EMPTY
+
+                if execution_plan is None:
+                    raise RuntimeError(
+                        "Planning phase produced no ExecutionPlan. "
+                        "Execution is forbidden."
+                    )
+
+                mode.mark_planning_complete()
+
+                # ---- EXECUTION GATE ----
+                assert mode.planning_completed
+                assert execution_plan is not None
 
                 AUTH_STATE.persist(
                     execution_mode="EXECUTING",
@@ -197,15 +151,18 @@ def main():
                 )
 
                 try:
+                    mode.execute()
+
                     operate_main(
-                        model=None,
+                        model=None,  # executor will be rewritten later
                         terminal_prompt=intent,
+                        execution_plan=execution_plan,
                         observer=observer,
                         screenpipe=screenpipe,
                     )
 
                 finally:
-                    # ---- RESTORE (FAIL-CLOSED) ----
+                    # ---- RESTORATION (FAIL-CLOSED) ----
                     try:
                         RESTORE_PROVIDER.restore_snapshot(snapshot_id)
                     except Exception:
@@ -225,8 +182,8 @@ def main():
             _force_safe_shutdown("observer-blindness")
             os._exit(1)
 
-        except Exception:
-            _force_safe_shutdown("main-loop-failure")
+        except Exception as e:
+            _force_safe_shutdown(f"main-loop-failure: {e}")
             os._exit(1)
 
         time.sleep(HEARTBEAT_INTERVAL)
