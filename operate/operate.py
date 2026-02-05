@@ -6,20 +6,85 @@ from operate.exceptions import ModelNotRecognizedException
 from operate.models.apis_openrouter import get_next_action
 
 from authority.authority_policy import AuthorityDecision
+from authority.input_arbitrator import InputArbitrator
+
 from core.safety.action_timeout import action_timeout, ActionTimeout
 from core.telemetry.logger import log_warn
 
+from operate.utils.operating_system import OperatingSystem
+from utils.accessibility import AccessibilityBackend
+from audit.journal import ActionJournal
 
-# --------------------------------------------------
-# PURE EXECUTION ENTRYPOINT
-# --------------------------------------------------
+
+# ==================================================
+# PUBLIC ENTRYPOINT (REQUIRED BY AUDIT)
+# ==================================================
+
+def operate_main(
+    *,
+    model: str,
+    terminal_prompt: str,
+    voice_mode: bool = False,
+    verbose_mode: bool = False,
+    observer=None,
+    screenpipe=None,
+):
+    """
+    Concrete execution wrapper.
+
+    RESPONSIBILITIES:
+    - Instantiate execution dependencies
+    - Wire observer + screenpipe where required
+    - Call execute_soc()
+
+    GUARANTEES:
+    - No lifecycle transitions
+    - No snapshot / restore logic
+    """
+
+    if not terminal_prompt:
+        raise ValueError("terminal_prompt is required")
+
+    # ---- OS backend ----
+    os_backend = OperatingSystem()
+
+    # ---- Accessibility backend ----
+    accessibility_backend = AccessibilityBackend()
+    if observer is not None and screenpipe is not None:
+        accessibility_backend.wire(
+            observer=observer,
+            screenpipe=screenpipe,
+        )
+
+    # ---- Audit journal ----
+    journal = ActionJournal()
+
+    # ---- Input arbitration ----
+    input_arbitrator = InputArbitrator()
+
+    # ---- Execute ----
+    execute_soc(
+        model=model,
+        objective=terminal_prompt,
+        observer=observer,
+        screenpipe=screenpipe,
+        os_backend=os_backend,
+        accessibility_backend=accessibility_backend,
+        journal=journal,
+        input_arbitrator=input_arbitrator,
+    )
+
+
+# ==================================================
+# PURE EXECUTION ENGINE
+# ==================================================
 
 def execute_soc(
     *,
     model,
     objective,
     observer,
-    screenpipe,               # read-only, unused here by contract
+    screenpipe,               # read-only by contract
     os_backend,
     accessibility_backend,
     journal,
@@ -100,9 +165,9 @@ def execute_soc(
         raise
 
 
-# --------------------------------------------------
+# ==================================================
 # EXECUTION + VERIFICATION
-# --------------------------------------------------
+# ==================================================
 
 def _execute_operations(
     *,
@@ -187,7 +252,9 @@ def _execute_operations(
                     y = operation.get("y")
 
                     if not _valid_coord(x) or not _valid_coord(y):
-                        raise ValueError(f"invalid click coordinates: {x}, {y}")
+                        raise ValueError(
+                            f"invalid click coordinates: {x}, {y}"
+                        )
 
                     os_backend.mouse({"x": x, "y": y})
 
@@ -246,12 +313,16 @@ def _execute_operations(
     return False
 
 
-# --------------------------------------------------
+# ==================================================
 # HELPERS
-# --------------------------------------------------
+# ==================================================
 
 def _valid_coord(v):
-    return isinstance(v, (int, float)) and not math.isnan(v) and 0.0 <= v <= 1.0
+    return (
+        isinstance(v, (int, float))
+        and not math.isnan(v)
+        and 0.0 <= v <= 1.0
+    )
 
 
 def _state_changed(a, b):
@@ -259,4 +330,4 @@ def _state_changed(a, b):
         return False
     if not isinstance(a, dict) or not isinstance(b, dict):
         return True
-    return a.get("screen_hash") != b.get("screen_hash")
+    return a.get("screen_text_hash") != b.get("screen_text_hash")
