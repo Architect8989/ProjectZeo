@@ -95,6 +95,16 @@ def serialize(
 
 _AUTH_STATE_VERSION = "AUTH-STATE-1"
 
+_REQUIRED_KEYS = {
+    "version",
+    "execution_mode",
+    "automation_active",
+    "restore_required",
+    "last_snapshot_id",
+    "dirty",
+    "updated_at",
+}
+
 _DEFAULT_STATE = {
     "version": _AUTH_STATE_VERSION,
     "execution_mode": "OBSERVER",
@@ -116,9 +126,8 @@ class AuthorityStateSerializer:
 
     GUARANTEES:
     - Atomic replace
+    - fsync on file + directory (where supported)
     - No temp-file collision
-    - No TOCTOU window
-    - No cleanup race
     - Safe under concurrency
     """
 
@@ -133,7 +142,7 @@ class AuthorityStateSerializer:
     def load(self) -> Dict[str, Any]:
         """
         Load persisted authority state.
-        Corruption or mismatch → safe defaults.
+        Any corruption or schema mismatch → safe defaults.
         """
         try:
             if not os.path.exists(self._state_path):
@@ -142,7 +151,11 @@ class AuthorityStateSerializer:
             with open(self._state_path, "r", encoding="utf-8") as f:
                 state = json.load(f)
 
-            if state.get("version") != _AUTH_STATE_VERSION:
+            if (
+                not isinstance(state, dict)
+                or state.get("version") != _AUTH_STATE_VERSION
+                or not _REQUIRED_KEYS.issubset(state.keys())
+            ):
                 return dict(_DEFAULT_STATE)
 
             return state
@@ -188,16 +201,10 @@ class AuthorityStateSerializer:
         )
 
     # --------------------------------------------------
-    # Internal — TOCTOU SAFE
+    # Internal — Atomic & Durable
     # --------------------------------------------------
 
     def _atomic_write(self, state: Dict[str, Any]) -> None:
-        """
-        Atomic write using:
-        - unique temp filename
-        - fsync
-        - os.replace
-        """
         directory = os.path.dirname(self._state_path) or "."
         os.makedirs(directory, exist_ok=True)
 
@@ -209,10 +216,22 @@ class AuthorityStateSerializer:
         )
         tmp_path = os.path.join(directory, tmp_name)
 
+        # --- write temp file ---
         with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(state, f, indent=2)
             f.flush()
             os.fsync(f.fileno())
 
-        # Atomic on POSIX + Windows
+        # --- atomic replace ---
         os.replace(tmp_path, self._state_path)
+
+        # --- fsync directory (POSIX only, best-effort) ---
+        try:
+            dir_fd = os.open(directory, os.O_DIRECTORY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except Exception:
+            # Windows / restricted FS — safe to ignore
+            pass
