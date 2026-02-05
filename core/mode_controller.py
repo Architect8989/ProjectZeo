@@ -22,13 +22,13 @@ class VisionUnavailableError(ModeTransitionError):
 
 class ModeController:
     """
-    Single authoritative execution-mode state machine.
+    Single authoritative lifecycle controller.
 
-    Guarantees:
-    - Explicit think → act separation
-    - Frozen intent before execution
-    - OS access only in EXECUTING
-    - Atomic, auditable transitions
+    Enforces:
+    - OBSERVER → ARMED → PLANNING → EXECUTING → OBSERVER
+    - Intent frozen before planning
+    - Execution only after planning
+    - Abort always returns to OBSERVER safely
     """
 
     MAX_TRANSITION_HISTORY = 2000
@@ -36,25 +36,21 @@ class ModeController:
     def __init__(self):
         self._lock = threading.RLock()
 
-        # ---- authority ----
         self._mode: SystemMode = SystemMode.OBSERVER
         self._mode_entered_at: float = time.time()
         self._last_transition_reason: Optional[str] = None
 
-        # ---- intent ----
         self._intent: Optional[str] = None
         self._intent_frozen: bool = False
+        self._planning_completed: bool = False
 
-        # ---- health ----
         self._vision_ok: bool = False
         self._observer_healthy: bool = True
         self._vision_failed_permanently: bool = False
         self._failure_reason: Optional[str] = None
 
-        # ---- input ----
         self._input_locked: bool = False
 
-        # ---- audit ----
         self._transition_history: Deque[Dict[str, object]] = deque(
             maxlen=self.MAX_TRANSITION_HISTORY
         )
@@ -68,26 +64,17 @@ class ModeController:
         with self._lock:
             return self._mode
 
-    @property
-    def mode_uptime_seconds(self) -> float:
-        with self._lock:
-            return time.time() - self._mode_entered_at
-
     def is_armed(self) -> bool:
         with self._lock:
             return self._mode == SystemMode.ARMED
 
     # --------------------------------------------------
-    # HEALTH SIGNALS
+    # HEALTH
     # --------------------------------------------------
 
     def update_observer_health(
         self, healthy: bool, *, reason: Optional[str] = None
     ) -> None:
-        """
-        Observer blindness is permanent.
-        Any loss during PLANNING or EXECUTING aborts immediately.
-        """
         with self._lock:
             if healthy:
                 return
@@ -97,7 +84,10 @@ class ModeController:
                 self._vision_failed_permanently = True
                 self._failure_reason = reason or "observer failure"
 
-                if self._mode in (SystemMode.PLANNING, SystemMode.EXECUTING):
+                if self._mode in (
+                    SystemMode.PLANNING,
+                    SystemMode.EXECUTING,
+                ):
                     self._abort_locked(
                         "observer health lost during active task"
                     )
@@ -110,34 +100,29 @@ class ModeController:
     # TRANSITIONS
     # --------------------------------------------------
 
-    def arm(self, reason: str) -> None:
-        """
-        OBSERVER → ARMED
-        Accept intent exactly once.
-        """
+    def arm(self, intent: str) -> None:
         with self._lock:
             if self._mode != SystemMode.OBSERVER:
                 raise ModeTransitionError(
                     "Cannot arm unless in OBSERVER"
                 )
 
-            if not reason or not reason.strip():
+            if not intent or not intent.strip():
                 raise ModeTransitionError(
-                    "Arm requires a non-empty intent"
+                    "Intent must be non-empty"
                 )
 
-            self._intent = reason
+            self._intent = intent.strip()
             self._intent_frozen = False
+            self._planning_completed = False
 
             self._commit_transition(
-                SystemMode.ARMED, reason, forced=False
+                SystemMode.ARMED,
+                reason="intent armed",
+                forced=False,
             )
 
-    def begin_planning(self, reason: str = "begin planning") -> None:
-        """
-        ARMED → PLANNING
-        Intent becomes frozen here.
-        """
+    def begin_planning(self) -> None:
         with self._lock:
             if self._mode != SystemMode.ARMED:
                 raise ModeTransitionError(
@@ -145,7 +130,7 @@ class ModeController:
                 )
 
             if not self._intent:
-                raise ModeTransitionError("No intent to plan")
+                raise ModeTransitionError("No intent available")
 
             if not self._observer_healthy:
                 raise VisionUnavailableError(self._failure_reason)
@@ -153,35 +138,51 @@ class ModeController:
             self._intent_frozen = True
 
             self._commit_transition(
-                SystemMode.PLANNING, reason, forced=False
+                SystemMode.PLANNING,
+                reason="planning started",
+                forced=False,
             )
 
-    def execute(self, reason: str) -> None:
+    def mark_planning_complete(self) -> None:
         """
-        PLANNING → EXECUTING
-        OS access becomes legal here.
+        Explicit signal from planner that a plan exists.
         """
+        with self._lock:
+            if self._mode != SystemMode.PLANNING:
+                raise ModeTransitionError(
+                    "Planning not active"
+                )
+
+            self._planning_completed = True
+
+    def execute(self) -> None:
         with self._lock:
             if self._mode != SystemMode.PLANNING:
                 raise ModeTransitionError(
                     "Execute requires PLANNING state"
                 )
 
-            if not self._observer_healthy:
-                raise VisionUnavailableError(self._failure_reason)
+            if not self._planning_completed:
+                raise ModeTransitionError(
+                    "Cannot execute without completed plan"
+                )
 
-            if not self._vision_ok:
-                raise VisionUnavailableError("Vision not available")
+            if not self._observer_healthy or not self._vision_ok:
+                raise VisionUnavailableError(
+                    self._failure_reason or "vision unavailable"
+                )
 
             self._input_locked = True
 
             self._commit_transition(
-                SystemMode.EXECUTING, reason, forced=False
+                SystemMode.EXECUTING,
+                reason="execution started",
+                forced=False,
             )
 
-    def consume_intent(self) -> str:
+    def consume_intent(self) -> Optional[str]:
         """
-        Intent can be consumed exactly once, only in EXECUTING.
+        Idempotent-safe intent consumption.
         """
         with self._lock:
             if self._mode != SystemMode.EXECUTING:
@@ -189,50 +190,30 @@ class ModeController:
                     "Intent consumed outside EXECUTING"
                 )
 
-            if not self._intent:
-                raise ModeTransitionError("No intent available")
-
             intent = self._intent
             self._intent = None
             return intent
 
     # --------------------------------------------------
-    # COMPLETION
+    # COMPLETION / ABORT
     # --------------------------------------------------
 
-    def complete_execution(
-        self, reason: str = "execution complete"
-    ) -> None:
-        """
-        EXECUTING → OBSERVER
-        """
+    def complete_execution(self, reason: str = "execution complete") -> None:
         with self._lock:
             if self._mode != SystemMode.EXECUTING:
-                raise ModeTransitionError(
-                    "Cannot complete unless EXECUTING"
-                )
+                return  # already safe
 
-            self._input_locked = False
-            self._intent = None
-            self._intent_frozen = False
+            self._reset_internal_state()
 
             self._commit_transition(
-                SystemMode.OBSERVER, reason, forced=False
+                SystemMode.OBSERVER,
+                reason=reason,
+                forced=False,
             )
 
-    # --------------------------------------------------
-    # EMERGENCY
-    # --------------------------------------------------
-
     def force_observer(self) -> None:
-        """
-        Emergency reset.
-        """
         with self._lock:
-            self._intent = None
-            self._intent_frozen = False
-            self._input_locked = False
-
+            self._reset_internal_state()
             self._commit_transition(
                 SystemMode.OBSERVER,
                 reason="forced reset",
@@ -240,15 +221,19 @@ class ModeController:
             )
 
     def _abort_locked(self, reason: str) -> None:
-        self._intent = None
-        self._intent_frozen = False
-        self._input_locked = False
-
+        self._failure_reason = reason
+        self._reset_internal_state()
         self._commit_transition(
             SystemMode.OBSERVER,
             reason=reason,
             forced=True,
         )
+
+    def _reset_internal_state(self) -> None:
+        self._intent = None
+        self._intent_frozen = False
+        self._planning_completed = False
+        self._input_locked = False
 
     # --------------------------------------------------
     # SINGLE COMMIT POINT
@@ -260,8 +245,8 @@ class ModeController:
         reason: str,
         forced: bool,
     ) -> None:
-        prev = self._mode
         now = time.time()
+        prev = self._mode
 
         self._mode = target
         self._mode_entered_at = now
@@ -284,19 +269,16 @@ class ModeController:
     # --------------------------------------------------
 
     def get_authority_snapshot(self) -> Dict[str, object]:
-        """
-        Single authoritative snapshot.
-        """
         with self._lock:
             return {
                 "mode": self._mode.value,
-                "mode_uptime_seconds": self.mode_uptime_seconds,
                 "observer_healthy": self._observer_healthy,
                 "vision_ok": self._vision_ok,
                 "vision_failed_permanently": self._vision_failed_permanently,
                 "failure_reason": self._failure_reason,
                 "input_locked": self._input_locked,
                 "intent_frozen": self._intent_frozen,
+                "planning_completed": self._planning_completed,
                 "transition_history_depth": len(
                     self._transition_history
                 ),
