@@ -1,10 +1,6 @@
 import time
-import asyncio
 import math
-from typing import Any, Dict, List
-
-from operate.exceptions import ModelNotRecognizedException
-from operate.models.apis_openrouter import get_next_action
+from typing import Any, Dict, List, Optional
 
 from authority.authority_policy import AuthorityDecision
 from authority.input_arbitrator import InputArbitrator
@@ -16,272 +12,264 @@ from operate.utils.operating_system import OperatingSystem
 from utils.accessibility import AccessibilityBackend
 from audit.journal import ActionJournal
 
+# NEW REQUIRED CONTRACTS
+from core.schemas.execution_plan import ExecutionPlan, ExecutionStep, StepType
+from core.verification.step_verifier import StepVerifier
+from core.execution.progress_tracker import ProgressTracker
+from core.execution.failure_recovery import FailureRecoveryManager
+
 
 # ==================================================
-# PUBLIC ENTRYPOINT (REQUIRED BY AUDIT)
+# PUBLIC ENTRYPOINT
 # ==================================================
 
 def operate_main(
     *,
-    model: str,
-    terminal_prompt: str,
+    model: Optional[str],               # ignored by executor (planning only)
+    terminal_prompt: str,                # retained for audit/context
+    execution_plan: ExecutionPlan,       # REQUIRED
     observer=None,
     screenpipe=None,
+    max_wallclock_seconds: int = 90 * 60,
 ):
     """
-    Concrete execution wrapper.
+    Deterministic plan executor.
 
-    RESPONSIBILITIES:
-    - Instantiate execution dependencies
-    - Wire observer + screenpipe where required
-    - Call execute_soc()
-
-    GUARANTEES:
+    HARD GUARANTEES:
+    - No planning
     - No lifecycle transitions
-    - No snapshot / restore logic
+    - No snapshot / restore
+    - Executes ONLY an ExecutionPlan
     """
 
-    if not terminal_prompt:
-        raise ValueError("terminal_prompt is required")
+    if not isinstance(execution_plan, ExecutionPlan):
+        raise ValueError("execution_plan is required and must be ExecutionPlan")
+
+    if not execution_plan.validate():
+        raise ValueError("ExecutionPlan failed validation")
 
     os_backend = OperatingSystem()
 
     accessibility_backend = AccessibilityBackend()
     if observer is not None and screenpipe is not None:
-        accessibility_backend.wire(
-            observer=observer,
-            screenpipe=screenpipe,
-        )
+        accessibility_backend.wire(observer=observer, screenpipe=screenpipe)
 
     journal = ActionJournal()
     input_arbitrator = InputArbitrator()
 
-    execute_soc(
-        model=model,
-        objective=terminal_prompt,
+    verifier = StepVerifier(os_backend=os_backend)
+    recovery = FailureRecoveryManager()
+    progress = ProgressTracker(execution_plan)
+
+    _execute_plan(
+        execution_plan=execution_plan,
         observer=observer,
-        screenpipe=screenpipe,
         os_backend=os_backend,
         accessibility_backend=accessibility_backend,
         journal=journal,
         input_arbitrator=input_arbitrator,
+        verifier=verifier,
+        recovery=recovery,
+        progress=progress,
+        max_wallclock_seconds=max_wallclock_seconds,
     )
 
 
 # ==================================================
-# PURE EXECUTION ENGINE
+# PLAN EXECUTION
 # ==================================================
 
-def execute_soc(
+def _execute_plan(
     *,
-    model: str,
-    objective: str,
+    execution_plan: ExecutionPlan,
     observer,
-    screenpipe,
-    os_backend,
-    accessibility_backend,
+    os_backend: OperatingSystem,
+    accessibility_backend: AccessibilityBackend,
     journal: ActionJournal,
     input_arbitrator: InputArbitrator,
-    max_iterations: int = 500,
+    verifier: StepVerifier,
+    recovery: FailureRecoveryManager,
+    progress: ProgressTracker,
+    max_wallclock_seconds: int,
 ):
-    """
-    SOC executor.
+    start_ts = time.time()
+    progress.start_execution()
 
-    HARD CONTRACT:
-    - NO mode transitions
-    - NO snapshot control
-    - NO restoration
-    - NO authority ownership
-    """
+    journal.record(
+        event="execution_start",
+        objective=execution_plan.objective,
+        total_steps=len(execution_plan.steps),
+    )
 
-    messages: List[Dict[str, Any]] = []
-    session_id = None
-    iteration = 0
+    for step in execution_plan.steps:
+        # ---- global timeout ----
+        if time.time() - start_ts > max_wallclock_seconds:
+            journal.record(event="execution_timeout")
+            raise RuntimeError("Execution wall-clock timeout exceeded")
 
-    try:
-        while True:
-            os_backend.heartbeat()
-
-            iteration += 1
-            if iteration > max_iterations:
-                raise RuntimeError("Iteration budget exceeded")
-
-            operations, session_id = asyncio.run(
-                get_next_action(
-                    model,
-                    messages,
-                    objective,
-                    session_id,
-                )
-            )
-
-            if not isinstance(operations, list):
+        # ---- dependency enforcement ----
+        for dep in step.dependencies:
+            if not progress.is_completed(dep):
                 journal.record(
-                    event="invalid_plan",
-                    reason="operations_not_list",
-                    value=str(type(operations)),
+                    event="dependency_violation",
+                    step_id=step.id,
+                    missing_dependency=dep,
                 )
-                return
+                raise RuntimeError("Dependency not satisfied")
 
-            stop = _execute_operations(
-                operations=operations,
-                observer=observer,
-                os_backend=os_backend,
-                accessibility_backend=accessibility_backend,
-                journal=journal,
-                input_arbitrator=input_arbitrator,
-            )
-
-            if stop:
-                return
-
-    except ModelNotRecognizedException as e:
-        journal.record(event="fatal_error", error=str(e))
-        raise
-
-    except Exception as e:
-        journal.record(event="fatal_error", error=str(e))
-        raise
-
-
-# ==================================================
-# EXECUTION + VERIFICATION
-# ==================================================
-
-def _execute_operations(
-    *,
-    operations: List[Dict[str, Any]],
-    observer,
-    os_backend,
-    accessibility_backend,
-    journal: ActionJournal,
-    input_arbitrator: InputArbitrator,
-) -> bool:
-    if not operations:
-        journal.record(event="no_operations")
-        return True
-
-    pre_state = observer.get_state()
-
-    for operation in operations:
-        time.sleep(0.25)
-        os_backend.heartbeat()
-
-        if not isinstance(operation, dict):
-            journal.record(
-                event="invalid_operation",
-                reason="not_dict",
-                value=str(operation),
-            )
-            return True
-
-        op_type = operation.get("operation")
-        thought = operation.get("thought")
-
-        if not isinstance(op_type, str):
-            journal.record(
-                event="invalid_operation",
-                reason="missing_operation_type",
-                operation=operation,
-            )
-            return True
-
-        op_type = op_type.lower()
-
-        journal.record(
-            event="operation_start",
-            operation=op_type,
-            thought=thought,
-        )
-
+        # ---- authority gate ----
         decision = input_arbitrator.evaluate(
             input_event_ts=time.monotonic(),
-            high_risk=False,
+            high_risk=step.type == StepType.TOOL_INSTALLATION,
             soc_confident=True,
         )
 
-        if decision in (
-            AuthorityDecision.YIELD,
-            AuthorityDecision.ABORT,
-        ):
+        if decision in (AuthorityDecision.YIELD, AuthorityDecision.ABORT):
             journal.record(event=f"authority_{decision.name.lower()}")
-            return True
+            raise RuntimeError("Authority aborted execution")
 
-        try:
-            input_arbitrator.soc_action_started()
-
-            with action_timeout(5):
-                if op_type in ("press", "hotkey"):
-                    keys = operation.get("keys")
-                    if not keys:
-                        raise ValueError("missing keys")
-                    os_backend.press(keys)
-
-                elif op_type == "write":
-                    content = operation.get("content")
-                    if not isinstance(content, str):
-                        raise ValueError("invalid write content")
-                    os_backend.write(content)
-
-                elif op_type == "click":
-                    x = operation.get("x")
-                    y = operation.get("y")
-
-                    if not _valid_coord(x) or not _valid_coord(y):
-                        raise ValueError(
-                            f"invalid click coordinates: {x}, {y}"
-                        )
-
-                    os_backend.mouse({"x": x, "y": y})
-
-                elif op_type == "done":
-                    journal.record(
-                        event="objective_complete",
-                        summary=operation.get("summary"),
-                    )
-                    return True
-
-                else:
-                    journal.record(
-                        event="unknown_operation",
-                        detail=operation,
-                    )
-                    return True
-
-        except ActionTimeout:
-            log_warn(f"[SOC] Action timeout: {operation}")
-            journal.record(
-                event="action_timeout",
-                operation=op_type,
-            )
-            return True
-
-        except Exception as e:
-            journal.record(
-                event="operation_abort",
-                operation=op_type,
-                error=str(e),
-            )
-            return True
-
-        post_state = observer.get_state()
-
-        if not _state_changed(pre_state, post_state):
-            journal.record(
-                event="verification_failed",
-                operation=op_type,
-                detail="no observable change",
-            )
-            return True
-
+        progress.start_step(step.id)
         journal.record(
-            event="operation_complete",
-            operation=op_type,
+            event="step_start",
+            step_id=step.id,
+            step_type=step.type.value,
+            description=step.description,
         )
 
-        pre_state = post_state
+        attempt_ctx = {"attempt": 0}
 
-    return False
+        while True:
+            try:
+                os_backend.heartbeat()
+
+                with action_timeout(step.estimated_duration or 30):
+                    _execute_step(
+                        step=step,
+                        os_backend=os_backend,
+                        accessibility_backend=accessibility_backend,
+                    )
+
+                # ---- verification ----
+                verification = verifier.verify_step(step)
+                if not verification.success:
+                    raise RuntimeError(verification.reason)
+
+                progress.complete_step(step.id)
+                journal.record(
+                    event="step_complete",
+                    step_id=step.id,
+                    details=verification.details,
+                )
+                break
+
+            except ActionTimeout as e:
+                log_warn(f"[EXEC] timeout on step {step.id}")
+                action = recovery.handle_failure(step, e, attempt_ctx)
+
+            except Exception as e:
+                action = recovery.handle_failure(step, e, attempt_ctx)
+
+            # ---- recovery decision ----
+            if action.action == "retry":
+                time.sleep(action.delay)
+                attempt_ctx = action.context or attempt_ctx
+                continue
+
+            if action.action == "alternative":
+                _execute_alternatives(
+                    action.alternative_operations,
+                    os_backend,
+                    accessibility_backend,
+                )
+                continue
+
+            # abort
+            progress.fail_step(step.id, action.reason or "fatal")
+            journal.record(
+                event="step_failed",
+                step_id=step.id,
+                reason=action.reason,
+            )
+            raise RuntimeError("Execution aborted")
+
+    journal.record(event="execution_complete")
+
+
+# ==================================================
+# STEP EXECUTION
+# ==================================================
+
+def _execute_step(
+    *,
+    step: ExecutionStep,
+    os_backend: OperatingSystem,
+    accessibility_backend: AccessibilityBackend,
+):
+    if step.type == StepType.COMMAND_EXECUTION:
+        cmd = step.action.get("command")
+        if not cmd:
+            raise ValueError("Missing command")
+        os_backend.exec(cmd, sudo=step.action.get("sudo", False))
+
+    elif step.type == StepType.FILE_CREATION:
+        path = step.action.get("path")
+        content = step.action.get("content", "")
+        if not path:
+            raise ValueError("Missing file path")
+        os_backend.write_file(path, content)
+
+    elif step.type == StepType.UI_INTERACTION:
+        ui = step.action
+        _execute_ui(ui, os_backend)
+
+    elif step.type == StepType.TOOL_INSTALLATION:
+        # must be handled by AutonomousInstaller in future
+        raise RuntimeError("AutonomousInstaller not integrated")
+
+    elif step.type == StepType.VERIFICATION:
+        return
+
+    else:
+        raise ValueError(f"Unknown step type: {step.type}")
+
+
+def _execute_ui(ui: Dict[str, Any], os_backend: OperatingSystem):
+    op = ui.get("op")
+    if op == "click":
+        x, y = ui.get("x"), ui.get("y")
+        if not _valid_coord(x) or not _valid_coord(y):
+            raise ValueError("Invalid coordinates")
+        os_backend.mouse({"x": x, "y": y})
+
+    elif op == "write":
+        text = ui.get("text")
+        if not isinstance(text, str):
+            raise ValueError("Invalid text")
+        os_backend.write(text)
+
+    elif op == "press":
+        keys = ui.get("keys")
+        if not keys:
+            raise ValueError("Missing keys")
+        os_backend.press(keys)
+
+    else:
+        raise ValueError(f"Unknown UI op: {op}")
+
+
+def _execute_alternatives(
+    alternatives: List[Dict[str, Any]],
+    os_backend: OperatingSystem,
+    accessibility_backend: AccessibilityBackend,
+):
+    for alt in alternatives:
+        # minimal deterministic handling
+        if alt.get("operation") == "mkdir":
+            os_backend.mkdir(alt["path"])
+        elif alt.get("operation") == "tool_install":
+            raise RuntimeError("AutonomousInstaller required")
+        else:
+            raise RuntimeError("Unknown alternative operation")
 
 
 # ==================================================
@@ -293,12 +281,4 @@ def _valid_coord(v: Any) -> bool:
         isinstance(v, (int, float))
         and not math.isnan(v)
         and 0.0 <= v <= 1.0
-    )
-
-
-def _state_changed(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
-    if a is b:
-        return False
-    if not isinstance(a, dict) or not isinstance(b, dict):
-        return True
-    return a.get("screen_hash") != b.get("screen_hash")
+   )
