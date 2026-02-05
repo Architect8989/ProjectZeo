@@ -1,5 +1,6 @@
 import time
 import asyncio
+import math
 
 from operate.exceptions import ModelNotRecognizedException
 from operate.models.apis_openrouter import get_next_action
@@ -18,7 +19,7 @@ def execute_soc(
     model,
     objective,
     observer,
-    screenpipe,               # injected, read-only, NOT controlled here
+    screenpipe,               # read-only, unused here by contract
     os_backend,
     accessibility_backend,
     journal,
@@ -30,16 +31,13 @@ def execute_soc(
 
     HARD CONTRACT:
     - NO mode transitions
-    - NO snapshot capture
+    - NO snapshot control
     - NO restoration
-    - NO lifecycle control
     - NO authority ownership
-
-    Responsibilities:
-    - Planning via LLM
-    - Deterministic execution
-    - Post-action verification
     """
+
+    if not objective:
+        raise ValueError("objective is required")
 
     messages = []
     session_id = None
@@ -47,7 +45,6 @@ def execute_soc(
 
     try:
         while True:
-            # Heartbeat before any external call
             os_backend.heartbeat()
 
             iteration += 1
@@ -55,7 +52,7 @@ def execute_soc(
                 raise RuntimeError("Iteration budget exceeded")
 
             # ----------------------------
-            # PLANNING (LLM ONLY)
+            # PLANNING (LLM)
             # ----------------------------
             operations, session_id = asyncio.run(
                 get_next_action(
@@ -66,8 +63,18 @@ def execute_soc(
                 )
             )
 
-            # Heartbeat after LLM
             os_backend.heartbeat()
+
+            # ----------------------------
+            # VALIDATION (HARD GATE)
+            # ----------------------------
+            if not isinstance(operations, list):
+                journal.record(
+                    event="invalid_plan",
+                    reason="operations_not_list",
+                    value=str(type(operations)),
+                )
+                return
 
             # ----------------------------
             # EXECUTION
@@ -110,19 +117,32 @@ def _execute_operations(
         journal.record(event="no_operations")
         return True
 
-    # Snapshot observer state BEFORE execution batch
     pre_state = observer.get_state()
 
-    # Freeze accessibility perception for determinism
-    frozen_nodes = accessibility_backend.get_nodes()
-
     for operation in operations:
-        time.sleep(0.5)
+        time.sleep(0.25)
         os_backend.heartbeat()
 
-        op_type = operation.get("operation", "").lower()
+        if not isinstance(operation, dict):
+            journal.record(
+                event="invalid_operation",
+                reason="not_dict",
+                value=str(operation),
+            )
+            return True
+
+        op_type = operation.get("operation")
         thought = operation.get("thought")
-        detail = None
+
+        if not isinstance(op_type, str):
+            journal.record(
+                event="invalid_operation",
+                reason="missing_operation_type",
+                operation=operation,
+            )
+            return True
+
+        op_type = op_type.lower()
 
         journal.record(
             event="operation_start",
@@ -131,7 +151,7 @@ def _execute_operations(
         )
 
         # ----------------------------
-        # HUMAN AUTHORITY ARBITRATION
+        # AUTHORITY CHECK
         # ----------------------------
         decision = input_arbitrator.evaluate(
             input_event_ts=time.monotonic(),
@@ -143,9 +163,7 @@ def _execute_operations(
             AuthorityDecision.YIELD,
             AuthorityDecision.ABORT,
         ):
-            journal.record(
-                event=f"authority_{decision.name.lower()}"
-            )
+            journal.record(event=f"authority_{decision.name.lower()}")
             return True
 
         try:
@@ -153,19 +171,25 @@ def _execute_operations(
 
             with action_timeout(5):
                 if op_type in ("press", "hotkey"):
-                    detail = operation.get("keys")
-                    os_backend.press(detail)
+                    keys = operation.get("keys")
+                    if not keys:
+                        raise ValueError("missing keys")
+                    os_backend.press(keys)
 
                 elif op_type == "write":
-                    detail = operation.get("content")
-                    os_backend.write(detail)
+                    content = operation.get("content")
+                    if not isinstance(content, str):
+                        raise ValueError("invalid write content")
+                    os_backend.write(content)
 
                 elif op_type == "click":
-                    detail = {
-                        "x": operation.get("x"),
-                        "y": operation.get("y"),
-                    }
-                    os_backend.mouse(detail)
+                    x = operation.get("x")
+                    y = operation.get("y")
+
+                    if not _valid_coord(x) or not _valid_coord(y):
+                        raise ValueError(f"invalid click coordinates: {x}, {y}")
+
+                    os_backend.mouse({"x": x, "y": y})
 
                 elif op_type == "done":
                     journal.record(
@@ -200,25 +224,39 @@ def _execute_operations(
         os_backend.heartbeat()
 
         # ----------------------------
-        # VERIFICATION (MANDATORY)
+        # VERIFICATION (MINIMUM SAFE)
         # ----------------------------
-
         post_state = observer.get_state()
 
-        if pre_state == post_state:
+        if not _state_changed(pre_state, post_state):
             journal.record(
                 event="verification_failed",
                 operation=op_type,
-                detail="no observable state change",
+                detail="no observable change",
             )
             return True
 
         journal.record(
             event="operation_complete",
             operation=op_type,
-            detail=detail,
         )
 
         pre_state = post_state
 
     return False
+
+
+# --------------------------------------------------
+# HELPERS
+# --------------------------------------------------
+
+def _valid_coord(v):
+    return isinstance(v, (int, float)) and not math.isnan(v) and 0.0 <= v <= 1.0
+
+
+def _state_changed(a, b):
+    if a is b:
+        return False
+    if not isinstance(a, dict) or not isinstance(b, dict):
+        return True
+    return a.get("screen_hash") != b.get("screen_hash")
