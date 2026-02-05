@@ -51,7 +51,21 @@ class ScreenpipeAdapter:
 
         print("[SCREENPIPE] Adapter initialized")
 
+        # -------------------------------------------------
+        # Check if Screenpipe service is available on initialization
+        if not self._is_screenpipe_running():
+            raise ScreenpipeBlindnessError("Screenpipe service is not available.")
+
     # -------------------------------------------------
+    def _is_screenpipe_running(self) -> bool:
+        """Checks if the Screenpipe service is running."""
+        try:
+            response = requests.get(self.SCREENPIPE_URL, timeout=self.REQUEST_TIMEOUT)
+            if response.status_code == 200:
+                return True
+        except requests.exceptions.RequestException:
+            return False
+        return False
 
     def _hash_payload(self, text: str, ts: float) -> str:
         h = hashlib.sha256()
