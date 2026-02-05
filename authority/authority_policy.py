@@ -5,12 +5,18 @@ class AuthorityDecision(str, Enum):
     CONTINUE = "CONTINUE"
     YIELD = "YIELD"
     ABORT = "ABORT"
-    RELEASE = "RELEASE"   # NEW: compatibility alias
+    RELEASE = "RELEASE"   # compatibility alias (treated as YIELD)
 
 
 class AuthorityPolicy:
     """
-    Decides what to do when human input is detected.
+    Authority decision policy.
+
+    HARD RULES:
+    - Human input always dominates automation
+    - High-risk situations abort immediately
+    - No silent overrides
+    - Deterministic outcomes (no randomness)
     """
 
     def decide(
@@ -21,16 +27,24 @@ class AuthorityPolicy:
         soc_confident: bool,
     ) -> AuthorityDecision:
 
+        # -------------------------------------------------
+        # NO HUMAN → SOC MAY CONTINUE
+        # -------------------------------------------------
         if not human_intervened:
             return AuthorityDecision.CONTINUE
 
-        # Human always wins
+        # -------------------------------------------------
+        # HUMAN INPUT DETECTED → HUMAN WINS
+        # -------------------------------------------------
+
+        # High-risk + human = immediate abort
         if high_risk:
             return AuthorityDecision.ABORT
 
-        # Allow co-pilot style intervention
+        # Human intervened, SOC not confident → yield
         if not soc_confident:
             return AuthorityDecision.YIELD
 
-        # Default: yield safely
+        # Human intervened, SOC confident → still yield
+        # (no contested authority allowed)
         return AuthorityDecision.YIELD
