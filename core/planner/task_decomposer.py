@@ -12,14 +12,20 @@ This module:
 - Does NOT assume UI
 
 It produces abstract action skeletons that the
-existing LLM executor later grounds into UI actions.
+existing executor later grounds into concrete actions.
 """
 
 from typing import List, Dict
 import json
 import re
+import time
 
 from core.telemetry.logger import log_info, log_warn
+from core.schemas.execution_plan import (
+    ExecutionPlan,
+    ExecutionStep,
+    StepType,
+)
 
 
 class DecompositionError(RuntimeError):
@@ -70,6 +76,8 @@ Rules:
         self.llm_call = llm_call
 
     # -----------------------------------------------------
+    # PUBLIC API
+    # -----------------------------------------------------
 
     def decompose(self, objective: str) -> List[Dict]:
         if not isinstance(objective, str) or not objective.strip():
@@ -84,7 +92,6 @@ Rules:
         last_error = None
 
         for attempt in range(self.MAX_RETRIES + 1):
-
             raw = self.llm_call(prompt)
 
             if not isinstance(raw, str):
@@ -119,29 +126,83 @@ Rules:
             f"Planner failed after retries: {last_error}"
         )
 
+    def to_execution_plan(self, objective: str) -> ExecutionPlan:
+        """
+        Converts decomposition output into a validated ExecutionPlan.
+        """
+        steps_raw = self.decompose(objective)
+
+        steps: List[ExecutionStep] = []
+        prev_id = None
+
+        for s in steps_raw:
+            step_id = s["id"]
+
+            steps.append(
+                ExecutionStep(
+                    id=step_id,
+                    type=StepType.UI_INTERACTION,
+                    description=s["goal"],
+                    action={"intent": s["goal"]},
+                    verification={},
+                    dependencies=[prev_id] if prev_id else [],
+                    estimated_duration=30.0,
+                )
+            )
+
+            prev_id = step_id
+
+        # Mandatory terminal step
+        terminal_id = (prev_id or 0) + 1
+        steps.append(
+            ExecutionStep(
+                id=terminal_id,
+                type=StepType.VERIFICATION,
+                description="Finalize objective",
+                action={"operation": "done"},
+                verification={},
+                dependencies=[prev_id],
+                estimated_duration=5.0,
+            )
+        )
+
+        plan = ExecutionPlan(
+            objective=objective,
+            steps=steps,
+            required_tools=[],
+            estimated_total_duration=sum(
+                s.estimated_duration for s in steps
+            ),
+            created_at=time.time(),
+        )
+
+        if not plan.validate():
+            raise DecompositionError(
+                "Generated execution plan failed validation"
+            )
+
+        return plan
+
     # -----------------------------------------------------
     # Internal Guards
     # -----------------------------------------------------
 
     def _sanitize(self, text: str) -> str:
-        # remove nulls and control chars
-        return re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F]", "", text).strip()
+        return re.sub(
+            r"[\x00-\x08\x0B\x0C\x0E-\x1F]", "", text
+        ).strip()
 
     def _safe_json_extract(self, text: str) -> Dict:
-        """
-        Extract first JSON object if model wrapped output.
-        """
         match = re.search(r"\{.*\}", text, re.S)
         if not match:
             raise DecompositionError("No JSON object found")
-
         return json.loads(match.group(0))
 
     def _validate_steps(self, steps: List[Dict]) -> None:
         if not isinstance(steps, list):
             raise DecompositionError("steps must be list")
 
-        if len(steps) == 0:
+        if not steps:
             raise DecompositionError("no steps produced")
 
         prev_id = 0
