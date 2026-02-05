@@ -301,4 +301,4 @@ def _state_changed(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
         return False
     if not isinstance(a, dict) or not isinstance(b, dict):
         return True
-    return a.get("screen_text_hash") != b.get("screen_text_hash")
+    return a.get("screen_hash") != b.get("screen_hash")
