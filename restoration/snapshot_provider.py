@@ -26,14 +26,15 @@ class SnapshotProvider:
 
     HARD CONTRACT:
     - Snapshot MUST be taken in OBSERVER mode
-    - Vision MUST be live
-    - Any failure aborts execution
+    - Vision MUST be live at capture time
+    - OS core state MUST be captured successfully
+    - Any failure aborts execution immediately
     """
 
-    SNAPSHOT_SCHEMA_VERSION = "1.2"
+    SNAPSHOT_SCHEMA_VERSION = "1.3"
 
     # -------------------------------------------------
-    # PROCESS-LOCAL SNAPSHOT REGISTRY
+    # PROCESS-LOCAL SNAPSHOT REGISTRY (NON-PERSISTENT)
     # -------------------------------------------------
 
     _snapshots: Dict[str, RestorationSnapshot] = {}
@@ -83,20 +84,20 @@ class SnapshotProvider:
         # ---- wiring validation ----
         if self._observer is None or self._screenpipe is None:
             raise SnapshotProviderError(
-                "SnapshotProvider not wired (observer/screenpipe missing)"
+                "SnapshotProvider not wired: observer or screenpipe missing"
             )
 
         # -------------------------------------------------
-        # 1. MODE CHECK
+        # 1. MODE CHECK (ABSOLUTE)
         # -------------------------------------------------
         if self._mode.mode is not SystemMode.OBSERVER:
             raise SnapshotProviderError(
                 f"Snapshot attempted in {self._mode.mode.value}; "
-                "must be OBSERVER"
+                "OBSERVER mode required"
             )
 
         # -------------------------------------------------
-        # 2. VISION CHECK (SINGLE SOURCE)
+        # 2. VISION CHECK (SINGLE AUTHORITATIVE READ)
         # -------------------------------------------------
         if self._screenpipe.blind:
             raise SnapshotProviderError(
@@ -104,13 +105,14 @@ class SnapshotProvider:
             )
 
         screen_state = self._screenpipe.read()
+
         if not screen_state.get("available"):
             raise SnapshotProviderError(
                 "Screen unavailable during snapshot"
             )
 
         # -------------------------------------------------
-        # 3. OS STATE (MANDATORY)
+        # 3. OS CORE STATE (MANDATORY, FAIL-CLOSED)
         # -------------------------------------------------
         try:
             cursor_x, cursor_y = self._os.get_cursor_position()
@@ -120,6 +122,11 @@ class SnapshotProvider:
             raise SnapshotProviderError(
                 f"OS state capture failed: {e}"
             ) from e
+
+        if focused_window is None or active_app is None:
+            raise SnapshotProviderError(
+                "OS backend returned null focus or application state"
+            )
 
         # -------------------------------------------------
         # 4. CORE STATE VALIDATION
@@ -134,15 +141,25 @@ class SnapshotProvider:
                 f"Invalid cursor position: {e}"
             ) from e
 
-        focus_state = FocusState(
-            window_id=str(focused_window.get("id")),
-            title=focused_window.get("title"),
-        )
+        try:
+            focus_state = FocusState(
+                window_id=str(focused_window.get("id")),
+                title=focused_window.get("title"),
+            )
+        except Exception as e:
+            raise SnapshotProviderError(
+                f"Invalid focused window state: {e}"
+            ) from e
 
-        application_state = ApplicationState(
-            process_name=str(active_app.get("process_name")),
-            pid=active_app.get("pid"),
-        )
+        try:
+            application_state = ApplicationState(
+                process_name=str(active_app.get("process_name")),
+                pid=active_app.get("pid"),
+            )
+        except Exception as e:
+            raise SnapshotProviderError(
+                f"Invalid application state: {e}"
+            ) from e
 
         # -------------------------------------------------
         # 5. EXTENDED STATE (EXPLICITLY BEST-EFFORT)
@@ -159,13 +176,13 @@ class SnapshotProvider:
             if hasattr(self._os, attr):
                 try:
                     extended[key] = getattr(self._os, attr)(
-                        focused_window.get("id")
+                        focus_state.window_id
                     )
                 except Exception:
                     extended[key] = None
 
         # -------------------------------------------------
-        # 6. METADATA
+        # 6. METADATA (SELF-DESCRIBING)
         # -------------------------------------------------
         metadata = {
             "schema_version": self.SNAPSHOT_SCHEMA_VERSION,
@@ -187,4 +204,4 @@ class SnapshotProvider:
             application=application_state,
             execution_mode=self._mode.mode.value,
             metadata=metadata,
-            )
+    )
