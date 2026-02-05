@@ -3,6 +3,8 @@ import os
 import signal
 import atexit
 import sys
+import subprocess
+import platform
 
 from core.mode_controller import ModeController
 from core.intent_listener import IntentListener
@@ -31,14 +33,12 @@ STATE_PATH = os.path.join(os.getcwd(), ".authority_state.json")
 AUTH_STATE = AuthorityStateSerializer(STATE_PATH)
 
 observer = ObserverCore()
-screenpipe = ScreenpipeAdapter()
 perception = PerceptionEngine()
-
 mode = ModeController()
 
 SNAPSHOT_PROVIDER = SnapshotProvider(
     observer=observer,
-    screenpipe=screenpipe,
+    screenpipe=None,  # Will assign later after ensuring installation
     os_backend=OS_BACKEND,
     mode_controller=mode,
 )
@@ -77,6 +77,61 @@ signal.signal(signal.SIGTERM, _signal_handler)
 signal.signal(signal.SIGQUIT, _signal_handler)
 
 # ==================================================
+# FUNCTION TO CHECK AND INSTALL SCREENPIPE
+# ==================================================
+
+def is_screenpipe_running():
+    """Check if Screenpipe service is running."""
+    try:
+        response = subprocess.check_output(["curl", "-s", "http://127.0.0.1:3030/latest"])
+        if "Screenpipe" in response.decode("utf-8"):
+            return True
+    except subprocess.CalledProcessError:
+        pass
+    return False
+
+def install_screenpipe():
+    """Install Screenpipe service if not running."""
+    system = platform.system().lower()
+
+    if system == 'linux':
+        install_command = "sudo apt-get install screenpipe"  # Example for Linux
+    elif system == 'darwin':  # macOS
+        install_command = "brew install screenpipe"  # Assuming Homebrew is installed
+    elif system == 'windows':
+        # Assuming Windows has a corresponding installer or script
+        install_command = "powershell -Command Install-Package Screenpipe"
+    else:
+        raise Exception("Unsupported OS")
+
+    try:
+        print("Installing Screenpipe...")
+        subprocess.check_call(install_command, shell=True)
+        print("Screenpipe installed successfully.")
+    except subprocess.CalledProcessError as e:
+        print(f"Error installing Screenpipe: {e}")
+        sys.exit(1)
+
+def start_screenpipe():
+    """Start the Screenpipe service."""
+    try:
+        print("Starting Screenpipe service...")
+        subprocess.check_call(["screenpipe", "start"])  # Adjust to the correct command to start Screenpipe
+        print("Screenpipe service started successfully.")
+    except subprocess.CalledProcessError as e:
+        print(f"Error starting Screenpipe: {e}")
+        sys.exit(1)
+
+def ensure_screenpipe_installed():
+    """Ensure Screenpipe is installed and running."""
+    if not is_screenpipe_running():
+        print("Screenpipe not running. Installing...")
+        install_screenpipe()
+        start_screenpipe()
+    else:
+        print("Screenpipe is already running.")
+
+# ==================================================
 # ROOT MAIN (LIFECYCLE AUTHORITY)
 # ==================================================
 
@@ -92,6 +147,12 @@ def main():
         OS_BACKEND.force_release_all()
         AUTH_STATE.force_safe_state()
         mode.force_observer()
+
+    # ---- Ensure Screenpipe is installed and running ----
+    ensure_screenpipe_installed()
+
+    # ---- Initialize Screenpipe Adapter after installation check ----
+    screenpipe = ScreenpipeAdapter()
 
     # ---- intent listener ----
     intent_listener = IntentListener(mode)
