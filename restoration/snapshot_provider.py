@@ -22,18 +22,18 @@ class SnapshotProviderError(RuntimeError):
 
 class SnapshotProvider:
     """
-    Concrete snapshot provider.
+    Snapshot provider.
 
     HARD CONTRACT:
     - Snapshot MUST be taken in OBSERVER mode
     - Vision MUST be live
-    - Any failure aborts SOC execution
+    - Any failure aborts execution
     """
 
-    SNAPSHOT_SCHEMA_VERSION = "1.1"
+    SNAPSHOT_SCHEMA_VERSION = "1.2"
 
     # -------------------------------------------------
-    # SNAPSHOT REGISTRY (PROCESS-LOCAL, THREAD-SAFE)
+    # PROCESS-LOCAL SNAPSHOT REGISTRY
     # -------------------------------------------------
 
     _snapshots: Dict[str, RestorationSnapshot] = {}
@@ -41,10 +41,9 @@ class SnapshotProvider:
 
     @classmethod
     def store_snapshot(cls, snapshot: RestorationSnapshot) -> str:
-        snapshot_id = snapshot.snapshot_id
         with cls._lock:
-            cls._snapshots[snapshot_id] = snapshot
-        return snapshot_id
+            cls._snapshots[snapshot.snapshot_id] = snapshot
+        return snapshot.snapshot_id
 
     @classmethod
     def get_snapshot(cls, snapshot_id: str) -> Optional[RestorationSnapshot]:
@@ -73,49 +72,45 @@ class SnapshotProvider:
     # -------------------------------------------------
 
     def take_snapshot(self) -> str:
-        snapshot = self.capture_pre_hijack_snapshot()
+        snapshot = self._capture_snapshot()
         return self.store_snapshot(snapshot)
 
     # -------------------------------------------------
     # INTERNAL SNAPSHOT LOGIC
     # -------------------------------------------------
 
-    def capture_pre_hijack_snapshot(self) -> RestorationSnapshot:
-        """
-        Capture and validate pre-hijack snapshot.
-
-        Any exception here MUST abort SOC execution.
-        """
-
+    def _capture_snapshot(self) -> RestorationSnapshot:
         # ---- wiring validation ----
         if self._observer is None or self._screenpipe is None:
             raise SnapshotProviderError(
-                "SnapshotProvider not fully wired (observer/screenpipe missing)"
+                "SnapshotProvider not wired (observer/screenpipe missing)"
             )
 
         # -------------------------------------------------
-        # 1. AUTHORITY CHECK (SINGLE SOURCE OF TRUTH)
+        # 1. MODE CHECK
         # -------------------------------------------------
-        if self._mode.mode != SystemMode.OBSERVER:
+        if self._mode.mode is not SystemMode.OBSERVER:
             raise SnapshotProviderError(
-                f"Snapshot capture attempted in mode '{self._mode.mode.value}'. "
-                "Snapshots MUST be captured in OBSERVER mode."
+                f"Snapshot attempted in {self._mode.mode.value}; "
+                "must be OBSERVER"
             )
 
         # -------------------------------------------------
-        # 2. VISION AVAILABILITY CHECK
+        # 2. VISION CHECK (SINGLE SOURCE)
         # -------------------------------------------------
-        if getattr(self._screenpipe, "blind", False):
-            raise SnapshotProviderError("Screenpipe is blind")
+        if self._screenpipe.blind:
+            raise SnapshotProviderError(
+                f"Screenpipe blind: {self._screenpipe.blind_reason}"
+            )
 
         screen_state = self._screenpipe.read()
-        if not screen_state.get("available") or screen_state.get("blind"):
+        if not screen_state.get("available"):
             raise SnapshotProviderError(
-                "Screenpipe vision unavailable during snapshot capture"
+                "Screen unavailable during snapshot"
             )
 
         # -------------------------------------------------
-        # 3. OS STATE (READ-ONLY)
+        # 3. OS STATE (MANDATORY)
         # -------------------------------------------------
         try:
             cursor_x, cursor_y = self._os.get_cursor_position()
@@ -123,19 +118,18 @@ class SnapshotProvider:
             active_app = self._os.get_active_application()
         except Exception as e:
             raise SnapshotProviderError(
-                f"Failed to retrieve OS state: {e}"
+                f"OS state capture failed: {e}"
             ) from e
 
         # -------------------------------------------------
-        # 4. VALIDATE CORE STATE
+        # 4. CORE STATE VALIDATION
         # -------------------------------------------------
         try:
-            x = int(cursor_x)
-            y = int(cursor_y)
-            if x < 0 or y < 0:
-                raise ValueError("Cursor coordinates must be non-negative")
-            cursor_state = CursorState(x=x, y=y)
-        except (TypeError, ValueError) as e:
+            cursor_state = CursorState(
+                x=int(cursor_x),
+                y=int(cursor_y),
+            )
+        except Exception as e:
             raise SnapshotProviderError(
                 f"Invalid cursor position: {e}"
             ) from e
@@ -151,74 +145,46 @@ class SnapshotProvider:
         )
 
         # -------------------------------------------------
-        # 5. EXTENDED STATE (BEST EFFORT)
+        # 5. EXTENDED STATE (EXPLICITLY BEST-EFFORT)
         # -------------------------------------------------
-        window_geometry: Optional[Dict[str, int]] = None
-        window_z_order: Optional[int] = None
-        browser_state: Optional[Dict[str, Any]] = None
-        media_position: Optional[float] = None
-        os_signature: Optional[Dict[str, Any]] = None
+        extended: Dict[str, Any] = {}
 
-        try:
-            if hasattr(self._os, "get_window_geometry"):
-                window_geometry = self._os.get_window_geometry(
-                    focused_window.get("id")
-                )
-        except Exception:
-            pass
-
-        try:
-            if hasattr(self._os, "get_window_z_order"):
-                window_z_order = self._os.get_window_z_order(
-                    focused_window.get("id")
-                )
-        except Exception:
-            pass
-
-        try:
-            if hasattr(self._os, "get_browser_state"):
-                browser_state = self._os.get_browser_state()
-        except Exception:
-            pass
-
-        try:
-            if hasattr(self._os, "get_media_playback_position"):
-                media_position = self._os.get_media_playback_position()
-        except Exception:
-            pass
-
-        try:
-            if hasattr(self._os, "get_os_signature"):
-                os_signature = self._os.get_os_signature()
-        except Exception:
-            pass
+        for attr, key in (
+            ("get_window_geometry", "window_geometry"),
+            ("get_window_z_order", "window_z_order"),
+            ("get_browser_state", "browser_state"),
+            ("get_media_playback_position", "media_playback_position"),
+            ("get_os_signature", "os_signature"),
+        ):
+            if hasattr(self._os, attr):
+                try:
+                    extended[key] = getattr(self._os, attr)(
+                        focused_window.get("id")
+                    )
+                except Exception:
+                    extended[key] = None
 
         # -------------------------------------------------
-        # 6. METADATA BINDING
+        # 6. METADATA
         # -------------------------------------------------
-        metadata: Dict[str, Any] = {
+        metadata = {
             "schema_version": self.SNAPSHOT_SCHEMA_VERSION,
-            "screenpipe": {
+            "captured_at": time.time(),
+            "execution_mode": self._mode.mode.value,
+            "screen": {
                 "frame_ts": screen_state.get("frame_ts"),
-                "screen_text_hash": screen_state.get("screen_text_hash"),
-                "captured_at": time.time(),
+                "screen_hash": screen_state.get("screen_hash"),
             },
-            "window_geometry": window_geometry,
-            "window_z_order": window_z_order,
-            "browser_state": browser_state,
-            "media_playback_position": media_position,
-            "os_signature": os_signature,
+            "extended": extended,
         }
 
         # -------------------------------------------------
-        # 7. IMMUTABLE SNAPSHOT CREATION
+        # 7. IMMUTABLE SNAPSHOT
         # -------------------------------------------------
-        snapshot = RestorationSnapshot.create(
+        return RestorationSnapshot.create(
             cursor=cursor_state,
             focus=focus_state,
             application=application_state,
             execution_mode=self._mode.mode.value,
             metadata=metadata,
-        )
-
-        return snapshot
+            )
