@@ -1,6 +1,7 @@
 import time
 import asyncio
 import math
+from typing import Any, Dict, List
 
 from operate.exceptions import ModelNotRecognizedException
 from operate.models.apis_openrouter import get_next_action
@@ -24,8 +25,6 @@ def operate_main(
     *,
     model: str,
     terminal_prompt: str,
-    voice_mode: bool = False,
-    verbose_mode: bool = False,
     observer=None,
     screenpipe=None,
 ):
@@ -45,10 +44,8 @@ def operate_main(
     if not terminal_prompt:
         raise ValueError("terminal_prompt is required")
 
-    # ---- OS backend ----
     os_backend = OperatingSystem()
 
-    # ---- Accessibility backend ----
     accessibility_backend = AccessibilityBackend()
     if observer is not None and screenpipe is not None:
         accessibility_backend.wire(
@@ -56,13 +53,9 @@ def operate_main(
             screenpipe=screenpipe,
         )
 
-    # ---- Audit journal ----
     journal = ActionJournal()
-
-    # ---- Input arbitration ----
     input_arbitrator = InputArbitrator()
 
-    # ---- Execute ----
     execute_soc(
         model=model,
         objective=terminal_prompt,
@@ -81,15 +74,15 @@ def operate_main(
 
 def execute_soc(
     *,
-    model,
-    objective,
+    model: str,
+    objective: str,
     observer,
-    screenpipe,               # read-only by contract
+    screenpipe,
     os_backend,
     accessibility_backend,
-    journal,
-    input_arbitrator,
-    max_iterations=500,
+    journal: ActionJournal,
+    input_arbitrator: InputArbitrator,
+    max_iterations: int = 500,
 ):
     """
     SOC executor.
@@ -101,10 +94,7 @@ def execute_soc(
     - NO authority ownership
     """
 
-    if not objective:
-        raise ValueError("objective is required")
-
-    messages = []
+    messages: List[Dict[str, Any]] = []
     session_id = None
     iteration = 0
 
@@ -116,9 +106,6 @@ def execute_soc(
             if iteration > max_iterations:
                 raise RuntimeError("Iteration budget exceeded")
 
-            # ----------------------------
-            # PLANNING (LLM)
-            # ----------------------------
             operations, session_id = asyncio.run(
                 get_next_action(
                     model,
@@ -128,11 +115,6 @@ def execute_soc(
                 )
             )
 
-            os_backend.heartbeat()
-
-            # ----------------------------
-            # VALIDATION (HARD GATE)
-            # ----------------------------
             if not isinstance(operations, list):
                 journal.record(
                     event="invalid_plan",
@@ -141,9 +123,6 @@ def execute_soc(
                 )
                 return
 
-            # ----------------------------
-            # EXECUTION
-            # ----------------------------
             stop = _execute_operations(
                 operations=operations,
                 observer=observer,
@@ -171,13 +150,13 @@ def execute_soc(
 
 def _execute_operations(
     *,
-    operations,
+    operations: List[Dict[str, Any]],
     observer,
     os_backend,
     accessibility_backend,
-    journal,
-    input_arbitrator,
-):
+    journal: ActionJournal,
+    input_arbitrator: InputArbitrator,
+) -> bool:
     if not operations:
         journal.record(event="no_operations")
         return True
@@ -215,9 +194,6 @@ def _execute_operations(
             thought=thought,
         )
 
-        # ----------------------------
-        # AUTHORITY CHECK
-        # ----------------------------
         decision = input_arbitrator.evaluate(
             input_event_ts=time.monotonic(),
             high_risk=False,
@@ -288,11 +264,6 @@ def _execute_operations(
             )
             return True
 
-        os_backend.heartbeat()
-
-        # ----------------------------
-        # VERIFICATION (MINIMUM SAFE)
-        # ----------------------------
         post_state = observer.get_state()
 
         if not _state_changed(pre_state, post_state):
@@ -317,7 +288,7 @@ def _execute_operations(
 # HELPERS
 # ==================================================
 
-def _valid_coord(v):
+def _valid_coord(v: Any) -> bool:
     return (
         isinstance(v, (int, float))
         and not math.isnan(v)
@@ -325,7 +296,7 @@ def _valid_coord(v):
     )
 
 
-def _state_changed(a, b):
+def _state_changed(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
     if a is b:
         return False
     if not isinstance(a, dict) or not isinstance(b, dict):
