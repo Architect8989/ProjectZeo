@@ -12,7 +12,6 @@ from operate.utils.operating_system import OperatingSystem
 from utils.accessibility import AccessibilityBackend
 from audit.journal import ActionJournal
 
-# NEW REQUIRED CONTRACTS
 from core.schemas.execution_plan import ExecutionPlan, ExecutionStep, StepType
 from core.verification.step_verifier import StepVerifier
 from core.execution.progress_tracker import ProgressTracker
@@ -25,7 +24,7 @@ from core.execution.failure_recovery import FailureRecoveryManager
 
 def operate_main(
     *,
-    model: Optional[str],               # ignored by executor (planning only)
+    model: Optional[str],               # ignored (planning-only concern)
     terminal_prompt: str,                # retained for audit/context
     execution_plan: ExecutionPlan,       # REQUIRED
     observer=None,
@@ -33,7 +32,7 @@ def operate_main(
     max_wallclock_seconds: int = 90 * 60,
 ):
     """
-    Deterministic plan executor.
+    Deterministic ExecutionPlan executor.
 
     HARD GUARANTEES:
     - No planning
@@ -43,10 +42,10 @@ def operate_main(
     """
 
     if not isinstance(execution_plan, ExecutionPlan):
-        raise ValueError("execution_plan is required and must be ExecutionPlan")
+        raise ValueError("execution_plan must be ExecutionPlan")
 
     if not execution_plan.validate():
-        raise ValueError("ExecutionPlan failed validation")
+        raise ValueError("ExecutionPlan validation failed")
 
     os_backend = OperatingSystem()
 
@@ -102,7 +101,7 @@ def _execute_plan(
     )
 
     for step in execution_plan.steps:
-        # ---- global timeout ----
+        # ---- global wall-clock timeout ----
         if time.time() - start_ts > max_wallclock_seconds:
             journal.record(event="execution_timeout")
             raise RuntimeError("Execution wall-clock timeout exceeded")
@@ -149,7 +148,6 @@ def _execute_plan(
                         accessibility_backend=accessibility_backend,
                     )
 
-                # ---- verification ----
                 verification = verifier.verify_step(step)
                 if not verification.success:
                     raise RuntimeError(verification.reason)
@@ -169,7 +167,6 @@ def _execute_plan(
             except Exception as e:
                 action = recovery.handle_failure(step, e, attempt_ctx)
 
-            # ---- recovery decision ----
             if action.action == "retry":
                 time.sleep(action.delay)
                 attempt_ctx = action.context or attempt_ctx
@@ -183,7 +180,6 @@ def _execute_plan(
                 )
                 continue
 
-            # abort
             progress.fail_step(step.id, action.reason or "fatal")
             journal.record(
                 event="step_failed",
@@ -219,11 +215,9 @@ def _execute_step(
         os_backend.write_file(path, content)
 
     elif step.type == StepType.UI_INTERACTION:
-        ui = step.action
-        _execute_ui(ui, os_backend)
+        _execute_ui(step.action, os_backend)
 
     elif step.type == StepType.TOOL_INSTALLATION:
-        # must be handled by AutonomousInstaller in future
         raise RuntimeError("AutonomousInstaller not integrated")
 
     elif step.type == StepType.VERIFICATION:
@@ -263,7 +257,6 @@ def _execute_alternatives(
     accessibility_backend: AccessibilityBackend,
 ):
     for alt in alternatives:
-        # minimal deterministic handling
         if alt.get("operation") == "mkdir":
             os_backend.mkdir(alt["path"])
         elif alt.get("operation") == "tool_install":
