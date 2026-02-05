@@ -10,10 +10,10 @@ class InputArbitrator:
     """
     Arbitrates control between SOC and human.
 
-    Guarantees:
-    - SOC never fights the human
-    - All continuations are policy-approved
-    - Emergency reclaim is monotonic-time safe
+    HARD GUARANTEES:
+    - Human input always dominates
+    - Forced release is monotonic until explicit clear
+    - Watchdog cannot be bypassed by SOC activity
     """
 
     # MUST exceed action_timeout (5s)
@@ -38,12 +38,14 @@ class InputArbitrator:
     def soc_action_started(self) -> None:
         """
         Marks SOC liveness.
-        Clears forced-release only via explicit SOC activity.
+
+        IMPORTANT:
+        - Does NOT clear forced release
+        - Forced release can only be cleared explicitly
         """
         self.tracker.mark_soc_action()
         with self._lock:
             self._last_soc_action_mono = self._clock()
-            self._forced_release = False
 
     # -------------------------------------------------
     # DECISION
@@ -59,9 +61,11 @@ class InputArbitrator:
         """
         Decide whether SOC continues or releases control.
 
-        Fail-closed:
-        - Forced release always wins
-        - High-risk always routed through policy
+        ORDER OF PRECEDENCE:
+        1. Forced release (absolute)
+        2. Human input (policy)
+        3. High-risk escalation (policy)
+        4. Continue
         """
         source = self.tracker.classify_input(input_event_ts)
 
@@ -69,7 +73,7 @@ class InputArbitrator:
             if self._forced_release:
                 return AuthorityDecision.RELEASE
 
-        # Human input always escalates to policy
+        # Human input → policy
         if source == InputSource.HUMAN:
             return self.policy.decide(
                 human_intervened=True,
@@ -77,7 +81,7 @@ class InputArbitrator:
                 soc_confident=soc_confident,
             )
 
-        # SOC-only continuation still goes through policy if high-risk
+        # High-risk even without human → policy
         if high_risk:
             return self.policy.decide(
                 human_intervened=False,
@@ -93,8 +97,7 @@ class InputArbitrator:
 
     def emergency_reclaim(self) -> None:
         """
-        Immediate, idempotent reclaim.
-        Can be bound to OS-level hotkey.
+        Immediate, monotonic reclaim.
         """
         with self._lock:
             self._forced_release = True
@@ -102,28 +105,29 @@ class InputArbitrator:
     def clear_emergency_reclaim(self) -> None:
         """
         Explicit manual clear.
-        Should only be called after human confirmation.
+
+        MUST be called only after human confirmation.
         """
         with self._lock:
             self._forced_release = False
+            self._last_soc_action_mono = None
 
     # -------------------------------------------------
     # WATCHDOG
     # -------------------------------------------------
 
     def _start_watchdog(self) -> None:
-        t = threading.Thread(
+        threading.Thread(
             target=self._watchdog_loop,
             daemon=True,
-        )
-        t.start()
+        ).start()
 
     def _watchdog_loop(self) -> None:
         """
         Deadman switch.
 
-        If SOC stops emitting heartbeats,
-        human control is forcibly restored.
+        If SOC goes silent, control is reclaimed
+        and CANNOT be auto-cleared by SOC.
         """
         while True:
             time.sleep(0.5)
