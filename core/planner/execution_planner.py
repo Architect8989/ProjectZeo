@@ -2,17 +2,18 @@
 Execution Planner
 
 Purpose:
-Deterministically converts decomposed intent into a validated ExecutionPlan.
+Authoritatively converts intent into a validated ExecutionPlan.
 
 This module:
 - DOES planning only
 - DOES NOT execute
 - DOES NOT touch OS / UI / observer
-- DOES NOT invent tools
+- DOES NOT invent tools beyond LLM output
 - DOES emit strictly schema-valid execution graphs
 """
 
 from typing import List, Dict, Any, Optional
+import json
 import time
 
 from core.schemas.execution_plan import (
@@ -31,9 +32,9 @@ class ExecutionPlanner:
     Deterministic execution planner.
 
     HARD CONTRACT:
-    - Inputs are already semantically decomposed
-    - Output is a fully ordered, validated ExecutionPlan
-    - No guessing, no side effects, no execution logic
+    - Planner is the ONLY place intelligence exists
+    - LLM output must be structured and validated
+    - No side effects, no execution, no guessing
     """
 
     def __init__(
@@ -42,6 +43,9 @@ class ExecutionPlanner:
         llm_call,
         environment_fingerprint: Optional[Dict[str, Any]] = None,
     ):
+        if not callable(llm_call):
+            raise PlanningError("llm_call must be callable")
+
         self._llm_call = llm_call
         self._environment = environment_fingerprint or {}
 
@@ -56,13 +60,6 @@ class ExecutionPlanner:
         requirements: Dict[str, Any],
         high_level_steps: List[Dict[str, Any]],
     ) -> ExecutionPlan:
-        """
-        Build a fully validated ExecutionPlan.
-
-        Raises:
-            PlanningError on any structural violation.
-        """
-
         if not isinstance(objective, str) or not objective.strip():
             raise PlanningError("Objective must be non-empty string")
 
@@ -73,27 +70,17 @@ class ExecutionPlanner:
         step_id = 1
         last_step_id: Optional[int] = None
 
-        # --------------------------------------------------
-        # Expand high-level goals deterministically
-        # --------------------------------------------------
-
         for hl in high_level_steps:
             goal = hl.get("goal")
-
             if not isinstance(goal, str) or not goal.strip():
                 raise PlanningError("Invalid high-level goal entry")
 
-            expanded_specs = self._expand_goal(goal.strip())
+            expanded = self._expand_goal(goal.strip())
+            if not expanded:
+                raise PlanningError(f"Goal produced no steps: {goal}")
 
-            if not expanded_specs:
-                raise PlanningError(
-                    f"Goal produced no executable steps: {goal}"
-                )
-
-            for spec in expanded_specs:
-                dependencies: List[int] = []
-                if last_step_id is not None:
-                    dependencies.append(last_step_id)
+            for spec in expanded:
+                deps = [last_step_id] if last_step_id else []
 
                 step = ExecutionStep(
                     id=step_id,
@@ -101,10 +88,8 @@ class ExecutionPlanner:
                     description=spec["description"],
                     action=spec.get("action", {}),
                     verification=spec.get("verification", {}),
-                    dependencies=dependencies,
-                    estimated_duration=spec.get(
-                        "estimated_duration", 0.0
-                    ),
+                    dependencies=deps,
+                    estimated_duration=spec.get("estimated_duration", 0.0),
                     retryable=spec.get("retryable", True),
                 )
 
@@ -115,10 +100,7 @@ class ExecutionPlanner:
         if not execution_steps:
             raise PlanningError("No executable steps generated")
 
-        # --------------------------------------------------
-        # Mandatory terminal DONE step
-        # --------------------------------------------------
-
+        # ---- mandatory DONE step ----
         execution_steps.append(
             ExecutionStep(
                 id=step_id,
@@ -142,10 +124,6 @@ class ExecutionPlanner:
             created_at=time.time(),
         )
 
-        # --------------------------------------------------
-        # HARD VALIDATION (authoritative)
-        # --------------------------------------------------
-
         if not plan.validate():
             raise PlanningError("ExecutionPlan validation failed")
 
@@ -158,99 +136,88 @@ class ExecutionPlanner:
     def _extract_required_tools(
         self, requirements: Dict[str, Any]
     ) -> List[str]:
-        """
-        Extracts required tools conservatively.
-        Planning does not install or verify tools.
-        """
         tools = requirements.get("tools", [])
         if not isinstance(tools, list):
             return []
         return [t for t in tools if isinstance(t, str)]
 
     # ==================================================
-    # GOAL EXPANSION LOGIC
+    # LLM-POWERED GOAL EXPANSION
     # ==================================================
 
     def _expand_goal(self, goal: str) -> List[Dict[str, Any]]:
         """
-        Expands a single high-level goal into conservative execution steps.
+        Uses LLM to expand goal into executable, schema-valid steps.
 
-        Rules:
-        - Deterministic
-        - No UI emission
-        - No tool invention
-        - Always verifiable
+        HARD RULES:
+        - LLM MUST return valid JSON
+        - Steps MUST conform to ExecutionStep schema
+        - Planner validates everything
         """
 
-        normalized = goal.lower()
-        steps: List[Dict[str, Any]] = []
+        prompt = f"""
+You are the planning brain of a self-operating computer.
 
-        # ---- filesystem intent ----
-        if any(k in normalized for k in ("create", "setup", "initialize", "scaffold")):
-            steps.append(
+Environment fingerprint:
+{json.dumps(self._environment, indent=2)}
+
+Task:
+"{goal}"
+
+Return ONLY valid JSON.
+
+Schema:
+[
+  {{
+    "type": "ui_interaction" | "command_execution" | "file_creation" | "tool_installation" | "verification",
+    "description": "...",
+    "action": {{ }},
+    "verification": {{ }},
+    "estimated_duration": number,
+    "retryable": boolean
+  }}
+]
+
+Rules:
+- No hallucinated tools
+- If a tool is required, emit tool_installation step
+- Every step must be verifiable
+- Be conservative and explicit
+"""
+
+        raw = self._llm_call(prompt)
+
+        try:
+            data = json.loads(raw)
+        except Exception as e:
+            raise PlanningError(f"LLM returned invalid JSON: {e}")
+
+        if not isinstance(data, list) or not data:
+            raise PlanningError("LLM produced empty or invalid step list")
+
+        validated: List[Dict[str, Any]] = []
+
+        for idx, step in enumerate(data):
+            if not isinstance(step, dict):
+                raise PlanningError(f"Invalid step at index {idx}")
+
+            step_type = step.get("type")
+            if step_type not in StepType.__members__.values() and step_type not in [
+                t.value for t in StepType
+            ]:
+                raise PlanningError(f"Invalid step type: {step_type}")
+
+            validated.append(
                 {
-                    "type": StepType.FILE_CREATION,
-                    "description": goal,
-                    "action": {
-                        "path": "./",
-                        "content": "",
-                    },
-                    "verification": {
-                        "exists": True,
-                    },
-                    "estimated_duration": 10.0,
+                    "type": StepType(step_type),
+                    "description": step.get("description", "").strip(),
+                    "action": step.get("action", {}),
+                    "verification": step.get("verification", {}),
+                    "estimated_duration": float(
+                        step.get("estimated_duration", 0.0)
+                    ),
+                    "retryable": bool(step.get("retryable", True)),
                 }
             )
 
-            steps.append(
-                {
-                    "type": StepType.VERIFICATION,
-                    "description": f"Verify filesystem effect: {goal}",
-                    "action": {},
-                    "verification": {},
-                    "estimated_duration": 5.0,
-                    "retryable": False,
-                }
-            )
-            return steps
-
-        # ---- command intent ----
-        if any(k in normalized for k in ("run", "build", "generate", "start")):
-            steps.append(
-                {
-                    "type": StepType.COMMAND_EXECUTION,
-                    "description": goal,
-                    "action": {
-                        "command": "",
-                        "sudo": False,
-                    },
-                    "verification": {},
-                    "estimated_duration": 20.0,
-                }
-            )
-
-            steps.append(
-                {
-                    "type": StepType.VERIFICATION,
-                    "description": f"Verify command effect: {goal}",
-                    "action": {},
-                    "verification": {},
-                    "estimated_duration": 5.0,
-                    "retryable": False,
-                }
-            )
-            return steps
-
-        # ---- fallback: verification-only ----
-        steps.append(
-            {
-                "type": StepType.VERIFICATION,
-                "description": goal,
-                "action": {},
-                "verification": {},
-                "estimated_duration": 5.0,
-                "retryable": False,
-            }
-        )
-
-        return steps
+        return validated
