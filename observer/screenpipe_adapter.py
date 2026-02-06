@@ -3,30 +3,45 @@ import hashlib
 import requests
 import threading
 from typing import Dict, Optional
+from enum import Enum
 
 
 class ScreenpipeBlindnessError(RuntimeError):
-    """Raised when screen capture is provably unavailable."""
+    """Raised when screen capture is temporarily unavailable."""
+
+
+class ScreenpipeState(Enum):
+    INIT = "init"
+    READY = "ready"
+    TEMP_UNAVAILABLE = "temporary_unavailable"
+    FATAL = "fatal"
 
 
 class ScreenpipeAdapter:
     """
-    Read-only adapter for Screenpipe outputs.
+    Authoritative, read-only adapter for Screenpipe.
 
-    Properties:
-    - No permanent blindness
-    - Failure reasons preserved
-    - Bounded staleness tolerance
-    - Deterministic hashing
+    HARD GUARANTEES:
+    - No permanent blindness unless explicitly fatal
+    - Temporary failures are recoverable
+    - read() is deterministic: valid frame OR typed exception
+    - Adapter owns all readiness & health logic
     """
 
     SCREENPIPE_URL = "http://127.0.0.1:3030/latest"
     REQUEST_TIMEOUT = 0.3
 
-    MAX_FRAME_AGE_SECONDS = 1.5        # relaxed (audit fix)
-    MAX_CONSECUTIVE_FAILURES = 5       # before blindness
+    MAX_FRAME_AGE_SECONDS = 1.5
+    MAX_CONSECUTIVE_FAILURES = 5
+    RECOVERY_COOLDOWN_SECONDS = 2.0
+
+    # -------------------------------------------------
 
     def __init__(self):
+        self._lock = threading.Lock()
+
+        self.state = ScreenpipeState.INIT
+
         self.last_read_mono: Optional[float] = None
         self.last_frame_ts: Optional[float] = None
         self.last_hash: Optional[str] = None
@@ -35,37 +50,23 @@ class ScreenpipeAdapter:
         self.frame_counter = 0
 
         self.failure_count = 0
-        self.blind = False
+        self.last_failure_mono: Optional[float] = None
         self.blind_reason: Optional[str] = None
 
-        self._lock = threading.Lock()
-
-        self._state: Dict[str, object] = {
+        self._state_snapshot: Dict[str, object] = {
             "available": False,
             "frame_ts": None,
-            "screen_hash": None,
+            "screen_text_hash": None,
             "stale": True,
             "blind": False,
             "reason": None,
         }
 
-        print("[SCREENPIPE] Adapter initialized")
+        print("[SCREENPIPE] Adapter initialized (non-fatal init)")
 
-        # -------------------------------------------------
-        # Check if Screenpipe service is available on initialization
-        if not self._is_screenpipe_running():
-            raise ScreenpipeBlindnessError("Screenpipe service is not available.")
-
-    # -------------------------------------------------
-    def _is_screenpipe_running(self) -> bool:
-        """Checks if the Screenpipe service is running."""
-        try:
-            response = requests.get(self.SCREENPIPE_URL, timeout=self.REQUEST_TIMEOUT)
-            if response.status_code == 200:
-                return True
-        except requests.exceptions.RequestException:
-            return False
-        return False
+    # =================================================
+    # Internal helpers
+    # =================================================
 
     def _hash_payload(self, text: str, ts: float) -> str:
         h = hashlib.sha256()
@@ -79,35 +80,82 @@ class ScreenpipeAdapter:
             ts /= 1000.0
         return ts
 
-    def _set_state(
+    def _set_snapshot(
         self,
         *,
         available: bool,
         frame_ts=None,
-        screen_hash=None,
+        screen_text_hash=None,
         stale=True,
         blind=False,
         reason=None,
-    ):
-        self._state = {
+    ) -> Dict[str, object]:
+        self._state_snapshot = {
             "available": available,
             "frame_ts": frame_ts,
-            "screen_hash": screen_hash,
+            "screen_text_hash": screen_text_hash,
             "stale": stale,
             "blind": blind,
             "reason": reason,
         }
-        return dict(self._state)
+        return dict(self._state_snapshot)
 
-    # -------------------------------------------------
+    # =================================================
+    # Failure & recovery logic
+    # =================================================
+
+    def _mark_failure(self, reason: str) -> Dict[str, object]:
+        with self._lock:
+            self.failure_count += 1
+            self.last_failure_mono = time.monotonic()
+            self.blind_reason = reason
+
+            if self.failure_count >= self.MAX_CONSECUTIVE_FAILURES:
+                self.state = ScreenpipeState.TEMP_UNAVAILABLE
+
+            return self._set_snapshot(
+                available=False,
+                stale=True,
+                blind=self.state != ScreenpipeState.READY,
+                reason=reason,
+            )
+
+    def _maybe_recover(self) -> None:
+        if self.state != ScreenpipeState.TEMP_UNAVAILABLE:
+            return
+
+        if self.last_failure_mono is None:
+            return
+
+        if (
+            time.monotonic() - self.last_failure_mono
+            < self.RECOVERY_COOLDOWN_SECONDS
+        ):
+            return
+
+        # allow retry
+        self.failure_count = 0
+        self.blind_reason = None
+        self.state = ScreenpipeState.INIT
+
+    # =================================================
+    # Public API
+    # =================================================
 
     def read(self) -> Dict[str, object]:
         with self._lock:
-            if self.blind:
-                raise ScreenpipeBlindnessError(
-                    f"Screenpipe blind: {self.blind_reason}"
-                )
+            if self.state == ScreenpipeState.FATAL:
+                raise ScreenpipeBlindnessError("Screenpipe entered fatal state")
 
+            if self.state == ScreenpipeState.TEMP_UNAVAILABLE:
+                self._maybe_recover()
+                if self.state == ScreenpipeState.TEMP_UNAVAILABLE:
+                    raise ScreenpipeBlindnessError(
+                        f"Screenpipe temporarily unavailable: {self.blind_reason}"
+                    )
+
+        # -------------------------------------------------
+        # Attempt read
         try:
             resp = requests.get(
                 self.SCREENPIPE_URL,
@@ -150,43 +198,31 @@ class ScreenpipeAdapter:
             self.last_frame_ts = frame_ts
             self.last_hash = screen_hash
             self.frame_counter += 1
-            self.failure_count = 0
 
-            return self._set_state(
+            self.failure_count = 0
+            self.blind_reason = None
+            self.state = ScreenpipeState.READY
+
+            return self._set_snapshot(
                 available=True,
                 frame_ts=frame_ts,
-                screen_hash=screen_hash,
+                screen_text_hash=screen_hash,
                 stale=False,
                 blind=False,
             )
 
-    # -------------------------------------------------
-
-    def _mark_failure(self, reason: str) -> Dict[str, object]:
-        with self._lock:
-            self.failure_count += 1
-
-            if self.failure_count >= self.MAX_CONSECUTIVE_FAILURES:
-                self.blind = True
-                self.blind_reason = reason
-
-            return self._set_state(
-                available=False,
-                stale=True,
-                blind=self.blind,
-                reason=reason,
-            )
-
-    # -------------------------------------------------
+    # =================================================
+    # Introspection
+    # =================================================
 
     def is_available(self) -> bool:
         with self._lock:
-            return bool(self._state.get("available"))
+            return self.state == ScreenpipeState.READY
 
     def get_health_snapshot(self) -> Dict[str, object]:
         with self._lock:
             return {
-                "blind": self.blind,
+                "state": self.state.value,
                 "blind_reason": self.blind_reason,
                 "failure_count": self.failure_count,
                 "frame_counter": self.frame_counter,
@@ -203,5 +239,5 @@ class ScreenpipeAdapter:
         try:
             state = self.read()
             return bool(state.get("available"))
-        except Exception:
+        except ScreenpipeBlindnessError:
             return False
