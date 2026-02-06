@@ -9,9 +9,9 @@ import time
 from typing import Dict, Any, Optional
 
 from observer.observer_core import ObserverCore
-from observer.screenpipe_adapter import ScreenpipeAdapter
+from observer.screenpipe_adapter import ScreenpipeAdapter, ScreenpipeBlindnessError
 from operate.utils.operating_system import OperatingSystem
-from core.verification.step_verifier import StepVerifier
+from core.verification.step_verifier import StepVerifier, VerificationError
 
 
 class InstallationError(RuntimeError):
@@ -27,10 +27,12 @@ class AutonomousInstaller:
     - UI-observed
     - Deterministic fallbacks only
     - No silent shell installs
+    - Idempotent (never reinstall if already present)
     """
 
     MAX_INSTALL_TIME = 15 * 60  # seconds
     UI_SETTLE_DELAY = 1.0
+    PAGE_LOAD_TIMEOUT = 10.0
 
     def __init__(
         self,
@@ -42,11 +44,11 @@ class AutonomousInstaller:
         self._observer = observer
         self._screenpipe = screenpipe
         self._os = os_backend
-        self._verifier = StepVerifier(os_backend=os_backend)
+        self._verifier = StepVerifier()
 
-    # -------------------------------------------------
+    # =================================================
     # PUBLIC API
-    # -------------------------------------------------
+    # =================================================
 
     def install_tool(self, tool: Dict[str, Any]) -> None:
         """
@@ -59,49 +61,92 @@ class AutonomousInstaller:
         if not isinstance(name, str) or not isinstance(url, str):
             raise InstallationError("Tool definition incomplete")
 
+        # --------------------------------------------------
+        # IDEMPOTENCE CHECK (AUTHORITATIVE)
+        # --------------------------------------------------
+        if self._is_already_installed(tool):
+            return
+
         start_ts = time.time()
 
+        # --------------------------------------------------
+        # OPEN BROWSER
+        # --------------------------------------------------
         self._open_browser()
         self._wait_ui()
 
+        # --------------------------------------------------
+        # NAVIGATE TO OFFICIAL URL
+        # --------------------------------------------------
         self._navigate(url)
-        self._wait_ui()
+        self._wait_for_page_change()
 
-        if not self._click_download_button(name):
+        # --------------------------------------------------
+        # CLICK DOWNLOAD
+        # --------------------------------------------------
+        if not self._click_download_button():
             raise InstallationError(
                 f"Download button not found for {name}"
             )
 
+        # --------------------------------------------------
+        # WAIT FOR DOWNLOAD
+        # --------------------------------------------------
         installer_path = self._wait_for_download(start_ts)
         if not installer_path:
             raise InstallationError(
                 f"Installer download not detected for {name}"
             )
 
+        # --------------------------------------------------
+        # RUN INSTALLER (VISIBLE)
+        # --------------------------------------------------
         self._os.exec(installer_path)
         self._wait_ui()
 
+        # --------------------------------------------------
+        # INSTALLER WIZARD
+        # --------------------------------------------------
         self._navigate_installer_wizard(start_ts)
 
-        verification = self._verify_installation(tool)
-        if not verification.success:
+        # --------------------------------------------------
+        # POST-INSTALL VERIFICATION
+        # --------------------------------------------------
+        if not self._is_already_installed(tool):
             raise InstallationError(
-                f"Post-install verification failed: {verification.reason}"
+                f"Post-install verification failed for {name}"
             )
 
-    # -------------------------------------------------
+    # =================================================
     # INTERNAL UI ACTIONS
-    # -------------------------------------------------
+    # =================================================
 
     def _open_browser(self) -> None:
         self._os.open_browser()
 
     def _navigate(self, url: str) -> None:
         self._os.focus_address_bar()
+        self._os.press(["ctrl", "a"])
         self._os.write(url)
         self._os.press(["enter"])
 
-    def _click_download_button(self, tool_name: str) -> bool:
+    def _wait_for_page_change(self) -> None:
+        try:
+            initial = self._safe_read().get("screen_hash")
+        except Exception:
+            initial = None
+
+        start = time.time()
+        while time.time() - start < self.PAGE_LOAD_TIMEOUT:
+            state = self._safe_read()
+            if state.get("screen_hash") and state.get("screen_hash") != initial:
+                time.sleep(self.UI_SETTLE_DELAY)
+                return
+            time.sleep(0.5)
+
+        raise InstallationError("Page load timeout")
+
+    def _click_download_button(self) -> bool:
         """
         Conservative: click only when high confidence.
         """
@@ -138,7 +183,7 @@ class AutonomousInstaller:
                 self._click_button(["finish", "done"])
                 return
 
-            if self._click_button(["next", "agree", "install"]):
+            if self._click_button(["next", "agree", "install", "continue"]):
                 self._wait_ui()
                 continue
 
@@ -154,26 +199,34 @@ class AutonomousInstaller:
                 return True
         return False
 
-    # -------------------------------------------------
+    # =================================================
     # VERIFICATION
-    # -------------------------------------------------
+    # =================================================
 
-    def _verify_installation(self, tool: Dict[str, Any]):
+    def _is_already_installed(self, tool: Dict[str, Any]) -> bool:
         """
-        Delegates to StepVerifier (authoritative).
+        Authoritative tool existence check.
         """
-        step_like = {
+        action = {
             "operation": "tool_check",
             "tool": tool.get("name"),
             "version_command": tool.get("version_command"),
             "min_version": tool.get("min_version"),
         }
 
-        return self._verifier.verify_step_like(step_like)
+        try:
+            return self._verifier.verify_step(
+                action=action,
+                execution_result=None,
+                screenshot=None,
+                previous_screenshot=None,
+            )
+        except (VerificationError, Exception):
+            return False
 
-    # -------------------------------------------------
+    # =================================================
     # UTIL
-    # -------------------------------------------------
+    # =================================================
 
     def _wait_ui(self) -> None:
         time.sleep(self.UI_SETTLE_DELAY)
@@ -181,5 +234,7 @@ class AutonomousInstaller:
     def _safe_read(self) -> Dict[str, Any]:
         try:
             return self._screenpipe.read() or {}
+        except ScreenpipeBlindnessError:
+            raise
         except Exception:
             return {}
