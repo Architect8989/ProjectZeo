@@ -16,6 +16,7 @@ from core.schemas.execution_plan import ExecutionPlan, ExecutionStep, StepType
 from core.verification.step_verifier import StepVerifier
 from core.execution.progress_tracker import ProgressTracker
 from core.execution.failure_recovery import FailureRecoveryManager
+from core.tools.autonomous_installer import AutonomousInstaller
 
 
 # ==================================================
@@ -60,6 +61,14 @@ def operate_main(
     recovery = FailureRecoveryManager()
     progress = ProgressTracker(execution_plan)
 
+    installer: Optional[AutonomousInstaller] = None
+    if observer is not None and screenpipe is not None:
+        installer = AutonomousInstaller(
+            observer=observer,
+            screenpipe=screenpipe,
+            os_backend=os_backend,
+        )
+
     _execute_plan(
         execution_plan=execution_plan,
         observer=observer,
@@ -70,6 +79,7 @@ def operate_main(
         verifier=verifier,
         recovery=recovery,
         progress=progress,
+        installer=installer,
         max_wallclock_seconds=max_wallclock_seconds,
     )
 
@@ -89,6 +99,7 @@ def _execute_plan(
     verifier: StepVerifier,
     recovery: FailureRecoveryManager,
     progress: ProgressTracker,
+    installer: Optional[AutonomousInstaller],
     max_wallclock_seconds: int,
 ):
     start_ts = time.time()
@@ -146,9 +157,9 @@ def _execute_plan(
                         step=step,
                         os_backend=os_backend,
                         accessibility_backend=accessibility_backend,
+                        installer=installer,
                     )
 
-                # ---- verification (authoritative object) ----
                 verification = verifier.verify_step(step)
                 if not verification.success:
                     raise RuntimeError(verification.reason)
@@ -177,7 +188,6 @@ def _execute_plan(
                 _execute_alternatives(
                     action.alternative_operations,
                     os_backend,
-                    accessibility_backend,
                 )
                 continue
 
@@ -201,6 +211,7 @@ def _execute_step(
     step: ExecutionStep,
     os_backend: OperatingSystem,
     accessibility_backend: AccessibilityBackend,
+    installer: Optional[AutonomousInstaller],
 ):
     if step.type == StepType.COMMAND_EXECUTION:
         cmd = step.action.get("command")
@@ -219,7 +230,12 @@ def _execute_step(
         _execute_ui(step.action, os_backend)
 
     elif step.type == StepType.TOOL_INSTALLATION:
-        raise RuntimeError("AutonomousInstaller not integrated")
+        if installer is None:
+            raise RuntimeError(
+                "TOOL_INSTALLATION requires observer + screenpipe"
+            )
+
+        installer.install_tool(step.action)
 
     elif step.type in (StepType.VERIFICATION, StepType.DONE):
         return
@@ -256,13 +272,10 @@ def _execute_ui(ui: Dict[str, Any], os_backend: OperatingSystem):
 def _execute_alternatives(
     alternatives: List[Dict[str, Any]],
     os_backend: OperatingSystem,
-    accessibility_backend: AccessibilityBackend,
 ):
     for alt in alternatives:
         if alt.get("operation") == "mkdir":
             os_backend.mkdir(alt["path"])
-        elif alt.get("operation") == "tool_install":
-            raise RuntimeError("AutonomousInstaller required")
         else:
             raise RuntimeError("Unknown alternative operation")
 
@@ -276,4 +289,4 @@ def _valid_coord(v: Any) -> bool:
         isinstance(v, (int, float))
         and not math.isnan(v)
         and 0.0 <= v <= 1.0
-    )
+   )
