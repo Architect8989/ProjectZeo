@@ -11,7 +11,7 @@ from restoration.snapshot_types import (
     RestorationSnapshot,
 )
 
-from observer.screenpipe_adapter import ScreenpipeAdapter
+from observer.screenpipe_adapter import ScreenpipeAdapter, ScreenpipeBlindnessError
 from observer.observer_core import ObserverCore
 from core.mode_controller import ModeController, SystemMode
 
@@ -43,11 +43,17 @@ class SnapshotProvider:
     @classmethod
     def store_snapshot(cls, snapshot: RestorationSnapshot) -> str:
         with cls._lock:
+            if snapshot.snapshot_id in cls._snapshots:
+                raise SnapshotProviderError(
+                    f"Snapshot id collision: {snapshot.snapshot_id}"
+                )
             cls._snapshots[snapshot.snapshot_id] = snapshot
         return snapshot.snapshot_id
 
     @classmethod
-    def get_snapshot(cls, snapshot_id: str) -> Optional[RestorationSnapshot]:
+    def get_snapshot(
+        cls, snapshot_id: str
+    ) -> Optional[RestorationSnapshot]:
         with cls._lock:
             return cls._snapshots.get(snapshot_id)
 
@@ -97,14 +103,17 @@ class SnapshotProvider:
             )
 
         # -------------------------------------------------
-        # 2. VISION CHECK (SINGLE AUTHORITATIVE READ)
+        # 2. VISION CHECK (AUTHORITATIVE)
         # -------------------------------------------------
         if self._screenpipe.blind:
-            raise SnapshotProviderError(
-                f"Screenpipe blind: {self._screenpipe.blind_reason}"
-            )
+            raise SnapshotProviderError("Screenpipe is blind")
 
-        screen_state = self._screenpipe.read()
+        try:
+            screen_state = self._screenpipe.read()
+        except ScreenpipeBlindnessError as e:
+            raise SnapshotProviderError(
+                f"Screenpipe read failed: {e}"
+            ) from e
 
         if not screen_state.get("available"):
             raise SnapshotProviderError(
@@ -112,7 +121,7 @@ class SnapshotProvider:
             )
 
         # -------------------------------------------------
-        # 3. OS CORE STATE (MANDATORY, FAIL-CLOSED)
+        # 3. OS CORE STATE (MANDATORY)
         # -------------------------------------------------
         try:
             cursor_x, cursor_y = self._os.get_cursor_position()
@@ -123,9 +132,14 @@ class SnapshotProvider:
                 f"OS state capture failed: {e}"
             ) from e
 
-        if focused_window is None or active_app is None:
+        if not isinstance(focused_window, dict):
             raise SnapshotProviderError(
-                "OS backend returned null focus or application state"
+                "Focused window state invalid or missing"
+            )
+
+        if not isinstance(active_app, dict):
+            raise SnapshotProviderError(
+                "Active application state invalid or missing"
             )
 
         # -------------------------------------------------
@@ -162,7 +176,7 @@ class SnapshotProvider:
             ) from e
 
         # -------------------------------------------------
-        # 5. EXTENDED STATE (EXPLICITLY BEST-EFFORT)
+        # 5. EXTENDED STATE (BEST-EFFORT, NEVER FAILS)
         # -------------------------------------------------
         extended: Dict[str, Any] = {}
 
@@ -175,9 +189,7 @@ class SnapshotProvider:
         ):
             if hasattr(self._os, attr):
                 try:
-                    extended[key] = getattr(self._os, attr)(
-                        focus_state.window_id
-                    )
+                    extended[key] = getattr(self._os, attr)()
                 except Exception:
                     extended[key] = None
 
@@ -204,4 +216,4 @@ class SnapshotProvider:
             application=application_state,
             execution_mode=self._mode.mode.value,
             metadata=metadata,
-    )
+            )
