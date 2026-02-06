@@ -314,7 +314,7 @@ class OperatingSystem:
         pyautogui.moveTo(int(x), int(y), duration=0)
 
     # -------------------------------------------------
-    # WINDOW / APPLICATION (BEST-EFFORT REAL)
+    # WINDOW / APPLICATION
     # -------------------------------------------------
 
     def get_focused_window(self):
@@ -393,6 +393,142 @@ class OperatingSystem:
 
         except Exception:
             return False
+
+        return False
+
+    # -------------------------------------------------
+    # APPLICATION (PROCESS LEVEL)
+    # -------------------------------------------------
+
+    def get_active_application(self):
+        system = platform.system()
+
+        try:
+            if system == "Darwin":
+                script = '''
+                tell application "System Events"
+                    set frontApp to first application process whose frontmost is true
+                    return (name of frontApp) & "|" & (unix id of frontApp)
+                end tell
+                '''
+                result = subprocess.run(
+                    ["osascript", "-e", script],
+                    capture_output=True,
+                    text=True,
+                )
+                if result.returncode == 0:
+                    name, pid = result.stdout.strip().split("|", 1)
+                    return {
+                        "process_name": name,
+                        "pid": int(pid),
+                        "application": name,
+                    }
+
+            elif system == "Linux":
+                wid = subprocess.check_output(
+                    ["xdotool", "getactivewindow"],
+                    text=True,
+                ).strip()
+                pid = subprocess.check_output(
+                    ["xdotool", "getwindowpid", wid],
+                    text=True,
+                ).strip()
+                proc = subprocess.check_output(
+                    ["ps", "-p", pid, "-o", "comm="],
+                    text=True,
+                ).strip()
+                return {
+                    "process_name": proc,
+                    "pid": int(pid),
+                    "application": proc,
+                }
+
+            elif system == "Windows":
+                import win32gui
+                import win32process
+                import psutil
+
+                hwnd = win32gui.GetForegroundWindow()
+                _, pid = win32process.GetWindowThreadProcessId(hwnd)
+                proc = psutil.Process(pid)
+                return {
+                    "process_name": proc.name(),
+                    "pid": pid,
+                    "application": proc.name(),
+                }
+
+        except Exception:
+            pass
+
+        return {
+            "process_name": "unknown",
+            "pid": None,
+            "application": None,
+        }
+
+    def activate_application(
+        self,
+        process_name: str,
+        pid: Optional[int] = None,
+    ) -> bool:
+        if not isinstance(process_name, str) or not process_name:
+            return False
+
+        system = platform.system()
+
+        try:
+            if system == "Darwin":
+                subprocess.run(
+                    ["osascript", "-e", f'tell application "{process_name}" to activate'],
+                    capture_output=True,
+                )
+                return True
+
+            elif system == "Linux":
+                if pid:
+                    windows = subprocess.check_output(
+                        ["xdotool", "search", "--pid", str(pid)],
+                        text=True,
+                    ).strip().split("\n")
+                    if windows and windows[0]:
+                        subprocess.run(
+                            ["xdotool", "windowactivate", windows[0]],
+                            check=False,
+                        )
+                        return True
+
+                windows = subprocess.check_output(
+                    ["xdotool", "search", "--class", process_name],
+                    text=True,
+                ).strip().split("\n")
+                if windows and windows[0]:
+                    subprocess.run(
+                        ["xdotool", "windowactivate", windows[0]],
+                        check=False,
+                    )
+                    return True
+
+            elif system == "Windows":
+                import win32gui
+                import win32con
+
+                def _enum(hwnd, acc):
+                    if win32gui.IsWindowVisible(hwnd):
+                        acc.append(hwnd)
+                    return True
+
+                windows = []
+                win32gui.EnumWindows(_enum, windows)
+
+                for hwnd in windows:
+                    title = win32gui.GetWindowText(hwnd).lower()
+                    if process_name.lower() in title:
+                        win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+                        win32gui.SetForegroundWindow(hwnd)
+                        return True
+
+        except Exception:
+            pass
 
         return False
 
