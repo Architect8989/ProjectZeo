@@ -1,7 +1,8 @@
 import time
 import threading
+import os
 from enum import Enum
-from typing import Optional, Deque, Dict
+from typing import Optional, Deque, Dict, Callable
 from collections import deque
 
 
@@ -30,6 +31,11 @@ class ModeController:
     - Planning MUST attach a plan artifact
     - Execution impossible without completed + attached plan
     - Abort always returns to OBSERVER
+
+    IMPORTANT:
+    - This class does NOT think
+    - This class does NOT plan
+    - This class only enforces authority + lifecycle
     """
 
     MAX_TRANSITION_HISTORY = 2000
@@ -41,6 +47,7 @@ class ModeController:
         self._mode_entered_at: float = time.time()
         self._last_transition_reason: Optional[str] = None
 
+        # ---- HUMAN AUTHORITY ----
         self._intent: Optional[str] = None
         self._intent_frozen: bool = False
 
@@ -73,6 +80,46 @@ class ModeController:
     def is_armed(self) -> bool:
         with self._lock:
             return self._mode == SystemMode.ARMED
+
+    # --------------------------------------------------
+    # BRAIN–BODY INTERFACE (FIXED)
+    # --------------------------------------------------
+
+    def get_intent(self) -> Optional[str]:
+        """
+        Read-only access to the raw human prompt.
+
+        - No mutation
+        - No interpretation
+        - No preprocessing
+        """
+        with self._lock:
+            return self._intent
+
+    def get_llm_callable(self) -> Callable[[str], str]:
+        """
+        Returns the external brain callable.
+
+        ModeController does NOT reason.
+        It only exposes a configured brain entrypoint.
+        """
+        from anthropic import Anthropic
+
+        api_key = os.getenv("ANTHROPIC_API_KEY")
+        if not api_key:
+            raise RuntimeError("ANTHROPIC_API_KEY not set")
+
+        client = Anthropic(api_key=api_key)
+
+        def llm_call(prompt: str) -> str:
+            response = client.messages.create(
+                model="claude-sonnet-4-20250514",
+                max_tokens=4096,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            return response.content[0].text
+
+        return llm_call
 
     # --------------------------------------------------
     # HEALTH
@@ -123,7 +170,6 @@ class ModeController:
             self._intent = intent.strip()
             self._intent_frozen = False
 
-            # reset planning contract
             self._planning_completed = False
             self._execution_plan_attached = False
             self._execution_plan_id = None
@@ -147,7 +193,6 @@ class ModeController:
             if not self._observer_healthy:
                 raise VisionUnavailableError(self._failure_reason)
 
-            # intent becomes immutable here
             self._intent_frozen = True
 
             self._commit_transition(
@@ -156,14 +201,11 @@ class ModeController:
                 forced=False,
             )
 
-    # ----------------------------
-    # PLANNING CONTRACT (NEW)
-    # ----------------------------
+    # --------------------------------------------------
+    # PLANNING CONTRACT
+    # --------------------------------------------------
 
     def attach_execution_plan(self, plan_id: str) -> None:
-        """
-        Planner must call this exactly once with a stable plan identifier.
-        """
         with self._lock:
             if self._mode != SystemMode.PLANNING:
                 raise ModeTransitionError(
@@ -226,9 +268,6 @@ class ModeController:
             )
 
     def consume_intent(self) -> Optional[str]:
-        """
-        Idempotent-safe intent consumption.
-        """
         with self._lock:
             if self._mode != SystemMode.EXECUTING:
                 raise ModeTransitionError(
@@ -335,4 +374,4 @@ class ModeController:
                 "transition_history_depth": len(
                     self._transition_history
                 ),
-        }
+    }
