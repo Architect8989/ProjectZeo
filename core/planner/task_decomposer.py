@@ -2,30 +2,24 @@
 High-Level Task Decomposer
 
 Purpose:
-Transforms a raw human objective into a structured,
-ordered execution plan suitable for KernelController.
+Transforms a raw human objective into structured,
+ordered high-level goals suitable for ExecutionPlanner.
 
 This module:
-- Does NOT execute
-- Does NOT touch OS
-- Does NOT call screen
-- Does NOT assume UI
+- DOES NOT execute
+- DOES NOT touch OS
+- DOES NOT emit UI actions
+- DOES NOT construct ExecutionPlan
+- DOES NOT invent step types
 
-It produces abstract action skeletons that the
-existing executor later grounds into concrete actions.
+It produces ONLY abstract goals.
 """
 
 from typing import List, Dict
 import json
 import re
-import time
 
 from core.telemetry.logger import log_info, log_warn
-from core.schemas.execution_plan import (
-    ExecutionPlan,
-    ExecutionStep,
-    StepType,
-)
 
 
 class DecompositionError(RuntimeError):
@@ -34,8 +28,7 @@ class DecompositionError(RuntimeError):
 
 class TaskDecomposer:
     """
-    Stateless planner.
-    Deterministic interface.
+    Stateless, deterministic decomposer.
     """
 
     MAX_STEPS = 50
@@ -43,20 +36,20 @@ class TaskDecomposer:
     MAX_RETRIES = 2
 
     SYSTEM_PROMPT = """
-You are a software planning engine.
+You are a task decomposition engine.
 
-You do NOT control a computer.
-You do NOT describe UI clicks.
-You ONLY decompose objectives into high-level steps.
+You do NOT execute tasks.
+You do NOT describe UI actions.
+You do NOT mention mouse, keyboard, click, type, open.
+You ONLY break an objective into ordered, high-level goals.
 
-Return STRICT JSON.
+Return STRICT JSON ONLY.
 
 Schema:
-
 {
   "steps": [
-     {"id": 1, "goal": "short description"},
-     {"id": 2, "goal": "short description"}
+     {"id": 1, "goal": "short, concrete, verifiable goal"},
+     {"id": 2, "goal": "short, concrete, verifiable goal"}
   ]
 }
 
@@ -64,22 +57,18 @@ Rules:
 - Steps must be ordered
 - Each step must be independently verifiable
 - No UI references
-- No mouse, keyboard, click, type, open
 - No commentary
 - No markdown
 """
 
     def __init__(self, llm_call):
-        """
-        llm_call(prompt:str)->str
-        """
         self.llm_call = llm_call
 
-    # -----------------------------------------------------
+    # -------------------------------------------------
     # PUBLIC API
-    # -----------------------------------------------------
+    # -------------------------------------------------
 
-    def decompose(self, objective: str) -> List[Dict]:
+    def decompose(self, objective: str) -> List[Dict[str, str]]:
         if not isinstance(objective, str) or not objective.strip():
             raise DecompositionError("Objective must be non-empty string")
 
@@ -95,97 +84,39 @@ Rules:
             raw = self.llm_call(prompt)
 
             if not isinstance(raw, str):
-                last_error = "Planner returned non-string"
+                last_error = "LLM returned non-string"
                 continue
 
             raw = self._sanitize(raw)
 
             if len(raw) > self.MAX_RAW_CHARS:
-                last_error = "Planner output too large"
+                last_error = "LLM output too large"
                 continue
 
             try:
                 parsed = self._safe_json_extract(raw)
-                steps = parsed["steps"]
+                steps = parsed.get("steps")
+                self._validate_steps(steps)
             except Exception as e:
                 last_error = str(e)
                 continue
 
-            self._validate_steps(steps)
-
             if len(steps) > self.MAX_STEPS:
                 log_warn(
-                    f"[PLANNER] Truncating steps {len(steps)} -> {self.MAX_STEPS}"
+                    f"[DECOMPOSER] Truncating steps {len(steps)} → {self.MAX_STEPS}"
                 )
                 steps = steps[: self.MAX_STEPS]
 
-            log_info(f"[PLANNER] Generated {len(steps)} steps")
+            log_info(f"[DECOMPOSER] Produced {len(steps)} goals")
             return steps
 
         raise DecompositionError(
-            f"Planner failed after retries: {last_error}"
+            f"Task decomposition failed after retries: {last_error}"
         )
 
-    def to_execution_plan(self, objective: str) -> ExecutionPlan:
-        """
-        Converts decomposition output into a validated ExecutionPlan.
-        """
-        steps_raw = self.decompose(objective)
-
-        steps: List[ExecutionStep] = []
-        prev_id = None
-
-        for s in steps_raw:
-            step_id = s["id"]
-
-            steps.append(
-                ExecutionStep(
-                    id=step_id,
-                    type=StepType.UI_INTERACTION,
-                    description=s["goal"],
-                    action={"intent": s["goal"]},
-                    verification={},
-                    dependencies=[prev_id] if prev_id else [],
-                    estimated_duration=30.0,
-                )
-            )
-
-            prev_id = step_id
-
-        # Mandatory terminal step
-        terminal_id = (prev_id or 0) + 1
-        steps.append(
-            ExecutionStep(
-                id=terminal_id,
-                type=StepType.VERIFICATION,
-                description="Finalize objective",
-                action={"operation": "done"},
-                verification={},
-                dependencies=[prev_id],
-                estimated_duration=5.0,
-            )
-        )
-
-        plan = ExecutionPlan(
-            objective=objective,
-            steps=steps,
-            required_tools=[],
-            estimated_total_duration=sum(
-                s.estimated_duration for s in steps
-            ),
-            created_at=time.time(),
-        )
-
-        if not plan.validate():
-            raise DecompositionError(
-                "Generated execution plan failed validation"
-            )
-
-        return plan
-
-    # -----------------------------------------------------
-    # Internal Guards
-    # -----------------------------------------------------
+    # -------------------------------------------------
+    # Internal guards
+    # -------------------------------------------------
 
     def _sanitize(self, text: str) -> str:
         return re.sub(
@@ -199,11 +130,8 @@ Rules:
         return json.loads(match.group(0))
 
     def _validate_steps(self, steps: List[Dict]) -> None:
-        if not isinstance(steps, list):
-            raise DecompositionError("steps must be list")
-
-        if not steps:
-            raise DecompositionError("no steps produced")
+        if not isinstance(steps, list) or not steps:
+            raise DecompositionError("steps must be non-empty list")
 
         prev_id = 0
 
@@ -212,15 +140,15 @@ Rules:
                 raise DecompositionError("step must be object")
 
             if "id" not in s or "goal" not in s:
-                raise DecompositionError("Invalid step schema")
-
-            if not isinstance(s["goal"], str):
-                raise DecompositionError("goal must be string")
+                raise DecompositionError("step missing id or goal")
 
             if not isinstance(s["id"], int):
                 raise DecompositionError("id must be integer")
 
+            if not isinstance(s["goal"], str) or not s["goal"].strip():
+                raise DecompositionError("goal must be non-empty string")
+
             if s["id"] <= prev_id:
-                raise DecompositionError("steps not ordered")
+                raise DecompositionError("steps not strictly ordered")
 
             prev_id = s["id"]
