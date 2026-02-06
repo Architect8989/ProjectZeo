@@ -93,7 +93,7 @@ def main():
         AUTH_STATE.force_safe_state()
         mode.force_observer()
 
-    # ---- REQUIRED DEPENDENCY: Screenpipe must already be running ----
+    # ---- REQUIRED DEPENDENCY: Screenpipe ----
     screenpipe = ScreenpipeAdapter()
     SNAPSHOT_PROVIDER.screenpipe = screenpipe
 
@@ -115,23 +115,25 @@ def main():
             observer.attach_ui_snapshot(ui_snapshot)
             observer.tick()
 
-            mode.update_vision_status(screen_state.get("available", False))
+            mode.update_vision_status(bool(screen_state.get("available")))
             mode.update_observer_health(observer.is_healthy())
 
             # ==================================================
             # EXECUTION TRIGGER
             # ==================================================
             if mode.is_armed():
-                # ---- SNAPSHOT (OBSERVER ONLY) ----
+                # ---- SNAPSHOT (OBSERVER-ONLY) ----
                 snapshot_id = SNAPSHOT_PROVIDER.take_snapshot()
 
-                # ---- PLANNING ----
+                # ==================================================
+                # PLANNING PHASE
+                # ==================================================
                 mode.begin_planning()
 
-                # READ intent WITHOUT consuming
+                # READ intent without consuming
                 intent = mode.get_intent()
-                if not intent:
-                    raise RuntimeError("Armed with no intent")
+                if not intent or not intent.strip():
+                    raise RuntimeError("System armed without valid intent")
 
                 planner = ExecutionPlanner(
                     llm_call=lambda prompt: prompt  # placeholder
@@ -140,9 +142,7 @@ def main():
                 execution_plan = planner.create_plan(
                     objective=intent,
                     requirements={},
-                    high_level_steps=[
-                        {"goal": intent}
-                    ],
+                    high_level_steps=[{"goal": intent}],
                 )
 
                 plan_id = f"plan_{int(time.time())}_{abs(hash(intent))}"
@@ -157,10 +157,13 @@ def main():
                     dirty=True,
                 )
 
+                # ==================================================
+                # EXECUTION PHASE
+                # ==================================================
                 try:
                     mode.execute()
 
-                    # NOW consume intent (EXECUTING only)
+                    # NOW consume intent (EXECUTING-only)
                     consumed_intent = mode.consume_intent()
 
                     operate_main(
@@ -172,7 +175,9 @@ def main():
                     )
 
                 finally:
-                    # ---- RESTORE (FAIL-CLOSED) ----
+                    # ==================================================
+                    # RESTORATION (FAIL-CLOSED)
+                    # ==================================================
                     try:
                         RESTORE_PROVIDER.restore_snapshot(snapshot_id)
                     except Exception:
