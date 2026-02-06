@@ -1,20 +1,20 @@
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Dict, Any, List, Optional, Set
+from typing import Dict, Any, List, Set
 import time
 
 
 # =================================================
-# STEP TYPES
+# CANONICAL STEP TYPES (LOCKED)
 # =================================================
 
 class StepType(str, Enum):
-    UI_ACTION = "ui_action"          # click / write / press
-    COMMAND = "command"              # shell / cli execution
-    FILE_WRITE = "file_write"        # create or modify files
-    TOOL_INSTALL = "tool_install"    # tool installation
-    VERIFICATION = "verification"    # explicit verification step
-    DONE = "done"
+    UI_INTERACTION = "ui_interaction"          # click / write / press
+    COMMAND_EXECUTION = "command_execution"    # shell / cli execution
+    FILE_CREATION = "file_creation"            # create or modify files
+    TOOL_INSTALLATION = "tool_installation"    # autonomous installer
+    VERIFICATION = "verification"              # explicit verification step
+    DONE = "done"                              # terminal step
 
 
 # =================================================
@@ -50,14 +50,14 @@ class ExecutionStep:
     type: StepType
     description: str
 
-    # Action payload (SOC-compatible or extended)
+    # Action payload
     action: Dict[str, Any]
 
-    # Verification contract (what proves success)
+    # Verification contract
     verification: Dict[str, Any] = field(default_factory=dict)
 
-    # Dependency graph
-    depends_on: List[int] = field(default_factory=list)
+    # Dependency graph (STRICT)
+    dependencies: List[int] = field(default_factory=list)
 
     # Metadata
     estimated_duration: float = 0.0
@@ -76,22 +76,26 @@ class ExecutionPlan:
     required_tools: List[str] = field(default_factory=list)
     created_at: float = field(default_factory=time.time)
 
-    def validate(self) -> None:
+    def validate(self) -> bool:
         """
         HARD VALIDATION.
-        Raises ValueError on any violation.
+        Returns True if valid, False otherwise.
         """
+        try:
+            if not isinstance(self.objective, str) or not self.objective.strip():
+                return False
 
-        if not self.objective or not self.objective.strip():
-            raise ValueError("ExecutionPlan.objective is empty")
+            if not self.steps or not isinstance(self.steps, list):
+                return False
 
-        if not self.steps:
-            raise ValueError("ExecutionPlan has no steps")
+            self._validate_step_ids()
+            self._validate_dependencies()
+            self._validate_steps()
+            self._validate_done_step()
 
-        self._validate_step_ids()
-        self._validate_dependencies()
-        self._validate_steps()
-        self._validate_done_step()
+            return True
+        except Exception:
+            return False
 
     # -------------------------------------------------
 
@@ -104,17 +108,24 @@ class ExecutionPlan:
         ids: Set[int] = {s.id for s in self.steps}
 
         for step in self.steps:
-            for dep in step.depends_on:
+            if not isinstance(step.dependencies, list):
+                raise ValueError(f"Step {step.id} dependencies must be list")
+
+            for dep in step.dependencies:
                 if dep not in ids:
                     raise ValueError(
                         f"Step {step.id} depends on missing step {dep}"
                     )
+                if dep >= step.id:
+                    raise ValueError(
+                        f"Step {step.id} has invalid forward/self dependency {dep}"
+                    )
 
         if self._has_cycles():
-            raise ValueError("Circular dependency detected in execution plan")
+            raise ValueError("Circular dependency detected")
 
     def _has_cycles(self) -> bool:
-        graph = {s.id: set(s.depends_on) for s in self.steps}
+        graph = {s.id: set(s.dependencies) for s in self.steps}
         visited = set()
         stack = set()
 
@@ -136,12 +147,12 @@ class ExecutionPlan:
     def _validate_steps(self) -> None:
         for step in self.steps:
             if not isinstance(step.action, dict):
-                raise ValueError(f"Step {step.id} action is not a dict")
+                raise ValueError(f"Step {step.id} action must be dict")
 
-            if step.type == StepType.UI_ACTION:
+            if step.type == StepType.UI_INTERACTION:
                 if not validate_action(step.action):
                     raise ValueError(
-                        f"Invalid UI action in step {step.id}: {step.action}"
+                        f"Invalid UI action in step {step.id}"
                     )
 
             if step.type == StepType.DONE:
@@ -154,7 +165,7 @@ class ExecutionPlan:
         done_steps = [s for s in self.steps if s.type == StepType.DONE]
         if len(done_steps) != 1:
             raise ValueError(
-                f"ExecutionPlan must have exactly one DONE step, found {len(done_steps)}"
+                f"ExecutionPlan must contain exactly one DONE step"
             )
 
 
@@ -163,7 +174,7 @@ class ExecutionPlan:
 # =================================================
 
 def _is_string(v):
-    return isinstance(v, str) and len(v.strip()) > 0
+    return isinstance(v, str) and bool(v.strip())
 
 
 def _is_list(v):
