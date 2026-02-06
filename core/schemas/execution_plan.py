@@ -9,16 +9,16 @@ import time
 # =================================================
 
 class StepType(str, Enum):
-    UI_INTERACTION = "ui_interaction"          # click / write / press
-    COMMAND_EXECUTION = "command_execution"    # shell / cli execution
-    FILE_CREATION = "file_creation"            # create or modify files
-    TOOL_INSTALLATION = "tool_installation"    # autonomous installer
-    VERIFICATION = "verification"              # explicit verification step
-    DONE = "done"                              # terminal step
+    UI_INTERACTION = "ui_interaction"
+    COMMAND_EXECUTION = "command_execution"
+    FILE_CREATION = "file_creation"
+    TOOL_INSTALLATION = "tool_installation"
+    VERIFICATION = "verification"
+    DONE = "done"
 
 
 # =================================================
-# ALLOWED UI ACTION SURFACE (SOC COMPAT)
+# UI ACTION SCHEMA (SOC-COMPAT, STRICT)
 # =================================================
 
 ALLOWED_OPERATIONS = {"click", "write", "press", "done"}
@@ -34,9 +34,9 @@ REQUIRED_FIELDS = {
 
 OPTIONAL_FIELDS = {
     "click": {"x", "y", "label", "text", "thought"},
-    "write": {"content", "thought"},
-    "press": {"keys", "thought"},
-    "done": {"summary", "thought"},
+    "write": {"thought"},
+    "press": {"thought"},
+    "done": {"thought"},
 }
 
 
@@ -49,17 +49,9 @@ class ExecutionStep:
     id: int
     type: StepType
     description: str
-
-    # Action payload
     action: Dict[str, Any]
-
-    # Verification contract
     verification: Dict[str, Any] = field(default_factory=dict)
-
-    # Dependency graph (STRICT)
     dependencies: List[int] = field(default_factory=list)
-
-    # Metadata
     estimated_duration: float = 0.0
     retryable: bool = True
 
@@ -72,15 +64,10 @@ class ExecutionStep:
 class ExecutionPlan:
     objective: str
     steps: List[ExecutionStep]
-
     required_tools: List[str] = field(default_factory=list)
     created_at: float = field(default_factory=time.time)
 
     def validate(self) -> bool:
-        """
-        HARD VALIDATION.
-        Returns True if valid, False otherwise.
-        """
         try:
             if not isinstance(self.objective, str) or not self.objective.strip():
                 return False
@@ -89,6 +76,7 @@ class ExecutionPlan:
                 return False
 
             self._validate_step_ids()
+            self._validate_step_order()
             self._validate_dependencies()
             self._validate_steps()
             self._validate_done_step()
@@ -104,6 +92,11 @@ class ExecutionPlan:
         if len(ids) != len(set(ids)):
             raise ValueError("Duplicate step IDs detected")
 
+    def _validate_step_order(self) -> None:
+        ids = [s.id for s in self.steps]
+        if ids != sorted(ids):
+            raise ValueError("Step IDs must be strictly increasing")
+
     def _validate_dependencies(self) -> None:
         ids: Set[int] = {s.id for s in self.steps}
 
@@ -118,7 +111,7 @@ class ExecutionPlan:
                     )
                 if dep >= step.id:
                     raise ValueError(
-                        f"Step {step.id} has invalid forward/self dependency {dep}"
+                        f"Step {step.id} has forward/self dependency {dep}"
                     )
 
         if self._has_cycles():
@@ -164,13 +157,15 @@ class ExecutionPlan:
     def _validate_done_step(self) -> None:
         done_steps = [s for s in self.steps if s.type == StepType.DONE]
         if len(done_steps) != 1:
-            raise ValueError(
-                f"ExecutionPlan must contain exactly one DONE step"
-            )
+            raise ValueError("ExecutionPlan must contain exactly one DONE step")
+
+        done_step = done_steps[0]
+        if done_step.id != max(s.id for s in self.steps):
+            raise ValueError("DONE step must be the final step")
 
 
 # =================================================
-# UI ACTION VALIDATION (SOC-COMPAT)
+# UI ACTION VALIDATION
 # =================================================
 
 def _is_string(v):
@@ -230,7 +225,12 @@ def validate_action(action: Dict[str, Any]) -> bool:
     if not REQUIRED_FIELDS[op].issubset(action.keys()):
         return False
 
-    allowed_fields = COMMON_FIELDS | OPTIONAL_FIELDS[op]
+    allowed_fields = (
+        COMMON_FIELDS
+        | REQUIRED_FIELDS[op]
+        | OPTIONAL_FIELDS[op]
+    )
+
     if not set(action.keys()).issubset(allowed_fields):
         return False
 
