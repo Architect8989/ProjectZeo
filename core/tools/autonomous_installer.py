@@ -2,16 +2,7 @@
 Autonomous Installer
 
 Purpose:
-Installs missing tools using **human-like interaction**, not scripted shell installs.
-
-This module:
-- DOES interact with UI via observer + screenpipe
-- DOES use OS backend for clicks / typing
-- DOES NOT execute arbitrary shell installers silently
-- DOES verify installation post-completion
-- DOES fail hard if installer flow is ambiguous
-
-This is the ONLY allowed mechanism for TOOL_INSTALLATION steps.
+Installs missing tools using human-like interaction, not scripted installs.
 """
 
 import time
@@ -38,7 +29,7 @@ class AutonomousInstaller:
     - No silent shell installs
     """
 
-    MAX_INSTALL_TIME = 15 * 60  # 15 minutes per tool
+    MAX_INSTALL_TIME = 15 * 60  # seconds
     UI_SETTLE_DELAY = 1.0
 
     def __init__(
@@ -51,7 +42,7 @@ class AutonomousInstaller:
         self._observer = observer
         self._screenpipe = screenpipe
         self._os = os_backend
-        self._verifier = StepVerifier()
+        self._verifier = StepVerifier(os_backend=os_backend)
 
     # -------------------------------------------------
     # PUBLIC API
@@ -60,55 +51,42 @@ class AutonomousInstaller:
     def install_tool(self, tool: Dict[str, Any]) -> None:
         """
         Install a tool via browser + installer wizard.
-
-        tool schema (minimal):
-        {
-            "name": "node",
-            "official_url": "https://nodejs.org",
-            "verification": {...}
-        }
         """
 
         name = tool.get("name")
         url = tool.get("official_url")
 
-        if not name or not url:
+        if not isinstance(name, str) or not isinstance(url, str):
             raise InstallationError("Tool definition incomplete")
 
         start_ts = time.time()
 
-        # ---- open browser ----
         self._open_browser()
         self._wait_ui()
 
-        # ---- navigate to official site ----
         self._navigate(url)
         self._wait_ui()
 
-        # ---- locate download ----
         if not self._click_download_button(name):
             raise InstallationError(
-                f"Could not locate download button for {name}"
+                f"Download button not found for {name}"
             )
 
-        # ---- wait for download ----
         installer_path = self._wait_for_download(start_ts)
         if not installer_path:
             raise InstallationError(
                 f"Installer download not detected for {name}"
             )
 
-        # ---- run installer ----
         self._os.exec(installer_path)
         self._wait_ui()
 
-        # ---- wizard navigation ----
         self._navigate_installer_wizard(start_ts)
 
-        # ---- verification ----
-        if not self._verify_installation(tool):
+        verification = self._verify_installation(tool)
+        if not verification.success:
             raise InstallationError(
-                f"Post-install verification failed for {name}"
+                f"Post-install verification failed: {verification.reason}"
             )
 
     # -------------------------------------------------
@@ -125,29 +103,22 @@ class AutonomousInstaller:
 
     def _click_download_button(self, tool_name: str) -> bool:
         """
-        Uses screen text to infer download CTA.
-        Conservative: only clicks when high confidence.
+        Conservative: click only when high confidence.
         """
-        state = self._screenpipe.read()
+        state = self._safe_read()
         text = state.get("text", "").lower()
 
-        keywords = ["download", tool_name.lower()]
-        if not all(k in text for k in keywords):
+        if "download" not in text:
             return False
 
-        button = self._observer.find_click_target(
-            contains="download"
-        )
-        if not button:
+        target = self._observer.find_click_target(contains="download")
+        if not target:
             return False
 
-        self._os.mouse(button)
+        self._os.mouse(target)
         return True
 
     def _wait_for_download(self, start_ts: float) -> Optional[str]:
-        """
-        Poll downloads directory heuristically.
-        """
         while time.time() - start_ts < self.MAX_INSTALL_TIME:
             path = self._os.get_latest_download()
             if path:
@@ -157,14 +128,13 @@ class AutonomousInstaller:
 
     def _navigate_installer_wizard(self, start_ts: float) -> None:
         """
-        Generic installer wizard handler:
-        clicks Next / Agree / Install until completion.
+        Deterministic wizard navigation.
         """
         while time.time() - start_ts < self.MAX_INSTALL_TIME:
-            state = self._screenpipe.read()
+            state = self._safe_read()
             text = state.get("text", "").lower()
 
-            if any(k in text for k in ("finish", "completed", "done")):
+            if any(k in text for k in ("completed", "finish", "done")):
                 self._click_button(["finish", "done"])
                 return
 
@@ -188,20 +158,18 @@ class AutonomousInstaller:
     # VERIFICATION
     # -------------------------------------------------
 
-    def _verify_installation(self, tool: Dict[str, Any]) -> bool:
+    def _verify_installation(self, tool: Dict[str, Any]):
         """
-        Delegates to StepVerifier using tool_check semantics.
+        Delegates to StepVerifier (authoritative).
         """
-        action = {
+        step_like = {
             "operation": "tool_check",
             "tool": tool.get("name"),
             "version_command": tool.get("version_command"),
             "min_version": tool.get("min_version"),
         }
-        return self._verifier.verify_step(
-            action=action,
-            execution_result=None,
-        )
+
+        return self._verifier.verify_step_like(step_like)
 
     # -------------------------------------------------
     # UTIL
@@ -209,3 +177,9 @@ class AutonomousInstaller:
 
     def _wait_ui(self) -> None:
         time.sleep(self.UI_SETTLE_DELAY)
+
+    def _safe_read(self) -> Dict[str, Any]:
+        try:
+            return self._screenpipe.read() or {}
+        except Exception:
+            return {}
