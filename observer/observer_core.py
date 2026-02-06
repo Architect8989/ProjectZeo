@@ -21,10 +21,10 @@ class ObserverCore:
 
     MAX_HISTORY = 1000
 
-    STARTUP_GRACE_TICKS = 10          # relaxed
-    STARTUP_GRACE_SECONDS = 5.0       # relaxed
+    STARTUP_GRACE_TICKS = 10
+    STARTUP_GRACE_SECONDS = 5.0
 
-    MAX_CONSECUTIVE_MISSES = 5        # before blindness
+    MAX_CONSECUTIVE_MISSES = 5
 
     def __init__(self):
         self._clock = time.monotonic
@@ -62,9 +62,6 @@ class ObserverCore:
     # --------------------------------------------------
 
     def reset_for_new_task(self) -> None:
-        """
-        Enforces full observer amnesia between executions.
-        """
         with self._lock:
             self._history.clear()
 
@@ -107,7 +104,6 @@ class ObserverCore:
 
             now = self._clock()
 
-            # ---- startup grace ----
             if self.last_frame_seen is None:
                 grace_ok = (
                     self.tick_count < self.STARTUP_GRACE_TICKS
@@ -161,7 +157,6 @@ class ObserverCore:
                 "frame_ts"
             )
 
-            # Blind only after sustained loss
             if (
                 not available
                 and self._consecutive_misses
@@ -177,6 +172,65 @@ class ObserverCore:
             self._state["ui_snapshot"] = copy.deepcopy(
                 ui_snapshot
             )
+
+    # --------------------------------------------------
+    # UI QUERY (READ-ONLY)
+    # --------------------------------------------------
+
+    def find_click_target(
+        self,
+        *,
+        contains: Optional[str] = None,
+        exact: Optional[str] = None,
+    ) -> Optional[Dict[str, float]]:
+        """
+        Locate a clickable UI element from the latest ui_snapshot.
+
+        Contract:
+        - Observer-only (no OS access)
+        - Deterministic
+        - Returns normalized coordinates {x, y} in [0.0, 1.0]
+        - Returns None if no match
+        """
+        with self._lock:
+            ui_snapshot = self._state.get("ui_snapshot")
+            if not ui_snapshot:
+                return None
+
+            elements = ui_snapshot.get("elements")
+            if not isinstance(elements, list):
+                return None
+
+            contains_l = contains.lower() if contains else None
+            exact_l = exact.lower() if exact else None
+
+            for el in elements:
+                if not isinstance(el, dict):
+                    continue
+
+                text = str(el.get("text", "")).lower()
+
+                if exact_l is not None:
+                    if text != exact_l:
+                        continue
+                elif contains_l is not None:
+                    if contains_l not in text:
+                        continue
+                else:
+                    continue
+
+                x = el.get("x")
+                y = el.get("y")
+
+                if (
+                    isinstance(x, (int, float))
+                    and isinstance(y, (int, float))
+                    and 0.0 <= x <= 1.0
+                    and 0.0 <= y <= 1.0
+                ):
+                    return {"x": float(x), "y": float(y)}
+
+            return None
 
     # --------------------------------------------------
 
