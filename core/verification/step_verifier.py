@@ -1,6 +1,7 @@
 import os
 import shutil
 import subprocess
+from dataclasses import dataclass
 from typing import Optional, Any, Dict
 
 from core.schemas.execution_plan import ExecutionStep, StepType
@@ -8,6 +9,20 @@ from core.schemas.execution_plan import ExecutionStep, StepType
 
 class VerificationError(RuntimeError):
     """Authoritative verification failure."""
+
+
+@dataclass(frozen=True)
+class VerificationResult:
+    """
+    Immutable verification outcome.
+
+    success: definitive truth value
+    reason: human-readable failure reason
+    details: optional forensic metadata
+    """
+    success: bool
+    reason: Optional[str] = None
+    details: Optional[Dict[str, Any]] = None
 
 
 class StepVerifier:
@@ -32,32 +47,55 @@ class StepVerifier:
         *,
         screenshot: Optional[Dict[str, Any]] = None,
         previous_screenshot: Optional[Dict[str, Any]] = None,
-    ) -> bool:
+    ) -> VerificationResult:
         if not isinstance(step, ExecutionStep):
             raise VerificationError("Invalid step object")
 
-        if step.type == StepType.DONE:
-            return True
+        try:
+            if step.type == StepType.DONE:
+                return VerificationResult(True, reason="done")
 
-        if step.type == StepType.VERIFICATION:
-            return True
+            if step.type == StepType.VERIFICATION:
+                return VerificationResult(True, reason="verification-only")
 
-        if step.type == StepType.COMMAND_EXECUTION:
-            return self._verify_command(step, execution_result)
+            if step.type == StepType.COMMAND_EXECUTION:
+                ok = self._verify_command(step, execution_result)
+                return self._result(ok, "command verification failed")
 
-        if step.type == StepType.FILE_CREATION:
-            return self._verify_file(step)
+            if step.type == StepType.FILE_CREATION:
+                ok = self._verify_file(step)
+                return self._result(ok, "file verification failed")
 
-        if step.type == StepType.TOOL_INSTALLATION:
-            return self._verify_tool(step)
+            if step.type == StepType.TOOL_INSTALLATION:
+                ok = self._verify_tool(step)
+                return self._result(ok, "tool verification failed")
 
-        if step.type == StepType.UI_INTERACTION:
-            return self._verify_ui_change(
-                screenshot=screenshot,
-                previous_screenshot=previous_screenshot,
+            if step.type == StepType.UI_INTERACTION:
+                ok = self._verify_ui_change(
+                    screenshot=screenshot,
+                    previous_screenshot=previous_screenshot,
+                )
+                return self._result(ok, "ui verification failed")
+
+        except Exception as e:
+            return VerificationResult(
+                success=False,
+                reason=f"verification exception: {e}",
             )
 
-        raise VerificationError(f"Unhandled step type: {step.type}")
+        return VerificationResult(
+            success=False,
+            reason=f"Unhandled step type: {step.type}",
+        )
+
+    # =================================================
+    # INTERNAL HELPERS
+    # =================================================
+
+    def _result(self, ok: bool, reason: str) -> VerificationResult:
+        if ok:
+            return VerificationResult(success=True)
+        return VerificationResult(success=False, reason=reason)
 
     # =================================================
     # COMMAND VERIFICATION
