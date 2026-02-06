@@ -24,9 +24,9 @@ from core.execution.failure_recovery import FailureRecoveryManager
 
 def operate_main(
     *,
-    model: Optional[str],               # ignored (planning-only concern)
-    terminal_prompt: str,               # retained for audit/context
-    execution_plan: ExecutionPlan,       # REQUIRED
+    model: Optional[str],
+    terminal_prompt: str,
+    execution_plan: ExecutionPlan,
     observer=None,
     screenpipe=None,
     max_wallclock_seconds: int = 90 * 60,
@@ -44,7 +44,7 @@ def operate_main(
     if not isinstance(execution_plan, ExecutionPlan):
         raise ValueError("execution_plan must be ExecutionPlan")
 
-    # validate() raises on failure (authoritative)
+    # authoritative validation (raises)
     execution_plan.validate()
 
     os_backend = OperatingSystem()
@@ -56,7 +56,7 @@ def operate_main(
     journal = ActionJournal()
     input_arbitrator = InputArbitrator()
 
-    verifier = StepVerifier()
+    verifier = StepVerifier(os_backend=os_backend)
     recovery = FailureRecoveryManager()
     progress = ProgressTracker(execution_plan)
 
@@ -101,13 +101,13 @@ def _execute_plan(
     )
 
     for step in execution_plan.steps:
-        # ---- global wall-clock timeout ----
+        # ---- wall-clock guard ----
         if time.time() - start_ts > max_wallclock_seconds:
             journal.record(event="execution_timeout")
             raise RuntimeError("Execution wall-clock timeout exceeded")
 
         # ---- dependency enforcement ----
-        for dep in step.depends_on:
+        for dep in step.dependencies:
             if not progress.is_completed(dep):
                 journal.record(
                     event="dependency_violation",
@@ -119,7 +119,7 @@ def _execute_plan(
         # ---- authority gate ----
         decision = input_arbitrator.evaluate(
             input_event_ts=time.monotonic(),
-            high_risk=(step.type == StepType.TOOL_INSTALL),
+            high_risk=(step.type == StepType.TOOL_INSTALLATION),
             soc_confident=True,
         )
 
@@ -148,21 +148,16 @@ def _execute_plan(
                         accessibility_backend=accessibility_backend,
                     )
 
-                # ---- verification (boolean, authoritative) ----
-                ok = verifier.verify_step(
-                    action=step.action,
-                    execution_result=None,
-                    screenshot=None,
-                    previous_screenshot=None,
-                )
-
-                if not ok:
-                    raise RuntimeError("Step verification failed")
+                # ---- verification (authoritative object) ----
+                verification = verifier.verify_step(step)
+                if not verification.success:
+                    raise RuntimeError(verification.reason)
 
                 progress.complete_step(step.id)
                 journal.record(
                     event="step_complete",
                     step_id=step.id,
+                    details=verification.details,
                 )
                 break
 
@@ -207,30 +202,26 @@ def _execute_step(
     os_backend: OperatingSystem,
     accessibility_backend: AccessibilityBackend,
 ):
-    if step.type == StepType.COMMAND:
+    if step.type == StepType.COMMAND_EXECUTION:
         cmd = step.action.get("command")
         if not cmd:
             raise ValueError("Missing command")
         os_backend.exec(cmd, sudo=step.action.get("sudo", False))
 
-    elif step.type == StepType.FILE_WRITE:
+    elif step.type == StepType.FILE_CREATION:
         path = step.action.get("path")
         content = step.action.get("content", "")
         if not path:
             raise ValueError("Missing file path")
         os_backend.write_file(path, content)
 
-    elif step.type == StepType.UI_ACTION:
+    elif step.type == StepType.UI_INTERACTION:
         _execute_ui(step.action, os_backend)
 
-    elif step.type == StepType.TOOL_INSTALL:
-        # Explicitly fail-closed until installer is wired
+    elif step.type == StepType.TOOL_INSTALLATION:
         raise RuntimeError("AutonomousInstaller not integrated")
 
-    elif step.type == StepType.VERIFICATION:
-        return
-
-    elif step.type == StepType.DONE:
+    elif step.type in (StepType.VERIFICATION, StepType.DONE):
         return
 
     else:
@@ -285,4 +276,4 @@ def _valid_coord(v: Any) -> bool:
         isinstance(v, (int, float))
         and not math.isnan(v)
         and 0.0 <= v <= 1.0
-   )
+    )
