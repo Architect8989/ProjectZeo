@@ -125,17 +125,28 @@ def main():
                 # ---- SNAPSHOT (OBSERVER ONLY) ----
                 snapshot_id = SNAPSHOT_PROVIDER.take_snapshot()
 
-                intent = mode.consume_intent()
-
                 # ---- PLANNING ----
                 mode.begin_planning()
 
+                # READ intent WITHOUT consuming
+                intent = mode.get_intent()
+                if not intent:
+                    raise RuntimeError("Armed with no intent")
+
                 planner = ExecutionPlanner(
-                    llm_call=lambda prompt: prompt  # placeholder; replace with real LLM call
+                    llm_call=lambda prompt: prompt  # placeholder
                 )
 
-                execution_plan = planner.create_plan(intent)
+                execution_plan = planner.create_plan(
+                    objective=intent,
+                    requirements={},
+                    high_level_steps=[
+                        {"goal": intent}
+                    ],
+                )
 
+                plan_id = f"plan_{int(time.time())}_{abs(hash(intent))}"
+                mode.attach_execution_plan(plan_id)
                 mode.mark_planning_complete()
 
                 AUTH_STATE.persist(
@@ -149,9 +160,12 @@ def main():
                 try:
                     mode.execute()
 
+                    # NOW consume intent (EXECUTING only)
+                    consumed_intent = mode.consume_intent()
+
                     operate_main(
                         model=None,
-                        terminal_prompt=intent,
+                        terminal_prompt=consumed_intent,
                         execution_plan=execution_plan,
                         observer=observer,
                         screenpipe=screenpipe,
