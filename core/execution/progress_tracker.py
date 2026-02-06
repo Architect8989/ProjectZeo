@@ -1,6 +1,8 @@
 # core/execution/progress_tracker.py
 
 import time
+import json
+import os
 from typing import Set, Optional
 
 from core.schemas.execution_plan import ExecutionPlan
@@ -19,7 +21,7 @@ class ProgressTracker:
     - No execution
     - No retries
     - No recovery logic
-    - No side effects outside memory
+    - Side effects limited to progress persistence
     """
 
     def __init__(self, execution_plan: ExecutionPlan):
@@ -34,6 +36,47 @@ class ProgressTracker:
         self._current_step: Optional[int] = None
         self._execution_start_ts: Optional[float] = None
 
+        self._progress_path = f".progress_{id(self._plan)}.json"
+        self._load()
+
+    # ==================================================
+    # PERSISTENCE
+    # ==================================================
+
+    def _load(self) -> None:
+        if not os.path.exists(self._progress_path):
+            return
+
+        try:
+            with open(self._progress_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+
+            self._completed = set(data.get("completed", []))
+            self._failed = set(data.get("failed", []))
+            self._current_step = data.get("current_step")
+            self._execution_start_ts = data.get("execution_start_ts")
+        except Exception:
+            # Fail-closed: corrupted progress is ignored
+            self._completed.clear()
+            self._failed.clear()
+            self._current_step = None
+            self._execution_start_ts = None
+
+    def _persist(self) -> None:
+        tmp_path = f"{self._progress_path}.tmp"
+
+        payload = {
+            "completed": sorted(self._completed),
+            "failed": sorted(self._failed),
+            "current_step": self._current_step,
+            "execution_start_ts": self._execution_start_ts,
+        }
+
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+
+        os.replace(tmp_path, self._progress_path)
+
     # ==================================================
     # EXECUTION LIFECYCLE
     # ==================================================
@@ -43,6 +86,7 @@ class ProgressTracker:
             raise RuntimeError("Execution already started")
 
         self._execution_start_ts = time.time()
+        self._persist()
 
     # ==================================================
     # STEP STATE
@@ -56,6 +100,7 @@ class ProgressTracker:
             raise RuntimeError(f"Step {step_id} already failed")
 
         self._current_step = step_id
+        self._persist()
 
     def complete_step(self, step_id: int) -> None:
         if self._current_step != step_id:
@@ -65,13 +110,15 @@ class ProgressTracker:
 
         self._completed.add(step_id)
         self._current_step = None
+        self._persist()
 
     def fail_step(self, step_id: int, reason: str) -> None:
-        # reason is recorded by journal; tracker enforces state only
         self._failed.add(step_id)
 
         if self._current_step == step_id:
             self._current_step = None
+
+        self._persist()
 
     # ==================================================
     # QUERY INTERFACE
