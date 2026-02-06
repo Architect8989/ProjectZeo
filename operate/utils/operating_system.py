@@ -3,6 +3,8 @@ import platform
 import time
 import math
 import threading
+import subprocess
+import os
 from typing import Optional
 
 from operate.utils.misc import convert_percent_to_decimal
@@ -84,13 +86,9 @@ class OperatingSystem:
                     self._automation_active = False
 
             if timed_out:
-                # fail-open, visible failure
                 try:
-                    self.force_release_all(
-                        reason="heartbeat_timeout"
-                    )
+                    self.force_release_all(reason="heartbeat_timeout")
                 except Exception:
-                    # never re-raise from watchdog
                     pass
 
     # -------------------------------------------------
@@ -169,14 +167,84 @@ class OperatingSystem:
 
         pyautogui.moveTo(x_px, y_px, duration=0.1)
 
-        # minimal verification: cursor reached target
         cur_x, cur_y = pyautogui.position()
         if abs(cur_x - x_px) > 2 or abs(cur_y - y_px) > 2:
-            raise RuntimeError(
-                "Cursor failed to reach target position"
-            )
+            raise RuntimeError("Cursor failed to reach target position")
 
         pyautogui.click(x_px, y_px)
+
+    # -------------------------------------------------
+    # COMMAND EXECUTION
+    # -------------------------------------------------
+
+    def exec(self, command: str, sudo: bool = False) -> None:
+        if not isinstance(command, str) or not command.strip():
+            raise RuntimeError("exec(): command must be non-empty string")
+
+        full_cmd = command
+        if sudo and platform.system() != "Windows":
+            full_cmd = f"sudo {command}"
+
+        result = subprocess.run(
+            full_cmd,
+            shell=True,
+            capture_output=True,
+            text=True,
+        )
+
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"Command failed: {full_cmd}\n{result.stderr}"
+            )
+
+    # -------------------------------------------------
+    # FILESYSTEM
+    # -------------------------------------------------
+
+    def write_file(self, path: str, content: str) -> None:
+        if not isinstance(path, str) or not path:
+            raise RuntimeError("write_file(): invalid path")
+
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content or "")
+
+    def mkdir(self, path: str) -> None:
+        if not isinstance(path, str) or not path:
+            raise RuntimeError("mkdir(): invalid path")
+        os.makedirs(path, exist_ok=True)
+
+    # -------------------------------------------------
+    # BROWSER / DOWNLOAD SUPPORT (INSTALLER)
+    # -------------------------------------------------
+
+    def open_browser(self) -> None:
+        system = platform.system()
+        if system == "Windows":
+            os.startfile("https://www.google.com")
+        elif system == "Darwin":
+            subprocess.run(["open", "https://www.google.com"])
+        else:
+            subprocess.run(["xdg-open", "https://www.google.com"])
+
+    def focus_address_bar(self) -> None:
+        self.press(["ctrl", "l"])
+
+    def get_latest_download(self) -> Optional[str]:
+        downloads = os.path.join(os.path.expanduser("~"), "Downloads")
+        if not os.path.isdir(downloads):
+            return None
+
+        files = [
+            os.path.join(downloads, f)
+            for f in os.listdir(downloads)
+        ]
+        files = [f for f in files if os.path.isfile(f)]
+        if not files:
+            return None
+
+        return max(files, key=os.path.getmtime)
 
     # -------------------------------------------------
     # FAIL-OPEN SAFETY (VISIBLE)
@@ -257,4 +325,4 @@ class OperatingSystem:
             isinstance(v, float)
             and not math.isnan(v)
             and 0.0 <= v <= 1.0
-                    )
+        )
