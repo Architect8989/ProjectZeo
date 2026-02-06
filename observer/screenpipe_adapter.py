@@ -2,6 +2,7 @@ import time
 import hashlib
 import requests
 import threading
+import os
 from typing import Dict, Optional
 from enum import Enum
 
@@ -28,7 +29,10 @@ class ScreenpipeAdapter:
     - Adapter owns all readiness & health logic
     """
 
-    SCREENPIPE_URL = "http://127.0.0.1:3030/latest"
+    SCREENPIPE_URL = os.getenv(
+        "SCREENPIPE_URL",
+        "http://127.0.0.1:3030/latest",
+    )
     REQUEST_TIMEOUT = 0.3
 
     MAX_FRAME_AGE_SECONDS = 1.5
@@ -60,7 +64,22 @@ class ScreenpipeAdapter:
             "text": "",
         }
 
-        print("[SCREENPIPE] Adapter initialized")
+    # =================================================
+    # PROPERTIES
+    # =================================================
+
+    @property
+    def blind(self) -> bool:
+        """
+        Exposed blindness flag required by SnapshotProvider.
+
+        True means the adapter must not be trusted for reads.
+        """
+        with self._lock:
+            return self.state in (
+                ScreenpipeState.TEMP_UNAVAILABLE,
+                ScreenpipeState.FATAL,
+            )
 
     # =================================================
     # Internal helpers
@@ -72,7 +91,8 @@ class ScreenpipeAdapter:
         h.update(str(int(ts)).encode())
         return h.hexdigest()
 
-    def _normalize_timestamp(self, raw_ts: float) -> float:
+    @staticmethod
+    def _normalize_timestamp(raw_ts: float) -> float:
         ts = float(raw_ts)
         if ts > 1e12:  # ms → sec
             ts /= 1000.0
@@ -89,6 +109,10 @@ class ScreenpipeAdapter:
 
         if self.failure_count >= self.MAX_CONSECUTIVE_FAILURES:
             self.state = ScreenpipeState.TEMP_UNAVAILABLE
+
+    def _enter_fatal(self, reason: str) -> None:
+        self.state = ScreenpipeState.FATAL
+        self.blind_reason = reason
 
     def _maybe_recover(self) -> None:
         if self.state != ScreenpipeState.TEMP_UNAVAILABLE:
@@ -116,7 +140,7 @@ class ScreenpipeAdapter:
         with self._lock:
             if self.state == ScreenpipeState.FATAL:
                 raise ScreenpipeBlindnessError(
-                    "Screenpipe entered fatal state"
+                    f"Screenpipe fatal: {self.blind_reason}"
                 )
 
             if self.state == ScreenpipeState.TEMP_UNAVAILABLE:
@@ -223,6 +247,9 @@ class ScreenpipeAdapter:
             }
 
     def self_test(self) -> bool:
+        """
+        Hard readiness check used at system startup.
+        """
         try:
             frame = self.read()
             return bool(frame.get("available"))
