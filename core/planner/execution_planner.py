@@ -58,12 +58,8 @@ class ExecutionPlanner:
         requirements: Dict[str, Any],
         high_level_steps: List[Dict[str, Any]],
     ) -> ExecutionPlan:
-        """
-        Build an ExecutionPlan from decomposed steps.
-
-        Raises:
-            PlanningError on any structural violation
-        """
+        if not isinstance(objective, str) or not objective.strip():
+            raise PlanningError("Objective must be non-empty string")
 
         if not high_level_steps:
             raise PlanningError("No high-level steps provided")
@@ -72,17 +68,21 @@ class ExecutionPlanner:
         step_id = 1
         last_step_id: Optional[int] = None
 
+        # --------------------------------------------------
+        # Expand high-level goals
+        # --------------------------------------------------
+
         for hl in high_level_steps:
             goal = hl.get("goal")
-            if not isinstance(goal, str):
+            if not isinstance(goal, str) or not goal.strip():
                 raise PlanningError("Invalid high-level step goal")
 
-            expanded_steps = self._expand_goal(goal)
+            expanded = self._expand_goal(goal.strip())
 
-            for spec in expanded_steps:
-                deps = []
+            for spec in expanded:
+                depends_on: List[int] = []
                 if last_step_id is not None:
-                    deps.append(last_step_id)
+                    depends_on.append(last_step_id)
 
                 step = ExecutionStep(
                     id=step_id,
@@ -90,8 +90,9 @@ class ExecutionPlanner:
                     description=spec["description"],
                     action=spec.get("action", {}),
                     verification=spec.get("verification", {}),
-                    dependencies=deps,
-                    estimated_duration=spec.get("estimated_duration", 30),
+                    depends_on=depends_on,
+                    estimated_duration=spec.get("estimated_duration", 0.0),
+                    retryable=True,
                 )
 
                 execution_steps.append(step)
@@ -99,20 +100,37 @@ class ExecutionPlanner:
                 step_id += 1
 
         if not execution_steps:
-            raise PlanningError("Execution plan is empty")
+            raise PlanningError("Execution plan has no executable steps")
+
+        # --------------------------------------------------
+        # Append FINAL DONE step (mandatory)
+        # --------------------------------------------------
+
+        execution_steps.append(
+            ExecutionStep(
+                id=step_id,
+                type=StepType.DONE,
+                description="Objective complete",
+                action={
+                    "operation": "done",
+                    "summary": objective.strip(),
+                },
+                verification={},
+                depends_on=[last_step_id] if last_step_id else [],
+                estimated_duration=0.0,
+                retryable=False,
+            )
+        )
 
         plan = ExecutionPlan(
-            objective=objective,
+            objective=objective.strip(),
             steps=execution_steps,
-            required_tools=[],  # tool manager added later
-            estimated_total_duration=sum(
-                s.estimated_duration for s in execution_steps
-            ),
+            required_tools=[],  # tool resolution handled elsewhere
             created_at=time.time(),
         )
 
-        if not plan.validate():
-            raise PlanningError("ExecutionPlan validation failed")
+        # HARD VALIDATION (raises on failure)
+        plan.validate()
 
         return plan
 
@@ -125,9 +143,10 @@ class ExecutionPlanner:
         Expands a single high-level goal into conservative execution steps.
 
         Rules:
-        - Always produce verifiable structure
-        - Never invent tools
-        - Never emit UI ops here
+        - Deterministic
+        - No UI emission
+        - No tool invention
+        - Always verifiable
         """
 
         normalized = goal.lower()
@@ -137,7 +156,7 @@ class ExecutionPlanner:
         if any(k in normalized for k in ("create", "setup", "initialize", "scaffold")):
             steps.append(
                 {
-                    "type": StepType.FILE_CREATION,
+                    "type": StepType.FILE_WRITE,
                     "description": goal,
                     "action": {
                         "path": "./",
@@ -146,7 +165,7 @@ class ExecutionPlanner:
                     "verification": {
                         "exists": True,
                     },
-                    "estimated_duration": 10,
+                    "estimated_duration": 10.0,
                 }
             )
 
@@ -156,7 +175,7 @@ class ExecutionPlanner:
                     "description": f"Verify filesystem effect: {goal}",
                     "action": {},
                     "verification": {},
-                    "estimated_duration": 5,
+                    "estimated_duration": 5.0,
                 }
             )
             return steps
@@ -165,14 +184,14 @@ class ExecutionPlanner:
         if any(k in normalized for k in ("run", "build", "generate", "start")):
             steps.append(
                 {
-                    "type": StepType.COMMAND_EXECUTION,
+                    "type": StepType.COMMAND,
                     "description": goal,
                     "action": {
                         "command": "",
                         "sudo": False,
                     },
                     "verification": {},
-                    "estimated_duration": 20,
+                    "estimated_duration": 20.0,
                 }
             )
 
@@ -182,19 +201,20 @@ class ExecutionPlanner:
                     "description": f"Verify command effect: {goal}",
                     "action": {},
                     "verification": {},
-                    "estimated_duration": 5,
+                    "estimated_duration": 5.0,
                 }
             )
             return steps
 
-        # ---- fallback: explicit verification-only step ----
+        # ---- fallback: verification-only ----
         steps.append(
             {
                 "type": StepType.VERIFICATION,
                 "description": goal,
                 "action": {},
                 "verification": {},
-                "estimated_duration": 5,
+                "estimated_duration": 5.0,
             }
         )
+
         return steps
