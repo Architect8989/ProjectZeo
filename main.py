@@ -9,7 +9,7 @@ from core.intent_listener import IntentListener
 from core.environment_fingerprint import collect_environment_fingerprint
 
 from observer.observer_core import ObserverCore, ObserverBlindnessError
-from observer.screenpipe_adapter import ScreenpipeAdapter
+from observer.screenpipe_adapter import ScreenpipeAdapter, ScreenpipeBlindnessError
 from observer.perception_engine import PerceptionEngine
 
 from state.serializer import AuthorityStateSerializer
@@ -24,7 +24,7 @@ from core.planner.execution_planner import ExecutionPlanner
 HEARTBEAT_INTERVAL = 2.0
 
 # ==================================================
-# PROCESS AUTHORITY (SINGLETONS)
+# PROCESS SINGLETONS
 # ==================================================
 
 OS_BACKEND = OperatingSystem()
@@ -38,7 +38,7 @@ mode = ModeController()
 
 SNAPSHOT_PROVIDER = SnapshotProvider(
     observer=observer,
-    screenpipe=None,
+    screenpipe=None,  # injected after validation
     os_backend=OS_BACKEND,
     mode_controller=mode,
 )
@@ -54,7 +54,7 @@ RESTORE_PROVIDER = RestoreProvider(
 
 def _force_safe_shutdown(reason: str):
     try:
-        OS_BACKEND.force_release_all()
+        OS_BACKEND.force_release_all(reason=reason)
     except Exception:
         pass
 
@@ -77,37 +77,54 @@ signal.signal(signal.SIGTERM, _signal_handler)
 signal.signal(signal.SIGQUIT, _signal_handler)
 
 # ==================================================
-# ROOT MAIN (LIFECYCLE AUTHORITY)
+# ROOT MAIN
 # ==================================================
 
 def main():
     print("[BOOT] System starting")
 
-    # ---- environment probe (non-fatal) ----
-    collect_environment_fingerprint()
+    # --------------------------------------------------
+    # ENVIRONMENT FINGERPRINT (AUTHORITATIVE)
+    # --------------------------------------------------
+    env_fingerprint = collect_environment_fingerprint()
 
-    # ---- crash recovery gate ----
+    # --------------------------------------------------
+    # CRASH RECOVERY GATE
+    # --------------------------------------------------
     persisted = AUTH_STATE.load()
     if persisted.get("dirty") or persisted.get("restore_required"):
-        OS_BACKEND.force_release_all()
+        OS_BACKEND.force_release_all(reason="crash_recovery")
         AUTH_STATE.force_safe_state()
         mode.force_observer()
 
-    # ---- REQUIRED DEPENDENCY: Screenpipe ----
+    # --------------------------------------------------
+    # REQUIRED DEPENDENCY: SCREENPIPE
+    # --------------------------------------------------
     screenpipe = ScreenpipeAdapter()
-    SNAPSHOT_PROVIDER.screenpipe = screenpipe
 
-    # ---- intent listener ----
+    if not screenpipe.self_test():
+        raise RuntimeError("Screenpipe self-test failed")
+
+    SNAPSHOT_PROVIDER.screenpipe = screenpipe
+    print("[SCREENPIPE] Connected and healthy")
+
+    # --------------------------------------------------
+    # INTENT LISTENER
+    # --------------------------------------------------
     intent_listener = IntentListener(mode)
     intent_listener.start()
 
     print("[OBSERVER] Active")
 
+    # ==================================================
+    # MAIN LOOP
+    # ==================================================
+
     while True:
         try:
-            # ==================================================
-            # OBSERVER LOOP
-            # ==================================================
+            # ----------------------------------------------
+            # PERCEPTION (SINGLE READ PER LOOP)
+            # ----------------------------------------------
             screen_state = screenpipe.read()
             ui_snapshot = perception.process(screen_state)
 
@@ -115,33 +132,34 @@ def main():
             observer.attach_ui_snapshot(ui_snapshot)
             observer.tick()
 
-            mode.update_vision_status(bool(screen_state.get("available")))
+            mode.update_vision_status(screen_state.get("available") is True)
             mode.update_observer_health(observer.is_healthy())
 
-            # ==================================================
+            # ----------------------------------------------
             # EXECUTION TRIGGER
-            # ==================================================
+            # ----------------------------------------------
             if mode.is_armed():
                 # ---- SNAPSHOT (OBSERVER-ONLY) ----
                 snapshot_id = SNAPSHOT_PROVIDER.take_snapshot()
 
-                # ==================================================
-                # PLANNING PHASE
-                # ==================================================
+                # ---- PLANNING ----
                 mode.begin_planning()
 
-                # READ intent without consuming
                 intent = mode.get_intent()
                 if not intent or not intent.strip():
-                    raise RuntimeError("System armed without valid intent")
+                    raise RuntimeError("Armed without valid intent")
 
                 planner = ExecutionPlanner(
-                    llm_call=lambda prompt: prompt  # placeholder
+                    llm_call=mode.get_llm_callable(),
+                    environment_fingerprint=env_fingerprint,
                 )
 
                 execution_plan = planner.create_plan(
                     objective=intent,
-                    requirements={},
+                    requirements={
+                        "environment": env_fingerprint,
+                        "tools": env_fingerprint.get("tools", []),
+                    },
                     high_level_steps=[{"goal": intent}],
                 )
 
@@ -157,13 +175,10 @@ def main():
                     dirty=True,
                 )
 
-                # ==================================================
-                # EXECUTION PHASE
-                # ==================================================
+                # ---- EXECUTION ----
                 try:
                     mode.execute()
 
-                    # NOW consume intent (EXECUTING-only)
                     consumed_intent = mode.consume_intent()
 
                     operate_main(
@@ -175,9 +190,7 @@ def main():
                     )
 
                 finally:
-                    # ==================================================
-                    # RESTORATION (FAIL-CLOSED)
-                    # ==================================================
+                    # ---- RESTORATION (FAIL-CLOSED) ----
                     try:
                         RESTORE_PROVIDER.restore_snapshot(snapshot_id)
                     except Exception:
@@ -193,12 +206,12 @@ def main():
 
                     mode.force_observer()
 
-        except ObserverBlindnessError:
-            _force_safe_shutdown("observer-blindness")
+        except (ObserverBlindnessError, ScreenpipeBlindnessError):
+            _force_safe_shutdown("perception-blindness")
             os._exit(1)
 
         except Exception as e:
-            _force_safe_shutdown(f"main-loop-failure: {e}")
+            _force_safe_shutdown(f"main-loop-failure:{e}")
             os._exit(1)
 
         time.sleep(HEARTBEAT_INTERVAL)
