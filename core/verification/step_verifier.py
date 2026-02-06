@@ -1,11 +1,13 @@
 import os
 import shutil
 import subprocess
-from typing import Dict, Any, Optional
+from typing import Optional, Any, Dict
+
+from core.schemas.execution_plan import ExecutionStep, StepType
 
 
 class VerificationError(RuntimeError):
-    pass
+    """Authoritative verification failure."""
 
 
 class StepVerifier:
@@ -16,69 +18,66 @@ class StepVerifier:
     - Evidence > vision
     - Vision is last-resort only
     - Absence of evidence == failure
-    - Unknown operations == failure
+    - Unknown step types == failure
     """
 
-    # -------------------------------------------------
-    # Public API
-    # -------------------------------------------------
+    # =================================================
+    # PUBLIC API
+    # =================================================
 
     def verify_step(
         self,
-        action: Dict[str, Any],
-        execution_result: Optional[Any],
+        step: ExecutionStep,
+        execution_result: Optional[Any] = None,
+        *,
         screenshot: Optional[Dict[str, Any]] = None,
         previous_screenshot: Optional[Dict[str, Any]] = None,
     ) -> bool:
-        if not isinstance(action, dict):
-            raise VerificationError("Invalid action object")
+        if not isinstance(step, ExecutionStep):
+            raise VerificationError("Invalid step object")
 
-        op = action.get("operation")
-        if not isinstance(op, str):
-            raise VerificationError("Action missing operation field")
-
-        if op == "done":
+        if step.type == StepType.DONE:
             return True
 
-        if op == "command":
-            return self._verify_command(action, execution_result)
+        if step.type == StepType.VERIFICATION:
+            return True
 
-        if op == "file_create":
-            return self._verify_file_creation(action, must_preexist=False)
+        if step.type == StepType.COMMAND_EXECUTION:
+            return self._verify_command(step, execution_result)
 
-        if op == "file_append":
-            return self._verify_file_creation(action, must_preexist=True)
+        if step.type == StepType.FILE_CREATION:
+            return self._verify_file(step)
 
-        if op == "mkdir":
-            return self._verify_directory(action)
+        if step.type == StepType.TOOL_INSTALLATION:
+            return self._verify_tool(step)
 
-        if op == "tool_check":
-            return self._verify_tool(action)
-
-        if op == "ui_action":
+        if step.type == StepType.UI_INTERACTION:
             return self._verify_ui_change(
                 screenshot=screenshot,
                 previous_screenshot=previous_screenshot,
             )
 
-        raise VerificationError(f"Unknown operation type: {op}")
+        raise VerificationError(f"Unhandled step type: {step.type}")
 
-    # -------------------------------------------------
+    # =================================================
     # COMMAND VERIFICATION
-    # -------------------------------------------------
+    # =================================================
 
-    def _verify_command(self, action: Dict[str, Any], result: Any) -> bool:
-        if result is None:
+    def _verify_command(
+        self,
+        step: ExecutionStep,
+        result: Any,
+    ) -> bool:
+        if result is None or not hasattr(result, "returncode"):
             return False
 
-        if not hasattr(result, "returncode"):
-            return False
+        verification = step.verification or {}
+        expected_codes = verification.get("expected_return_codes", [0])
 
-        expected_codes = action.get("expected_return_codes", [0])
         if result.returncode not in expected_codes:
             return False
 
-        expected_output = action.get("output_contains")
+        expected_output = verification.get("output_contains")
         if expected_output:
             combined = (result.stdout or "") + (result.stderr or "")
             for token in expected_output:
@@ -87,27 +86,28 @@ class StepVerifier:
 
         return True
 
-    # -------------------------------------------------
+    # =================================================
     # FILE VERIFICATION
-    # -------------------------------------------------
+    # =================================================
 
-    def _verify_file_creation(
-        self,
-        action: Dict[str, Any],
-        *,
-        must_preexist: bool,
-    ) -> bool:
+    def _verify_file(self, step: ExecutionStep) -> bool:
+        action = step.action or {}
+        verification = step.verification or {}
+
         path = action.get("path")
         if not isinstance(path, str):
             return False
 
-        if must_preexist and not os.path.exists(path):
+        if not os.path.exists(path):
             return False
+
+        if verification.get("is_directory"):
+            return os.path.isdir(path)
 
         if not os.path.isfile(path):
             return False
 
-        expected = action.get("content_contains")
+        expected = verification.get("content_contains")
         if expected:
             try:
                 with open(path, "r", encoding="utf-8", errors="ignore") as f:
@@ -120,15 +120,14 @@ class StepVerifier:
 
         return True
 
-    def _verify_directory(self, action: Dict[str, Any]) -> bool:
-        path = action.get("path")
-        return isinstance(path, str) and os.path.isdir(path)
-
-    # -------------------------------------------------
+    # =================================================
     # TOOL VERIFICATION
-    # -------------------------------------------------
+    # =================================================
 
-    def _verify_tool(self, action: Dict[str, Any]) -> bool:
+    def _verify_tool(self, step: ExecutionStep) -> bool:
+        action = step.action or {}
+        verification = step.verification or {}
+
         tool = action.get("tool")
         if not isinstance(tool, str):
             return False
@@ -137,8 +136,8 @@ class StepVerifier:
         if not tool_path:
             return False
 
-        version_cmd = action.get("version_command")
-        min_version = action.get("min_version")
+        version_cmd = verification.get("version_command")
+        min_version = verification.get("min_version")
 
         if version_cmd:
             try:
@@ -156,9 +155,9 @@ class StepVerifier:
 
         return True
 
-    # -------------------------------------------------
-    # UI VERIFICATION (LAST RESORT ONLY)
-    # -------------------------------------------------
+    # =================================================
+    # UI VERIFICATION (LAST RESORT)
+    # =================================================
 
     def _verify_ui_change(
         self,
@@ -178,7 +177,6 @@ class StepVerifier:
         if curr_hash and prev_hash and curr_hash != prev_hash:
             return True
 
-        # Timestamp alone is NOT sufficient unless explicitly advancing
         curr_ts = screenshot.get("frame_ts")
         prev_ts = previous_screenshot.get("frame_ts")
 
