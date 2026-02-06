@@ -12,6 +12,7 @@ from observer.observer_core import ObserverCore
 from observer.screenpipe_adapter import ScreenpipeAdapter, ScreenpipeBlindnessError
 from operate.utils.operating_system import OperatingSystem
 from core.verification.step_verifier import StepVerifier, VerificationError
+from core.schemas.execution_plan import ExecutionStep, StepType
 
 
 class InstallationError(RuntimeError):
@@ -69,44 +70,26 @@ class AutonomousInstaller:
 
         start_ts = time.time()
 
-        # --------------------------------------------------
-        # OPEN BROWSER
-        # --------------------------------------------------
         self._open_browser()
         self._wait_ui()
 
-        # --------------------------------------------------
-        # NAVIGATE TO OFFICIAL URL
-        # --------------------------------------------------
         self._navigate(url)
         self._wait_for_page_change()
 
-        # --------------------------------------------------
-        # CLICK DOWNLOAD
-        # --------------------------------------------------
         if not self._click_download_button():
             raise InstallationError(
                 f"Download button not found for {name}"
             )
 
-        # --------------------------------------------------
-        # WAIT FOR DOWNLOAD
-        # --------------------------------------------------
         installer_path = self._wait_for_download(start_ts)
         if not installer_path:
             raise InstallationError(
                 f"Installer download not detected for {name}"
             )
 
-        # --------------------------------------------------
-        # RUN INSTALLER (VISIBLE)
-        # --------------------------------------------------
         self._os.exec(installer_path)
         self._wait_ui()
 
-        # --------------------------------------------------
-        # INSTALLER WIZARD
-        # --------------------------------------------------
         self._navigate_installer_wizard(start_ts)
 
         # --------------------------------------------------
@@ -131,12 +114,9 @@ class AutonomousInstaller:
         self._os.press(["enter"])
 
     def _wait_for_page_change(self) -> None:
-        try:
-            initial = self._safe_read().get("screen_hash")
-        except Exception:
-            initial = None
-
+        initial = self._safe_read().get("screen_hash")
         start = time.time()
+
         while time.time() - start < self.PAGE_LOAD_TIMEOUT:
             state = self._safe_read()
             if state.get("screen_hash") and state.get("screen_hash") != initial:
@@ -147,9 +127,6 @@ class AutonomousInstaller:
         raise InstallationError("Page load timeout")
 
     def _click_download_button(self) -> bool:
-        """
-        Conservative: click only when high confidence.
-        """
         state = self._safe_read()
         text = state.get("text", "").lower()
 
@@ -172,9 +149,6 @@ class AutonomousInstaller:
         return None
 
     def _navigate_installer_wizard(self, start_ts: float) -> None:
-        """
-        Deterministic wizard navigation.
-        """
         while time.time() - start_ts < self.MAX_INSTALL_TIME:
             state = self._safe_read()
             text = state.get("text", "").lower()
@@ -200,27 +174,30 @@ class AutonomousInstaller:
         return False
 
     # =================================================
-    # VERIFICATION
+    # VERIFICATION (FIXED)
     # =================================================
 
     def _is_already_installed(self, tool: Dict[str, Any]) -> bool:
         """
         Authoritative tool existence check.
         """
-        action = {
-            "operation": "tool_check",
-            "tool": tool.get("name"),
-            "version_command": tool.get("version_command"),
-            "min_version": tool.get("min_version"),
-        }
+
+        step = ExecutionStep(
+            id=0,
+            type=StepType.TOOL_INSTALLATION,
+            description=f"Verify {tool.get('name')} installed",
+            action={
+                "tool": tool.get("name"),
+            },
+            verification={
+                "version_command": tool.get("version_command"),
+                "min_version": tool.get("min_version"),
+            },
+        )
 
         try:
-            return self._verifier.verify_step(
-                action=action,
-                execution_result=None,
-                screenshot=None,
-                previous_screenshot=None,
-            )
+            result = self._verifier.verify_step(step)
+            return bool(result.success)
         except (VerificationError, Exception):
             return False
 
