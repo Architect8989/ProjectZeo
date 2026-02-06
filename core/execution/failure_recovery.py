@@ -83,7 +83,7 @@ class FailureRecoveryManager:
 
         attempt = int(attempt_ctx.get("attempt", 0))
 
-        # ---- non-retryable steps ----
+        # ---- non-retryable steps (hard stop) ----
         if not getattr(step, "retryable", True):
             return RecoveryAction(
                 action="abort",
@@ -99,17 +99,20 @@ class FailureRecoveryManager:
                 context={"attempt": attempt + 1},
             )
 
-        # ---- alternatives (explicit only) ----
+        # ---- explicit alternatives only ----
         alternatives = step.action.get("alternatives")
         if isinstance(alternatives, list) and alternatives:
             return RecoveryAction(
                 action="alternative",
-                reason=f"Retry budget exhausted, attempting alternatives: {error}",
+                reason=(
+                    f"Retry budget exhausted for step {step.id}, "
+                    f"attempting alternatives: {error}"
+                ),
                 alternative_operations=alternatives,
             )
 
-        # ---- abort (fail-closed) ----
+        # ---- fail-closed abort ----
         return RecoveryAction(
             action="abort",
             reason=f"Max retries exceeded for step {step.id}: {error}",
-  )
+)
