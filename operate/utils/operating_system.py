@@ -27,7 +27,7 @@ class OperatingSystem:
     NON-GUARANTEES:
     - Native OS safety
     - Verified UI semantics
-    - Cross-platform window control
+    - Perfect cross-platform window control
     """
 
     # -------------------------------------------------
@@ -73,17 +73,15 @@ class OperatingSystem:
         while True:
             time.sleep(self._WATCHDOG_INTERVAL)
 
+            timed_out = False
             with self._heartbeat_lock, self._automation_lock:
-                if not self._automation_active or self._last_heartbeat is None:
-                    continue
-
-                timed_out = (
-                    time.time() - self._last_heartbeat
-                    > self._HEARTBEAT_TIMEOUT
-                )
-
-                if timed_out:
-                    self._automation_active = False
+                if self._automation_active and self._last_heartbeat is not None:
+                    timed_out = (
+                        time.time() - self._last_heartbeat
+                        > self._HEARTBEAT_TIMEOUT
+                    )
+                    if timed_out:
+                        self._automation_active = False
 
             if timed_out:
                 try:
@@ -177,7 +175,7 @@ class OperatingSystem:
     # COMMAND EXECUTION
     # -------------------------------------------------
 
-    def exec(self, command: str, sudo: bool = False) -> None:
+    def exec(self, command: str, sudo: bool = False):
         if not isinstance(command, str) or not command.strip():
             raise RuntimeError("exec(): command must be non-empty string")
 
@@ -185,17 +183,12 @@ class OperatingSystem:
         if sudo and platform.system() != "Windows":
             full_cmd = f"sudo {command}"
 
-        result = subprocess.run(
+        return subprocess.run(
             full_cmd,
             shell=True,
             capture_output=True,
             text=True,
         )
-
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"Command failed: {full_cmd}\n{result.stderr}"
-            )
 
     # -------------------------------------------------
     # FILESYSTEM
@@ -216,38 +209,59 @@ class OperatingSystem:
         os.makedirs(path, exist_ok=True)
 
     # -------------------------------------------------
-    # BROWSER / DOWNLOAD SUPPORT (INSTALLER)
+    # BROWSER / DOWNLOAD SUPPORT
     # -------------------------------------------------
 
-    def open_browser(self) -> None:
+    def open_browser(self, url: str = "https://www.google.com") -> None:
         system = platform.system()
         if system == "Windows":
-            os.startfile("https://www.google.com")
+            os.startfile(url)
         elif system == "Darwin":
-            subprocess.run(["open", "https://www.google.com"])
+            subprocess.run(["open", url])
         else:
-            subprocess.run(["xdg-open", "https://www.google.com"])
+            subprocess.run(["xdg-open", url])
 
     def focus_address_bar(self) -> None:
         self.press(["ctrl", "l"])
 
-    def get_latest_download(self) -> Optional[str]:
+    def get_latest_download(
+        self,
+        *,
+        expected_extension: Optional[str] = None,
+        min_size_bytes: int = 1024,
+    ) -> Optional[str]:
         downloads = os.path.join(os.path.expanduser("~"), "Downloads")
         if not os.path.isdir(downloads):
             return None
 
-        files = [
-            os.path.join(downloads, f)
-            for f in os.listdir(downloads)
-        ]
-        files = [f for f in files if os.path.isfile(f)]
-        if not files:
+        candidates = []
+
+        for f in os.listdir(downloads):
+            path = os.path.join(downloads, f)
+            if not os.path.isfile(path):
+                continue
+
+            if f.endswith((".crdownload", ".part", ".tmp")):
+                continue
+
+            if expected_extension and not f.endswith(expected_extension):
+                continue
+
+            try:
+                if os.path.getsize(path) < min_size_bytes:
+                    continue
+            except Exception:
+                continue
+
+            candidates.append(path)
+
+        if not candidates:
             return None
 
-        return max(files, key=os.path.getmtime)
+        return max(candidates, key=os.path.getmtime)
 
     # -------------------------------------------------
-    # FAIL-OPEN SAFETY (VISIBLE)
+    # FAIL-OPEN SAFETY
     # -------------------------------------------------
 
     def force_release_all(self, *, reason: Optional[str] = None) -> None:
@@ -300,19 +314,86 @@ class OperatingSystem:
         pyautogui.moveTo(int(x), int(y), duration=0)
 
     # -------------------------------------------------
-    # WINDOW / APPLICATION (INTENTIONAL STUBS)
+    # WINDOW / APPLICATION (BEST-EFFORT REAL)
     # -------------------------------------------------
 
     def get_focused_window(self):
+        system = platform.system()
+
+        try:
+            if system == "Darwin":
+                script = '''
+                tell application "System Events"
+                    set frontApp to first application process whose frontmost is true
+                    set frontWindow to front window of frontApp
+                    return (name of frontApp) & "|" & (name of frontWindow)
+                end tell
+                '''
+                result = subprocess.run(
+                    ["osascript", "-e", script],
+                    capture_output=True,
+                    text=True,
+                )
+                if result.returncode == 0:
+                    app, title = result.stdout.strip().split("|", 1)
+                    return {
+                        "id": f"{app}:{title}",
+                        "title": title,
+                        "application": app,
+                    }
+
+            elif system == "Linux":
+                wid = subprocess.check_output(
+                    ["xdotool", "getactivewindow"],
+                    text=True,
+                ).strip()
+                title = subprocess.check_output(
+                    ["xdotool", "getwindowname", wid],
+                    text=True,
+                ).strip()
+                return {"id": wid, "title": title}
+
+            elif system == "Windows":
+                import win32gui
+                hwnd = win32gui.GetForegroundWindow()
+                title = win32gui.GetWindowText(hwnd)
+                return {"id": str(hwnd), "title": title}
+
+        except Exception:
+            pass
+
         return {"id": "unknown", "title": None}
 
     def focus_window(self, window_id: str) -> bool:
-        return False
+        if not isinstance(window_id, str):
+            return False
 
-    def get_active_application(self):
-        return {"process_name": platform.system(), "pid": None}
+        system = platform.system()
 
-    def activate_application(self, process_name: str, pid=None) -> bool:
+        try:
+            if system == "Darwin":
+                app = window_id.split(":", 1)[0]
+                subprocess.run(
+                    ["osascript", "-e", f'tell application "{app}" to activate'],
+                    check=True,
+                )
+                return True
+
+            elif system == "Linux":
+                subprocess.run(
+                    ["xdotool", "windowactivate", window_id],
+                    check=True,
+                )
+                return True
+
+            elif system == "Windows":
+                import win32gui
+                win32gui.SetForegroundWindow(int(window_id))
+                return True
+
+        except Exception:
+            return False
+
         return False
 
     # -------------------------------------------------
@@ -325,4 +406,4 @@ class OperatingSystem:
             isinstance(v, float)
             and not math.isnan(v)
             and 0.0 <= v <= 1.0
-        )
+    )
