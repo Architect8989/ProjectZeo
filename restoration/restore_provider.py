@@ -23,7 +23,7 @@ class RestoreProvider:
     - Single authority for mode reset
     """
 
-    CURSOR_TOLERANCE_PX = 2
+    CURSOR_TOLERANCE_PX = 5  # relaxed for DPI / latency safety
 
     def __init__(self, *, os_backend, mode_controller: ModeController):
         self._os = os_backend
@@ -58,20 +58,27 @@ class RestoreProvider:
                 return
 
             # -------------------------------------------------
-            # PHASE 0 — HARD SAFETY (BEST-EFFORT)
+            # PHASE 0 — HARD SAFETY (FAIL-CLOSED)
             # -------------------------------------------------
             try:
                 self._os.mark_automation_inactive()
                 self._os.force_release_all(reason="restoration")
                 self._os.stop_automated_input()
-            except Exception:
-                pass
+            except Exception as e:
+                raise RestorationError(
+                    f"Automation shutdown failed: {e}"
+                ) from e
+
+            if getattr(self._os, "_automation_active", False):
+                raise RestorationError(
+                    "Automation still active after shutdown"
+                )
 
             meta = snapshot.metadata or {}
             extended = meta.get("extended") or {}
 
             # -------------------------------------------------
-            # PHASE 1 — EXTENDED STATE (BEST-EFFORT ONLY)
+            # PHASE 1 — EXTENDED STATE (BEST-EFFORT)
             # -------------------------------------------------
             try:
                 if (
@@ -184,9 +191,10 @@ class RestoreProvider:
 
         try:
             x, y = self._os.get_cursor_position()
+            current_window = self._os.get_focused_window()
         except Exception as e:
             raise RestorationError(
-                f"Cursor verification failed: {e}"
+                f"Verification read failed: {e}"
             ) from e
 
         if (
@@ -195,4 +203,9 @@ class RestoreProvider:
         ):
             raise RestorationError(
                 "Cursor position mismatch after restore"
-                )
+            )
+
+        if not current_window or current_window.get("id") is None:
+            raise RestorationError(
+                "No valid focused window after restore"
+        )
