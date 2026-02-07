@@ -38,6 +38,7 @@ class ProgressTracker:
 
         self._current_step: Optional[int] = None
         self._execution_start_ts: Optional[float] = None
+        self._execution_end_ts: Optional[float] = None
         self._execution_finished: bool = False
 
         self._plan_hash = self._hash_plan(execution_plan)
@@ -51,9 +52,6 @@ class ProgressTracker:
 
     @staticmethod
     def _hash_plan(plan: ExecutionPlan) -> str:
-        """
-        Stable hash binding progress to a specific execution plan.
-        """
         h = hashlib.sha256()
         h.update(plan.json().encode("utf-8"))
         return h.hexdigest()[:16]
@@ -80,14 +78,16 @@ class ProgressTracker:
             self._failed = set(data.get("failed", []))
             self._current_step = data.get("current_step")
             self._execution_start_ts = data.get("execution_start_ts")
+            self._execution_end_ts = data.get("execution_end_ts")
             self._execution_finished = data.get("execution_finished", False)
 
         except Exception:
-            # Fail-closed: corrupted or mismatched progress is discarded
+            # Fail-closed: discard corrupted or incompatible progress
             self._completed.clear()
             self._failed.clear()
             self._current_step = None
             self._execution_start_ts = None
+            self._execution_end_ts = None
             self._execution_finished = False
 
     def _persist(self) -> None:
@@ -100,6 +100,7 @@ class ProgressTracker:
             "failed": sorted(self._failed),
             "current_step": self._current_step,
             "execution_start_ts": self._execution_start_ts,
+            "execution_end_ts": self._execution_end_ts,
             "execution_finished": self._execution_finished,
         }
 
@@ -119,6 +120,8 @@ class ProgressTracker:
             raise RuntimeError("Execution already started")
 
         self._execution_start_ts = time.time()
+        self._execution_end_ts = None
+        self._execution_finished = False
         self._persist()
 
     def finish_execution(self) -> None:
@@ -126,6 +129,7 @@ class ProgressTracker:
             return
 
         self._execution_finished = True
+        self._execution_end_ts = time.time()
         self._current_step = None
         self._persist()
 
@@ -189,9 +193,10 @@ class ProgressTracker:
     def execution_runtime_seconds(self) -> Optional[float]:
         if self._execution_start_ts is None:
             return None
+
         end = (
-            self._execution_start_ts
-            if not self._execution_finished
+            self._execution_end_ts
+            if self._execution_finished and self._execution_end_ts
             else time.time()
         )
-        return time.time() - self._execution_start_ts
+        return round(end - self._execution_start_ts, 2)
