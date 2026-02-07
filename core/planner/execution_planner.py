@@ -32,18 +32,23 @@ class ExecutionPlanner:
     """
 
     LLM_TIMEOUT_SECONDS = 30.0
+    MAX_SCREEN_CHARS = 500  # audit: bounded screen context
 
     def __init__(
         self,
         *,
         llm_call,
         environment_fingerprint: Optional[Dict[str, Any]] = None,
+        observer=None,
+        screenpipe=None,
     ):
         if not callable(llm_call):
             raise PlanningError("llm_call must be callable")
 
         self._llm_call = llm_call
         self._environment = environment_fingerprint or {}
+        self._observer = observer
+        self._screenpipe = screenpipe
 
     # ==================================================
     # PUBLIC API
@@ -137,16 +142,36 @@ class ExecutionPlanner:
             return []
         return [t for t in tools if isinstance(t, str)]
 
+    def _read_screen_context(self) -> str:
+        """
+        Best-effort, read-only screen context.
+        MUST NOT fail planning.
+        """
+        if not self._screenpipe:
+            return ""
+
+        try:
+            state = self._screenpipe.read()
+            text = state.get("text") or ""
+            return text[: self.MAX_SCREEN_CHARS]
+        except Exception:
+            return ""
+
     # ==================================================
     # LLM-POWERED GOAL EXPANSION (TIME-BOUNDED)
     # ==================================================
 
     def _expand_goal(self, goal: str) -> List[Dict[str, Any]]:
+        screen_context = self._read_screen_context()
+
         prompt = f"""
 You are the planning brain of a self-operating computer.
 
 Environment fingerprint:
 {json.dumps(self._environment, indent=2)}
+
+Current screen state (read-only, may be partial):
+{screen_context}
 
 Task:
 "{goal}"
