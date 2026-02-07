@@ -32,21 +32,20 @@ def operate_main(
     screenpipe=None,
     max_wallclock_seconds: int = 90 * 60,
 ):
-    """
-    Deterministic ExecutionPlan executor.
-
-    HARD GUARANTEES:
-    - No planning
-    - No lifecycle transitions
-    - No snapshot / restore
-    - Executes ONLY an ExecutionPlan
-    """
-
     if not isinstance(execution_plan, ExecutionPlan):
         raise ValueError("execution_plan must be ExecutionPlan")
 
-    # authoritative validation (raises)
+    # authoritative validation
     execution_plan.validate()
+
+    # ---- early validation for TOOL steps ----
+    has_tool_steps = any(
+        s.type == StepType.TOOL_INSTALLATION for s in execution_plan.steps
+    )
+    if has_tool_steps and (observer is None or screenpipe is None):
+        raise ValueError(
+            "ExecutionPlan contains TOOL_INSTALLATION but observer/screenpipe missing"
+        )
 
     os_backend = OperatingSystem()
 
@@ -57,7 +56,7 @@ def operate_main(
     journal = ActionJournal()
     input_arbitrator = InputArbitrator()
 
-    verifier = StepVerifier(os_backend=os_backend)
+    verifier = StepVerifier()
     recovery = FailureRecoveryManager()
     progress = ProgressTracker(execution_plan)
 
@@ -72,6 +71,7 @@ def operate_main(
     _execute_plan(
         execution_plan=execution_plan,
         observer=observer,
+        screenpipe=screenpipe,
         os_backend=os_backend,
         accessibility_backend=accessibility_backend,
         journal=journal,
@@ -92,6 +92,7 @@ def _execute_plan(
     *,
     execution_plan: ExecutionPlan,
     observer,
+    screenpipe,
     os_backend: OperatingSystem,
     accessibility_backend: AccessibilityBackend,
     journal: ActionJournal,
@@ -120,11 +121,6 @@ def _execute_plan(
         # ---- dependency enforcement ----
         for dep in step.dependencies:
             if not progress.is_completed(dep):
-                journal.record(
-                    event="dependency_violation",
-                    step_id=step.id,
-                    missing_dependency=dep,
-                )
                 raise RuntimeError("Dependency not satisfied")
 
         # ---- authority gate ----
@@ -152,6 +148,14 @@ def _execute_plan(
             try:
                 os_backend.heartbeat()
 
+                # ---- UI EVIDENCE CAPTURE (BEFORE) ----
+                before_screen = None
+                if step.type == StepType.UI_INTERACTION and screenpipe:
+                    try:
+                        before_screen = screenpipe.read()
+                    except Exception:
+                        before_screen = None
+
                 with action_timeout(step.estimated_duration or 30):
                     _execute_step(
                         step=step,
@@ -160,16 +164,26 @@ def _execute_plan(
                         installer=installer,
                     )
 
-                verification = verifier.verify_step(step)
+                # ---- UI EVIDENCE CAPTURE (AFTER) ----
+                after_screen = None
+                if step.type == StepType.UI_INTERACTION and screenpipe:
+                    time.sleep(0.4)
+                    try:
+                        after_screen = screenpipe.read()
+                    except Exception:
+                        after_screen = None
+
+                verification = verifier.verify_step(
+                    step,
+                    screenshot=after_screen,
+                    previous_screenshot=before_screen,
+                )
+
                 if not verification.success:
                     raise RuntimeError(verification.reason)
 
                 progress.complete_step(step.id)
-                journal.record(
-                    event="step_complete",
-                    step_id=step.id,
-                    details=verification.details,
-                )
+                journal.record(event="step_complete", step_id=step.id)
                 break
 
             except ActionTimeout as e:
@@ -184,19 +198,8 @@ def _execute_plan(
                 attempt_ctx = action.context or attempt_ctx
                 continue
 
-            if action.action == "alternative":
-                _execute_alternatives(
-                    action.alternative_operations,
-                    os_backend,
-                )
-                continue
-
             progress.fail_step(step.id, action.reason or "fatal")
-            journal.record(
-                event="step_failed",
-                step_id=step.id,
-                reason=action.reason,
-            )
+            journal.record(event="step_failed", step_id=step.id)
             raise RuntimeError("Execution aborted")
 
     journal.record(event="execution_complete")
@@ -231,10 +234,7 @@ def _execute_step(
 
     elif step.type == StepType.TOOL_INSTALLATION:
         if installer is None:
-            raise RuntimeError(
-                "TOOL_INSTALLATION requires observer + screenpipe"
-            )
-
+            raise RuntimeError("Installer unavailable")
         installer.install_tool(step.action)
 
     elif step.type in (StepType.VERIFICATION, StepType.DONE):
@@ -243,6 +243,10 @@ def _execute_step(
     else:
         raise ValueError(f"Unknown step type: {step.type}")
 
+
+# ==================================================
+# UI EXECUTION
+# ==================================================
 
 def _execute_ui(ui: Dict[str, Any], os_backend: OperatingSystem):
     op = ui.get("operation")
@@ -267,17 +271,6 @@ def _execute_ui(ui: Dict[str, Any], os_backend: OperatingSystem):
 
     else:
         raise ValueError(f"Unknown UI op: {op}")
-
-
-def _execute_alternatives(
-    alternatives: List[Dict[str, Any]],
-    os_backend: OperatingSystem,
-):
-    for alt in alternatives:
-        if alt.get("operation") == "mkdir":
-            os_backend.mkdir(alt["path"])
-        else:
-            raise RuntimeError("Unknown alternative operation")
 
 
 # ==================================================
