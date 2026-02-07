@@ -37,7 +37,9 @@ class ScreenpipeAdapter:
 
     MAX_FRAME_AGE_SECONDS = 1.5
     MAX_CONSECUTIVE_FAILURES = 5
-    RECOVERY_COOLDOWN_SECONDS = 2.0
+
+    # ↓ audit fix (medium severity)
+    RECOVERY_COOLDOWN_SECONDS = 0.5
 
     # -------------------------------------------------
 
@@ -70,11 +72,6 @@ class ScreenpipeAdapter:
 
     @property
     def blind(self) -> bool:
-        """
-        Exposed blindness flag required by SnapshotProvider.
-
-        True means the adapter must not be trusted for reads.
-        """
         with self._lock:
             return self.state in (
                 ScreenpipeState.TEMP_UNAVAILABLE,
@@ -127,7 +124,6 @@ class ScreenpipeAdapter:
         ):
             return
 
-        # allow retry
         self.failure_count = 0
         self.blind_reason = None
         self.state = ScreenpipeState.INIT
@@ -191,8 +187,13 @@ class ScreenpipeAdapter:
                 self._record_failure("bad_timestamp")
             raise ScreenpipeBlindnessError("Bad frame timestamp")
 
+        # =================================================
+        # CRITICAL FIX — CLOCK SKEW TOLERANCE
+        # =================================================
         age = time.time() - frame_ts
-        if age < -0.1 or age > self.MAX_FRAME_AGE_SECONDS:
+
+        # Allow ±1s skew (GPU pipelines, IPC, multicore clocks)
+        if age < -1.0 or age > self.MAX_FRAME_AGE_SECONDS:
             with self._lock:
                 self._record_failure(f"stale_frame:{age:.2f}s")
             raise ScreenpipeBlindnessError("Stale screen frame")
@@ -247,9 +248,6 @@ class ScreenpipeAdapter:
             }
 
     def self_test(self) -> bool:
-        """
-        Hard readiness check used at system startup.
-        """
         try:
             frame = self.read()
             return bool(frame.get("available"))
