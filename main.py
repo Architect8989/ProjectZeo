@@ -24,6 +24,13 @@ from core.planner.execution_planner import ExecutionPlanner
 HEARTBEAT_INTERVAL = 2.0
 
 # ==================================================
+# EXECUTION TIME BOUND (HARD SAFETY)
+# ==================================================
+
+TASK_START = None
+MAX_TASK_SECONDS = 90 * 60  # 90 minutes hard cap
+
+# ==================================================
 # PROCESS SINGLETONS
 # ==================================================
 
@@ -38,7 +45,7 @@ mode = ModeController()
 
 SNAPSHOT_PROVIDER = SnapshotProvider(
     observer=observer,
-    screenpipe=None,  # injected after validation
+    screenpipe=None,
     os_backend=OS_BACKEND,
     mode_controller=mode,
 )
@@ -81,10 +88,12 @@ signal.signal(signal.SIGQUIT, _signal_handler)
 # ==================================================
 
 def main():
+    global TASK_START
+
     print("[BOOT] System starting")
 
     # --------------------------------------------------
-    # ENVIRONMENT FINGERPRINT (AUTHORITATIVE)
+    # ENVIRONMENT FINGERPRINT
     # --------------------------------------------------
     env_fingerprint = collect_environment_fingerprint()
 
@@ -98,7 +107,7 @@ def main():
         mode.force_observer()
 
     # --------------------------------------------------
-    # REQUIRED DEPENDENCY: SCREENPIPE
+    # SCREENPIPE (REQUIRED)
     # --------------------------------------------------
     screenpipe = ScreenpipeAdapter()
 
@@ -123,7 +132,7 @@ def main():
     while True:
         try:
             # ----------------------------------------------
-            # PERCEPTION (SINGLE READ PER LOOP)
+            # PERCEPTION
             # ----------------------------------------------
             screen_state = screenpipe.read()
             ui_snapshot = perception.process(screen_state)
@@ -139,10 +148,10 @@ def main():
             # EXECUTION TRIGGER
             # ----------------------------------------------
             if mode.is_armed():
-                # ---- SNAPSHOT (OBSERVER-ONLY) ----
+                TASK_START = time.time()
+
                 snapshot_id = SNAPSHOT_PROVIDER.take_snapshot()
 
-                # ---- PLANNING ----
                 mode.begin_planning()
 
                 intent = mode.get_intent()
@@ -175,7 +184,6 @@ def main():
                     dirty=True,
                 )
 
-                # ---- EXECUTION ----
                 try:
                     mode.execute()
 
@@ -187,14 +195,16 @@ def main():
                         execution_plan=execution_plan,
                         observer=observer,
                         screenpipe=screenpipe,
+                        llm_callable=mode.get_llm_callable(),
                     )
 
                 finally:
-                    # ---- RESTORATION (FAIL-CLOSED) ----
+                    # ---- FAIL-CLOSED RESTORATION ----
                     try:
                         RESTORE_PROVIDER.restore_snapshot(snapshot_id)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        _force_safe_shutdown(f"restoration_failed:{e}")
+                        os._exit(1)
 
                     AUTH_STATE.persist(
                         execution_mode="OBSERVER",
@@ -205,13 +215,21 @@ def main():
                     )
 
                     mode.force_observer()
+                    TASK_START = None
+
+            # ----------------------------------------------
+            # HARD WALL-CLOCK ENFORCEMENT
+            # ----------------------------------------------
+            if TASK_START and (time.time() - TASK_START) > MAX_TASK_SECONDS:
+                _force_safe_shutdown("task_timeout")
+                os._exit(1)
 
         except (ObserverBlindnessError, ScreenpipeBlindnessError):
-            _force_safe_shutdown("perception-blindness")
+            _force_safe_shutdown("perception_blindness")
             os._exit(1)
 
         except Exception as e:
-            _force_safe_shutdown(f"main-loop-failure:{e}")
+            _force_safe_shutdown(f"main_loop_failure:{e}")
             os._exit(1)
 
         time.sleep(HEARTBEAT_INTERVAL)
