@@ -3,18 +3,12 @@ Execution Planner
 
 Purpose:
 Authoritatively converts intent into a validated ExecutionPlan.
-
-This module:
-- DOES planning only
-- DOES NOT execute
-- DOES NOT touch OS / UI / observer
-- DOES NOT invent tools beyond LLM output
-- DOES emit strictly schema-valid execution graphs
 """
 
 from typing import List, Dict, Any, Optional
 import json
 import time
+import concurrent.futures
 
 from core.schemas.execution_plan import (
     ExecutionPlan,
@@ -36,6 +30,8 @@ class ExecutionPlanner:
     - LLM output must be structured and validated
     - No side effects, no execution, no guessing
     """
+
+    LLM_TIMEOUT_SECONDS = 30.0
 
     def __init__(
         self,
@@ -142,19 +138,10 @@ class ExecutionPlanner:
         return [t for t in tools if isinstance(t, str)]
 
     # ==================================================
-    # LLM-POWERED GOAL EXPANSION
+    # LLM-POWERED GOAL EXPANSION (TIME-BOUNDED)
     # ==================================================
 
     def _expand_goal(self, goal: str) -> List[Dict[str, Any]]:
-        """
-        Uses LLM to expand goal into executable, schema-valid steps.
-
-        HARD RULES:
-        - LLM MUST return valid JSON
-        - Steps MUST conform to ExecutionStep schema
-        - Planner validates everything
-        """
-
         prompt = f"""
 You are the planning brain of a self-operating computer.
 
@@ -185,7 +172,15 @@ Rules:
 - Be conservative and explicit
 """
 
-        raw = self._llm_call(prompt)
+        # ---- HARD TIMEOUT ENFORCEMENT ----
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(self._llm_call, prompt)
+            try:
+                raw = future.result(timeout=self.LLM_TIMEOUT_SECONDS)
+            except concurrent.futures.TimeoutError:
+                raise PlanningError(
+                    f"LLM call timed out after {self.LLM_TIMEOUT_SECONDS}s"
+                )
 
         try:
             data = json.loads(raw)
@@ -202,9 +197,7 @@ Rules:
                 raise PlanningError(f"Invalid step at index {idx}")
 
             step_type = step.get("type")
-            if step_type not in StepType.__members__.values() and step_type not in [
-                t.value for t in StepType
-            ]:
+            if step_type not in [t.value for t in StepType]:
                 raise PlanningError(f"Invalid step type: {step_type}")
 
             validated.append(
