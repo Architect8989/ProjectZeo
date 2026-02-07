@@ -23,10 +23,12 @@ class ObserverCore:
 
     MAX_HISTORY = 1000
 
-    STARTUP_GRACE_TICKS = 10
-    STARTUP_GRACE_SECONDS = 5.0
+    # ---- FIXED: startup grace widened ----
+    STARTUP_GRACE_TICKS = 30
+    STARTUP_GRACE_SECONDS = 15.0
 
-    MAX_CONSECUTIVE_MISSES = 5
+    # ---- FIXED: transient loss tolerance ----
+    MAX_CONSECUTIVE_MISSES = 15
 
     # --------------------------------------------------
     # INIT
@@ -44,6 +46,7 @@ class ObserverCore:
 
         self.observer_healthy: bool = True
         self.blind_reason: Optional[str] = None
+        self._blind_timestamp: Optional[float] = None
         self._consecutive_misses: int = 0
 
         self._lock = threading.RLock()
@@ -82,6 +85,7 @@ class ObserverCore:
 
             self.observer_healthy = True
             self.blind_reason = None
+            self._blind_timestamp = None
             self._consecutive_misses = 0
 
             self.start_time = self._clock()
@@ -109,6 +113,7 @@ class ObserverCore:
 
         self.observer_healthy = False
         self.blind_reason = reason
+        self._blind_timestamp = self._clock()
 
     # --------------------------------------------------
     # MAIN TICK
@@ -120,12 +125,24 @@ class ObserverCore:
         Raises ObserverBlindnessError if vision is unusable.
         """
         with self._lock:
+            now = self._clock()
+
+            # ---- RECOVERY LOGIC (FIXED) ----
+            if (
+                not self.observer_healthy
+                and self.last_frame_seen is not None
+                and self._blind_timestamp is not None
+                and (now - self._blind_timestamp) > 5.0
+            ):
+                self.observer_healthy = True
+                self.blind_reason = None
+                self._blind_timestamp = None
+                self._consecutive_misses = 0
+
             if not self.observer_healthy:
                 raise ObserverBlindnessError(
                     f"Observer blind: {self.blind_reason}"
                 )
-
-            now = self._clock()
 
             # ---- startup grace enforcement ----
             if self.last_frame_seen is None:
@@ -212,7 +229,7 @@ class ObserverCore:
             )
 
     # --------------------------------------------------
-    # UI QUERY (READ-ONLY, DETERMINISTIC)
+    # UI QUERY
     # --------------------------------------------------
 
     def find_click_target(
@@ -221,13 +238,6 @@ class ObserverCore:
         contains: Optional[str] = None,
         exact: Optional[str] = None,
     ) -> Optional[Dict[str, float]]:
-        """
-        Locate a clickable UI element from the latest ui_snapshot.
-
-        Returns:
-            {"x": float, "y": float} in normalized [0.0, 1.0] space
-            or None if no match
-        """
         if not contains and not exact:
             return None
 
@@ -265,10 +275,7 @@ class ObserverCore:
                     and 0.0 <= float(x) <= 1.0
                     and 0.0 <= float(y) <= 1.0
                 ):
-                    return {
-                        "x": float(x),
-                        "y": float(y),
-                    }
+                    return {"x": float(x), "y": float(y)}
 
             return None
 
@@ -294,8 +301,7 @@ class ObserverCore:
                     now - self.start_time, 2
                 ),
                 "ticks": self.tick_count,
-                "first_frame_seen": self.first_frame_seen
-                is not None,
+                "first_frame_seen": self.first_frame_seen is not None,
                 "consecutive_misses": self._consecutive_misses,
                 "history_depth": len(self._history),
         }
