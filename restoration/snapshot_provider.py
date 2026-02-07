@@ -121,30 +121,41 @@ class SnapshotProvider:
             )
 
         # -------------------------------------------------
-        # 3. OS CORE STATE (MANDATORY)
+        # 3. OS CORE STATE (MANDATORY, RETRIED)
         # -------------------------------------------------
-        try:
-            cursor_x, cursor_y = self._os.get_cursor_position()
-            focused_window = self._os.get_focused_window()
-            active_app = self._os.get_active_application()
-        except Exception as e:
-            raise SnapshotProviderError(
-                f"OS state capture failed: {e}"
-            ) from e
+        last_error: Optional[Exception] = None
 
-        if not isinstance(focused_window, dict):
+        for attempt in range(3):
+            try:
+                cursor_x, cursor_y = self._os.get_cursor_position()
+                focused_window = self._os.get_focused_window()
+                active_app = self._os.get_active_application()
+                break
+            except Exception as e:
+                last_error = e
+                if attempt == 2:
+                    raise SnapshotProviderError(
+                        f"OS state capture failed after retries: {e}"
+                    ) from e
+                time.sleep(0.1)
+
+        # -------------------------------------------------
+        # 4. CORE STATE VALIDATION (STRICT)
+        # -------------------------------------------------
+        if not isinstance(focused_window, dict) or not focused_window.get("id"):
             raise SnapshotProviderError(
                 "Focused window state invalid or missing"
             )
 
-        if not isinstance(active_app, dict):
+        if (
+            not isinstance(active_app, dict)
+            or not active_app.get("process_name")
+            or active_app.get("pid") is None
+        ):
             raise SnapshotProviderError(
                 "Active application state invalid or missing"
             )
 
-        # -------------------------------------------------
-        # 4. CORE STATE VALIDATION
-        # -------------------------------------------------
         try:
             cursor_state = CursorState(
                 x=int(cursor_x),
@@ -157,7 +168,7 @@ class SnapshotProvider:
 
         try:
             focus_state = FocusState(
-                window_id=str(focused_window.get("id")),
+                window_id=str(focused_window["id"]),
                 title=focused_window.get("title"),
             )
         except Exception as e:
@@ -167,8 +178,8 @@ class SnapshotProvider:
 
         try:
             application_state = ApplicationState(
-                process_name=str(active_app.get("process_name")),
-                pid=active_app.get("pid"),
+                process_name=str(active_app["process_name"]),
+                pid=int(active_app["pid"]),
             )
         except Exception as e:
             raise SnapshotProviderError(
@@ -216,4 +227,4 @@ class SnapshotProvider:
             application=application_state,
             execution_mode=self._mode.mode.value,
             metadata=metadata,
-            )
+    )
