@@ -72,6 +72,7 @@ class StepVerifier:
 
             if step.type == StepType.UI_INTERACTION:
                 ok = self._verify_ui_change(
+                    step=step,
                     screenshot=screenshot,
                     previous_screenshot=previous_screenshot,
                 )
@@ -194,31 +195,43 @@ class StepVerifier:
         return True
 
     # =================================================
-    # UI VERIFICATION (LAST RESORT)
+    # UI VERIFICATION (STRICT, LAST RESORT)
     # =================================================
 
     def _verify_ui_change(
         self,
         *,
+        step: ExecutionStep,
         screenshot: Optional[Dict[str, Any]],
         previous_screenshot: Optional[Dict[str, Any]],
     ) -> bool:
+        # No evidence → failure
         if not screenshot or not screenshot.get("available"):
             return False
 
-        if previous_screenshot is None:
+        verification = step.verification or {}
+
+        # -------------------------------------------------
+        # EXPLICIT VERIFICATION (REQUIRED IF PROVIDED)
+        # -------------------------------------------------
+        expected_text = verification.get("screen_contains")
+        if expected_text:
+            screen_text = screenshot.get("text") or ""
+            for token in expected_text:
+                if token not in screen_text:
+                    return False
             return True
+
+        # -------------------------------------------------
+        # FALLBACK (WEAK SIGNAL, ONLY IF NO CRITERIA)
+        # -------------------------------------------------
+        if previous_screenshot is None:
+            return False
 
         curr_hash = screenshot.get("screen_text_hash")
         prev_hash = previous_screenshot.get("screen_text_hash")
 
         if curr_hash and prev_hash and curr_hash != prev_hash:
-            return True
-
-        curr_ts = screenshot.get("frame_ts")
-        prev_ts = previous_screenshot.get("frame_ts")
-
-        if curr_ts and prev_ts and curr_ts > prev_ts:
             return True
 
         return False
