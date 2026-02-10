@@ -36,7 +36,7 @@ MAX_TASK_SECONDS = 90 * 60  # 90 minutes hard cap
 
 
 # ==================================================
-# PROCESS SINGLETONS
+# PROCESS SINGLETONS (COMPOSITION ROOT)
 # ==================================================
 
 OS_BACKEND = OperatingSystem()
@@ -56,16 +56,20 @@ observer_loop = ObserverLoop(
 
 mode = ModeController()
 
+
 # ==================================================
-# LLM INJECTION (AUTHORITATIVE FIX)
+# LLM INJECTION (AUTHORITATIVE, FAIL-CLOSED)
 # ==================================================
 
 def create_llm_callable() -> Callable[[str], str]:
+    try:
+        from anthropic import Anthropic
+    except ImportError:
+        raise RuntimeError("Anthropic SDK not installed")
+
     api_key = os.getenv("ANTHROPIC_API_KEY")
     if not api_key:
         raise RuntimeError("ANTHROPIC_API_KEY not set")
-
-    from anthropic import Anthropic
 
     client = Anthropic(api_key=api_key)
 
@@ -80,9 +84,13 @@ def create_llm_callable() -> Callable[[str], str]:
     return llm_call
 
 
-# 🔒 Inject ONCE, before any planning can occur
+# Inject exactly once, before any planning or execution
 mode.inject_llm_callable(create_llm_callable())
 
+
+# ==================================================
+# PROVIDERS
+# ==================================================
 
 SNAPSHOT_PROVIDER = SnapshotProvider(
     observer=observer,
@@ -122,7 +130,8 @@ def _signal_handler(signum, frame):
 atexit.register(_force_safe_shutdown, "atexit")
 signal.signal(signal.SIGINT, _signal_handler)
 signal.signal(signal.SIGTERM, _signal_handler)
-signal.signal(signal.SIGQUIT, _signal_handler)
+if hasattr(signal, "SIGQUIT"):
+    signal.signal(signal.SIGQUIT, _signal_handler)
 
 
 # ==================================================
@@ -134,8 +143,14 @@ def main():
 
     print("[BOOT] ProjectZeo kernel starting")
 
+    # --------------------------------------------------
+    # ENVIRONMENT FINGERPRINT
+    # --------------------------------------------------
     env_fingerprint = collect_environment_fingerprint()
 
+    # --------------------------------------------------
+    # CRASH RECOVERY GATE
+    # --------------------------------------------------
     persisted = AUTH_STATE.load()
     if persisted.get("dirty") or persisted.get("restore_required"):
         try:
@@ -146,17 +161,25 @@ def main():
         AUTH_STATE.force_safe_state()
         mode.force_observer()
 
+    # --------------------------------------------------
+    # START OBSERVER SUBSYSTEM
+    # --------------------------------------------------
     vision_runtime.start()
     observer_loop.start()
 
     intent_listener = IntentListener(mode)
     intent_listener.start()
 
+    # --------------------------------------------------
+    # MAIN ORCHESTRATION LOOP
+    # --------------------------------------------------
     while True:
         try:
+            # Health propagation (authoritative but mechanical)
             mode.update_observer_health(observer.is_healthy())
             mode.update_vision_status(vision_runtime.is_healthy())
 
+            # ---------------- EXECUTION TRIGGER ----------------
             if mode.is_armed():
                 TASK_START = time.time()
 
@@ -225,6 +248,7 @@ def main():
                     mode.force_observer()
                     TASK_START = None
 
+            # ---------------- HARD TIME BOUND ----------------
             if TASK_START and (time.time() - TASK_START) > MAX_TASK_SECONDS:
                 _force_safe_shutdown("task_timeout")
                 os._exit(1)
