@@ -20,6 +20,10 @@ class VisionUnavailableError(ModeTransitionError):
     pass
 
 
+class ObserverUnavailableError(ModeTransitionError):
+    pass
+
+
 class ModeController:
     """
     Single authoritative lifecycle controller.
@@ -52,7 +56,6 @@ class ModeController:
         # ---- HEALTH ----
         self._vision_ok: bool = False
         self._observer_healthy: bool = True
-        self._vision_failed_permanently: bool = False
         self._failure_reason: Optional[str] = None
 
         # ---- INPUT / AUTHORITY ----
@@ -91,16 +94,20 @@ class ModeController:
     # BRAIN INTERFACE (INJECTED, NOT CREATED)
     # --------------------------------------------------
 
-    def set_llm_callable(self, llm_call: Callable[[str], str]) -> None:
+    def inject_llm_callable(self, llm_call: Callable[[str], str]) -> None:
         """
         Inject external intelligence.
 
-        Must be called during boot.
+        Must be called exactly once during boot.
         """
         if not callable(llm_call):
             raise TypeError("llm_call must be callable")
 
         with self._lock:
+            if self._llm_callable is not None:
+                raise RuntimeError(
+                    "LLM callable already injected"
+                )
             self._llm_callable = llm_call
 
     def get_llm_callable(self) -> Callable[[str], str]:
@@ -112,7 +119,7 @@ class ModeController:
             return self._llm_callable
 
     # --------------------------------------------------
-    # HEALTH
+    # HEALTH (AUTHORITATIVE SOURCES ONLY)
     # --------------------------------------------------
 
     def update_observer_health(
@@ -138,10 +145,16 @@ class ModeController:
                 )
 
     def update_vision_status(self, ok: bool) -> None:
+        """
+        Vision status updates must come ONLY from vision runtime.
+        """
         with self._lock:
             self._vision_ok = bool(ok)
-            if not ok:
-                self._vision_failed_permanently = True
+
+            if not ok and self._mode == SystemMode.EXECUTING:
+                self._abort_locked(
+                    "vision lost during execution"
+                )
 
     # --------------------------------------------------
     # TRANSITIONS
@@ -165,6 +178,7 @@ class ModeController:
             self._planning_completed = False
             self._execution_plan_attached = False
             self._execution_plan_id = None
+            self._failure_reason = None
 
             self._commit_transition(
                 SystemMode.ARMED,
@@ -183,7 +197,9 @@ class ModeController:
                 raise ModeTransitionError("No intent available")
 
             if not self._observer_healthy:
-                raise VisionUnavailableError(self._failure_reason)
+                raise ObserverUnavailableError(
+                    self._failure_reason
+                )
 
             self._intent_frozen = True
 
@@ -239,9 +255,14 @@ class ModeController:
                     "Cannot execute without completed plan"
                 )
 
-            if not self._observer_healthy or not self._vision_ok:
+            if not self._vision_ok:
                 raise VisionUnavailableError(
-                    self._failure_reason or "vision unavailable"
+                    "vision unavailable"
+                )
+
+            if not self._observer_healthy:
+                raise ObserverUnavailableError(
+                    self._failure_reason
                 )
 
             self._input_locked = True
@@ -283,6 +304,8 @@ class ModeController:
     def force_observer(self) -> None:
         with self._lock:
             self._reset_internal_state()
+            self._failure_reason = None
+
             self._commit_transition(
                 SystemMode.OBSERVER,
                 reason="forced reset",
@@ -292,6 +315,7 @@ class ModeController:
     def _abort_locked(self, reason: str) -> None:
         self._failure_reason = reason
         self._reset_internal_state()
+
         self._commit_transition(
             SystemMode.OBSERVER,
             reason=reason,
@@ -347,7 +371,6 @@ class ModeController:
                 "mode": self._mode.value,
                 "observer_healthy": self._observer_healthy,
                 "vision_ok": self._vision_ok,
-                "vision_failed_permanently": self._vision_failed_permanently,
                 "failure_reason": self._failure_reason,
                 "input_locked": self._input_locked,
                 "intent_frozen": self._intent_frozen,
@@ -357,4 +380,4 @@ class ModeController:
                 "transition_history_depth": len(
                     self._transition_history
                 ),
-                 }
+        }
