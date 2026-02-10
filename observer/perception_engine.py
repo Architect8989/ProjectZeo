@@ -1,5 +1,6 @@
-from typing import Dict, Set
+from typing import Dict, Set, Tuple, List
 import time
+
 from observer.ui_schema import UISnapshot
 from observer.self_healing import PerceptionHealth
 
@@ -14,7 +15,8 @@ class PerceptionEngine:
     READ-ONLY. NO DECISIONS. NO ACTIONS.
 
     Guarantees:
-    - Deterministic verification
+    - Deterministic semantic verification
+    - Constructive evidence (what changed, why)
     - Bounded latency
     - No cross-task state leakage
     - FAIL-CLOSED semantics
@@ -31,12 +33,20 @@ class PerceptionEngine:
     # --------------------------------------------------
 
     def process(self, screen_state: Dict[str, object]) -> UISnapshot:
+        """
+        Returns the authoritative UISnapshot produced upstream.
+        PerceptionEngine does NOT enrich or mutate snapshots.
+        """
         available = bool(screen_state.get("available", False))
         frame_ts = screen_state.get("frame_ts")
 
-        stable = self.health.update(frame_ts, available)
+        self.health.update(frame_ts, available)
 
-        return screen_state.get("snapshot")  # authoritative snapshot only
+        snapshot = screen_state.get("snapshot")
+        if not isinstance(snapshot, UISnapshot):
+            raise PerceptionVerificationError("missing UISnapshot in screen_state")
+
+        return snapshot
 
     # --------------------------------------------------
     # VERIFICATION (SEMANTIC, FAIL-CLOSED)
@@ -53,10 +63,10 @@ class PerceptionEngine:
         Evidence-based semantic verification.
 
         HARD RULES:
-        - Timestamp change is NOT evidence
-        - Semantic delta MUST be computed internally
+        - Timestamp is NEVER evidence
+        - Delta is computed internally
         - No delta when change expected == failure
-        - Health degradation aborts verification
+        - Ambiguity == failure
         """
 
         start = time.monotonic()
@@ -73,17 +83,15 @@ class PerceptionEngine:
         pre_snapshot = pre_state.get("snapshot")
         post_snapshot = post_state.get("snapshot")
 
-        if not isinstance(pre_snapshot, UISnapshot) or not isinstance(
-            post_snapshot, UISnapshot
-        ):
-            self._fail("invalid or missing UISnapshot")
+        if not isinstance(pre_snapshot, UISnapshot):
+            self._fail("pre_state missing valid UISnapshot")
+        if not isinstance(post_snapshot, UISnapshot):
+            self._fail("post_state missing valid UISnapshot")
 
-        semantic_changed = self._semantic_delta(
-            pre_snapshot, post_snapshot
-        )
+        changed, evidence = self._semantic_delta(pre_snapshot, post_snapshot)
 
-        if expect_change and not semantic_changed:
-            self._fail("no semantic UI change detected")
+        if expect_change and not changed:
+            self._fail("no provable semantic UI change detected")
 
         # ---- LATENCY BOUND ----
         if (time.monotonic() - start) > self.MAX_VERIFICATION_LATENCY_SECONDS:
@@ -91,49 +99,74 @@ class PerceptionEngine:
 
         self.last_verification_ts = time.monotonic()
         self.last_verification_reason = "verified"
+        self.last_verification_evidence = evidence
+
         return True
 
     # --------------------------------------------------
-    # SEMANTIC DIFF (DETERMINISTIC)
+    # SEMANTIC DIFF (CONSTRUCTIVE)
     # --------------------------------------------------
 
     def _semantic_delta(
         self, pre: UISnapshot, post: UISnapshot
-    ) -> bool:
+    ) -> Tuple[bool, Dict[str, object]]:
         """
-        Returns True iff a provable semantic change occurred.
+        Computes a deterministic semantic delta.
+
+        Returns:
+            (changed: bool, evidence: dict)
         """
 
+        evidence: Dict[str, object] = {}
+
+        # ---- STABILITY CHANGE ----
         if pre.stable != post.stable:
-            return True
+            evidence["stable_changed"] = {
+                "from": pre.stable,
+                "to": post.stable,
+            }
 
+        # ---- STRUCTURAL COUNTS ----
         if len(pre.elements) != len(post.elements):
-            return True
+            evidence["elements_count"] = (len(pre.elements), len(post.elements))
 
         if len(pre.dialogs) != len(post.dialogs):
-            return True
+            evidence["dialogs_count"] = (len(pre.dialogs), len(post.dialogs))
 
         if len(pre.progress) != len(post.progress):
-            return True
+            evidence["progress_count"] = (len(pre.progress), len(post.progress))
 
+        # ---- TEXTUAL SEMANTICS ----
         pre_text = self._extract_text(pre)
         post_text = self._extract_text(post)
 
-        return pre_text != post_text
+        added = post_text - pre_text
+        removed = pre_text - post_text
+
+        if added:
+            evidence["text_added"] = sorted(added)
+        if removed:
+            evidence["text_removed"] = sorted(removed)
+
+        return bool(evidence), evidence
 
     def _extract_text(self, snap: UISnapshot) -> Set[str]:
-        texts = set()
+        texts: Set[str] = set()
+
         for el in snap.elements:
-            if el.label:
-                texts.add(el.label)
+            if isinstance(el.label, str) and el.label.strip():
+                texts.add(el.label.strip())
+
         for dlg in snap.dialogs:
-            if dlg.title:
-                texts.add(dlg.title)
-            if dlg.message:
-                texts.add(dlg.message)
+            if isinstance(dlg.title, str) and dlg.title.strip():
+                texts.add(dlg.title.strip())
+            if isinstance(dlg.message, str) and dlg.message.strip():
+                texts.add(dlg.message.strip())
+
         for prog in snap.progress:
-            if prog.label:
-                texts.add(prog.label)
+            if isinstance(prog.label, str) and prog.label.strip():
+                texts.add(prog.label.strip())
+
         return texts
 
     # --------------------------------------------------
@@ -144,6 +177,9 @@ class PerceptionEngine:
         return {
             "last_verification_ts": self.last_verification_ts,
             "last_verification_reason": self.last_verification_reason,
+            "last_verification_evidence": getattr(
+                self, "last_verification_evidence", None
+            ),
             "health_degraded": self.health.degraded(),
         }
 
@@ -158,3 +194,4 @@ class PerceptionEngine:
     def _reset_verification_state(self) -> None:
         self.last_verification_ts = None
         self.last_verification_reason = None
+        self.last_verification_evidence = None
