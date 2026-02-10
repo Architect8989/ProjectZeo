@@ -1,12 +1,5 @@
-"""
-Autonomous Installer
-
-Purpose:
-Installs missing tools using human-like interaction, not scripted installs.
-"""
-
 import time
-from typing import Dict, Any, Optional
+from typing import Dict, Any
 
 from observer.observer_core import ObserverCore
 from operate.utils.operating_system import OperatingSystem
@@ -24,19 +17,20 @@ class AutonomousInstaller:
 
     HARD CONTRACT:
     - Browser-driven
-    - UI-observed
+    - UI-observed (when vision is available)
     - Deterministic fallbacks only
     - No silent shell installs
     - Idempotent (never reinstall if already present)
 
-    NOTE:
-    Screen vision is currently stubbed.
-    This class will not function fully until vision integration is complete.
+    CURRENT LIMITATION:
+    - Without vision, installer may only navigate + wait
+    - Success is NEVER assumed without verification
     """
 
     MAX_INSTALL_TIME = 15 * 60  # seconds
     UI_SETTLE_DELAY = 1.0
     PAGE_LOAD_TIMEOUT = 10.0
+    VERIFICATION_POLL_INTERVAL = 5.0
 
     def __init__(
         self,
@@ -55,6 +49,8 @@ class AutonomousInstaller:
     def install_tool(self, tool: Dict[str, Any]) -> None:
         """
         Install a tool via browser + installer wizard.
+
+        This method NEVER reports success unless verification passes.
         """
 
         name = tool.get("name")
@@ -71,41 +67,62 @@ class AutonomousInstaller:
 
         start_ts = time.time()
 
+        # --------------------------------------------------
+        # BROWSER-DRIVEN NAVIGATION
+        # --------------------------------------------------
         self._open_browser()
         self._wait_ui()
 
         self._navigate(url)
         self._wait_for_page_change()
 
-        # From here onward, UI automation is unsafe without vision
+        # --------------------------------------------------
+        # INSTALLATION WAIT LOOP (FAIL-CLOSED)
+        # --------------------------------------------------
+        while time.time() - start_ts < self.MAX_INSTALL_TIME:
+            if self._is_already_installed(tool):
+                return  # VERIFIED SUCCESS
+
+            time.sleep(self.VERIFICATION_POLL_INTERVAL)
+
+        # --------------------------------------------------
+        # TIMEOUT → AUTHORITATIVE FAILURE
+        # --------------------------------------------------
         raise InstallationError(
-            f"Autonomous installation disabled (vision unavailable) for {name}"
+            f"Tool installation timed out without verification: {name}"
         )
 
     # =================================================
-    # INTERNAL UI ACTIONS (PARTIAL)
+    # INTERNAL UI ACTIONS
     # =================================================
 
     def _open_browser(self) -> None:
-        self._os.open_browser()
+        try:
+            self._os.open_browser()
+        except Exception as e:
+            raise InstallationError(
+                f"Failed to open browser: {e}"
+            ) from e
 
     def _navigate(self, url: str) -> None:
-        self._os.focus_address_bar()
-        self._os.press(["ctrl", "a"])
-        self._os.write(url)
-        self._os.press(["enter"])
+        try:
+            self._os.focus_address_bar()
+            self._os.press(["ctrl", "a"])
+            self._os.write(url)
+            self._os.press(["enter"])
+        except Exception as e:
+            raise InstallationError(
+                f"Browser navigation failed: {e}"
+            ) from e
 
     def _wait_for_page_change(self) -> None:
         """
-        Stubbed.
-
-        Previously used screen hash comparison.
-        Will be replaced by vision-based state change detection.
+        Deterministic delay until vision-based detection exists.
         """
         time.sleep(self.PAGE_LOAD_TIMEOUT)
 
     # =================================================
-    # VERIFICATION (UNCHANGED, SAFE)
+    # VERIFICATION (AUTHORITATIVE)
     # =================================================
 
     def _is_already_installed(self, tool: Dict[str, Any]) -> bool:
