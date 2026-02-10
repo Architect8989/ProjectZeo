@@ -5,14 +5,15 @@ import threading
 from typing import Dict, Any, Optional, List
 import base64
 import io
+import json
 
 from PIL import Image, ImageGrab
 import ollama
 
-# -------------------------------------------------
-# ERRORS
-# -------------------------------------------------
 
+# =================================================
+# ERRORS (AUTHORITATIVE)
+# =================================================
 
 class VisionUnavailableError(RuntimeError):
     """Vision runtime cannot observe screen."""
@@ -22,96 +23,144 @@ class VisionDegradedError(RuntimeError):
     """Vision runtime observing unstable or invalid frames."""
 
 
-# -------------------------------------------------
-# CONFIG
-# -------------------------------------------------
-
+# =================================================
+# CONFIG (HARD LIMITS)
+# =================================================
 
 QWEN_MODEL = "qwen2.5-vl:7b-instruct"
 
 MAX_LATENCY_SECONDS = 1.5
-MAX_FRAME_BYTES = 4 * 1024 * 1024  # 4MB hard ceiling
+MAX_FRAME_BYTES = 4 * 1024 * 1024  # 4MB
 MAX_ELEMENTS = 128
+MAX_CONSECUTIVE_FAILURES = 5
+CAPTURE_INTERVAL_SECONDS = 0.5  # observer cadence
 
-# -------------------------------------------------
+
+# =================================================
 # VISION RUNTIME
-# -------------------------------------------------
-
+# =================================================
 
 class VisionRuntime:
     """
-    Continuous local vision processor.
+    Continuous local vision resident.
 
-    DESIGN PRINCIPLES:
-    - Observer-safe
-    - Planner-agnostic
-    - Executor-blind
+    HARD CONTRACT:
+    - Runs independently of planner/executor
+    - Produces perception ONLY
+    - No intent, no suggestions, no actions
     - Deterministic schema
+    - Fail-fast, fail-closed
     """
 
     def __init__(self):
         self._lock = threading.RLock()
+
+        self._last_output: Optional[Dict[str, Any]] = None
         self._last_frame_ts: Optional[float] = None
+
         self._consecutive_failures: int = 0
         self._healthy: bool = True
+        self._running: bool = False
+
+        self._thread: Optional[threading.Thread] = None
 
     # -------------------------------------------------
-    # PUBLIC API
+    # LIFECYCLE
     # -------------------------------------------------
 
-    def process_frame(self) -> Dict[str, Any]:
-        """
-        Capture framebuffer and return structured perception.
-
-        This is the ONLY entry point for vision.
-        """
-        start = time.monotonic()
-
+    def start(self) -> None:
         with self._lock:
-            if not self._healthy:
-                raise VisionUnavailableError("Vision runtime unhealthy")
+            if self._running:
+                return
 
-            frame_ts = time.monotonic()
+            self._running = True
+            self._thread = threading.Thread(
+                target=self._loop,
+                name="VisionRuntime",
+                daemon=True,
+            )
+            self._thread.start()
 
-            try:
-                image = self._capture_frame()
-                encoded = self._encode_image(image)
-
-                perception = self._call_qwen(encoded)
-
-                output = self._normalize_output(
-                    perception=perception,
-                    frame_ts=frame_ts,
-                )
-
-                self._last_frame_ts = frame_ts
-                self._consecutive_failures = 0
-
-            except Exception as e:
-                self._consecutive_failures += 1
-                if self._consecutive_failures >= 5:
-                    self._healthy = False
-                raise VisionDegradedError(f"Vision failure: {e}") from e
-
-            latency = time.monotonic() - start
-            if latency > MAX_LATENCY_SECONDS:
-                raise VisionDegradedError(
-                    f"Vision latency exceeded: {latency:.2f}s"
-                )
-
-            return output
+    def stop(self) -> None:
+        with self._lock:
+            self._running = False
 
     def is_healthy(self) -> bool:
-        return self._healthy
+        with self._lock:
+            return self._healthy
+
+    def get_latest(self) -> Optional[Dict[str, Any]]:
+        """
+        Observer-safe snapshot access.
+        """
+        with self._lock:
+            return (
+                json.loads(json.dumps(self._last_output))
+                if self._last_output is not None
+                else None
+            )
+
+    # -------------------------------------------------
+    # MAIN LOOP (RESIDENT)
+    # -------------------------------------------------
+
+    def _loop(self) -> None:
+        while True:
+            with self._lock:
+                if not self._running:
+                    return
+
+            try:
+                output = self._process_frame_internal()
+
+                with self._lock:
+                    self._last_output = output
+                    self._last_frame_ts = output["frame_ts"]
+                    self._consecutive_failures = 0
+
+            except Exception:
+                with self._lock:
+                    self._consecutive_failures += 1
+                    if self._consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                        self._healthy = False
+
+            time.sleep(CAPTURE_INTERVAL_SECONDS)
+
+    # -------------------------------------------------
+    # CORE FRAME PROCESSING (INTERNAL ONLY)
+    # -------------------------------------------------
+
+    def _process_frame_internal(self) -> Dict[str, Any]:
+        start = time.monotonic()
+
+        if not self._healthy:
+            raise VisionUnavailableError("Vision runtime unhealthy")
+
+        frame_ts = time.monotonic()
+
+        image = self._capture_frame()
+        encoded = self._encode_image(image)
+
+        perception = self._call_qwen(encoded)
+
+        output = self._normalize_output(
+            perception=perception,
+            frame_ts=frame_ts,
+        )
+
+        latency = time.monotonic() - start
+        if latency > MAX_LATENCY_SECONDS:
+            raise VisionDegradedError(
+                f"Vision latency exceeded: {latency:.2f}s"
+            )
+
+        return output
 
     # -------------------------------------------------
     # FRAME CAPTURE
     # -------------------------------------------------
 
     def _capture_frame(self) -> Image.Image:
-        """
-        Capture full screen including cursor.
-        """
         try:
             img = ImageGrab.grab(all_screens=True)
             if img.mode != "RGB":
@@ -123,9 +172,6 @@ class VisionRuntime:
             )
 
     def _encode_image(self, img: Image.Image) -> str:
-        """
-        Encode image to base64 JPEG with size enforcement.
-        """
         buf = io.BytesIO()
         img.save(buf, format="JPEG", quality=85)
         data = buf.getvalue()
@@ -138,15 +184,15 @@ class VisionRuntime:
         return base64.b64encode(data).decode("utf-8")
 
     # -------------------------------------------------
-    # MODEL CALL
+    # MODEL CALL (VISION ONLY)
     # -------------------------------------------------
 
     def _call_qwen(self, image_b64: str) -> Dict[str, Any]:
-        """
-        Call local Qwen vision model.
-        """
         prompt = (
-            "You are a vision perception system.\n"
+            "You are a visual perception system.\n"
+            "You do NOT infer intent.\n"
+            "You do NOT suggest actions.\n"
+            "You ONLY describe what is visible.\n\n"
             "Return ONLY valid JSON.\n\n"
             "Schema:\n"
             "{\n"
@@ -161,7 +207,7 @@ class VisionRuntime:
             '  "focused_app": string|null\n'
             "}\n\n"
             "Rules:\n"
-            "- Coordinates must be normalized (0..1)\n"
+            "- Coordinates normalized (0..1)\n"
             "- Max 128 elements\n"
             "- No hallucinated text\n"
         )
@@ -180,11 +226,10 @@ class VisionRuntime:
         )
 
         content = response["message"]["content"]
-
         return self._parse_json(content)
 
     # -------------------------------------------------
-    # NORMALIZATION
+    # NORMALIZATION (FAIL CLOSED)
     # -------------------------------------------------
 
     def _normalize_output(
@@ -193,10 +238,8 @@ class VisionRuntime:
         perception: Dict[str, Any],
         frame_ts: float,
     ) -> Dict[str, Any]:
-        """
-        Enforce strict schema and bounds.
-        """
-        elements = perception.get("elements") or []
+
+        elements = perception.get("elements")
         if not isinstance(elements, list):
             elements = []
 
@@ -241,10 +284,10 @@ class VisionRuntime:
         raw = raw.strip()
         if raw.startswith("```"):
             raw = raw.split("```")[1]
+
         try:
-            import json
             return json.loads(raw)
         except Exception as e:
             raise VisionDegradedError(
                 f"Invalid JSON from vision model: {e}"
-  )
+    )
