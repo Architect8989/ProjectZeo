@@ -9,7 +9,6 @@ from core.intent_listener import IntentListener
 from core.environment_fingerprint import collect_environment_fingerprint
 
 from observer.observer_core import ObserverCore, ObserverBlindnessError
-from observer.screenpipe_adapter import ScreenpipeAdapter, ScreenpipeBlindnessError
 from observer.perception_engine import PerceptionEngine
 
 from state.serializer import AuthorityStateSerializer
@@ -45,7 +44,6 @@ mode = ModeController()
 
 SNAPSHOT_PROVIDER = SnapshotProvider(
     observer=observer,
-    screenpipe=None,
     os_backend=OS_BACKEND,
     mode_controller=mode,
 )
@@ -107,23 +105,12 @@ def main():
         mode.force_observer()
 
     # --------------------------------------------------
-    # SCREENPIPE (REQUIRED)
-    # --------------------------------------------------
-    screenpipe = ScreenpipeAdapter()
-
-    if not screenpipe.self_test():
-        raise RuntimeError("Screenpipe self-test failed")
-
-    SNAPSHOT_PROVIDER.screenpipe = screenpipe
-    print("[SCREENPIPE] Connected and healthy")
-
-    # --------------------------------------------------
     # INTENT LISTENER
     # --------------------------------------------------
     intent_listener = IntentListener(mode)
     intent_listener.start()
 
-    print("[OBSERVER] Active")
+    print("[OBSERVER] Active (perception stubbed)")
 
     # ==================================================
     # MAIN LOOP
@@ -132,16 +119,16 @@ def main():
     while True:
         try:
             # ----------------------------------------------
-            # PERCEPTION
+            # PERCEPTION (SCREENPIPE REMOVED)
             # ----------------------------------------------
-            screen_state = screenpipe.read()
+            screen_state = {}  # TODO: Replace with vision model output
             ui_snapshot = perception.process(screen_state)
 
             observer.attach_screen_state(screen_state)
             observer.attach_ui_snapshot(ui_snapshot)
             observer.tick()
 
-            mode.update_vision_status(screen_state.get("available") is True)
+            mode.update_vision_status(False)
             mode.update_observer_health(observer.is_healthy())
 
             # ----------------------------------------------
@@ -194,7 +181,6 @@ def main():
                         terminal_prompt=consumed_intent,
                         execution_plan=execution_plan,
                         observer=observer,
-                        screenpipe=screenpipe,
                         llm_callable=mode.get_llm_callable(),
                     )
 
@@ -224,7 +210,7 @@ def main():
                 _force_safe_shutdown("task_timeout")
                 os._exit(1)
 
-        except (ObserverBlindnessError, ScreenpipeBlindnessError):
+        except ObserverBlindnessError:
             _force_safe_shutdown("perception_blindness")
             os._exit(1)
 
