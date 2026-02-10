@@ -73,9 +73,7 @@ class OperatingSystem:
 
             if timed_out:
                 try:
-                    self.force_release_all(
-                        reason="heartbeat_timeout"
-                    )
+                    self.force_release_all(reason="heartbeat_timeout")
                 except Exception:
                     pass
 
@@ -189,7 +187,8 @@ class OperatingSystem:
                 script = '''
                 tell application "System Events"
                     set frontApp to first application process whose frontmost is true
-                    return name of frontApp
+                    set pid to unix id of frontApp
+                    return (name of frontApp) & "|" & pid
                 end tell
                 '''
                 result = subprocess.run(
@@ -198,37 +197,52 @@ class OperatingSystem:
                     text=True,
                 )
                 if result.returncode == 0:
-                    return {"application": result.stdout.strip()}
+                    name, pid = result.stdout.strip().split("|", 1)
+                    return {
+                        "process_name": name,
+                        "pid": int(pid),
+                    }
 
             if system == "Linux":
                 wid = subprocess.check_output(
                     ["xdotool", "getactivewindow"],
                     text=True,
                 ).strip()
+                pid = subprocess.check_output(
+                    ["xdotool", "getwindowpid", wid],
+                    text=True,
+                ).strip()
                 title = subprocess.check_output(
                     ["xdotool", "getwindowname", wid],
                     text=True,
                 ).strip()
-                return {"id": wid, "title": title}
+                return {
+                    "process_name": title,
+                    "pid": int(pid),
+                }
 
             if system == "Windows":
                 try:
                     import win32gui
+                    import win32process
                 except ImportError as e:
-                    raise OSError("win32gui not installed") from e
+                    raise OSError("win32 extensions not installed") from e
 
                 hwnd = win32gui.GetForegroundWindow()
+                _, pid = win32process.GetWindowThreadProcessId(hwnd)
                 title = win32gui.GetWindowText(hwnd)
-                return {"id": str(hwnd), "title": title}
+                return {
+                    "process_name": title,
+                    "pid": int(pid),
+                }
 
         except Exception as e:
             raise OSError(f"Failed to get focused window: {e}") from e
 
         raise OSError("Focused window unavailable")
 
-    def get_active_application(self) -> Optional[str]:
-        info = self.get_focused_window()
-        return info.get("application") or info.get("title")
+    def get_active_application(self) -> Dict[str, int]:
+        return self.get_focused_window()
 
     # -------------------------------------------------
     # RESTORATION / SAFETY
@@ -262,20 +276,51 @@ class OperatingSystem:
                 capture_output=True,
             )
 
-    def activate_application(self, name: str) -> None:
-        if platform.system() == "Darwin" and name:
+    def activate_application(
+        self, name: str, pid: Optional[int] = None
+    ) -> None:
+        system = platform.system()
+
+        if system == "Darwin" and name:
             subprocess.run(["open", "-a", name])
 
+        elif system == "Linux" and pid:
+            subprocess.run(
+                ["wmctrl", "-i", "-a", str(pid)],
+                capture_output=True,
+            )
+
+    # -------------------------------------------------
+    # BROWSER HELPERS (BEST-EFFORT)
+    # -------------------------------------------------
+
+    def open_browser(self) -> None:
+        system = platform.system()
+        if system == "Darwin":
+            subprocess.run(["open", "-a", "Safari"])
+        elif system == "Linux":
+            subprocess.run(["xdg-open", "about:blank"])
+        elif system == "Windows":
+            os.startfile("about:blank")
+
+    def focus_address_bar(self) -> None:
+        system = platform.system()
+        if system in ("Linux", "Windows"):
+            pyautogui.hotkey("ctrl", "l")
+        elif system == "Darwin":
+            pyautogui.hotkey("cmd", "l")
+
+    # -------------------------------------------------
+    # EXTENDED RESTORATION (DOCUMENTED NO-OPS)
+    # -------------------------------------------------
+
     def set_window_geometry(self, *args, **kwargs) -> None:
-        # best-effort noop (documented)
         return
 
     def set_window_z_order(self, *args, **kwargs) -> None:
-        # best-effort noop (documented)
         return
 
     def restore_browser_state(self, *args, **kwargs) -> None:
-        # best-effort noop (documented)
         return
 
     # -------------------------------------------------
@@ -288,4 +333,4 @@ class OperatingSystem:
             isinstance(v, float)
             and not math.isnan(v)
             and 0.0 <= v <= 1.0
-            )
+    )
