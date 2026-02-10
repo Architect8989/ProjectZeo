@@ -9,7 +9,6 @@ from typing import Optional, Dict
 
 from operate.utils.misc import convert_percent_to_decimal
 
-
 # HARD FAILSAFE (cursor to corner aborts)
 pyautogui.FAILSAFE = True
 
@@ -166,20 +165,10 @@ class OperatingSystem:
         pyautogui.click(x_px, y_px)
 
     # -------------------------------------------------
-    # CURSOR
-    # -------------------------------------------------
-
-    def get_cursor_position(self):
-        return pyautogui.position()
-
-    def set_cursor_position(self, x: int, y: int) -> None:
-        pyautogui.moveTo(int(x), int(y), duration=0)
-
-    # -------------------------------------------------
     # WINDOW / APPLICATION
     # -------------------------------------------------
 
-    def get_focused_window(self) -> Dict[str, str]:
+    def get_focused_window(self) -> Dict[str, int]:
         system = platform.system()
 
         try:
@@ -198,10 +187,7 @@ class OperatingSystem:
                 )
                 if result.returncode == 0:
                     name, pid = result.stdout.strip().split("|", 1)
-                    return {
-                        "process_name": name,
-                        "pid": int(pid),
-                    }
+                    return {"process_name": name, "pid": int(pid)}
 
             if system == "Linux":
                 wid = subprocess.check_output(
@@ -216,25 +202,15 @@ class OperatingSystem:
                     ["xdotool", "getwindowname", wid],
                     text=True,
                 ).strip()
-                return {
-                    "process_name": title,
-                    "pid": int(pid),
-                }
+                return {"process_name": title, "pid": int(pid)}
 
             if system == "Windows":
-                try:
-                    import win32gui
-                    import win32process
-                except ImportError as e:
-                    raise OSError("win32 extensions not installed") from e
+                import win32gui, win32process
 
                 hwnd = win32gui.GetForegroundWindow()
                 _, pid = win32process.GetWindowThreadProcessId(hwnd)
                 title = win32gui.GetWindowText(hwnd)
-                return {
-                    "process_name": title,
-                    "pid": int(pid),
-                }
+                return {"process_name": title, "pid": int(pid)}
 
         except Exception as e:
             raise OSError(f"Failed to get focused window: {e}") from e
@@ -257,7 +233,6 @@ class OperatingSystem:
 
     def force_release_all(self, *, reason: str) -> None:
         self.mark_automation_inactive()
-
         try:
             pyautogui.mouseUp()
         except Exception:
@@ -268,13 +243,6 @@ class OperatingSystem:
                 pyautogui.keyUp(key)
             except Exception:
                 pass
-
-    def focus_window(self, identifier: str) -> None:
-        if platform.system() == "Linux" and identifier:
-            subprocess.run(
-                ["xdotool", "windowactivate", identifier],
-                capture_output=True,
-            )
 
     def activate_application(
         self, name: str, pid: Optional[int] = None
@@ -291,7 +259,7 @@ class OperatingSystem:
             )
 
     # -------------------------------------------------
-    # BROWSER HELPERS (BEST-EFFORT)
+    # BROWSER HELPERS
     # -------------------------------------------------
 
     def open_browser(self) -> None:
@@ -305,23 +273,10 @@ class OperatingSystem:
 
     def focus_address_bar(self) -> None:
         system = platform.system()
-        if system in ("Linux", "Windows"):
-            pyautogui.hotkey("ctrl", "l")
-        elif system == "Darwin":
+        if system == "Darwin":
             pyautogui.hotkey("cmd", "l")
-
-    # -------------------------------------------------
-    # EXTENDED RESTORATION (DOCUMENTED NO-OPS)
-    # -------------------------------------------------
-
-    def set_window_geometry(self, *args, **kwargs) -> None:
-        return
-
-    def set_window_z_order(self, *args, **kwargs) -> None:
-        return
-
-    def restore_browser_state(self, *args, **kwargs) -> None:
-        return
+        else:
+            pyautogui.hotkey("ctrl", "l")
 
     # -------------------------------------------------
     # HELPERS
