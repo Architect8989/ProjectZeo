@@ -1,10 +1,3 @@
-"""
-Execution Planner
-
-Purpose:
-Authoritatively converts intent into a validated ExecutionPlan.
-"""
-
 from typing import List, Dict, Any, Optional
 import json
 import time
@@ -40,6 +33,7 @@ class ExecutionPlanner:
         llm_call,
         environment_fingerprint: Optional[Dict[str, Any]] = None,
         observer=None,
+        world_graph=None,
     ):
         if not callable(llm_call):
             raise PlanningError("llm_call must be callable")
@@ -47,6 +41,7 @@ class ExecutionPlanner:
         self._llm_call = llm_call
         self._environment = environment_fingerprint or {}
         self._observer = observer
+        self._world_graph = world_graph
 
     # ==================================================
     # PUBLIC API
@@ -142,12 +137,29 @@ class ExecutionPlanner:
 
     def _read_screen_context(self) -> str:
         """
-        Stubbed.
+        Read-only grounding context.
 
-        Previously read from screenpipe.
-        Will be replaced with world-graph snapshot.
+        Uses world graph snapshot if available.
+        Bounded, non-authoritative, advisory only.
         """
-        return ""
+        if not self._world_graph:
+            return ""
+
+        try:
+            snapshot = self._world_graph.snapshot()
+        except Exception:
+            return ""
+
+        text_chunks = []
+
+        for ent in snapshot.get("entities", []):
+            label = ent.get("text")
+            etype = ent.get("type")
+            if label:
+                text_chunks.append(f"{etype}: {label}")
+
+        context = "\n".join(text_chunks)
+        return context[: self.MAX_SCREEN_CHARS]
 
     # ==================================================
     # LLM-POWERED GOAL EXPANSION (TIME-BOUNDED)
