@@ -51,23 +51,29 @@ class ObserverLoop:
         if self._running:
             return
 
+        # Vision runtime must be alive BEFORE observer loop
+        self._vision.start()
+
         self._stop_event.clear()
+        self._running = True
+
         self._thread = threading.Thread(
             target=self._run,
             name="observer-loop",
             daemon=True,
         )
         self._thread.start()
-        self._running = True
 
     def stop(self) -> None:
         if not self._running:
             return
 
         self._stop_event.set()
+
         if self._thread:
             self._thread.join(timeout=2.0)
 
+        self._vision.stop()
         self._running = False
 
     # --------------------------------------------------
@@ -79,8 +85,8 @@ class ObserverLoop:
         Infinite passive perception loop.
 
         Failure semantics:
-        - Vision failures mark screen unavailable
-        - Persistent failures cause observer blindness
+        - Vision absence is reported, not inferred
+        - ObserverCore decides blindness
         - Loop NEVER exits unless stop() is called
         """
         while not self._stop_event.is_set():
@@ -90,33 +96,40 @@ class ObserverLoop:
                 # 1. Pull latest perception (NON-BLOCKING)
                 perception = self._vision.get_latest()
 
-                if perception is None:
-                    raise ObserverBlindnessError("Vision produced no data")
-
-                # 2. Update world model (PURE DATA)
-                if perception.get("available"):
+                if isinstance(perception, dict) and perception.get("available"):
+                    # 2. Update world graph (PURE DATA)
                     self._world.ingest(perception)
 
-                # 3. Attach perception to observer core
-                self._observer.attach_perception_state(perception)
+                    # 3. Attach perception metadata to observer
+                    self._observer.attach_perception_state(
+                        {
+                            "available": True,
+                            "frame_ts": perception.get("frame_ts"),
+                        }
+                    )
+                else:
+                    # Vision produced no usable frame
+                    self._observer.attach_perception_state(
+                        {"available": False, "frame_ts": None}
+                    )
 
-                # 4. Advance observer clock
+                # 4. Advance observer clock (authoritative)
                 self._observer.tick()
 
             except ObserverBlindnessError:
-                # Authoritative blindness — do not crash
+                # Observer blindness is authoritative and expected
                 pass
 
             except Exception:
-                # Treat all other failures as transient blindness
+                # Never crash observer loop
+                traceback.print_exc()
+
                 try:
                     self._observer.attach_perception_state(
                         {"available": False, "frame_ts": None}
                     )
                 except Exception:
                     pass
-
-                traceback.print_exc()
 
             # 5. Tick pacing
             elapsed = time.monotonic() - start_ts
