@@ -23,11 +23,8 @@ class ObserverCore:
 
     MAX_HISTORY = 1000
 
-    # ---- FIXED: startup grace widened ----
     STARTUP_GRACE_TICKS = 30
     STARTUP_GRACE_SECONDS = 15.0
-
-    # ---- FIXED: transient loss tolerance ----
     MAX_CONSECUTIVE_MISSES = 15
 
     # --------------------------------------------------
@@ -56,7 +53,6 @@ class ObserverCore:
             "tick_count": 0,
             "last_tick_ts": None,
             "screen_available": False,
-            "screen_hash": None,
             "screen_frame_ts": None,
             "ui_snapshot": None,
         }
@@ -72,9 +68,7 @@ class ObserverCore:
     # --------------------------------------------------
 
     def reset_for_new_task(self) -> None:
-        """
-        Hard observer amnesia between executions.
-        """
+        """Hard observer amnesia between executions."""
         with self._lock:
             self._history.clear()
 
@@ -95,7 +89,6 @@ class ObserverCore:
                 "tick_count": 0,
                 "last_tick_ts": None,
                 "screen_available": False,
-                "screen_hash": None,
                 "screen_frame_ts": None,
                 "ui_snapshot": None,
             }
@@ -105,9 +98,6 @@ class ObserverCore:
     # --------------------------------------------------
 
     def _mark_blind(self, reason: str) -> None:
-        """
-        Transition to blind state. Idempotent.
-        """
         if not self.observer_healthy:
             return
 
@@ -120,14 +110,11 @@ class ObserverCore:
     # --------------------------------------------------
 
     def tick(self) -> Dict[str, object]:
-        """
-        Advances observer clock.
-        Raises ObserverBlindnessError if vision is unusable.
-        """
+        """Advance observer clock."""
         with self._lock:
             now = self._clock()
 
-            # ---- RECOVERY LOGIC (FIXED) ----
+            # recovery
             if (
                 not self.observer_healthy
                 and self.last_frame_seen is not None
@@ -144,14 +131,13 @@ class ObserverCore:
                     f"Observer blind: {self.blind_reason}"
                 )
 
-            # ---- startup grace enforcement ----
+            # startup grace
             if self.last_frame_seen is None:
                 grace_ok = (
                     self.tick_count < self.STARTUP_GRACE_TICKS
                     or (now - self.start_time)
                     < self.STARTUP_GRACE_SECONDS
                 )
-
                 if not grace_ok:
                     self._mark_blind(
                         "No initial frame within startup grace window"
@@ -160,7 +146,6 @@ class ObserverCore:
                         "Observer blind: no initial frame"
                     )
 
-            # ---- advance clock ----
             self.tick_count += 1
             self.last_tick_ts = now
 
@@ -182,7 +167,7 @@ class ObserverCore:
         self, screen_state: Dict[str, object]
     ) -> None:
         """
-        Attach raw screen availability and hash metadata.
+        Attach raw screen availability metadata.
         """
         if not isinstance(screen_state, dict):
             return
@@ -200,9 +185,6 @@ class ObserverCore:
                 self._consecutive_misses += 1
 
             self._state["screen_available"] = available
-            self._state["screen_hash"] = screen_state.get(
-                "screen_text_hash"
-            )
             self._state["screen_frame_ts"] = screen_state.get(
                 "frame_ts"
             )
@@ -218,9 +200,6 @@ class ObserverCore:
                 )
 
     def attach_ui_snapshot(self, ui_snapshot) -> None:
-        """
-        Attach structured UI perception (read-only).
-        """
         with self._lock:
             self._state["ui_snapshot"] = (
                 copy.deepcopy(ui_snapshot)
@@ -304,4 +283,4 @@ class ObserverCore:
                 "first_frame_seen": self.first_frame_seen is not None,
                 "consecutive_misses": self._consecutive_misses,
                 "history_depth": len(self._history),
-        }
+    }
