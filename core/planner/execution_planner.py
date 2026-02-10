@@ -25,7 +25,7 @@ class ExecutionPlanner:
     """
 
     LLM_TIMEOUT_SECONDS = 30.0
-    MAX_SCREEN_CHARS = 500  # bounded future context
+    MAX_SCREEN_CHARS = 500  # bounded advisory context
 
     def __init__(
         self,
@@ -74,12 +74,18 @@ class ExecutionPlanner:
                 raise PlanningError(f"Goal produced no steps: {goal}")
 
             for spec in expanded:
+                description = spec.get("description", "").strip()
+                if not description:
+                    raise PlanningError(
+                        "LLM produced step without description"
+                    )
+
                 deps = [last_step_id] if last_step_id else []
 
                 step = ExecutionStep(
                     id=step_id,
                     type=spec["type"],
-                    description=spec["description"],
+                    description=description,
                     action=spec.get("action", {}),
                     verification=spec.get("verification", {}),
                     dependencies=deps,
@@ -133,14 +139,14 @@ class ExecutionPlanner:
         tools = requirements.get("tools", [])
         if not isinstance(tools, list):
             return []
-        return [t for t in tools if isinstance(t, str)]
+        return [t for t in tools if isinstance(t, str) and t.strip()]
 
     def _read_screen_context(self) -> str:
         """
         Read-only grounding context.
 
         Uses world graph snapshot if available.
-        Bounded, non-authoritative, advisory only.
+        Advisory only — never authoritative.
         """
         if not self._world_graph:
             return ""
@@ -150,12 +156,12 @@ class ExecutionPlanner:
         except Exception:
             return ""
 
-        text_chunks = []
+        text_chunks: List[str] = []
 
         for ent in snapshot.get("entities", []):
             label = ent.get("text")
             etype = ent.get("type")
-            if label:
+            if isinstance(label, str) and label.strip():
                 text_chunks.append(f"{etype}: {label}")
 
         context = "\n".join(text_chunks)
@@ -226,13 +232,13 @@ Rules:
                 raise PlanningError(f"Invalid step at index {idx}")
 
             step_type = step.get("type")
-            if step_type not in [t.value for t in StepType]:
+            if step_type not in {t.value for t in StepType}:
                 raise PlanningError(f"Invalid step type: {step_type}")
 
             validated.append(
                 {
                     "type": StepType(step_type),
-                    "description": step.get("description", "").strip(),
+                    "description": step.get("description", ""),
                     "action": step.get("action", {}),
                     "verification": step.get("verification", {}),
                     "estimated_duration": float(
