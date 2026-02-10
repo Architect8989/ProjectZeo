@@ -179,21 +179,25 @@ class RestoreProvider:
                 f"Cursor restore failed: {e}"
             ) from e
 
+        focused = False
         try:
-            self._os.focus_window(snapshot.focus.window_id)
-        except Exception:
-            pass
-
-        try:
-            self._os.activate_application(
-                snapshot.application.process_name,
-                snapshot.application.pid,
+            focused = self._os.focus_window(
+                snapshot.focus.window_id
             )
         except Exception:
-            pass
+            focused = False
+
+        if not focused:
+            try:
+                self._os.activate_application(
+                    snapshot.application.process_name,
+                    snapshot.application.pid,
+                )
+            except Exception:
+                pass
 
     # -------------------------------------------------
-    # Verification (strict)
+    # Verification (strict, identity-aware)
     # -------------------------------------------------
 
     def _verify(self, snapshot: RestorationSnapshot) -> None:
@@ -220,11 +224,20 @@ class RestoreProvider:
                 "Cursor position mismatch after restore"
             )
 
-        if (
-            not isinstance(current_window, dict)
-            or current_window.get("process_name") is None
-            or current_window.get("pid") is None
-        ):
+        if not isinstance(current_window, dict):
             raise RestorationError(
                 "Focused window invalid after restore"
+            )
+
+        if (
+            current_window.get("process_name")
+            != snapshot.application.process_name
+        ):
+            raise RestorationError(
+                "Focused application mismatch after restore"
+            )
+
+        if current_window.get("pid") != snapshot.application.pid:
+            raise RestorationError(
+                "Focused application PID mismatch after restore"
         )
