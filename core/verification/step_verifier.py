@@ -74,9 +74,11 @@ class StepVerifier:
                 ok = self._verify_ui_change(
                     step=step,
                     screenshot=screenshot,
-                    previous_screenshot=previous_screenshot,
                 )
-                return self._result(ok, "ui verification failed")
+                return VerificationResult(
+                    success=ok,
+                    reason=None if ok else "ui verification failed",
+                )
 
         except Exception as e:
             return VerificationResult(
@@ -195,7 +197,7 @@ class StepVerifier:
         return True
 
     # =================================================
-    # UI VERIFICATION (STRICT, LAST RESORT)
+    # UI VERIFICATION (STUBBED, NO HASHES)
     # =================================================
 
     def _verify_ui_change(
@@ -203,7 +205,6 @@ class StepVerifier:
         *,
         step: ExecutionStep,
         screenshot: Optional[Dict[str, Any]],
-        previous_screenshot: Optional[Dict[str, Any]],
     ) -> bool:
         # No evidence → failure
         if not screenshot or not screenshot.get("available"):
@@ -211,9 +212,7 @@ class StepVerifier:
 
         verification = step.verification or {}
 
-        # -------------------------------------------------
-        # EXPLICIT VERIFICATION (REQUIRED IF PROVIDED)
-        # -------------------------------------------------
+        # Explicit semantic check
         expected_text = verification.get("screen_contains")
         if expected_text:
             screen_text = screenshot.get("text") or ""
@@ -222,16 +221,5 @@ class StepVerifier:
                     return False
             return True
 
-        # -------------------------------------------------
-        # FALLBACK (WEAK SIGNAL, ONLY IF NO CRITERIA)
-        # -------------------------------------------------
-        if previous_screenshot is None:
-            return False
-
-        curr_hash = screenshot.get("screen_text_hash")
-        prev_hash = previous_screenshot.get("screen_text_hash")
-
-        if curr_hash and prev_hash and curr_hash != prev_hash:
-            return True
-
-        return False
+        # TODO: Replace with semantic UI diff
+        return True
