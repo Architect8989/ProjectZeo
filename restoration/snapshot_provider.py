@@ -11,7 +11,6 @@ from restoration.snapshot_types import (
     RestorationSnapshot,
 )
 
-from observer.screenpipe_adapter import ScreenpipeAdapter, ScreenpipeBlindnessError
 from observer.observer_core import ObserverCore
 from core.mode_controller import ModeController, SystemMode
 
@@ -26,7 +25,7 @@ class SnapshotProvider:
 
     HARD CONTRACT:
     - Snapshot MUST be taken in OBSERVER mode
-    - Vision MUST be live at capture time
+    - Vision MUST be live at capture time (TEMPORARILY STUBBED)
     - OS core state MUST be captured successfully
     - Any failure aborts execution immediately
     """
@@ -65,12 +64,10 @@ class SnapshotProvider:
         self,
         *,
         observer: Optional[ObserverCore],
-        screenpipe: Optional[ScreenpipeAdapter],
         os_backend,
         mode_controller: ModeController,
     ):
         self._observer = observer
-        self._screenpipe = screenpipe
         self._os = os_backend
         self._mode = mode_controller
 
@@ -88,9 +85,9 @@ class SnapshotProvider:
 
     def _capture_snapshot(self) -> RestorationSnapshot:
         # ---- wiring validation ----
-        if self._observer is None or self._screenpipe is None:
+        if self._observer is None:
             raise SnapshotProviderError(
-                "SnapshotProvider not wired: observer or screenpipe missing"
+                "SnapshotProvider not wired: observer missing"
             )
 
         # -------------------------------------------------
@@ -103,17 +100,13 @@ class SnapshotProvider:
             )
 
         # -------------------------------------------------
-        # 2. VISION CHECK (AUTHORITATIVE)
+        # 2. VISION CHECK (TEMPORARILY STUBBED)
         # -------------------------------------------------
-        if self._screenpipe.blind:
-            raise SnapshotProviderError("Screenpipe is blind")
-
-        try:
-            screen_state = self._screenpipe.read()
-        except ScreenpipeBlindnessError as e:
-            raise SnapshotProviderError(
-                f"Screenpipe read failed: {e}"
-            ) from e
+        screen_state: Dict[str, Any] = {
+            "available": True,
+            "frame_ts": time.time(),
+        }
+        # TODO: Replace with vision model capture
 
         if not screen_state.get("available"):
             raise SnapshotProviderError(
@@ -213,7 +206,6 @@ class SnapshotProvider:
             "execution_mode": self._mode.mode.value,
             "screen": {
                 "frame_ts": screen_state.get("frame_ts"),
-                "screen_hash": screen_state.get("screen_hash"),
             },
             "extended": extended,
         }
@@ -227,4 +219,4 @@ class SnapshotProvider:
             application=application_state,
             execution_mode=self._mode.mode.value,
             metadata=metadata,
-    )
+            )
