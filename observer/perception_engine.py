@@ -1,7 +1,7 @@
-from typing import Dict, Set, Tuple, List
+from typing import Dict, Set, Tuple
 import time
 
-from observer.ui_schema import UISnapshot
+from observer.ui_schema import UISnapshot, UIElement, UIDialog, UIProgress
 from observer.self_healing import PerceptionHealth
 
 
@@ -44,7 +44,9 @@ class PerceptionEngine:
 
         snapshot = screen_state.get("snapshot")
         if not isinstance(snapshot, UISnapshot):
-            raise PerceptionVerificationError("missing UISnapshot in screen_state")
+            raise PerceptionVerificationError(
+                "missing UISnapshot in screen_state"
+            )
 
         return snapshot
 
@@ -85,10 +87,13 @@ class PerceptionEngine:
 
         if not isinstance(pre_snapshot, UISnapshot):
             self._fail("pre_state missing valid UISnapshot")
+
         if not isinstance(post_snapshot, UISnapshot):
             self._fail("post_state missing valid UISnapshot")
 
-        changed, evidence = self._semantic_delta(pre_snapshot, post_snapshot)
+        changed, evidence = self._semantic_delta(
+            pre_snapshot, post_snapshot
+        )
 
         if expect_change and not changed:
             self._fail("no provable semantic UI change detected")
@@ -104,7 +109,7 @@ class PerceptionEngine:
         return True
 
     # --------------------------------------------------
-    # SEMANTIC DIFF (CONSTRUCTIVE)
+    # SEMANTIC DIFF (CONSTRUCTIVE, DETERMINISTIC)
     # --------------------------------------------------
 
     def _semantic_delta(
@@ -128,13 +133,22 @@ class PerceptionEngine:
 
         # ---- STRUCTURAL COUNTS ----
         if len(pre.elements) != len(post.elements):
-            evidence["elements_count"] = (len(pre.elements), len(post.elements))
+            evidence["elements_count"] = (
+                len(pre.elements),
+                len(post.elements),
+            )
 
         if len(pre.dialogs) != len(post.dialogs):
-            evidence["dialogs_count"] = (len(pre.dialogs), len(post.dialogs))
+            evidence["dialogs_count"] = (
+                len(pre.dialogs),
+                len(post.dialogs),
+            )
 
         if len(pre.progress) != len(post.progress):
-            evidence["progress_count"] = (len(pre.progress), len(post.progress))
+            evidence["progress_count"] = (
+                len(pre.progress),
+                len(post.progress),
+            )
 
         # ---- TEXTUAL SEMANTICS ----
         pre_text = self._extract_text(pre)
@@ -145,6 +159,7 @@ class PerceptionEngine:
 
         if added:
             evidence["text_added"] = sorted(added)
+
         if removed:
             evidence["text_removed"] = sorted(removed)
 
@@ -154,8 +169,8 @@ class PerceptionEngine:
         texts: Set[str] = set()
 
         for el in snap.elements:
-            if isinstance(el.label, str) and el.label.strip():
-                texts.add(el.label.strip())
+            if isinstance(el.text, str) and el.text.strip():
+                texts.add(el.text.strip())
 
         for dlg in snap.dialogs:
             if isinstance(dlg.title, str) and dlg.title.strip():
@@ -177,9 +192,7 @@ class PerceptionEngine:
         return {
             "last_verification_ts": self.last_verification_ts,
             "last_verification_reason": self.last_verification_reason,
-            "last_verification_evidence": getattr(
-                self, "last_verification_evidence", None
-            ),
+            "last_verification_evidence": self.last_verification_evidence,
             "health_degraded": self.health.degraded(),
         }
 
