@@ -55,7 +55,7 @@ def llm_call(prompt: str) -> str:
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                      OBSERVER MODE                          │
-│  - Screen reading continuous (screenpipe)                   │
+│  - Screen reading continuous (visionllm)                   │
 │  - Vision health monitoring                                 │
 │  - No automated input                                       │
 │  - Listening for human intent                               │
