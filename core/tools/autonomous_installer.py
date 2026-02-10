@@ -9,7 +9,6 @@ import time
 from typing import Dict, Any, Optional
 
 from observer.observer_core import ObserverCore
-from observer.screenpipe_adapter import ScreenpipeAdapter, ScreenpipeBlindnessError
 from operate.utils.operating_system import OperatingSystem
 from core.verification.step_verifier import StepVerifier, VerificationError
 from core.schemas.execution_plan import ExecutionStep, StepType
@@ -29,6 +28,10 @@ class AutonomousInstaller:
     - Deterministic fallbacks only
     - No silent shell installs
     - Idempotent (never reinstall if already present)
+
+    NOTE:
+    Screen vision is currently stubbed.
+    This class will not function fully until vision integration is complete.
     """
 
     MAX_INSTALL_TIME = 15 * 60  # seconds
@@ -39,11 +42,9 @@ class AutonomousInstaller:
         self,
         *,
         observer: ObserverCore,
-        screenpipe: ScreenpipeAdapter,
         os_backend: OperatingSystem,
     ):
         self._observer = observer
-        self._screenpipe = screenpipe
         self._os = os_backend
         self._verifier = StepVerifier()
 
@@ -76,32 +77,13 @@ class AutonomousInstaller:
         self._navigate(url)
         self._wait_for_page_change()
 
-        if not self._click_download_button():
-            raise InstallationError(
-                f"Download button not found for {name}"
-            )
-
-        installer_path = self._wait_for_download(start_ts)
-        if not installer_path:
-            raise InstallationError(
-                f"Installer download not detected for {name}"
-            )
-
-        self._os.exec(installer_path)
-        self._wait_ui()
-
-        self._navigate_installer_wizard(start_ts)
-
-        # --------------------------------------------------
-        # POST-INSTALL VERIFICATION
-        # --------------------------------------------------
-        if not self._is_already_installed(tool):
-            raise InstallationError(
-                f"Post-install verification failed for {name}"
-            )
+        # From here onward, UI automation is unsafe without vision
+        raise InstallationError(
+            f"Autonomous installation disabled (vision unavailable) for {name}"
+        )
 
     # =================================================
-    # INTERNAL UI ACTIONS
+    # INTERNAL UI ACTIONS (PARTIAL)
     # =================================================
 
     def _open_browser(self) -> None:
@@ -114,67 +96,16 @@ class AutonomousInstaller:
         self._os.press(["enter"])
 
     def _wait_for_page_change(self) -> None:
-        initial = self._safe_read().get("screen_hash")
-        start = time.time()
+        """
+        Stubbed.
 
-        while time.time() - start < self.PAGE_LOAD_TIMEOUT:
-            state = self._safe_read()
-            if state.get("screen_hash") and state.get("screen_hash") != initial:
-                time.sleep(self.UI_SETTLE_DELAY)
-                return
-            time.sleep(0.5)
-
-        raise InstallationError("Page load timeout")
-
-    def _click_download_button(self) -> bool:
-        state = self._safe_read()
-        text = state.get("text", "").lower()
-
-        if "download" not in text:
-            return False
-
-        target = self._observer.find_click_target(contains="download")
-        if not target:
-            return False
-
-        self._os.mouse(target)
-        return True
-
-    def _wait_for_download(self, start_ts: float) -> Optional[str]:
-        while time.time() - start_ts < self.MAX_INSTALL_TIME:
-            path = self._os.get_latest_download()
-            if path:
-                return path
-            time.sleep(1.0)
-        return None
-
-    def _navigate_installer_wizard(self, start_ts: float) -> None:
-        while time.time() - start_ts < self.MAX_INSTALL_TIME:
-            state = self._safe_read()
-            text = state.get("text", "").lower()
-
-            if any(k in text for k in ("completed", "finish", "done")):
-                self._click_button(["finish", "done"])
-                return
-
-            if self._click_button(["next", "agree", "install", "continue"]):
-                self._wait_ui()
-                continue
-
-            time.sleep(1.0)
-
-        raise InstallationError("Installer wizard timed out")
-
-    def _click_button(self, labels) -> bool:
-        for label in labels:
-            target = self._observer.find_click_target(contains=label)
-            if target:
-                self._os.mouse(target)
-                return True
-        return False
+        Previously used screen hash comparison.
+        Will be replaced by vision-based state change detection.
+        """
+        time.sleep(self.PAGE_LOAD_TIMEOUT)
 
     # =================================================
-    # VERIFICATION (FIXED)
+    # VERIFICATION (UNCHANGED, SAFE)
     # =================================================
 
     def _is_already_installed(self, tool: Dict[str, Any]) -> bool:
@@ -207,11 +138,3 @@ class AutonomousInstaller:
 
     def _wait_ui(self) -> None:
         time.sleep(self.UI_SETTLE_DELAY)
-
-    def _safe_read(self) -> Dict[str, Any]:
-        try:
-            return self._screenpipe.read() or {}
-        except ScreenpipeBlindnessError:
-            raise
-        except Exception:
-            return {}
