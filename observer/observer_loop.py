@@ -1,5 +1,3 @@
-# observer/observer_loop.py
-
 import threading
 import time
 import traceback
@@ -43,7 +41,6 @@ class ObserverLoop:
 
         self._thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
-
         self._running = False
 
     # --------------------------------------------------
@@ -90,51 +87,35 @@ class ObserverLoop:
             start_ts = time.monotonic()
 
             try:
-                # 1. Capture + perceive (NO DECISIONS)
-                perception = self._vision.capture_and_perceive()
+                # 1. Pull latest perception (NON-BLOCKING)
+                perception = self._vision.get_latest()
 
-                # perception schema (guaranteed by VisionRuntime):
-                # {
-                #   "available": bool,
-                #   "frame_ts": float,
-                #   "ui_snapshot": UISnapshot,
-                #   "raw_frame": optional
-                # }
+                if perception is None:
+                    raise ObserverBlindnessError("Vision produced no data")
 
-                # 2. Update world model (pure accumulation)
+                # 2. Update world model (PURE DATA)
                 if perception.get("available"):
-                    self._world.update(perception)
+                    self._world.ingest(perception)
 
-                # 3. Attach to observer core
-                self._observer.attach_screen_state(
-                    {
-                        "available": perception.get("available", False),
-                        "frame_ts": perception.get("frame_ts"),
-                    }
-                )
-
-                self._observer.attach_ui_snapshot(
-                    perception.get("ui_snapshot")
-                )
+                # 3. Attach perception to observer core
+                self._observer.attach_perception_state(perception)
 
                 # 4. Advance observer clock
                 self._observer.tick()
 
             except ObserverBlindnessError:
-                # Observer blindness is authoritative.
-                # Do not suppress, do not crash.
+                # Authoritative blindness — do not crash
                 pass
 
             except Exception:
-                # Vision/runtime failures are treated as transient blindness
+                # Treat all other failures as transient blindness
                 try:
-                    self._observer.attach_screen_state(
+                    self._observer.attach_perception_state(
                         {"available": False, "frame_ts": None}
                     )
                 except Exception:
                     pass
 
-                # Never crash the loop
                 traceback.print_exc()
 
             # 5. Tick pacing
