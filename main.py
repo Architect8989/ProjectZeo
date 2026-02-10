@@ -9,7 +9,10 @@ from core.intent_listener import IntentListener
 from core.environment_fingerprint import collect_environment_fingerprint
 
 from observer.observer_core import ObserverCore, ObserverBlindnessError
-from observer.perception_engine import PerceptionEngine
+from observer.observer_loop import ObserverLoop
+
+from core.vision.vision_runtime import VisionRuntime
+from core.vision.world_graph import WorldGraph
 
 from state.serializer import AuthorityStateSerializer
 from operate.utils.operating_system import OperatingSystem
@@ -39,7 +42,15 @@ STATE_PATH = os.path.join(os.getcwd(), ".authority_state.json")
 AUTH_STATE = AuthorityStateSerializer(STATE_PATH)
 
 observer = ObserverCore()
-perception = PerceptionEngine()
+vision_runtime = VisionRuntime()
+world_graph = WorldGraph()
+
+observer_loop = ObserverLoop(
+    observer=observer,
+    vision_runtime=vision_runtime,
+    world_graph=world_graph,
+)
+
 mode = ModeController()
 
 SNAPSHOT_PROVIDER = SnapshotProvider(
@@ -100,9 +111,19 @@ def main():
     # --------------------------------------------------
     persisted = AUTH_STATE.load()
     if persisted.get("dirty") or persisted.get("restore_required"):
-        OS_BACKEND.force_release_all(reason="crash_recovery")
+        try:
+            OS_BACKEND.force_release_all(reason="crash_recovery")
+        except Exception:
+            pass
+
         AUTH_STATE.force_safe_state()
         mode.force_observer()
+
+    # --------------------------------------------------
+    # START OBSERVER SUBSYSTEM
+    # --------------------------------------------------
+    observer_loop.start()
+    print("[OBSERVER] Passive observer loop started")
 
     # --------------------------------------------------
     # INTENT LISTENER
@@ -110,26 +131,17 @@ def main():
     intent_listener = IntentListener(mode)
     intent_listener.start()
 
-    print("[OBSERVER] Active (perception stubbed)")
-
     # ==================================================
-    # MAIN LOOP
+    # MAIN ORCHESTRATION LOOP (NO PERCEPTION)
     # ==================================================
 
     while True:
         try:
             # ----------------------------------------------
-            # PERCEPTION (SCREENPIPE REMOVED)
+            # HEALTH PROPAGATION
             # ----------------------------------------------
-            screen_state = {}  # TODO: Replace with vision model output
-            ui_snapshot = perception.process(screen_state)
-
-            observer.attach_screen_state(screen_state)
-            observer.attach_ui_snapshot(ui_snapshot)
-            observer.tick()
-
-            mode.update_vision_status(False)
             mode.update_observer_health(observer.is_healthy())
+            mode.update_vision_status(vision_runtime.is_healthy())
 
             # ----------------------------------------------
             # EXECUTION TRIGGER
@@ -148,6 +160,7 @@ def main():
                 planner = ExecutionPlanner(
                     llm_call=mode.get_llm_callable(),
                     environment_fingerprint=env_fingerprint,
+                    world_graph=world_graph,
                 )
 
                 execution_plan = planner.create_plan(
@@ -211,7 +224,7 @@ def main():
                 os._exit(1)
 
         except ObserverBlindnessError:
-            _force_safe_shutdown("perception_blindness")
+            _force_safe_shutdown("observer_blindness")
             os._exit(1)
 
         except Exception as e:
