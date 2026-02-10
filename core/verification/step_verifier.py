@@ -71,13 +71,13 @@ class StepVerifier:
                 return self._result(ok, "tool verification failed")
 
             if step.type == StepType.UI_INTERACTION:
-                ok = self._verify_ui_change(
+                ok, reason = self._verify_ui_change(
                     step=step,
                     screenshot=screenshot,
                 )
                 return VerificationResult(
                     success=ok,
-                    reason=None if ok else "ui verification failed",
+                    reason=None if ok else reason,
                 )
 
         except Exception as e:
@@ -197,7 +197,7 @@ class StepVerifier:
         return True
 
     # =================================================
-    # UI VERIFICATION (STUBBED, NO HASHES)
+    # UI VERIFICATION (FAIL-CLOSED)
     # =================================================
 
     def _verify_ui_change(
@@ -205,21 +205,35 @@ class StepVerifier:
         *,
         step: ExecutionStep,
         screenshot: Optional[Dict[str, Any]],
-    ) -> bool:
-        # No evidence → failure
+    ) -> tuple[bool, str]:
+        """
+        UI verification is ONLY allowed when an explicit
+        semantic condition is provided.
+
+        No condition == no evidence == failure.
+        """
+
         if not screenshot or not screenshot.get("available"):
-            return False
+            return False, "no screenshot evidence"
 
         verification = step.verification or {}
 
-        # Explicit semantic check
         expected_text = verification.get("screen_contains")
-        if expected_text:
-            screen_text = screenshot.get("text") or ""
-            for token in expected_text:
-                if token not in screen_text:
-                    return False
-            return True
+        if not expected_text:
+            return (
+                False,
+                "ui verification requires explicit screen_contains condition",
+            )
 
-        # TODO: Replace with semantic UI diff
-        return True
+        screen_text = screenshot.get("text")
+        if not isinstance(screen_text, str):
+            return False, "screenshot text unavailable"
+
+        for token in expected_text:
+            if token not in screen_text:
+                return (
+                    False,
+                    f"expected text not found on screen: {token}",
+                )
+
+        return True, ""
