@@ -17,14 +17,14 @@ class AutonomousInstaller:
 
     HARD CONTRACT:
     - Browser-driven
-    - UI-observed (when vision is available)
+    - UI-observed when vision exists
     - Deterministic fallbacks only
     - No silent shell installs
     - Idempotent (never reinstall if already present)
 
-    CURRENT LIMITATION:
-    - Without vision, installer may only navigate + wait
-    - Success is NEVER assumed without verification
+    WITHOUT VISION:
+    - Navigation + wait + verification polling only
+    - Success is NEVER assumed
     """
 
     MAX_INSTALL_TIME = 15 * 60  # seconds
@@ -50,7 +50,7 @@ class AutonomousInstaller:
         """
         Install a tool via browser + installer wizard.
 
-        This method NEVER reports success unless verification passes.
+        NEVER reports success unless verification passes.
         """
 
         name = tool.get("name")
@@ -127,16 +127,14 @@ class AutonomousInstaller:
 
     def _is_already_installed(self, tool: Dict[str, Any]) -> bool:
         """
-        Authoritative tool existence check.
+        Single source of truth for tool existence.
         """
 
         step = ExecutionStep(
             id=0,
             type=StepType.TOOL_INSTALLATION,
             description=f"Verify {tool.get('name')} installed",
-            action={
-                "tool": tool.get("name"),
-            },
+            action={"tool": tool.get("name")},
             verification={
                 "version_command": tool.get("version_command"),
                 "min_version": tool.get("min_version"),
