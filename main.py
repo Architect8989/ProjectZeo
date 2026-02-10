@@ -3,6 +3,7 @@ import os
 import signal
 import atexit
 import sys
+from typing import Callable
 
 from core.mode_controller import ModeController
 from core.intent_listener import IntentListener
@@ -55,6 +56,34 @@ observer_loop = ObserverLoop(
 
 mode = ModeController()
 
+# ==================================================
+# LLM INJECTION (AUTHORITATIVE FIX)
+# ==================================================
+
+def create_llm_callable() -> Callable[[str], str]:
+    api_key = os.getenv("ANTHROPIC_API_KEY")
+    if not api_key:
+        raise RuntimeError("ANTHROPIC_API_KEY not set")
+
+    from anthropic import Anthropic
+
+    client = Anthropic(api_key=api_key)
+
+    def llm_call(prompt: str) -> str:
+        response = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=4096,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return response.content[0].text
+
+    return llm_call
+
+
+# 🔒 Inject ONCE, before any planning can occur
+mode.inject_llm_callable(create_llm_callable())
+
+
 SNAPSHOT_PROVIDER = SnapshotProvider(
     observer=observer,
     os_backend=OS_BACKEND,
@@ -105,14 +134,8 @@ def main():
 
     print("[BOOT] ProjectZeo kernel starting")
 
-    # --------------------------------------------------
-    # ENVIRONMENT FINGERPRINT
-    # --------------------------------------------------
     env_fingerprint = collect_environment_fingerprint()
 
-    # --------------------------------------------------
-    # CRASH RECOVERY GATE
-    # --------------------------------------------------
     persisted = AUTH_STATE.load()
     if persisted.get("dirty") or persisted.get("restore_required"):
         try:
@@ -123,41 +146,21 @@ def main():
         AUTH_STATE.force_safe_state()
         mode.force_observer()
 
-    # --------------------------------------------------
-    # START OBSERVER SUBSYSTEM (VISION FIRST)
-    # --------------------------------------------------
     vision_runtime.start()
     observer_loop.start()
 
-    print("[OBSERVER] Vision runtime started")
-    print("[OBSERVER] Passive observer loop started")
-
-    # --------------------------------------------------
-    # INTENT LISTENER
-    # --------------------------------------------------
     intent_listener = IntentListener(mode)
     intent_listener.start()
 
-    # ==================================================
-    # MAIN ORCHESTRATION LOOP (NO PERCEPTION LOGIC HERE)
-    # ==================================================
-
     while True:
         try:
-            # ----------------------------------------------
-            # HEALTH PROPAGATION (AUTHORITATIVE)
-            # ----------------------------------------------
             mode.update_observer_health(observer.is_healthy())
             mode.update_vision_status(vision_runtime.is_healthy())
 
-            # ----------------------------------------------
-            # EXECUTION TRIGGER
-            # ----------------------------------------------
             if mode.is_armed():
                 TASK_START = time.time()
 
                 snapshot_id = SNAPSHOT_PROVIDER.take_snapshot()
-
                 mode.begin_planning()
 
                 intent = mode.get_intent()
@@ -205,7 +208,6 @@ def main():
                     )
 
                 finally:
-                    # ---- FAIL-CLOSED RESTORATION ----
                     try:
                         RESTORE_PROVIDER.restore_snapshot(snapshot_id)
                     except Exception as e:
@@ -223,9 +225,6 @@ def main():
                     mode.force_observer()
                     TASK_START = None
 
-            # ----------------------------------------------
-            # HARD WALL-CLOCK ENFORCEMENT
-            # ----------------------------------------------
             if TASK_START and (time.time() - TASK_START) > MAX_TASK_SECONDS:
                 _force_safe_shutdown("task_timeout")
                 os._exit(1)
