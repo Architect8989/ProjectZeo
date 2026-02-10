@@ -1,4 +1,4 @@
-from typing import Dict, Optional
+from typing import Dict
 import time
 from observer.ui_schema import UISnapshot, UIElement, UIDialog, UIProgress
 from observer.self_healing import PerceptionHealth
@@ -83,7 +83,7 @@ class PerceptionEngine:
         Rules:
         - Verification must complete within bounded time
         - Perception health must not be degraded
-        - Change can be proven by hash OR frame timestamp
+        - Change is proven by monotonic frame timestamp
         """
 
         start = time.monotonic()
@@ -106,8 +106,6 @@ class PerceptionEngine:
                 self.last_verification_reason
             )
 
-        pre_hash = pre_state.get("screen_text_hash")
-        post_hash = post_state.get("screen_text_hash")
         pre_ts = pre_state.get("frame_ts")
         post_ts = post_state.get("frame_ts")
 
@@ -123,7 +121,7 @@ class PerceptionEngine:
                 self.last_verification_reason
             )
 
-        changed = (pre_hash != post_hash) or (post_ts > pre_ts)
+        changed = post_ts > pre_ts
 
         if expect_change and not changed:
             self.last_verification_reason = (
