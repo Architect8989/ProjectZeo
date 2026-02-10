@@ -2,7 +2,7 @@ import os
 import shutil
 import subprocess
 from dataclasses import dataclass
-from typing import Optional, Any, Dict
+from typing import Optional, Any, Dict, Tuple
 
 from core.schemas.execution_plan import ExecutionStep, StepType
 
@@ -59,26 +59,23 @@ class StepVerifier:
                 return VerificationResult(True, reason="verification-only")
 
             if step.type == StepType.COMMAND_EXECUTION:
-                ok = self._verify_command(step, execution_result)
-                return self._result(ok, "command verification failed")
+                ok, reason = self._verify_command(step, execution_result)
+                return VerificationResult(ok, reason if not ok else None)
 
             if step.type == StepType.FILE_CREATION:
-                ok = self._verify_file(step)
-                return self._result(ok, "file verification failed")
+                ok, reason = self._verify_file(step)
+                return VerificationResult(ok, reason if not ok else None)
 
             if step.type == StepType.TOOL_INSTALLATION:
-                ok = self._verify_tool(step)
-                return self._result(ok, "tool verification failed")
+                ok, reason = self._verify_tool(step)
+                return VerificationResult(ok, reason if not ok else None)
 
             if step.type == StepType.UI_INTERACTION:
                 ok, reason = self._verify_ui_change(
                     step=step,
                     screenshot=screenshot,
                 )
-                return VerificationResult(
-                    success=ok,
-                    reason=None if ok else reason,
-                )
+                return VerificationResult(ok, reason if not ok else None)
 
         except Exception as e:
             return VerificationResult(
@@ -92,15 +89,6 @@ class StepVerifier:
         )
 
     # =================================================
-    # INTERNAL HELPERS
-    # =================================================
-
-    def _result(self, ok: bool, reason: str) -> VerificationResult:
-        if ok:
-            return VerificationResult(success=True)
-        return VerificationResult(success=False, reason=reason)
-
-    # =================================================
     # COMMAND VERIFICATION
     # =================================================
 
@@ -108,74 +96,90 @@ class StepVerifier:
         self,
         step: ExecutionStep,
         result: Any,
-    ) -> bool:
+    ) -> Tuple[bool, str]:
         if result is None or not hasattr(result, "returncode"):
-            return False
+            return False, "missing command execution result"
 
         verification = step.verification or {}
         expected_codes = verification.get("expected_return_codes", [0])
 
         if result.returncode not in expected_codes:
-            return False
+            return (
+                False,
+                f"unexpected return code: {result.returncode}",
+            )
 
         expected_output = verification.get("output_contains")
         if expected_output:
             combined = (result.stdout or "") + (result.stderr or "")
             for token in expected_output:
                 if token not in combined:
-                    return False
+                    return (
+                        False,
+                        f"expected output token missing: {token}",
+                    )
 
-        return True
+        return True, ""
 
     # =================================================
     # FILE VERIFICATION
     # =================================================
 
-    def _verify_file(self, step: ExecutionStep) -> bool:
+    def _verify_file(self, step: ExecutionStep) -> Tuple[bool, str]:
         action = step.action or {}
         verification = step.verification or {}
 
         path = action.get("path")
         if not isinstance(path, str):
-            return False
+            return False, "file path missing or invalid"
 
         if not os.path.exists(path):
-            return False
+            return False, f"path does not exist: {path}"
 
         if verification.get("is_directory"):
-            return os.path.isdir(path)
+            if not os.path.isdir(path):
+                return False, "expected directory but found file"
+            return True, ""
 
         if not os.path.isfile(path):
-            return False
+            return False, "expected file but path is not file"
 
         expected = verification.get("content_contains")
         if expected:
             try:
-                with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                with open(
+                    path,
+                    "r",
+                    encoding="utf-8",
+                    errors="ignore",
+                ) as f:
                     content = f.read()
                 for token in expected:
                     if token not in content:
-                        return False
-            except Exception:
-                return False
+                        return (
+                            False,
+                            f"expected file content missing: {token}",
+                        )
+            except Exception as e:
+                return False, f"file read failed: {e}"
 
-        return True
+        return True, ""
 
     # =================================================
     # TOOL VERIFICATION
     # =================================================
 
-    def _verify_tool(self, step: ExecutionStep) -> bool:
+    def _verify_tool(self, step: ExecutionStep) -> Tuple[bool, str]:
         action = step.action or {}
         verification = step.verification or {}
 
         tool = action.get("tool")
         if not isinstance(tool, str):
-            return False
+            return False, "tool name missing or invalid"
 
         tool_path = shutil.which(tool)
         if not tool_path:
-            return False
+            return False, f"tool not found in PATH: {tool}"
 
         version_cmd = verification.get("version_command")
         min_version = verification.get("min_version")
@@ -188,13 +192,16 @@ class StepVerifier:
                     shell=isinstance(version_cmd, str),
                     timeout=5,
                 ).decode(errors="ignore")
-            except Exception:
-                return False
+            except Exception as e:
+                return False, f"version command failed: {e}"
 
             if min_version and min_version not in out:
-                return False
+                return (
+                    False,
+                    f"minimum version not satisfied: {min_version}",
+                )
 
-        return True
+        return True, ""
 
     # =================================================
     # UI VERIFICATION (FAIL-CLOSED)
@@ -205,7 +212,7 @@ class StepVerifier:
         *,
         step: ExecutionStep,
         screenshot: Optional[Dict[str, Any]],
-    ) -> tuple[bool, str]:
+    ) -> Tuple[bool, str]:
         """
         UI verification is ONLY allowed when an explicit
         semantic condition is provided.
@@ -214,7 +221,7 @@ class StepVerifier:
         """
 
         if not screenshot or not screenshot.get("available"):
-            return False, "no screenshot evidence"
+            return False, "no screenshot evidence available"
 
         verification = step.verification or {}
 
@@ -233,7 +240,7 @@ class StepVerifier:
             if token not in screen_text:
                 return (
                     False,
-                    f"expected text not found on screen: {token}",
+                    f"expected screen text not found: {token}",
                 )
 
         return True, ""
