@@ -1,6 +1,5 @@
 import time
 import threading
-import os
 from enum import Enum
 from typing import Optional, Deque, Dict, Callable
 from collections import deque
@@ -27,15 +26,8 @@ class ModeController:
 
     HARD GUARANTEES:
     - Linear lifecycle: OBSERVER → ARMED → PLANNING → EXECUTING → OBSERVER
-    - Snapshot must exist before planning (enforced externally)
-    - Planning MUST attach a plan artifact
-    - Execution impossible without completed + attached plan
-    - Abort always returns to OBSERVER
-
-    IMPORTANT:
-    - This class does NOT think
-    - This class does NOT plan
-    - This class only enforces authority + lifecycle
+    - Kernel has ZERO intelligence
+    - All reasoning lives outside the kernel
     """
 
     MAX_TRANSITION_HISTORY = 2000
@@ -43,6 +35,7 @@ class ModeController:
     def __init__(self):
         self._lock = threading.RLock()
 
+        # ---- MODE ----
         self._mode: SystemMode = SystemMode.OBSERVER
         self._mode_entered_at: float = time.time()
         self._last_transition_reason: Optional[str] = None
@@ -62,8 +55,13 @@ class ModeController:
         self._vision_failed_permanently: bool = False
         self._failure_reason: Optional[str] = None
 
+        # ---- INPUT / AUTHORITY ----
         self._input_locked: bool = False
 
+        # ---- EXTERNAL INTELLIGENCE (INJECTED) ----
+        self._llm_callable: Optional[Callable[[str], str]] = None
+
+        # ---- FORENSICS ----
         self._transition_history: Deque[Dict[str, object]] = deque(
             maxlen=self.MAX_TRANSITION_HISTORY
         )
@@ -82,44 +80,36 @@ class ModeController:
             return self._mode == SystemMode.ARMED
 
     # --------------------------------------------------
-    # BRAIN–BODY INTERFACE (FIXED)
+    # INTENT
     # --------------------------------------------------
 
     def get_intent(self) -> Optional[str]:
-        """
-        Read-only access to the raw human prompt.
-
-        - No mutation
-        - No interpretation
-        - No preprocessing
-        """
         with self._lock:
             return self._intent
 
+    # --------------------------------------------------
+    # BRAIN INTERFACE (INJECTED, NOT CREATED)
+    # --------------------------------------------------
+
+    def set_llm_callable(self, llm_call: Callable[[str], str]) -> None:
+        """
+        Inject external intelligence.
+
+        Must be called during boot.
+        """
+        if not callable(llm_call):
+            raise TypeError("llm_call must be callable")
+
+        with self._lock:
+            self._llm_callable = llm_call
+
     def get_llm_callable(self) -> Callable[[str], str]:
-        """
-        Returns the external brain callable.
-
-        ModeController does NOT reason.
-        It only exposes a configured brain entrypoint.
-        """
-        from anthropic import Anthropic
-
-        api_key = os.getenv("ANTHROPIC_API_KEY")
-        if not api_key:
-            raise RuntimeError("ANTHROPIC_API_KEY not set")
-
-        client = Anthropic(api_key=api_key)
-
-        def llm_call(prompt: str) -> str:
-            response = client.messages.create(
-                model="claude-sonnet-4-20250514",
-                max_tokens=4096,
-                messages=[{"role": "user", "content": prompt}],
-            )
-            return response.content[0].text
-
-        return llm_call
+        with self._lock:
+            if self._llm_callable is None:
+                raise RuntimeError(
+                    "No LLM callable injected into ModeController"
+                )
+            return self._llm_callable
 
     # --------------------------------------------------
     # HEALTH
@@ -130,13 +120,13 @@ class ModeController:
     ) -> None:
         with self._lock:
             if healthy:
+                self._observer_healthy = True
                 return
 
             if not self._observer_healthy:
                 return
 
             self._observer_healthy = False
-            self._vision_failed_permanently = True
             self._failure_reason = reason or "observer failure"
 
             if self._mode in (
@@ -150,6 +140,8 @@ class ModeController:
     def update_vision_status(self, ok: bool) -> None:
         with self._lock:
             self._vision_ok = bool(ok)
+            if not ok:
+                self._vision_failed_permanently = True
 
     # --------------------------------------------------
     # TRANSITIONS
@@ -226,13 +218,11 @@ class ModeController:
     def mark_planning_complete(self) -> None:
         with self._lock:
             if self._mode != SystemMode.PLANNING:
-                raise ModeTransitionError(
-                    "Planning not active"
-                )
+                raise ModeTransitionError("Planning not active")
 
             if not self._execution_plan_attached:
                 raise ModeTransitionError(
-                    "Cannot complete planning without attached ExecutionPlan"
+                    "Cannot complete planning without attached plan"
                 )
 
             self._planning_completed = True
@@ -247,11 +237,6 @@ class ModeController:
             if not self._planning_completed:
                 raise ModeTransitionError(
                     "Cannot execute without completed plan"
-                )
-
-            if not self._execution_plan_attached:
-                raise ModeTransitionError(
-                    "No ExecutionPlan attached"
                 )
 
             if not self._observer_healthy or not self._vision_ok:
@@ -316,11 +301,9 @@ class ModeController:
     def _reset_internal_state(self) -> None:
         self._intent = None
         self._intent_frozen = False
-
         self._planning_completed = False
         self._execution_plan_attached = False
         self._execution_plan_id = None
-
         self._input_locked = False
 
     # --------------------------------------------------
@@ -374,4 +357,4 @@ class ModeController:
                 "transition_history_depth": len(
                     self._transition_history
                 ),
-    }
+                 }
