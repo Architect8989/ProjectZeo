@@ -25,7 +25,7 @@ class AccessibilityBackend:
     - Owns NO orchestration logic
 
     CONTRACT:
-    - observer and screenpipe are OPTIONAL, late-bound references
+    - observer is OPTIONAL, late-bound reference
     - If accessed without wiring → FAIL CLOSED
     - If AT-SPI unavailable → FAIL FAST
     """
@@ -39,9 +39,16 @@ class AccessibilityBackend:
 
         self.registry = pyatspi.Registry
 
-        # ---- Late-bound system interfaces (REQUIRED BY KERNEL PATHS) ----
+        # ---- Late-bound system interfaces ----
         self.observer: Optional[object] = None
-        self.screenpipe: Optional[object] = None
+
+    # -------------------------------------------------
+    # Wiring
+    # -------------------------------------------------
+
+    def wire(self, *, observer):
+        """Wire observer reference."""
+        self.observer = observer
 
     # -------------------------------------------------
     # Internal helpers
@@ -51,10 +58,10 @@ class AccessibilityBackend:
         """
         Fail-closed if system interfaces are accessed without wiring.
         """
-        if self.observer is None or self.screenpipe is None:
+        if self.observer is None:
             raise RuntimeError(
                 "ACCESSIBILITY_BACKEND_NOT_WIRED: "
-                "observer/screenpipe must be explicitly injected"
+                "observer must be explicitly injected"
             )
 
     def _get_stable_id(self, obj):
