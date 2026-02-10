@@ -1,19 +1,3 @@
-"""
-World Graph
-
-ROLE:
-- Canonical semantic state of the observed digital world
-- Accumulates perception over time
-- Supplies planners and verifiers with evidence, not pixels
-
-ABSOLUTE CONSTRAINTS:
-- READ-ONLY to everyone except VisionRuntime ingestion
-- No execution authority
-- No planning logic
-- No hallucination paths
-- Deterministic merge rules
-"""
-
 from __future__ import annotations
 
 import time
@@ -40,6 +24,10 @@ class WorldGraphError(RuntimeError):
 MAX_ENTITIES = 5000
 MAX_HISTORY = 2000
 ENTITY_STALE_SECONDS = 30.0
+
+# spatial quantization to reduce jitter but avoid collisions
+COORD_QUANT = 0.001  # ~0.1% of screen
+
 
 # -------------------------------------------------
 # WORLD GRAPH
@@ -73,7 +61,7 @@ class WorldGraph:
         """
         Merge a new perception frame into the world graph.
 
-        Only VisionRuntime may call this.
+        Only VisionRuntime / ObserverLoop may call this.
         """
         if not isinstance(perception, dict):
             return
@@ -82,15 +70,21 @@ class WorldGraph:
         if not isinstance(frame_ts, (int, float)):
             return
 
+        elements = perception.get("elements")
+        if not isinstance(elements, list):
+            return
+
+        now = time.monotonic()
+
         with self._lock:
             self._last_frame_ts = frame_ts
             self._focused_app = perception.get("focused_app")
 
-            elements = perception.get("elements") or []
-
             for el in elements:
+                if not isinstance(el, dict):
+                    continue
+
                 entity_id = self._stable_entity_id(el)
-                now = time.monotonic()
 
                 if entity_id not in self._entities:
                     self._entities[entity_id] = {
@@ -108,10 +102,19 @@ class WorldGraph:
                     ent["last_seen"] = now
                     ent["x"] = el.get("x")
                     ent["y"] = el.get("y")
-                    ent["confidence"] = min(ent["confidence"] + 0.05, 1.0)
+                    ent["confidence"] = min(
+                        ent.get("confidence", 0.5) + 0.05, 1.0
+                    )
 
-            self._prune(now=time.monotonic())
+            self._prune(now=now)
             self._record_history()
+
+    # ---- compatibility alias (CRITICAL) ----
+    def update(self, perception: Dict[str, Any]) -> None:
+        """
+        Compatibility alias.
+        """
+        self.ingest(perception)
 
     # -------------------------------------------------
     # SNAPSHOT API
@@ -184,12 +187,24 @@ class WorldGraph:
     def _stable_entity_id(self, el: Dict[str, Any]) -> str:
         """
         Deterministic identity across frames.
+
+        Uses quantized spatial buckets to avoid jitter
+        without introducing collisions.
         """
+        try:
+            x = float(el.get("x", 0.0))
+            y = float(el.get("y", 0.0))
+        except Exception:
+            x = 0.0
+            y = 0.0
+
+        qx = int(x / COORD_QUANT)
+        qy = int(y / COORD_QUANT)
+
         raw = (
             f"{el.get('type')}|"
             f"{el.get('text')}|"
-            f"{round(float(el.get('x', 0)), 3)}|"
-            f"{round(float(el.get('y', 0)), 3)}"
+            f"{qx}|{qy}"
         )
         return hashlib.sha256(raw.encode()).hexdigest()
 
@@ -197,22 +212,23 @@ class WorldGraph:
         """
         Remove stale or excessive entities.
         """
-        stale = [
+        stale_ids = [
             eid
             for eid, ent in self._entities.items()
             if now - ent.get("last_seen", now) > ENTITY_STALE_SECONDS
         ]
 
-        for eid in stale:
+        for eid in stale_ids:
             del self._entities[eid]
 
         if len(self._entities) > MAX_ENTITIES:
-            # drop lowest confidence first
+            # drop lowest confidence first (deterministic)
             sorted_ids = sorted(
                 self._entities.items(),
                 key=lambda kv: kv[1].get("confidence", 0.0),
             )
-            for eid, _ in sorted_ids[: len(self._entities) - MAX_ENTITIES]:
+            overflow = len(self._entities) - MAX_ENTITIES
+            for eid, _ in sorted_ids[:overflow]:
                 del self._entities[eid]
 
     def _record_history(self) -> None:
