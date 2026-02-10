@@ -6,12 +6,12 @@ import argparse
 import sys
 
 from operate.utils.style import ANSI_BRIGHT_MAGENTA
-from operate.operate import execute_soc
+from operate.operate import operate_main
 from core.telemetry.logger import log_info, log_error
 
 from operate.utils.operating_system import OperatingSystem
 from utils.accessibility import AccessibilityBackend
-from audit.journal import AuditJournal
+from audit.journal import ActionJournal
 from authority.input_arbitrator import InputArbitrator
 
 
@@ -22,7 +22,6 @@ def main_entry(
     voice_mode: bool = False,
     verbose_mode: bool = False,
     observer=None,
-    screenpipe=None,
 ):
     """
     Thin execution wrapper.
@@ -30,7 +29,7 @@ def main_entry(
     Responsibilities:
     - Parse CLI or accept programmatic input
     - Construct execution dependencies
-    - Call execute_soc()
+    - Call operate_main()
 
     Does NOT:
     - manage lifecycle
@@ -49,7 +48,7 @@ def main_entry(
 
             parser.add_argument(
                 "-m", "--model",
-                default="gpt-4-with-ocr",
+                default=None,
             )
 
             parser.add_argument(
@@ -64,11 +63,10 @@ def main_entry(
             objective = args.prompt
         else:
             objective = terminal_prompt
-            model = model or "gpt-4-with-ocr"
 
-        if observer is None or screenpipe is None:
+        if observer is None:
             raise RuntimeError(
-                "observer and screenpipe are required for execution"
+                "observer is required for execution"
             )
 
         # --------------------------------------------------
@@ -76,12 +74,10 @@ def main_entry(
         # --------------------------------------------------
         os_backend = OperatingSystem()
 
-        accessibility_backend = AccessibilityBackend(
-            observer=observer,
-            screenpipe=screenpipe,
-        )
+        accessibility_backend = AccessibilityBackend()
+        accessibility_backend.wire(observer=observer)
 
-        journal = AuditJournal()
+        journal = ActionJournal()
         input_arbitrator = InputArbitrator()
 
         log_info("[SYSTEM] Starting SOC execution")
@@ -89,15 +85,11 @@ def main_entry(
         # --------------------------------------------------
         # EXECUTION
         # --------------------------------------------------
-        execute_soc(
+        operate_main(
             model=model,
-            objective=objective,
+            terminal_prompt=objective,
+            execution_plan=None,  # expected to be provided by caller in SOC flow
             observer=observer,
-            screenpipe=screenpipe,
-            os_backend=os_backend,
-            accessibility_backend=accessibility_backend,
-            journal=journal,
-            input_arbitrator=input_arbitrator,
         )
 
     except KeyboardInterrupt:
