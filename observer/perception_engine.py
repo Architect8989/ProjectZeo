@@ -17,6 +17,7 @@ class PerceptionEngine:
     - Deterministic verification
     - Bounded latency
     - No cross-task state leakage
+    - FAIL-CLOSED semantics
     """
 
     MAX_VERIFICATION_LATENCY_SECONDS = 1.0
@@ -43,7 +44,7 @@ class PerceptionEngine:
             elements.append(
                 UIElement(
                     type="text",
-                    label="screen content present",
+                    label="screen available",
                     confidence=0.6,
                 )
             )
@@ -67,7 +68,7 @@ class PerceptionEngine:
         )
 
     # --------------------------------------------------
-    # VERIFICATION
+    # VERIFICATION (FAIL-CLOSED)
     # --------------------------------------------------
 
     def verify_task_completion(
@@ -76,29 +77,29 @@ class PerceptionEngine:
         post_state: Dict[str, object],
         *,
         expect_change: bool = True,
+        semantic_proof: bool = False,
     ) -> bool:
         """
         Evidence-based verification.
 
-        Rules:
-        - Verification must complete within bounded time
-        - Perception health must not be degraded
-        - Change is proven by monotonic frame timestamp
+        HARD RULES:
+        - Timestamp change is NOT evidence
+        - Verification REQUIRES explicit semantic proof
+        - Health degradation aborts verification
         """
 
         start = time.monotonic()
         self._reset_verification_state()
 
+        # ---- HEALTH GATE ----
         if self.health.degraded():
             self.last_verification_reason = "perception health degraded"
             raise PerceptionVerificationError(
                 self.last_verification_reason
             )
 
-        pre_available = bool(pre_state.get("available"))
-        post_available = bool(post_state.get("available"))
-
-        if not pre_available or not post_available:
+        # ---- AVAILABILITY GATE ----
+        if not pre_state.get("available") or not post_state.get("available"):
             self.last_verification_reason = (
                 "screen unavailable during verification"
             )
@@ -106,39 +107,16 @@ class PerceptionEngine:
                 self.last_verification_reason
             )
 
-        pre_ts = pre_state.get("frame_ts")
-        post_ts = post_state.get("frame_ts")
-
-        if pre_ts is None or post_ts is None:
-            self.last_verification_reason = "missing frame timestamp"
-            raise PerceptionVerificationError(
-                self.last_verification_reason
-            )
-
-        if post_ts < pre_ts:
-            self.last_verification_reason = "frame time regression"
-            raise PerceptionVerificationError(
-                self.last_verification_reason
-            )
-
-        changed = post_ts > pre_ts
-
-        if expect_change and not changed:
+        # ---- SEMANTIC EVIDENCE GATE ----
+        if expect_change and not semantic_proof:
             self.last_verification_reason = (
-                "expected UI change not observed"
+                "no semantic evidence of UI change"
             )
             raise PerceptionVerificationError(
                 self.last_verification_reason
             )
 
-        if not expect_change and changed:
-            self.last_verification_reason = (
-                "unexpected UI change observed"
-            )
-            raise PerceptionVerificationError(
-                self.last_verification_reason
-            )
-
+        # ---- LATENCY BOUND ----
         latency = time.monotonic() - start
         if latency > self.MAX_VERIFICATION_LATENCY_SECONDS:
             self.last_verification_reason = "verification timeout"
