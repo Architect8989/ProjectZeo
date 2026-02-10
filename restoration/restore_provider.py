@@ -23,7 +23,7 @@ class RestoreProvider:
     - Single authority for mode reset
     """
 
-    CURSOR_TOLERANCE_PX = 5  # relaxed for DPI / latency safety
+    CURSOR_TOLERANCE_PX = 5
 
     def __init__(self, *, os_backend, mode_controller: ModeController):
         self._os = os_backend
@@ -41,9 +41,7 @@ class RestoreProvider:
 
         snapshot = SnapshotProvider.get_snapshot(snapshot_id)
         if snapshot is None:
-            raise RestorationError(
-                f"Snapshot not found: {snapshot_id}"
-            )
+            raise RestorationError(f"Snapshot not found: {snapshot_id}")
 
         self.restore(snapshot)
 
@@ -52,7 +50,7 @@ class RestoreProvider:
 
         with self._lock:
             # -------------------------------------------------
-            # IDEMPOTENCY
+            # IDEMPOTENCY (SAFE EARLY EXIT)
             # -------------------------------------------------
             if self._completed_snapshot_id == snapshot_id:
                 return
@@ -78,83 +76,14 @@ class RestoreProvider:
             extended = meta.get("extended") or {}
 
             # -------------------------------------------------
-            # PHASE 1 — EXTENDED STATE (BEST-EFFORT)
+            # PHASE 1 — EXTENDED STATE (BEST-EFFORT, ISOLATED)
             # -------------------------------------------------
-            try:
-                if (
-                    extended.get("window_geometry") is not None
-                    and hasattr(self._os, "set_window_geometry")
-                ):
-                    self._os.set_window_geometry(
-                        snapshot.focus.window_id,
-                        extended["window_geometry"],
-                    )
-            except Exception:
-                pass
-
-            try:
-                if (
-                    extended.get("window_z_order") is not None
-                    and hasattr(self._os, "set_window_z_order")
-                ):
-                    self._os.set_window_z_order(
-                        snapshot.focus.window_id,
-                        extended["window_z_order"],
-                    )
-            except Exception:
-                pass
-
-            try:
-                if (
-                    extended.get("browser_state") is not None
-                    and hasattr(self._os, "restore_browser_state")
-                ):
-                    self._os.restore_browser_state(
-                        extended["browser_state"]
-                    )
-            except Exception:
-                pass
-
-            try:
-                if (
-                    extended.get("media_playback_position") is not None
-                    and hasattr(self._os, "set_media_playback_position")
-                ):
-                    self._os.set_media_playback_position(
-                        extended["media_playback_position"]
-                    )
-            except Exception:
-                pass
+            self._restore_extended_state(snapshot, extended)
 
             # -------------------------------------------------
             # PHASE 2 — CORE STATE (FAIL-CLOSED)
             # -------------------------------------------------
-            try:
-                self._os.set_cursor_position(
-                    snapshot.cursor.x,
-                    snapshot.cursor.y,
-                )
-            except Exception as e:
-                raise RestorationError(
-                    f"Cursor restore failed: {e}"
-                ) from e
-
-            focused = False
-            try:
-                focused = self._os.focus_window(
-                    snapshot.focus.window_id
-                )
-            except Exception:
-                focused = False
-
-            if not focused:
-                try:
-                    self._os.activate_application(
-                        snapshot.application.process_name,
-                        snapshot.application.pid,
-                    )
-                except Exception:
-                    pass
+            self._restore_core_state(snapshot)
 
             # -------------------------------------------------
             # PHASE 3 — AUTHORITY RESET (ABSOLUTE)
@@ -173,12 +102,98 @@ class RestoreProvider:
             self._verify(snapshot)
 
             # -------------------------------------------------
-            # PHASE 5 — COMMIT
+            # PHASE 5 — COMMIT (IDEMPOTENCY SEAL)
             # -------------------------------------------------
             self._completed_snapshot_id = snapshot_id
 
     # -------------------------------------------------
-    # Verification
+    # Extended restore (best-effort)
+    # -------------------------------------------------
+
+    def _restore_extended_state(
+        self,
+        snapshot: RestorationSnapshot,
+        extended: dict,
+    ) -> None:
+        try:
+            if (
+                extended.get("window_geometry") is not None
+                and hasattr(self._os, "set_window_geometry")
+            ):
+                self._os.set_window_geometry(
+                    snapshot.focus.window_id,
+                    extended["window_geometry"],
+                )
+        except Exception:
+            pass
+
+        try:
+            if (
+                extended.get("window_z_order") is not None
+                and hasattr(self._os, "set_window_z_order")
+            ):
+                self._os.set_window_z_order(
+                    snapshot.focus.window_id,
+                    extended["window_z_order"],
+                )
+        except Exception:
+            pass
+
+        try:
+            if (
+                extended.get("browser_state") is not None
+                and hasattr(self._os, "restore_browser_state")
+            ):
+                self._os.restore_browser_state(
+                    extended["browser_state"]
+                )
+        except Exception:
+            pass
+
+        try:
+            if (
+                extended.get("media_playback_position") is not None
+                and hasattr(self._os, "set_media_playback_position")
+            ):
+                self._os.set_media_playback_position(
+                    extended["media_playback_position"]
+                )
+        except Exception:
+            pass
+
+    # -------------------------------------------------
+    # Core restore (authoritative)
+    # -------------------------------------------------
+
+    def _restore_core_state(
+        self,
+        snapshot: RestorationSnapshot,
+    ) -> None:
+        try:
+            self._os.set_cursor_position(
+                snapshot.cursor.x,
+                snapshot.cursor.y,
+            )
+        except Exception as e:
+            raise RestorationError(
+                f"Cursor restore failed: {e}"
+            ) from e
+
+        try:
+            self._os.focus_window(snapshot.focus.window_id)
+        except Exception:
+            pass
+
+        try:
+            self._os.activate_application(
+                snapshot.application.process_name,
+                snapshot.application.pid,
+            )
+        except Exception:
+            pass
+
+    # -------------------------------------------------
+    # Verification (strict)
     # -------------------------------------------------
 
     def _verify(self, snapshot: RestorationSnapshot) -> None:
@@ -205,7 +220,11 @@ class RestoreProvider:
                 "Cursor position mismatch after restore"
             )
 
-        if not current_window or current_window.get("id") is None:
+        if (
+            not isinstance(current_window, dict)
+            or current_window.get("process_name") is None
+            or current_window.get("pid") is None
+        ):
             raise RestorationError(
-                "No valid focused window after restore"
-            )
+                "Focused window invalid after restore"
+        )
