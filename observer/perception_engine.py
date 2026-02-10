@@ -1,6 +1,6 @@
-from typing import Dict
+from typing import Dict, Set
 import time
-from observer.ui_schema import UISnapshot, UIElement, UIDialog, UIProgress
+from observer.ui_schema import UISnapshot
 from observer.self_healing import PerceptionHealth
 
 
@@ -36,39 +36,10 @@ class PerceptionEngine:
 
         stable = self.health.update(frame_ts, available)
 
-        elements = []
-        dialogs = []
-        progress = []
-
-        if available:
-            elements.append(
-                UIElement(
-                    type="text",
-                    label="screen available",
-                    confidence=0.6,
-                )
-            )
-
-        if self.health.degraded():
-            dialogs.append(
-                UIDialog(
-                    title="Perception degraded",
-                    message="Screen observation unstable",
-                    severity="warning",
-                    blocking=False,
-                    confidence=0.9,
-                )
-            )
-
-        return UISnapshot(
-            elements=elements,
-            dialogs=dialogs,
-            progress=progress,
-            stable=stable,
-        )
+        return screen_state.get("snapshot")  # authoritative snapshot only
 
     # --------------------------------------------------
-    # VERIFICATION (FAIL-CLOSED)
+    # VERIFICATION (SEMANTIC, FAIL-CLOSED)
     # --------------------------------------------------
 
     def verify_task_completion(
@@ -77,14 +48,14 @@ class PerceptionEngine:
         post_state: Dict[str, object],
         *,
         expect_change: bool = True,
-        semantic_proof: bool = False,
     ) -> bool:
         """
-        Evidence-based verification.
+        Evidence-based semantic verification.
 
         HARD RULES:
         - Timestamp change is NOT evidence
-        - Verification REQUIRES explicit semantic proof
+        - Semantic delta MUST be computed internally
+        - No delta when change expected == failure
         - Health degradation aborts verification
         """
 
@@ -93,40 +64,77 @@ class PerceptionEngine:
 
         # ---- HEALTH GATE ----
         if self.health.degraded():
-            self.last_verification_reason = "perception health degraded"
-            raise PerceptionVerificationError(
-                self.last_verification_reason
-            )
+            self._fail("perception health degraded")
 
         # ---- AVAILABILITY GATE ----
         if not pre_state.get("available") or not post_state.get("available"):
-            self.last_verification_reason = (
-                "screen unavailable during verification"
-            )
-            raise PerceptionVerificationError(
-                self.last_verification_reason
-            )
+            self._fail("screen unavailable during verification")
 
-        # ---- SEMANTIC EVIDENCE GATE ----
-        if expect_change and not semantic_proof:
-            self.last_verification_reason = (
-                "no semantic evidence of UI change"
-            )
-            raise PerceptionVerificationError(
-                self.last_verification_reason
-            )
+        pre_snapshot = pre_state.get("snapshot")
+        post_snapshot = post_state.get("snapshot")
+
+        if not isinstance(pre_snapshot, UISnapshot) or not isinstance(
+            post_snapshot, UISnapshot
+        ):
+            self._fail("invalid or missing UISnapshot")
+
+        semantic_changed = self._semantic_delta(
+            pre_snapshot, post_snapshot
+        )
+
+        if expect_change and not semantic_changed:
+            self._fail("no semantic UI change detected")
 
         # ---- LATENCY BOUND ----
-        latency = time.monotonic() - start
-        if latency > self.MAX_VERIFICATION_LATENCY_SECONDS:
-            self.last_verification_reason = "verification timeout"
-            raise PerceptionVerificationError(
-                self.last_verification_reason
-            )
+        if (time.monotonic() - start) > self.MAX_VERIFICATION_LATENCY_SECONDS:
+            self._fail("verification timeout")
 
         self.last_verification_ts = time.monotonic()
         self.last_verification_reason = "verified"
         return True
+
+    # --------------------------------------------------
+    # SEMANTIC DIFF (DETERMINISTIC)
+    # --------------------------------------------------
+
+    def _semantic_delta(
+        self, pre: UISnapshot, post: UISnapshot
+    ) -> bool:
+        """
+        Returns True iff a provable semantic change occurred.
+        """
+
+        if pre.stable != post.stable:
+            return True
+
+        if len(pre.elements) != len(post.elements):
+            return True
+
+        if len(pre.dialogs) != len(post.dialogs):
+            return True
+
+        if len(pre.progress) != len(post.progress):
+            return True
+
+        pre_text = self._extract_text(pre)
+        post_text = self._extract_text(post)
+
+        return pre_text != post_text
+
+    def _extract_text(self, snap: UISnapshot) -> Set[str]:
+        texts = set()
+        for el in snap.elements:
+            if el.label:
+                texts.add(el.label)
+        for dlg in snap.dialogs:
+            if dlg.title:
+                texts.add(dlg.title)
+            if dlg.message:
+                texts.add(dlg.message)
+        for prog in snap.progress:
+            if prog.label:
+                texts.add(prog.label)
+        return texts
 
     # --------------------------------------------------
     # FORENSICS
@@ -142,6 +150,10 @@ class PerceptionEngine:
     # --------------------------------------------------
     # INTERNAL
     # --------------------------------------------------
+
+    def _fail(self, reason: str):
+        self.last_verification_reason = reason
+        raise PerceptionVerificationError(reason)
 
     def _reset_verification_state(self) -> None:
         self.last_verification_ts = None
