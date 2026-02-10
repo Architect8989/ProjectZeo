@@ -55,14 +55,13 @@ class ObserverCore:
 
         self._lock = threading.RLock()
 
-        # ---- Observer state is PURELY DESCRIPTIVE ----
+        # ---- Descriptive observer state only ----
         self._state: Dict[str, object] = {
             "uptime_seconds": 0.0,
             "tick_count": 0,
             "last_tick_ts": None,
             "perception_available": False,
             "perception_frame_ts": None,
-            "ui_snapshot": None,
         }
 
         self._history: Deque[Dict[str, object]] = deque(
@@ -78,8 +77,6 @@ class ObserverCore:
     def reset_for_new_task(self) -> None:
         """
         Hard observer amnesia between executions.
-
-        Used at OBSERVER → ARMED transition.
         """
         with self._lock:
             self._history.clear()
@@ -102,7 +99,6 @@ class ObserverCore:
                 "last_tick_ts": None,
                 "perception_available": False,
                 "perception_frame_ts": None,
-                "ui_snapshot": None,
             }
 
     # --------------------------------------------------
@@ -130,13 +126,13 @@ class ObserverCore:
         with self._lock:
             now = self._clock()
 
-            # ---- RECOVERY LOGIC ----
+            # ---- RECOVERY LOGIC (REQUIRES NEW PERCEPTION) ----
             if (
                 not self.observer_healthy
                 and self.last_frame_seen is not None
                 and self._blind_timestamp is not None
-                and (now - self._blind_timestamp)
-                >= self.BLIND_RECOVERY_SECONDS
+                and (now - self.last_frame_seen)
+                <= self.BLIND_RECOVERY_SECONDS
             ):
                 self.observer_healthy = True
                 self.blind_reason = None
@@ -149,7 +145,7 @@ class ObserverCore:
                 )
 
             # ---- STARTUP GRACE ----
-            if self.last_frame_seen is None:
+            if self.first_frame_seen is None:
                 grace_ok = (
                     self.tick_count < self.STARTUP_GRACE_TICKS
                     or (now - self.start_time)
@@ -187,7 +183,7 @@ class ObserverCore:
         """
         Attach perception availability metadata.
 
-        Called by Observer Loop after VisionRuntime + WorldGraph ingest.
+        Called by ObserverLoop after VisionRuntime output.
         """
         if not isinstance(perception_state, dict):
             return
@@ -217,73 +213,6 @@ class ObserverCore:
                     f"Perception unavailable for "
                     f"{self._consecutive_misses} consecutive ticks"
                 )
-
-    def attach_ui_snapshot(self, ui_snapshot) -> None:
-        """
-        Attach structured UI snapshot (semantic, not pixel).
-        """
-        with self._lock:
-            self._state["ui_snapshot"] = (
-                copy.deepcopy(ui_snapshot)
-                if ui_snapshot is not None
-                else None
-            )
-
-    # --------------------------------------------------
-    # UI QUERY (LEGACY BRIDGE)
-    # --------------------------------------------------
-
-    def find_click_target(
-        self,
-        *,
-        contains: Optional[str] = None,
-        exact: Optional[str] = None,
-    ) -> Optional[Dict[str, float]]:
-        """
-        Transitional helper.
-
-        Long-term this will be replaced by WorldGraph queries.
-        """
-        if not contains and not exact:
-            return None
-
-        with self._lock:
-            ui_snapshot = self._state.get("ui_snapshot")
-            if not isinstance(ui_snapshot, dict):
-                return None
-
-            elements = ui_snapshot.get("elements")
-            if not isinstance(elements, list):
-                return None
-
-            contains_l = contains.lower() if contains else None
-            exact_l = exact.lower() if exact else None
-
-            for el in elements:
-                if not isinstance(el, dict):
-                    continue
-
-                text = str(el.get("text", "")).strip().lower()
-
-                if exact_l is not None:
-                    if text != exact_l:
-                        continue
-                elif contains_l is not None:
-                    if contains_l not in text:
-                        continue
-
-                x = el.get("x")
-                y = el.get("y")
-
-                if (
-                    isinstance(x, (int, float))
-                    and isinstance(y, (int, float))
-                    and 0.0 <= float(x) <= 1.0
-                    and 0.0 <= float(y) <= 1.0
-                ):
-                    return {"x": float(x), "y": float(y)}
-
-            return None
 
     # --------------------------------------------------
     # INTROSPECTION
