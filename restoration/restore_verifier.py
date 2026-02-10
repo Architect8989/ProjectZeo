@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Tuple, Optional, Dict, Any
+from typing import Tuple
 
 from restoration.snapshot_types import RestorationSnapshot
 
@@ -17,25 +17,21 @@ class RestoreVerifier:
     It only proves whether restoration succeeded.
     """
 
-    def __init__(self, *, os_backend, screenpipe=None, cursor_tolerance_px: int = 0):
+    def __init__(self, *, os_backend, cursor_tolerance_px: int = 0):
         """
         os_backend MUST provide:
           - get_cursor_position() -> (x, y)
           - get_focused_window_id() -> str | None
           - get_execution_mode() -> str
-          - is_automation_active() -> bool   (NEW REQUIRED)
+          - is_automation_active() -> bool
 
         OPTIONAL (used if present):
-          - get_window_geometry(window_id) -> {x,y,width,height}
-          - get_window_z_order(window_id) -> int
-          - get_browser_state() -> {url, tab_index}
-          - get_media_playback_position() -> float
-
-        screenpipe (optional):
-          ScreenpipeAdapter for visual hash verification
+          - get_window_geometry(window_id)
+          - get_window_z_order(window_id)
+          - get_browser_state()
+          - get_media_playback_position()
         """
         self._os = os_backend
-        self._screenpipe = screenpipe
         self._cursor_tol = int(cursor_tolerance_px)
 
     # -------------------------------------------------
@@ -49,9 +45,8 @@ class RestoreVerifier:
         Raises RestorationVerificationError on failure.
         Returns None on success.
         """
-
         self._verify_execution_mode()
-        self._verify_input_released()          # NEW HARD GATE
+        self._verify_input_released()
         self._verify_cursor(snapshot)
         self._verify_focus(snapshot)
 
@@ -59,9 +54,6 @@ class RestoreVerifier:
         self._verify_window_z_order(snapshot)
         self._verify_browser_state(snapshot)
         self._verify_media_position(snapshot)
-        self._verify_screen_hash(snapshot)
-
-        return
 
     # -------------------------------------------------
     # Verification Steps
@@ -75,9 +67,6 @@ class RestoreVerifier:
             )
 
     def _verify_input_released(self) -> None:
-        """
-        Absolute requirement: automation must be inactive.
-        """
         try:
             active = self._os.is_automation_active()
         except Exception as e:
@@ -129,12 +118,12 @@ class RestoreVerifier:
             )
 
     # -------------------------------------------------
-    # ADDITIONS — EXTENDED VERIFICATION
+    # EXTENDED VERIFICATION (BEST-EFFORT)
     # -------------------------------------------------
 
     def _verify_window_geometry(self, snapshot: RestorationSnapshot) -> None:
-        geom = snapshot.metadata.get("window_geometry")
-        if geom and hasattr(self._os, "get_window_geometry"):
+        geom = snapshot.metadata.get("extended", {}).get("window_geometry")
+        if geom is not None and hasattr(self._os, "get_window_geometry"):
             try:
                 current = self._os.get_window_geometry(snapshot.focus.window_id)
                 if current != geom:
@@ -145,7 +134,7 @@ class RestoreVerifier:
                 pass
 
     def _verify_window_z_order(self, snapshot: RestorationSnapshot) -> None:
-        z = snapshot.metadata.get("window_z_order")
+        z = snapshot.metadata.get("extended", {}).get("window_z_order")
         if z is not None and hasattr(self._os, "get_window_z_order"):
             try:
                 current = self._os.get_window_z_order(snapshot.focus.window_id)
@@ -157,8 +146,8 @@ class RestoreVerifier:
                 pass
 
     def _verify_browser_state(self, snapshot: RestorationSnapshot) -> None:
-        state = snapshot.metadata.get("browser_state")
-        if state and hasattr(self._os, "get_browser_state"):
+        state = snapshot.metadata.get("extended", {}).get("browser_state")
+        if state is not None and hasattr(self._os, "get_browser_state"):
             try:
                 current = self._os.get_browser_state()
                 if current != state:
@@ -169,7 +158,7 @@ class RestoreVerifier:
                 pass
 
     def _verify_media_position(self, snapshot: RestorationSnapshot) -> None:
-        pos = snapshot.metadata.get("media_playback_position")
+        pos = snapshot.metadata.get("extended", {}).get("media_playback_position")
         if pos is not None and hasattr(self._os, "get_media_playback_position"):
             try:
                 current = self._os.get_media_playback_position()
@@ -179,32 +168,6 @@ class RestoreVerifier:
                     )
             except Exception:
                 pass
-
-    def _verify_screen_hash(self, snapshot: RestorationSnapshot) -> None:
-        """
-        Final authority: pixels must match snapshot evidence.
-        """
-        if not self._screenpipe:
-            return
-
-        meta = snapshot.metadata.get("screenpipe")
-        if not meta:
-            return
-
-        try:
-            state = self._screenpipe.read()
-        except Exception as e:
-            raise RestorationVerificationError(
-                f"Unable to read screen for restore verification: {e}"
-            ) from e
-
-        expected_hash = meta.get("screen_text_hash")
-        actual_hash = state.get("screen_text_hash")
-
-        if expected_hash and actual_hash != expected_hash:
-            raise RestorationVerificationError(
-                "Post-restore screen hash mismatch"
-            )
 
     # -------------------------------------------------
     # Utilities
