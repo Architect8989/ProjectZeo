@@ -9,6 +9,8 @@ from typing import Optional, Dict
 
 from operate.utils.misc import convert_percent_to_decimal
 
+
+# HARD FAILSAFE (cursor to corner aborts)
 pyautogui.FAILSAFE = True
 
 
@@ -59,47 +61,53 @@ class OperatingSystem:
         while True:
             time.sleep(self._WATCHDOG_INTERVAL)
 
+            timed_out = False
             with self._heartbeat_lock, self._automation_lock:
-                if not self._automation_active:
-                    continue
+                if self._automation_active and self._last_heartbeat is not None:
+                    timed_out = (
+                        time.time() - self._last_heartbeat
+                        > self._HEARTBEAT_TIMEOUT
+                    )
+                    if timed_out:
+                        self._automation_active = False
 
-                if (
-                    self._last_heartbeat is not None
-                    and time.time() - self._last_heartbeat
-                    > self._HEARTBEAT_TIMEOUT
-                ):
-                    self._automation_active = False
-                    try:
-                        self.force_release_all(
-                            reason="heartbeat_timeout"
-                        )
-                    except Exception:
-                        pass
+            if timed_out:
+                try:
+                    self.force_release_all(
+                        reason="heartbeat_timeout"
+                    )
+                except Exception:
+                    pass
 
     # -------------------------------------------------
     # EXECUTION PRIMITIVES
     # -------------------------------------------------
 
-    def exec(self, cmd: str, *, sudo: bool = False) -> subprocess.CompletedProcess:
+    def exec(
+        self, cmd: str, *, sudo: bool = False
+    ) -> subprocess.CompletedProcess:
         if not isinstance(cmd, str) or not cmd.strip():
             raise RuntimeError("exec(): invalid command")
 
         full_cmd = cmd
-        if sudo and os.geteuid() != 0:
+        if sudo and hasattr(os, "geteuid") and os.geteuid() != 0:
             full_cmd = f"sudo {cmd}"
 
-        result = subprocess.run(
+        return subprocess.run(
             full_cmd,
             shell=True,
             capture_output=True,
             text=True,
         )
-        return result
 
     def write_file(self, path: str, content: str) -> None:
-        if not path or not isinstance(path, str):
+        if not isinstance(path, str) or not path:
             raise RuntimeError("write_file(): invalid path")
 
+        if not isinstance(content, str):
+            raise RuntimeError("write_file(): content must be string")
+
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
             f.write(content)
 
@@ -152,7 +160,10 @@ class OperatingSystem:
 
         cur_x, cur_y = pyautogui.position()
         if abs(cur_x - x_px) > 5 or abs(cur_y - y_px) > 5:
-            raise RuntimeError("Cursor positioning failed")
+            raise RuntimeError(
+                f"Cursor failed to reach target "
+                f"({x_px},{y_px}) got ({cur_x},{cur_y})"
+            )
 
         pyautogui.click(x_px, y_px)
 
@@ -173,41 +184,45 @@ class OperatingSystem:
     def get_focused_window(self) -> Dict[str, str]:
         system = platform.system()
 
-        if system == "Darwin":
-            script = '''
-            tell application "System Events"
-                set frontApp to first application process whose frontmost is true
-                return name of frontApp
-            end tell
-            '''
-            result = subprocess.run(
-                ["osascript", "-e", script],
-                capture_output=True,
-                text=True,
-            )
-            if result.returncode == 0:
-                return {"application": result.stdout.strip()}
+        try:
+            if system == "Darwin":
+                script = '''
+                tell application "System Events"
+                    set frontApp to first application process whose frontmost is true
+                    return name of frontApp
+                end tell
+                '''
+                result = subprocess.run(
+                    ["osascript", "-e", script],
+                    capture_output=True,
+                    text=True,
+                )
+                if result.returncode == 0:
+                    return {"application": result.stdout.strip()}
 
-        if system == "Linux":
-            wid = subprocess.check_output(
-                ["xdotool", "getactivewindow"],
-                text=True,
-            ).strip()
-            title = subprocess.check_output(
-                ["xdotool", "getwindowname", wid],
-                text=True,
-            ).strip()
-            return {"id": wid, "title": title}
+            if system == "Linux":
+                wid = subprocess.check_output(
+                    ["xdotool", "getactivewindow"],
+                    text=True,
+                ).strip()
+                title = subprocess.check_output(
+                    ["xdotool", "getwindowname", wid],
+                    text=True,
+                ).strip()
+                return {"id": wid, "title": title}
 
-        if system == "Windows":
-            try:
-                import win32gui
-            except ImportError:
-                raise OSError("win32gui not installed")
+            if system == "Windows":
+                try:
+                    import win32gui
+                except ImportError as e:
+                    raise OSError("win32gui not installed") from e
 
-            hwnd = win32gui.GetForegroundWindow()
-            title = win32gui.GetWindowText(hwnd)
-            return {"id": str(hwnd), "title": title}
+                hwnd = win32gui.GetForegroundWindow()
+                title = win32gui.GetWindowText(hwnd)
+                return {"id": str(hwnd), "title": title}
+
+        except Exception as e:
+            raise OSError(f"Failed to get focused window: {e}") from e
 
         raise OSError("Focused window unavailable")
 
@@ -228,30 +243,40 @@ class OperatingSystem:
 
     def force_release_all(self, *, reason: str) -> None:
         self.mark_automation_inactive()
-        pyautogui.mouseUp()
-        for key in ["shift", "ctrl", "alt", "cmd"]:
+
+        try:
+            pyautogui.mouseUp()
+        except Exception:
+            pass
+
+        for key in ("shift", "ctrl", "alt", "cmd"):
             try:
                 pyautogui.keyUp(key)
             except Exception:
                 pass
 
     def focus_window(self, identifier: str) -> None:
-        # Best-effort only
-        if platform.system() == "Linux":
-            subprocess.run(["xdotool", "windowactivate", identifier])
+        if platform.system() == "Linux" and identifier:
+            subprocess.run(
+                ["xdotool", "windowactivate", identifier],
+                capture_output=True,
+            )
 
     def activate_application(self, name: str) -> None:
-        if platform.system() == "Darwin":
+        if platform.system() == "Darwin" and name:
             subprocess.run(["open", "-a", name])
 
     def set_window_geometry(self, *args, **kwargs) -> None:
-        return  # best-effort noop
+        # best-effort noop (documented)
+        return
 
     def set_window_z_order(self, *args, **kwargs) -> None:
-        return  # best-effort noop
+        # best-effort noop (documented)
+        return
 
     def restore_browser_state(self, *args, **kwargs) -> None:
-        return  # best-effort noop
+        # best-effort noop (documented)
+        return
 
     # -------------------------------------------------
     # HELPERS
@@ -263,4 +288,4 @@ class OperatingSystem:
             isinstance(v, float)
             and not math.isnan(v)
             and 0.0 <= v <= 1.0
-        )
+            )
