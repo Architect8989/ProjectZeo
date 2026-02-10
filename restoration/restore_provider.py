@@ -208,4 +208,4 @@ class RestoreProvider:
         if not current_window or current_window.get("id") is None:
             raise RestorationError(
                 "No valid focused window after restore"
-        )
+            )
