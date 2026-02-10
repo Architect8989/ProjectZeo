@@ -12,45 +12,53 @@ class PerceptionHealth:
     - Explicit degradation + recovery thresholds
     """
 
-    # seconds since last fresh frame before considering stale
+    # seconds since last healthy frame before considering stale
     STALE_LIMIT_SECONDS = 5.0
 
     # consecutive failures before degraded
     DEGRADE_AFTER_MISSES = 3
 
-    # consecutive successes required to recover
+    # consecutive healthy frames required to recover
     RECOVER_AFTER_HITS = 2
 
     def __init__(self):
         self._clock = time.monotonic
 
         self._last_frame_mono: Optional[float] = None
-        self._misses = 0
-        self._hits = 0
-        self._degraded = False
+        self._misses: int = 0
+        self._hits: int = 0
+        self._degraded: bool = False
 
     def update(self, frame_ts: Optional[float], available: bool) -> bool:
         """
         Update health based on latest perception input.
 
-        Returns True if perception is currently stable.
+        Returns True iff perception is currently stable.
         """
         now = self._clock()
 
-        # --- failure cases ---
+        # --------------------------------------------------
+        # HARD FAILURE CASES
+        # --------------------------------------------------
         if not available or frame_ts is None:
             self._record_miss()
             return False
 
-        # frame_ts is wall-clock; compare staleness against now safely
+        # --------------------------------------------------
+        # STALENESS CHECK (MONOTONIC ONLY)
+        # --------------------------------------------------
         if self._last_frame_mono is not None:
-            if (now - self._last_frame_mono) > self.STALE_LIMIT_SECONDS:
+            elapsed = now - self._last_frame_mono
+            if elapsed > self.STALE_LIMIT_SECONDS:
                 self._record_miss()
                 return False
 
-        # --- success case ---
+        # --------------------------------------------------
+        # SUCCESS CASE
+        # --------------------------------------------------
         self._last_frame_mono = now
         self._record_hit()
+
         return not self._degraded
 
     def degraded(self) -> bool:
@@ -66,7 +74,7 @@ class PerceptionHealth:
         self._degraded = False
 
     # --------------------------------------------------
-    # INTERNAL
+    # INTERNAL (STRICT STATE MACHINE)
     # --------------------------------------------------
 
     def _record_miss(self) -> None:
