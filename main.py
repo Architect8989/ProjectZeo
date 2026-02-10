@@ -23,6 +23,7 @@ from restoration.restore_provider import RestoreProvider
 
 from core.planner.execution_planner import ExecutionPlanner
 
+
 HEARTBEAT_INTERVAL = 2.0
 
 # ==================================================
@@ -31,6 +32,7 @@ HEARTBEAT_INTERVAL = 2.0
 
 TASK_START = None
 MAX_TASK_SECONDS = 90 * 60  # 90 minutes hard cap
+
 
 # ==================================================
 # PROCESS SINGLETONS
@@ -64,6 +66,7 @@ RESTORE_PROVIDER = RestoreProvider(
     mode_controller=mode,
 )
 
+
 # ==================================================
 # SAFE SHUTDOWN (FAIL-CLOSED)
 # ==================================================
@@ -92,6 +95,7 @@ signal.signal(signal.SIGINT, _signal_handler)
 signal.signal(signal.SIGTERM, _signal_handler)
 signal.signal(signal.SIGQUIT, _signal_handler)
 
+
 # ==================================================
 # ROOT MAIN
 # ==================================================
@@ -99,7 +103,7 @@ signal.signal(signal.SIGQUIT, _signal_handler)
 def main():
     global TASK_START
 
-    print("[BOOT] System starting")
+    print("[BOOT] ProjectZeo kernel starting")
 
     # --------------------------------------------------
     # ENVIRONMENT FINGERPRINT
@@ -120,9 +124,12 @@ def main():
         mode.force_observer()
 
     # --------------------------------------------------
-    # START OBSERVER SUBSYSTEM
+    # START OBSERVER SUBSYSTEM (VISION FIRST)
     # --------------------------------------------------
+    vision_runtime.start()
     observer_loop.start()
+
+    print("[OBSERVER] Vision runtime started")
     print("[OBSERVER] Passive observer loop started")
 
     # --------------------------------------------------
@@ -132,13 +139,13 @@ def main():
     intent_listener.start()
 
     # ==================================================
-    # MAIN ORCHESTRATION LOOP (NO PERCEPTION)
+    # MAIN ORCHESTRATION LOOP (NO PERCEPTION LOGIC HERE)
     # ==================================================
 
     while True:
         try:
             # ----------------------------------------------
-            # HEALTH PROPAGATION
+            # HEALTH PROPAGATION (AUTHORITATIVE)
             # ----------------------------------------------
             mode.update_observer_health(observer.is_healthy())
             mode.update_vision_status(vision_runtime.is_healthy())
