@@ -60,22 +60,22 @@ class StepVerifier:
 
             if step.type == StepType.COMMAND_EXECUTION:
                 ok, reason = self._verify_command(step, execution_result)
-                return VerificationResult(ok, reason if not ok else None)
+                return VerificationResult(ok, None if ok else reason)
 
             if step.type == StepType.FILE_CREATION:
                 ok, reason = self._verify_file(step)
-                return VerificationResult(ok, reason if not ok else None)
+                return VerificationResult(ok, None if ok else reason)
 
             if step.type == StepType.TOOL_INSTALLATION:
                 ok, reason = self._verify_tool(step)
-                return VerificationResult(ok, reason if not ok else None)
+                return VerificationResult(ok, None if ok else reason)
 
             if step.type == StepType.UI_INTERACTION:
                 ok, reason = self._verify_ui_change(
                     step=step,
                     screenshot=screenshot,
                 )
-                return VerificationResult(ok, reason if not ok else None)
+                return VerificationResult(ok, None if ok else reason)
 
         except Exception as e:
             return VerificationResult(
