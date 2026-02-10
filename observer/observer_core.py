@@ -6,19 +6,25 @@ import copy
 
 
 class ObserverBlindnessError(RuntimeError):
-    """Observer is alive but vision is unusable."""
+    """Observer is alive but perception input is unusable."""
 
 
 class ObserverCore:
     """
     Passive witness core.
 
+    ROLE:
+    - Maintains temporal coherence
+    - Tracks perception availability
+    - Records immutable snapshots
+    - NEVER interprets or acts
+
     HARD GUARANTEES:
-    - Observer never mutates external inputs
+    - Observer never mutates external state
     - Snapshot isolation (deep copies only)
     - Deterministic blindness semantics
     - No permanent blindness unless upstream fails persistently
-    - Observer has NO authority to act
+    - Observer has ZERO execution authority
     """
 
     MAX_HISTORY = 1000
@@ -26,6 +32,7 @@ class ObserverCore:
     STARTUP_GRACE_TICKS = 30
     STARTUP_GRACE_SECONDS = 15.0
     MAX_CONSECUTIVE_MISSES = 15
+    BLIND_RECOVERY_SECONDS = 5.0
 
     # --------------------------------------------------
     # INIT
@@ -48,12 +55,13 @@ class ObserverCore:
 
         self._lock = threading.RLock()
 
+        # ---- Observer state is PURELY DESCRIPTIVE ----
         self._state: Dict[str, object] = {
             "uptime_seconds": 0.0,
             "tick_count": 0,
             "last_tick_ts": None,
-            "screen_available": False,
-            "screen_frame_ts": None,
+            "perception_available": False,
+            "perception_frame_ts": None,
             "ui_snapshot": None,
         }
 
@@ -68,7 +76,11 @@ class ObserverCore:
     # --------------------------------------------------
 
     def reset_for_new_task(self) -> None:
-        """Hard observer amnesia between executions."""
+        """
+        Hard observer amnesia between executions.
+
+        Used at OBSERVER → ARMED transition.
+        """
         with self._lock:
             self._history.clear()
 
@@ -88,8 +100,8 @@ class ObserverCore:
                 "uptime_seconds": 0.0,
                 "tick_count": 0,
                 "last_tick_ts": None,
-                "screen_available": False,
-                "screen_frame_ts": None,
+                "perception_available": False,
+                "perception_frame_ts": None,
                 "ui_snapshot": None,
             }
 
@@ -110,16 +122,21 @@ class ObserverCore:
     # --------------------------------------------------
 
     def tick(self) -> Dict[str, object]:
-        """Advance observer clock."""
+        """
+        Advance observer clock.
+
+        Raises ObserverBlindnessError if perception is unusable.
+        """
         with self._lock:
             now = self._clock()
 
-            # recovery
+            # ---- RECOVERY LOGIC ----
             if (
                 not self.observer_healthy
                 and self.last_frame_seen is not None
                 and self._blind_timestamp is not None
-                and (now - self._blind_timestamp) > 5.0
+                and (now - self._blind_timestamp)
+                >= self.BLIND_RECOVERY_SECONDS
             ):
                 self.observer_healthy = True
                 self.blind_reason = None
@@ -131,7 +148,7 @@ class ObserverCore:
                     f"Observer blind: {self.blind_reason}"
                 )
 
-            # startup grace
+            # ---- STARTUP GRACE ----
             if self.last_frame_seen is None:
                 grace_ok = (
                     self.tick_count < self.STARTUP_GRACE_TICKS
@@ -140,12 +157,13 @@ class ObserverCore:
                 )
                 if not grace_ok:
                     self._mark_blind(
-                        "No initial frame within startup grace window"
+                        "No perception input within startup grace window"
                     )
                     raise ObserverBlindnessError(
-                        "Observer blind: no initial frame"
+                        "Observer blind: no initial perception"
                     )
 
+            # ---- ADVANCE CLOCK ----
             self.tick_count += 1
             self.last_tick_ts = now
 
@@ -160,20 +178,23 @@ class ObserverCore:
             return snapshot
 
     # --------------------------------------------------
-    # SCREEN ATTACHMENT
+    # PERCEPTION ATTACHMENT
     # --------------------------------------------------
 
-    def attach_screen_state(
-        self, screen_state: Dict[str, object]
+    def attach_perception_state(
+        self, perception_state: Dict[str, object]
     ) -> None:
         """
-        Attach raw screen availability metadata.
+        Attach perception availability metadata.
+
+        Called by Observer Loop after VisionRuntime + WorldGraph ingest.
         """
-        if not isinstance(screen_state, dict):
+        if not isinstance(perception_state, dict):
             return
 
         with self._lock:
-            available = bool(screen_state.get("available"))
+            available = bool(perception_state.get("available"))
+            frame_ts = perception_state.get("frame_ts")
 
             if available:
                 now = self._clock()
@@ -184,10 +205,8 @@ class ObserverCore:
             else:
                 self._consecutive_misses += 1
 
-            self._state["screen_available"] = available
-            self._state["screen_frame_ts"] = screen_state.get(
-                "frame_ts"
-            )
+            self._state["perception_available"] = available
+            self._state["perception_frame_ts"] = frame_ts
 
             if (
                 not available
@@ -195,11 +214,14 @@ class ObserverCore:
                 >= self.MAX_CONSECUTIVE_MISSES
             ):
                 self._mark_blind(
-                    f"Screen unavailable for "
+                    f"Perception unavailable for "
                     f"{self._consecutive_misses} consecutive ticks"
                 )
 
     def attach_ui_snapshot(self, ui_snapshot) -> None:
+        """
+        Attach structured UI snapshot (semantic, not pixel).
+        """
         with self._lock:
             self._state["ui_snapshot"] = (
                 copy.deepcopy(ui_snapshot)
@@ -208,7 +230,7 @@ class ObserverCore:
             )
 
     # --------------------------------------------------
-    # UI QUERY
+    # UI QUERY (LEGACY BRIDGE)
     # --------------------------------------------------
 
     def find_click_target(
@@ -217,6 +239,11 @@ class ObserverCore:
         contains: Optional[str] = None,
         exact: Optional[str] = None,
     ) -> Optional[Dict[str, float]]:
+        """
+        Transitional helper.
+
+        Long-term this will be replaced by WorldGraph queries.
+        """
         if not contains and not exact:
             return None
 
@@ -280,7 +307,8 @@ class ObserverCore:
                     now - self.start_time, 2
                 ),
                 "ticks": self.tick_count,
-                "first_frame_seen": self.first_frame_seen is not None,
+                "first_perception_seen": self.first_frame_seen
+                is not None,
                 "consecutive_misses": self._consecutive_misses,
                 "history_depth": len(self._history),
-    }
+        }
