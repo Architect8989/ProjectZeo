@@ -1,6 +1,6 @@
 import time
 import math
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 from authority.authority_policy import AuthorityDecision
 from authority.input_arbitrator import InputArbitrator
@@ -29,8 +29,8 @@ def operate_main(
     terminal_prompt: str,
     execution_plan: ExecutionPlan,
     observer=None,
-    screenpipe=None,
     max_wallclock_seconds: int = 90 * 60,
+    llm_callable=None,
 ):
     if not isinstance(execution_plan, ExecutionPlan):
         raise ValueError("execution_plan must be ExecutionPlan")
@@ -42,16 +42,16 @@ def operate_main(
     has_tool_steps = any(
         s.type == StepType.TOOL_INSTALLATION for s in execution_plan.steps
     )
-    if has_tool_steps and (observer is None or screenpipe is None):
+    if has_tool_steps and observer is None:
         raise ValueError(
-            "ExecutionPlan contains TOOL_INSTALLATION but observer/screenpipe missing"
+            "ExecutionPlan contains TOOL_INSTALLATION but observer missing"
         )
 
     os_backend = OperatingSystem()
 
     accessibility_backend = AccessibilityBackend()
-    if observer is not None and screenpipe is not None:
-        accessibility_backend.wire(observer=observer, screenpipe=screenpipe)
+    if observer is not None:
+        accessibility_backend.wire(observer=observer)
 
     journal = ActionJournal()
     input_arbitrator = InputArbitrator()
@@ -61,17 +61,15 @@ def operate_main(
     progress = ProgressTracker(execution_plan)
 
     installer: Optional[AutonomousInstaller] = None
-    if observer is not None and screenpipe is not None:
+    if observer is not None:
         installer = AutonomousInstaller(
             observer=observer,
-            screenpipe=screenpipe,
             os_backend=os_backend,
         )
 
     _execute_plan(
         execution_plan=execution_plan,
         observer=observer,
-        screenpipe=screenpipe,
         os_backend=os_backend,
         accessibility_backend=accessibility_backend,
         journal=journal,
@@ -92,7 +90,6 @@ def _execute_plan(
     *,
     execution_plan: ExecutionPlan,
     observer,
-    screenpipe,
     os_backend: OperatingSystem,
     accessibility_backend: AccessibilityBackend,
     journal: ActionJournal,
@@ -148,13 +145,8 @@ def _execute_plan(
             try:
                 os_backend.heartbeat()
 
-                # ---- UI EVIDENCE CAPTURE (BEFORE) ----
-                before_screen = None
-                if step.type == StepType.UI_INTERACTION and screenpipe:
-                    try:
-                        before_screen = screenpipe.read()
-                    except Exception:
-                        before_screen = None
+                # ---- UI EVIDENCE CAPTURE (REMOVED) ----
+                before_screen = None  # TODO: vision model (future)
 
                 with action_timeout(step.estimated_duration or 30):
                     _execute_step(
@@ -164,14 +156,8 @@ def _execute_plan(
                         installer=installer,
                     )
 
-                # ---- UI EVIDENCE CAPTURE (AFTER) ----
-                after_screen = None
-                if step.type == StepType.UI_INTERACTION and screenpipe:
-                    time.sleep(0.4)
-                    try:
-                        after_screen = screenpipe.read()
-                    except Exception:
-                        after_screen = None
+                # ---- UI EVIDENCE CAPTURE (REMOVED) ----
+                after_screen = None  # TODO: vision model (future)
 
                 verification = verifier.verify_step(
                     step,
@@ -282,4 +268,4 @@ def _valid_coord(v: Any) -> bool:
         isinstance(v, (int, float))
         and not math.isnan(v)
         and 0.0 <= v <= 1.0
-   )
+       )
