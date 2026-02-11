@@ -14,10 +14,11 @@ class InputArbitrator:
     - Human input always dominates
     - Forced release is monotonic until explicit clear
     - Watchdog cannot be bypassed by SOC activity
+    - Watchdog thread can be cleanly stopped
     """
 
-    # MUST exceed action_timeout (5s)
     EMERGENCY_RECLAIM_TIMEOUT_SECONDS = 8.0
+    WATCHDOG_INTERVAL_SECONDS = 0.5
 
     def __init__(self):
         self.tracker = InputTracker()
@@ -29,7 +30,12 @@ class InputArbitrator:
         self._forced_release: bool = False
         self._lock = threading.Lock()
 
-        self._start_watchdog()
+        self._stop_event = threading.Event()
+        self._watchdog_thread = threading.Thread(
+            target=self._watchdog_loop,
+            daemon=True,
+        )
+        self._watchdog_thread.start()
 
     # -------------------------------------------------
     # SOC LIVENESS
@@ -39,13 +45,12 @@ class InputArbitrator:
         """
         Marks SOC liveness.
 
-        IMPORTANT:
-        - Does NOT clear forced release
-        - Forced release can only be cleared explicitly
+        DOES NOT clear forced release.
         """
         self.tracker.mark_soc_action()
+        now = self._clock()
         with self._lock:
-            self._last_soc_action_mono = self._clock()
+            self._last_soc_action_mono = now
 
     # -------------------------------------------------
     # DECISION
@@ -59,21 +64,19 @@ class InputArbitrator:
         soc_confident: bool,
     ) -> AuthorityDecision:
         """
-        Decide whether SOC continues or releases control.
-
         ORDER OF PRECEDENCE:
         1. Forced release (absolute)
         2. Human input (policy)
         3. High-risk escalation (policy)
         4. Continue
         """
+
         source = self.tracker.classify_input(input_event_ts)
 
         with self._lock:
             if self._forced_release:
                 return AuthorityDecision.RELEASE
 
-        # Human input → policy
         if source == InputSource.HUMAN:
             return self.policy.decide(
                 human_intervened=True,
@@ -81,7 +84,6 @@ class InputArbitrator:
                 soc_confident=soc_confident,
             )
 
-        # High-risk even without human → policy
         if high_risk:
             return self.policy.decide(
                 human_intervened=False,
@@ -96,18 +98,10 @@ class InputArbitrator:
     # -------------------------------------------------
 
     def emergency_reclaim(self) -> None:
-        """
-        Immediate, monotonic reclaim.
-        """
         with self._lock:
             self._forced_release = True
 
     def clear_emergency_reclaim(self) -> None:
-        """
-        Explicit manual clear.
-
-        MUST be called only after human confirmation.
-        """
         with self._lock:
             self._forced_release = False
             self._last_soc_action_mono = None
@@ -116,23 +110,25 @@ class InputArbitrator:
     # WATCHDOG
     # -------------------------------------------------
 
-    def _start_watchdog(self) -> None:
-        threading.Thread(
-            target=self._watchdog_loop,
-            daemon=True,
-        ).start()
+    def shutdown(self) -> None:
+        """
+        Cleanly stop watchdog thread.
+        """
+        self._stop_event.set()
+        if self._watchdog_thread.is_alive():
+            self._watchdog_thread.join(timeout=2)
 
     def _watchdog_loop(self) -> None:
         """
         Deadman switch.
-
-        If SOC goes silent, control is reclaimed
-        and CANNOT be auto-cleared by SOC.
         """
-        while True:
-            time.sleep(0.5)
+        while not self._stop_event.is_set():
+            time.sleep(self.WATCHDOG_INTERVAL_SECONDS)
 
             with self._lock:
+                if self._forced_release:
+                    continue
+
                 if self._last_soc_action_mono is None:
                     continue
 
