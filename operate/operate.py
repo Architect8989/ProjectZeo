@@ -103,16 +103,16 @@ def _execute_plan(
     start_ts = time.time()
     progress.start_execution()
 
-    journal.record(
-        event="execution_start",
-        objective=execution_plan.objective,
-        total_steps=len(execution_plan.steps),
-    )
+    journal.record({
+        "event": "execution_start",
+        "objective": execution_plan.objective,
+        "total_steps": len(execution_plan.steps),
+    })
 
     for step in execution_plan.steps:
 
         if time.time() - start_ts > max_wallclock_seconds:
-            journal.record(event="execution_timeout")
+            journal.record({"event": "execution_timeout"})
             raise RuntimeError("Execution wall-clock timeout exceeded")
 
         for dep in step.dependencies:
@@ -127,32 +127,31 @@ def _execute_plan(
         )
 
         if decision == AuthorityDecision.RELEASE:
-            journal.record(event="authority_release")
+            journal.record({"event": "authority_release"})
             raise RuntimeError("Authority released control")
 
         if decision == AuthorityDecision.ABORT:
-            journal.record(event="authority_abort")
+            journal.record({"event": "authority_abort"})
             raise RuntimeError("Authority aborted execution")
 
         if decision == AuthorityDecision.YIELD:
-            journal.record(event="authority_yield")
+            journal.record({"event": "authority_yield"})
             time.sleep(0.5)
-            continue
+            continue  # retry same step
 
         progress.start_step(step.id)
 
-        journal.record(
-            event="step_start",
-            step_id=step.id,
-            step_type=step.type.value,
-            description=step.description,
-        )
+        journal.record({
+            "event": "step_start",
+            "step_id": step.id,
+            "step_type": step.type.value,
+            "description": step.description,
+        })
 
         attempt_ctx = {"attempt": 0}
 
         while True:
             try:
-                # ---- authority re-check inside retry loop ----
                 decision = input_arbitrator.evaluate(
                     input_event_ts=time.monotonic(),
                     high_risk=(step.type == StepType.TOOL_INSTALLATION),
@@ -160,23 +159,17 @@ def _execute_plan(
                 )
 
                 if decision == AuthorityDecision.RELEASE:
-                    journal.record(event="authority_release")
+                    journal.record({"event": "authority_release"})
                     raise RuntimeError("Authority released control")
 
                 if decision == AuthorityDecision.ABORT:
-                    journal.record(event="authority_abort")
+                    journal.record({"event": "authority_abort"})
                     raise RuntimeError("Authority aborted execution")
 
                 input_arbitrator.soc_action_started()
                 os_backend.heartbeat()
 
-                before_screen = None
-                if observer:
-                    snap = observer.snapshot()
-                    before_screen = {
-                        "available": bool(snap),
-                        "text": str(snap),
-                    }
+                before_screen = _extract_screen(observer)
 
                 with action_timeout(step.estimated_duration or 30):
                     result = _execute_step(
@@ -186,13 +179,7 @@ def _execute_plan(
                         installer=installer,
                     )
 
-                after_screen = None
-                if observer:
-                    snap = observer.snapshot()
-                    after_screen = {
-                        "available": bool(snap),
-                        "text": str(snap),
-                    }
+                after_screen = _extract_screen(observer)
 
                 verification = verifier.verify_step(
                     step,
@@ -205,7 +192,7 @@ def _execute_plan(
                     raise RuntimeError(verification.reason)
 
                 progress.complete_step(step.id)
-                journal.record(event="step_complete", step_id=step.id)
+                journal.record({"event": "step_complete", "step_id": step.id})
                 break
 
             except ActionTimeout as e:
@@ -220,11 +207,16 @@ def _execute_plan(
                 attempt_ctx = action.context or attempt_ctx
                 continue
 
+            if action.action == "alternative":
+                progress.fail_step(step.id, action.reason or "alternative_failed")
+                journal.record({"event": "step_failed", "step_id": step.id})
+                raise RuntimeError("Execution aborted (alternative not implemented)")
+
             progress.fail_step(step.id, action.reason or "fatal")
-            journal.record(event="step_failed", step_id=step.id)
+            journal.record({"event": "step_failed", "step_id": step.id})
             raise RuntimeError("Execution aborted")
 
-    journal.record(event="execution_complete")
+    journal.record({"event": "execution_complete"})
 
 
 # ==================================================
@@ -242,9 +234,7 @@ def _execute_step(
         cmd = step.action.get("command")
         if not cmd:
             raise ValueError("Missing command")
-        return os_backend.exec(
-            cmd, sudo=step.action.get("sudo", False)
-        )
+        return os_backend.exec(cmd, sudo=step.action.get("sudo", False))
 
     elif step.type == StepType.FILE_CREATION:
         path = step.action.get("path")
@@ -301,6 +291,32 @@ def _execute_ui(ui: Dict[str, Any], os_backend: OperatingSystem):
 
 
 # ==================================================
+# SCREEN EXTRACTION FIX
+# ==================================================
+
+def _extract_screen(observer):
+    if not observer:
+        return None
+
+    snap = observer.snapshot()
+    perception = snap.get("perception")
+
+    if not isinstance(perception, dict):
+        return None
+
+    text_parts = []
+    for el in perception.get("elements", []):
+        t = el.get("text")
+        if isinstance(t, str) and t.strip():
+            text_parts.append(t.strip())
+
+    return {
+        "available": snap.get("available", False),
+        "text": " ".join(text_parts),
+    }
+
+
+# ==================================================
 # HELPERS
 # ==================================================
 
@@ -309,4 +325,4 @@ def _valid_coord(v: Any) -> bool:
         isinstance(v, (int, float))
         and not math.isnan(v)
         and 0.0 <= v <= 1.0
-   )
+       )
