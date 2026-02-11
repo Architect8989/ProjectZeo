@@ -8,18 +8,11 @@ from core.schemas.execution_plan import ExecutionStep, StepType
 
 
 class VerificationError(RuntimeError):
-    """Authoritative verification failure."""
+    pass
 
 
 @dataclass(frozen=True)
 class VerificationResult:
-    """
-    Immutable verification outcome.
-
-    success: definitive truth value
-    reason: human-readable failure reason
-    details: optional forensic metadata
-    """
     success: bool
     reason: Optional[str] = None
     details: Optional[Dict[str, Any]] = None
@@ -31,7 +24,6 @@ class StepVerifier:
 
     HARD RULES:
     - Evidence > vision
-    - Vision is last-resort only
     - Absence of evidence == failure
     - Unknown step types == failure
     """
@@ -48,6 +40,7 @@ class StepVerifier:
         screenshot: Optional[Dict[str, Any]] = None,
         previous_screenshot: Optional[Dict[str, Any]] = None,
     ) -> VerificationResult:
+
         if not isinstance(step, ExecutionStep):
             raise VerificationError("Invalid step object")
 
@@ -59,28 +52,31 @@ class StepVerifier:
                 return VerificationResult(True, reason="verification-only")
 
             if step.type == StepType.COMMAND_EXECUTION:
-                ok, reason = self._verify_command(step, execution_result)
-                return VerificationResult(ok, None if ok else reason)
+                ok, reason, details = self._verify_command(
+                    step, execution_result
+                )
+                return VerificationResult(ok, reason if not ok else None, details)
 
             if step.type == StepType.FILE_CREATION:
-                ok, reason = self._verify_file(step)
-                return VerificationResult(ok, None if ok else reason)
+                ok, reason, details = self._verify_file(step)
+                return VerificationResult(ok, reason if not ok else None, details)
 
             if step.type == StepType.TOOL_INSTALLATION:
-                ok, reason = self._verify_tool(step)
-                return VerificationResult(ok, None if ok else reason)
+                ok, reason, details = self._verify_tool(step)
+                return VerificationResult(ok, reason if not ok else None, details)
 
             if step.type == StepType.UI_INTERACTION:
-                ok, reason = self._verify_ui_change(
+                ok, reason, details = self._verify_ui_change(
                     step=step,
                     screenshot=screenshot,
                 )
-                return VerificationResult(ok, None if ok else reason)
+                return VerificationResult(ok, reason if not ok else None, details)
 
         except Exception as e:
             return VerificationResult(
                 success=False,
                 reason=f"verification exception: {e}",
+                details={"exception_type": type(e).__name__},
             )
 
         return VerificationResult(
@@ -96,9 +92,10 @@ class StepVerifier:
         self,
         step: ExecutionStep,
         result: Any,
-    ) -> Tuple[bool, str]:
+    ) -> Tuple[bool, str, Dict[str, Any]]:
+
         if result is None or not hasattr(result, "returncode"):
-            return False, "missing command execution result"
+            return False, "missing command execution result", {}
 
         verification = step.verification or {}
         expected_codes = verification.get("expected_return_codes", [0])
@@ -107,6 +104,7 @@ class StepVerifier:
             return (
                 False,
                 f"unexpected return code: {result.returncode}",
+                {"returncode": result.returncode},
             )
 
         expected_output = verification.get("output_contains")
@@ -117,69 +115,76 @@ class StepVerifier:
                     return (
                         False,
                         f"expected output token missing: {token}",
+                        {"stdout": result.stdout, "stderr": result.stderr},
                     )
 
-        return True, ""
+        return True, "", {
+            "returncode": result.returncode,
+        }
 
     # =================================================
     # FILE VERIFICATION
     # =================================================
 
-    def _verify_file(self, step: ExecutionStep) -> Tuple[bool, str]:
+    def _verify_file(
+        self,
+        step: ExecutionStep,
+    ) -> Tuple[bool, str, Dict[str, Any]]:
+
         action = step.action or {}
         verification = step.verification or {}
 
         path = action.get("path")
         if not isinstance(path, str):
-            return False, "file path missing or invalid"
+            return False, "file path missing or invalid", {}
 
         if not os.path.exists(path):
-            return False, f"path does not exist: {path}"
+            return False, f"path does not exist: {path}", {}
 
         if verification.get("is_directory"):
             if not os.path.isdir(path):
-                return False, "expected directory but found file"
-            return True, ""
+                return False, "expected directory but found file", {}
+            return True, "", {"path": path}
 
         if not os.path.isfile(path):
-            return False, "expected file but path is not file"
+            return False, "expected file but path is not file", {}
 
         expected = verification.get("content_contains")
         if expected:
             try:
-                with open(
-                    path,
-                    "r",
-                    encoding="utf-8",
-                    errors="ignore",
-                ) as f:
+                with open(path, "r", encoding="utf-8", errors="ignore") as f:
                     content = f.read()
                 for token in expected:
                     if token not in content:
                         return (
                             False,
                             f"expected file content missing: {token}",
+                            {},
                         )
             except Exception as e:
-                return False, f"file read failed: {e}"
+                return False, f"file read failed: {e}", {}
 
-        return True, ""
+        return True, "", {"path": path}
 
     # =================================================
     # TOOL VERIFICATION
     # =================================================
 
-    def _verify_tool(self, step: ExecutionStep) -> Tuple[bool, str]:
+    def _verify_tool(
+        self,
+        step: ExecutionStep,
+    ) -> Tuple[bool, str, Dict[str, Any]]:
+
         action = step.action or {}
         verification = step.verification or {}
 
         tool = action.get("tool")
         if not isinstance(tool, str):
-            return False, "tool name missing or invalid"
+            return False, "tool name missing or invalid", {}
 
         tool_path = shutil.which(tool)
         if not tool_path:
-            return False, f"tool not found in PATH: {tool}"
+            return False, f"tool not found in PATH: {tool}", {}
 
         version_cmd = verification.get("version_command")
         min_version = verification.get("min_version")
@@ -193,18 +198,19 @@ class StepVerifier:
                     timeout=5,
                 ).decode(errors="ignore")
             except Exception as e:
-                return False, f"version command failed: {e}"
+                return False, f"version command failed: {e}", {}
 
             if min_version and min_version not in out:
                 return (
                     False,
                     f"minimum version not satisfied: {min_version}",
+                    {"version_output": out},
                 )
 
-        return True, ""
+        return True, "", {"tool_path": tool_path}
 
     # =================================================
-    # UI VERIFICATION (FAIL-CLOSED)
+    # UI VERIFICATION
     # =================================================
 
     def _verify_ui_change(
@@ -212,35 +218,31 @@ class StepVerifier:
         *,
         step: ExecutionStep,
         screenshot: Optional[Dict[str, Any]],
-    ) -> Tuple[bool, str]:
-        """
-        UI verification is ONLY allowed when an explicit
-        semantic condition is provided.
-
-        No condition == no evidence == failure.
-        """
+    ) -> Tuple[bool, str, Dict[str, Any]]:
 
         if not screenshot or not screenshot.get("available"):
-            return False, "no screenshot evidence available"
+            return False, "no screenshot evidence available", {}
 
         verification = step.verification or {}
-
         expected_text = verification.get("screen_contains")
+
         if not expected_text:
             return (
                 False,
                 "ui verification requires explicit screen_contains condition",
+                {},
             )
 
-        screen_text = screenshot.get("text")
+        screen_text = screenshot.get("text") or ""
         if not isinstance(screen_text, str):
-            return False, "screenshot text unavailable"
+            return False, "screenshot text unavailable", {}
 
         for token in expected_text:
             if token not in screen_text:
                 return (
                     False,
                     f"expected screen text not found: {token}",
+                    {},
                 )
 
-        return True, ""
+        return True, "", {"matched_tokens": expected_text}
