@@ -9,19 +9,18 @@ from typing import Optional, Dict
 
 from operate.utils.misc import convert_percent_to_decimal
 
-# HARD FAILSAFE (cursor to corner aborts)
 pyautogui.FAILSAFE = True
 
 
 class OperatingSystem:
     """
-    OS interaction layer (best-effort, unsafe by nature).
+    Deterministic OS boundary.
 
-    GUARANTEES:
-    - Deterministic input calls
-    - Explicit failure surfacing
-    - Watchdog-based fail-open release
-    - No zombie automation
+    CONTRACT:
+    - Cursor schema: {"x": int, "y": int}
+    - Window schema: {"title": str}
+    - Explicit failures only
+    - No silent success
     """
 
     def __init__(self):
@@ -37,13 +36,13 @@ class OperatingSystem:
         self._watchdog_started = False
         self._watchdog_lock = threading.Lock()
 
-    # -------------------------------------------------
-    # HEARTBEAT / WATCHDOG
-    # -------------------------------------------------
+    # =================================================
+    # HEARTBEAT
+    # =================================================
 
     def heartbeat(self) -> None:
         with self._heartbeat_lock:
-            self._last_heartbeat = time.time()
+            self._last_heartbeat = time.monotonic()
         self._ensure_watchdog()
 
     def _ensure_watchdog(self) -> None:
@@ -62,23 +61,20 @@ class OperatingSystem:
 
             timed_out = False
             with self._heartbeat_lock, self._automation_lock:
-                if self._automation_active and self._last_heartbeat is not None:
-                    timed_out = (
-                        time.time() - self._last_heartbeat
+                if self._automation_active and self._last_heartbeat:
+                    if (
+                        time.monotonic() - self._last_heartbeat
                         > self._HEARTBEAT_TIMEOUT
-                    )
-                    if timed_out:
+                    ):
+                        timed_out = True
                         self._automation_active = False
 
             if timed_out:
-                try:
-                    self.force_release_all(reason="heartbeat_timeout")
-                except Exception:
-                    pass
+                self.force_release_all(reason="heartbeat_timeout")
 
-    # -------------------------------------------------
-    # EXECUTION PRIMITIVES
-    # -------------------------------------------------
+    # =================================================
+    # COMMANDS / FILES
+    # =================================================
 
     def exec(self, cmd: str, *, sudo: bool = False) -> subprocess.CompletedProcess:
         if not isinstance(cmd, str) or not cmd.strip():
@@ -98,7 +94,6 @@ class OperatingSystem:
     def write_file(self, path: str, content: str) -> None:
         if not isinstance(path, str) or not path:
             raise RuntimeError("write_file(): invalid path")
-
         if not isinstance(content, str):
             raise RuntimeError("write_file(): content must be string")
 
@@ -106,9 +101,9 @@ class OperatingSystem:
         with open(path, "w", encoding="utf-8") as f:
             f.write(content)
 
-    # -------------------------------------------------
+    # =================================================
     # INPUT ACTIONS
-    # -------------------------------------------------
+    # =================================================
 
     def write(self, content: str) -> None:
         if not isinstance(content, str):
@@ -119,9 +114,7 @@ class OperatingSystem:
         with self._automation_lock:
             self._automation_active = True
 
-        for char in content:
-            pyautogui.write(char)
-            time.sleep(0.01)
+        pyautogui.write(content, interval=0.01)
 
     def press(self, keys) -> None:
         if not isinstance(keys, list) or not keys:
@@ -130,11 +123,7 @@ class OperatingSystem:
         with self._automation_lock:
             self._automation_active = True
 
-        for key in keys:
-            pyautogui.keyDown(key)
-        time.sleep(0.05)
-        for key in reversed(keys):
-            pyautogui.keyUp(key)
+        pyautogui.hotkey(*keys)
 
     def mouse(self, click_detail: dict) -> None:
         x = convert_percent_to_decimal(click_detail.get("x"))
@@ -147,24 +136,24 @@ class OperatingSystem:
 
     def _click_at_percentage(self, x_pct: float, y_pct: float) -> None:
         screen_w, screen_h = pyautogui.size()
+
         x_px = int(screen_w * x_pct)
         y_px = int(screen_h * y_pct)
 
-        pyautogui.moveTo(x_px, y_px, duration=0.1)
-        time.sleep(0.05)
+        with self._automation_lock:
+            self._automation_active = True
+
+        pyautogui.moveTo(x_px, y_px, duration=0.05)
 
         cur_x, cur_y = pyautogui.position()
-        if abs(cur_x - x_px) > 5 or abs(cur_y - y_px) > 5:
-            raise RuntimeError(
-                f"Cursor failed to reach target "
-                f"({x_px},{y_px}) got ({cur_x},{cur_y})"
-            )
+        if abs(cur_x - x_px) > 3 or abs(cur_y - y_px) > 3:
+            raise RuntimeError("Cursor failed to reach target")
 
-        pyautogui.click(x_px, y_px)
+        pyautogui.click()
 
-    # -------------------------------------------------
-    # CURSOR STATE (SNAPSHOT / RESTORE)
-    # -------------------------------------------------
+    # =================================================
+    # CURSOR STATE
+    # =================================================
 
     def get_cursor_position(self) -> Dict[str, int]:
         x, y = pyautogui.position()
@@ -180,11 +169,11 @@ class OperatingSystem:
         if not isinstance(x, int) or not isinstance(y, int):
             raise RuntimeError("set_cursor_position(): invalid coordinates")
 
-        pyautogui.moveTo(x, y, duration=0.1)
+        pyautogui.moveTo(x, y, duration=0.05)
 
-    # -------------------------------------------------
+    # =================================================
     # WINDOW / APPLICATION
-    # -------------------------------------------------
+    # =================================================
 
     def get_focused_window(self) -> Dict[str, str]:
         system = platform.system()
@@ -203,22 +192,17 @@ class OperatingSystem:
                     text=True,
                 )
                 if result.returncode == 0:
-                    return {"title": result.stdout.strip()}
+                    title = result.stdout.strip()
+                    return {"title": title}
 
-            if system == "Linux":
-                wid = subprocess.check_output(
-                    ["xdotool", "getactivewindow"],
-                    text=True,
-                ).strip()
-
+            elif system == "Linux":
                 title = subprocess.check_output(
-                    ["xdotool", "getwindowname", wid],
+                    ["xdotool", "getactivewindow", "getwindowname"],
                     text=True,
                 ).strip()
-
                 return {"title": title}
 
-            if system == "Windows":
+            elif system == "Windows":
                 import win32gui
                 hwnd = win32gui.GetForegroundWindow()
                 title = win32gui.GetWindowText(hwnd)
@@ -233,8 +217,8 @@ class OperatingSystem:
         if not isinstance(window_id, dict):
             raise RuntimeError("focus_window(): invalid window_id")
 
-        target_title = window_id.get("title")
-        if not target_title:
+        title = window_id.get("title")
+        if not isinstance(title, str) or not title:
             raise RuntimeError("focus_window(): missing title")
 
         system = platform.system()
@@ -243,23 +227,20 @@ class OperatingSystem:
             if system == "Darwin":
                 script = f'''
                 tell application "System Events"
-                    set frontApp to first application process whose name is "{target_title}"
+                    set frontApp to first application process whose name is "{title}"
                     set frontmost of frontApp to true
                 end tell
                 '''
-                subprocess.run(["osascript", "-e", script])
+                subprocess.run(["osascript", "-e", script], check=False)
 
             elif system == "Linux":
-                subprocess.run(
-                    ["wmctrl", "-a", target_title],
-                    capture_output=True,
-                )
+                subprocess.run(["wmctrl", "-a", title], check=False)
 
             elif system == "Windows":
                 import win32gui
 
                 def enum_handler(hwnd, _):
-                    if win32gui.GetWindowText(hwnd) == target_title:
+                    if win32gui.GetWindowText(hwnd) == title:
                         win32gui.SetForegroundWindow(hwnd)
 
                 win32gui.EnumWindows(enum_handler, None)
@@ -270,9 +251,9 @@ class OperatingSystem:
     def get_active_application(self) -> Dict[str, str]:
         return self.get_focused_window()
 
-    # -------------------------------------------------
+    # =================================================
     # RESTORATION / SAFETY
-    # -------------------------------------------------
+    # =================================================
 
     def mark_automation_inactive(self) -> None:
         with self._automation_lock:
@@ -283,6 +264,7 @@ class OperatingSystem:
 
     def force_release_all(self, *, reason: str) -> None:
         self.mark_automation_inactive()
+
         try:
             pyautogui.mouseUp()
         except Exception:
@@ -294,9 +276,9 @@ class OperatingSystem:
             except Exception:
                 pass
 
-    # -------------------------------------------------
+    # =================================================
     # HELPERS
-    # -------------------------------------------------
+    # =================================================
 
     @staticmethod
     def _valid_coord(v) -> bool:
@@ -304,4 +286,4 @@ class OperatingSystem:
             isinstance(v, float)
             and not math.isnan(v)
             and 0.0 <= v <= 1.0
-                    )
+            )
