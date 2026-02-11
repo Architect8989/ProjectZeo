@@ -30,7 +30,7 @@ class SnapshotProvider:
     - Any failure aborts execution immediately
     """
 
-    SNAPSHOT_SCHEMA_VERSION = "1.5"
+    SNAPSHOT_SCHEMA_VERSION = "1.6"
 
     _snapshots: Dict[str, RestorationSnapshot] = {}
     _lock = threading.Lock()
@@ -93,30 +93,34 @@ class SnapshotProvider:
         # -----------------------------------------------------
         # 1. MODE CHECK (STRICT)
         # -----------------------------------------------------
-        if self._mode.mode != SystemMode.OBSERVER:
+        if self._mode.mode is not SystemMode.OBSERVER:
             raise SnapshotProviderError(
                 f"Snapshot attempted in {self._mode.mode.value}; "
                 "OBSERVER mode required"
             )
 
         # -----------------------------------------------------
-        # 2. VISION CHECK (REAL, NOT STUB)
+        # 2. VISION CHECK (AUTHORITATIVE)
         # -----------------------------------------------------
-        vision_snapshot = self._observer.snapshot()
+        vision_state = self._observer.snapshot()
 
         if (
-            not isinstance(vision_snapshot, dict)
-            or not vision_snapshot.get("available")
+            not isinstance(vision_state, dict)
+            or not vision_state.get("available")
         ):
             raise SnapshotProviderError(
                 "Vision unavailable during snapshot"
             )
 
-        frame_ts = vision_snapshot.get("frame_ts")
+        frame_ts = vision_state.get("frame_ts")
 
         # -----------------------------------------------------
         # 3. OS CORE STATE (RETRY SAFE)
         # -----------------------------------------------------
+        cursor = None
+        focused_window = None
+        active_app = None
+
         last_error: Optional[Exception] = None
 
         for attempt in range(3):
@@ -127,17 +131,18 @@ class SnapshotProvider:
                 break
             except Exception as e:
                 last_error = e
-                if attempt == 2:
-                    raise SnapshotProviderError(
-                        f"OS state capture failed: {e}"
-                    ) from e
                 time.sleep(0.1)
+
+        if cursor is None or focused_window is None or active_app is None:
+            raise SnapshotProviderError(
+                f"OS state capture failed: {last_error}"
+            )
 
         # -----------------------------------------------------
         # 4. STRICT SCHEMA VALIDATION
         # -----------------------------------------------------
 
-        # Cursor must be {"x": int, "y": int}
+        # Cursor: {"x": int, "y": int}
         if (
             not isinstance(cursor, dict)
             or "x" not in cursor
@@ -153,23 +158,25 @@ class SnapshotProvider:
                 f"Invalid cursor coordinates: {e}"
             ) from e
 
-        # Focused window must provide title
+        # Focused window: {"title": str}
         if (
             not isinstance(focused_window, dict)
-            or not focused_window.get("title")
+            or not isinstance(focused_window.get("title"), str)
+            or not focused_window["title"]
         ):
             raise SnapshotProviderError("Focused window invalid")
 
-        window_title = str(focused_window["title"])
+        window_title = focused_window["title"]
 
-        # Active application must provide title (PID removed)
+        # Active app: {"title": str}
         if (
             not isinstance(active_app, dict)
-            or not active_app.get("title")
+            or not isinstance(active_app.get("title"), str)
+            or not active_app["title"]
         ):
             raise SnapshotProviderError("Active application invalid")
 
-        app_title = str(active_app["title"])
+        app_title = active_app["title"]
 
         # -----------------------------------------------------
         # 5. STATE OBJECTS
@@ -187,7 +194,7 @@ class SnapshotProvider:
 
         application_state = ApplicationState(
             process_name=app_title,
-            pid=0,  # PID intentionally removed from OS contract
+            pid=0,  # PID intentionally removed
         )
 
         # -----------------------------------------------------
@@ -196,7 +203,8 @@ class SnapshotProvider:
 
         metadata = {
             "schema_version": self.SNAPSHOT_SCHEMA_VERSION,
-            "captured_at": time.time(),
+            "captured_at_monotonic": time.monotonic(),
+            "captured_at_wallclock": time.time(),
             "execution_mode": self._mode.mode.value,
             "vision_frame_ts": frame_ts,
         }
