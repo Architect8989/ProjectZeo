@@ -31,6 +31,7 @@ def operate_main(
     terminal_prompt: str,
     execution_plan: ExecutionPlan,
     observer=None,
+    world_graph=None,              # NEW
     max_wallclock_seconds: int = 90 * 60,
     llm_callable=None,
 ):
@@ -39,14 +40,6 @@ def operate_main(
 
     execution_plan.validate()
     PlanVerifier().verify(execution_plan)
-
-    has_tool_steps = any(
-        s.type == StepType.TOOL_INSTALLATION for s in execution_plan.steps
-    )
-    if has_tool_steps and observer is None:
-        raise ValueError(
-            "ExecutionPlan contains TOOL_INSTALLATION but observer missing"
-        )
 
     os_backend = OperatingSystem()
 
@@ -60,7 +53,12 @@ def operate_main(
     journal = ActionJournal()
     input_arbitrator = InputArbitrator()
     verifier = StepVerifier()
-    recovery = FailureRecoveryManager()
+
+    recovery = FailureRecoveryManager(
+        llm_callable=llm_callable,
+        world_graph=world_graph,
+    )
+
     progress = ProgressTracker(execution_plan)
 
     installer: Optional[AutonomousInstaller] = None
@@ -74,6 +72,7 @@ def operate_main(
         _execute_plan(
             execution_plan=execution_plan,
             observer=observer,
+            world_graph=world_graph,
             os_backend=os_backend,
             accessibility_backend=accessibility_backend,
             journal=journal,
@@ -82,6 +81,7 @@ def operate_main(
             recovery=recovery,
             progress=progress,
             installer=installer,
+            llm_callable=llm_callable,
             max_wallclock_seconds=max_wallclock_seconds,
         )
     finally:
@@ -96,6 +96,7 @@ def _execute_plan(
     *,
     execution_plan: ExecutionPlan,
     observer,
+    world_graph,
     os_backend: OperatingSystem,
     accessibility_backend: Optional[AccessibilityBackend],
     journal: ActionJournal,
@@ -104,6 +105,7 @@ def _execute_plan(
     recovery: FailureRecoveryManager,
     progress: ProgressTracker,
     installer: Optional[AutonomousInstaller],
+    llm_callable,
     max_wallclock_seconds: int,
 ):
     start_ts = time.time()
@@ -147,15 +149,6 @@ def _execute_plan(
 
         while True:
             try:
-                decision = input_arbitrator.evaluate(
-                    input_event_ts=time.monotonic(),
-                    high_risk=(step.type == StepType.TOOL_INSTALLATION),
-                    soc_confident=True,
-                )
-
-                if decision != AuthorityDecision.PROCEED:
-                    _handle_authority(decision, journal)
-
                 input_arbitrator.soc_action_started()
                 os_backend.heartbeat()
 
@@ -171,11 +164,24 @@ def _execute_plan(
 
                 after_screen = _extract_screen(observer)
 
+                # ==================================================
+                # WORLD GRAPH UPDATE (NEW)
+                # ==================================================
+                if world_graph and observer:
+                    snap = observer.snapshot()
+                    perception = snap.get("perception")
+                    if isinstance(perception, dict):
+                        try:
+                            world_graph.ingest(perception)
+                        except Exception:
+                            pass
+
                 verification = verifier.verify_step(
                     step,
                     execution_result=result,
                     screenshot=after_screen,
                     previous_screenshot=before_screen,
+                    world_graph=world_graph,      # NEW
                 )
 
                 if not verification.success:
@@ -187,6 +193,18 @@ def _execute_plan(
                     "event": "step_complete",
                     "step_id": step.id,
                 })
+
+                # ==================================================
+                # RE-EVALUATION CHECKPOINT (HOOK)
+                # ==================================================
+                if world_graph and llm_callable:
+                    if _should_replan(step, world_graph):
+                        journal.record({
+                            "event": "replan_triggered",
+                            "step_id": step.id,
+                        })
+                        # Replanning logic intentionally delegated
+                        # to higher orchestration layer.
 
                 break
 
@@ -211,6 +229,20 @@ def _execute_plan(
             raise RuntimeError("Execution aborted")
 
     journal.record({"event": "execution_complete"})
+
+
+# ==================================================
+# REPLAN HEURISTIC (MINIMAL SAFE)
+# ==================================================
+
+def _should_replan(step: ExecutionStep, world_graph) -> bool:
+    try:
+        snapshot = world_graph.snapshot()
+        if snapshot.get("dialogs"):
+            return True
+    except Exception:
+        pass
+    return False
 
 
 # ==================================================
@@ -248,11 +280,7 @@ def _execute_step(
         installer.install_tool(step.action)
         return None
 
-    elif step.type in (StepType.VERIFICATION, StepType.DONE):
-        return None
-
-    else:
-        raise ValueError(f"Unknown step type: {step.type}")
+    return None
 
 
 # ==================================================
@@ -285,7 +313,7 @@ def _execute_ui(ui: Dict[str, Any], os_backend: OperatingSystem):
 
 
 # ==================================================
-# SCREEN EXTRACTION (HARDENED)
+# SCREEN EXTRACTION
 # ==================================================
 
 def _extract_screen(observer):
@@ -293,30 +321,20 @@ def _extract_screen(observer):
         return None
 
     snap = observer.snapshot()
-
     if not isinstance(snap, dict):
         return None
 
     perception = snap.get("perception")
-
-    if not isinstance(perception, dict):
-        return {
-            "available": snap.get("available", False),
-            "text": "",
-            "hash": None,
-        }
-
     text_parts = []
 
-    for el in perception.get("elements", []):
-        if not isinstance(el, dict):
-            continue
-        t = el.get("text")
-        if isinstance(t, str) and t.strip():
-            text_parts.append(t.strip())
+    if isinstance(perception, dict):
+        for el in perception.get("elements", []):
+            if isinstance(el, dict):
+                t = el.get("text")
+                if isinstance(t, str) and t.strip():
+                    text_parts.append(t.strip())
 
     text = " ".join(text_parts)
-
     text_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
 
     return {
@@ -331,11 +349,7 @@ def _extract_screen(observer):
 # ==================================================
 
 def _valid_coord(v: Any) -> bool:
-    return (
-        isinstance(v, (int, float))
-        and not math.isnan(v)
-        and 0.0 <= v <= 1.0
-    )
+    return isinstance(v, (int, float)) and not math.isnan(v) and 0.0 <= v <= 1.0
 
 
 def _handle_authority(decision, journal):
@@ -350,4 +364,3 @@ def _handle_authority(decision, journal):
     if decision == AuthorityDecision.YIELD:
         journal.record({"event": "authority_yield"})
         time.sleep(0.5)
-        return
