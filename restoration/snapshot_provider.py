@@ -25,12 +25,13 @@ class SnapshotProvider:
 
     HARD CONTRACT:
     - Snapshot MUST be taken in OBSERVER mode
+    - Observer MUST be healthy
     - Vision MUST be live at capture time
     - OS core state MUST be captured successfully
     - Any failure aborts execution immediately
     """
 
-    SNAPSHOT_SCHEMA_VERSION = "1.6"
+    SNAPSHOT_SCHEMA_VERSION = "1.7"
 
     _snapshots: Dict[str, RestorationSnapshot] = {}
     _lock = threading.Lock()
@@ -77,7 +78,12 @@ class SnapshotProvider:
 
     def take_snapshot(self) -> str:
         snapshot = self._capture_snapshot()
-        return self.store_snapshot(snapshot)
+        snapshot_id = self.store_snapshot(snapshot)
+
+        # Attach snapshot boundary to mode controller
+        self._mode.attach_snapshot(snapshot_id)
+
+        return snapshot_id
 
     # =========================================================
     # INTERNAL CAPTURE
@@ -100,14 +106,24 @@ class SnapshotProvider:
             )
 
         # -----------------------------------------------------
-        # 2. VISION CHECK (AUTHORITATIVE)
+        # 2. OBSERVER HEALTH CHECK
+        # -----------------------------------------------------
+        if not self._observer.is_healthy():
+            raise SnapshotProviderError(
+                "Observer unhealthy during snapshot"
+            )
+
+        # -----------------------------------------------------
+        # 3. VISION CHECK (AUTHORITATIVE)
         # -----------------------------------------------------
         vision_state = self._observer.snapshot()
 
-        if (
-            not isinstance(vision_state, dict)
-            or not vision_state.get("available")
-        ):
+        if not isinstance(vision_state, dict):
+            raise SnapshotProviderError(
+                "Observer snapshot invalid structure"
+            )
+
+        if not vision_state.get("available"):
             raise SnapshotProviderError(
                 "Vision unavailable during snapshot"
             )
@@ -115,7 +131,7 @@ class SnapshotProvider:
         frame_ts = vision_state.get("frame_ts")
 
         # -----------------------------------------------------
-        # 3. OS CORE STATE (RETRY SAFE)
+        # 4. OS CORE STATE (RETRY SAFE)
         # -----------------------------------------------------
         cursor = None
         focused_window = None
@@ -123,7 +139,7 @@ class SnapshotProvider:
 
         last_error: Optional[Exception] = None
 
-        for attempt in range(3):
+        for _ in range(3):
             try:
                 cursor = self._os.get_cursor_position()
                 focused_window = self._os.get_focused_window()
@@ -139,16 +155,15 @@ class SnapshotProvider:
             )
 
         # -----------------------------------------------------
-        # 4. STRICT SCHEMA VALIDATION
+        # 5. STRICT SCHEMA VALIDATION
         # -----------------------------------------------------
 
-        # Cursor: {"x": int, "y": int}
-        if (
-            not isinstance(cursor, dict)
-            or "x" not in cursor
-            or "y" not in cursor
-        ):
+        # Cursor validation
+        if not isinstance(cursor, dict):
             raise SnapshotProviderError("Cursor state invalid")
+
+        if "x" not in cursor or "y" not in cursor:
+            raise SnapshotProviderError("Cursor coordinates missing")
 
         try:
             cursor_x = int(cursor["x"])
@@ -158,28 +173,28 @@ class SnapshotProvider:
                 f"Invalid cursor coordinates: {e}"
             ) from e
 
-        # Focused window: {"title": str}
+        # Focused window validation
         if (
             not isinstance(focused_window, dict)
             or not isinstance(focused_window.get("title"), str)
-            or not focused_window["title"]
+            or not focused_window["title"].strip()
         ):
             raise SnapshotProviderError("Focused window invalid")
 
-        window_title = focused_window["title"]
+        window_title = focused_window["title"].strip()
 
-        # Active app: {"title": str}
+        # Active application validation
         if (
             not isinstance(active_app, dict)
             or not isinstance(active_app.get("title"), str)
-            or not active_app["title"]
+            or not active_app["title"].strip()
         ):
             raise SnapshotProviderError("Active application invalid")
 
-        app_title = active_app["title"]
+        app_title = active_app["title"].strip()
 
         # -----------------------------------------------------
-        # 5. STATE OBJECTS
+        # 6. STATE OBJECTS
         # -----------------------------------------------------
 
         cursor_state = CursorState(
@@ -194,11 +209,11 @@ class SnapshotProvider:
 
         application_state = ApplicationState(
             process_name=app_title,
-            pid=0,  # PID intentionally removed
+            pid=0,  # PID intentionally omitted
         )
 
         # -----------------------------------------------------
-        # 6. METADATA (BOUNDARY FREEZE)
+        # 7. METADATA (BOUNDARY FREEZE)
         # -----------------------------------------------------
 
         metadata = {
@@ -210,7 +225,7 @@ class SnapshotProvider:
         }
 
         # -----------------------------------------------------
-        # 7. CREATE SNAPSHOT
+        # 8. CREATE SNAPSHOT
         # -----------------------------------------------------
 
         return RestorationSnapshot.create(
@@ -219,4 +234,4 @@ class SnapshotProvider:
             application=application_state,
             execution_mode=self._mode.mode.value,
             metadata=metadata,
-        )
+                )
