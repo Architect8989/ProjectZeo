@@ -80,9 +80,7 @@ class OperatingSystem:
     # EXECUTION PRIMITIVES
     # -------------------------------------------------
 
-    def exec(
-        self, cmd: str, *, sudo: bool = False
-    ) -> subprocess.CompletedProcess:
+    def exec(self, cmd: str, *, sudo: bool = False) -> subprocess.CompletedProcess:
         if not isinstance(cmd, str) or not cmd.strip():
             raise RuntimeError("exec(): invalid command")
 
@@ -165,10 +163,30 @@ class OperatingSystem:
         pyautogui.click(x_px, y_px)
 
     # -------------------------------------------------
+    # CURSOR STATE (SNAPSHOT / RESTORE)
+    # -------------------------------------------------
+
+    def get_cursor_position(self) -> Dict[str, int]:
+        x, y = pyautogui.position()
+        return {"x": int(x), "y": int(y)}
+
+    def set_cursor_position(self, position: Dict[str, int]) -> None:
+        if not isinstance(position, dict):
+            raise RuntimeError("set_cursor_position(): invalid position")
+
+        x = position.get("x")
+        y = position.get("y")
+
+        if not isinstance(x, int) or not isinstance(y, int):
+            raise RuntimeError("set_cursor_position(): invalid coordinates")
+
+        pyautogui.moveTo(x, y, duration=0.1)
+
+    # -------------------------------------------------
     # WINDOW / APPLICATION
     # -------------------------------------------------
 
-    def get_focused_window(self) -> Dict[str, int]:
+    def get_focused_window(self) -> Dict[str, str]:
         system = platform.system()
 
         try:
@@ -176,8 +194,7 @@ class OperatingSystem:
                 script = '''
                 tell application "System Events"
                     set frontApp to first application process whose frontmost is true
-                    set pid to unix id of frontApp
-                    return (name of frontApp) & "|" & pid
+                    return name of frontApp
                 end tell
                 '''
                 result = subprocess.run(
@@ -186,38 +203,71 @@ class OperatingSystem:
                     text=True,
                 )
                 if result.returncode == 0:
-                    name, pid = result.stdout.strip().split("|", 1)
-                    return {"process_name": name, "pid": int(pid)}
+                    return {"title": result.stdout.strip()}
 
             if system == "Linux":
                 wid = subprocess.check_output(
                     ["xdotool", "getactivewindow"],
                     text=True,
                 ).strip()
-                pid = subprocess.check_output(
-                    ["xdotool", "getwindowpid", wid],
-                    text=True,
-                ).strip()
+
                 title = subprocess.check_output(
                     ["xdotool", "getwindowname", wid],
                     text=True,
                 ).strip()
-                return {"process_name": title, "pid": int(pid)}
+
+                return {"title": title}
 
             if system == "Windows":
-                import win32gui, win32process
-
+                import win32gui
                 hwnd = win32gui.GetForegroundWindow()
-                _, pid = win32process.GetWindowThreadProcessId(hwnd)
                 title = win32gui.GetWindowText(hwnd)
-                return {"process_name": title, "pid": int(pid)}
+                return {"title": title}
 
         except Exception as e:
             raise OSError(f"Failed to get focused window: {e}") from e
 
         raise OSError("Focused window unavailable")
 
-    def get_active_application(self) -> Dict[str, int]:
+    def focus_window(self, window_id: Dict[str, str]) -> None:
+        if not isinstance(window_id, dict):
+            raise RuntimeError("focus_window(): invalid window_id")
+
+        target_title = window_id.get("title")
+        if not target_title:
+            raise RuntimeError("focus_window(): missing title")
+
+        system = platform.system()
+
+        try:
+            if system == "Darwin":
+                script = f'''
+                tell application "System Events"
+                    set frontApp to first application process whose name is "{target_title}"
+                    set frontmost of frontApp to true
+                end tell
+                '''
+                subprocess.run(["osascript", "-e", script])
+
+            elif system == "Linux":
+                subprocess.run(
+                    ["wmctrl", "-a", target_title],
+                    capture_output=True,
+                )
+
+            elif system == "Windows":
+                import win32gui
+
+                def enum_handler(hwnd, _):
+                    if win32gui.GetWindowText(hwnd) == target_title:
+                        win32gui.SetForegroundWindow(hwnd)
+
+                win32gui.EnumWindows(enum_handler, None)
+
+        except Exception as e:
+            raise OSError(f"Failed to focus window: {e}") from e
+
+    def get_active_application(self) -> Dict[str, str]:
         return self.get_focused_window()
 
     # -------------------------------------------------
@@ -244,40 +294,6 @@ class OperatingSystem:
             except Exception:
                 pass
 
-    def activate_application(
-        self, name: str, pid: Optional[int] = None
-    ) -> None:
-        system = platform.system()
-
-        if system == "Darwin" and name:
-            subprocess.run(["open", "-a", name])
-
-        elif system == "Linux" and pid:
-            subprocess.run(
-                ["wmctrl", "-i", "-a", str(pid)],
-                capture_output=True,
-            )
-
-    # -------------------------------------------------
-    # BROWSER HELPERS
-    # -------------------------------------------------
-
-    def open_browser(self) -> None:
-        system = platform.system()
-        if system == "Darwin":
-            subprocess.run(["open", "-a", "Safari"])
-        elif system == "Linux":
-            subprocess.run(["xdg-open", "about:blank"])
-        elif system == "Windows":
-            os.startfile("about:blank")
-
-    def focus_address_bar(self) -> None:
-        system = platform.system()
-        if system == "Darwin":
-            pyautogui.hotkey("cmd", "l")
-        else:
-            pyautogui.hotkey("ctrl", "l")
-
     # -------------------------------------------------
     # HELPERS
     # -------------------------------------------------
@@ -288,4 +304,4 @@ class OperatingSystem:
             isinstance(v, float)
             and not math.isnan(v)
             and 0.0 <= v <= 1.0
-    )
+                    )
