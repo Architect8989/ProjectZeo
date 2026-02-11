@@ -13,16 +13,18 @@ class IntentListener:
     Guarantees:
     - NEVER blocks main thread
     - Accepts intent ONLY in OBSERVER mode
+    - Snapshot taken BEFORE arming
     - No intent overwrite
     - Works in interactive + non-interactive environments
     - Clean shutdown
     """
 
     POLL_INTERVAL = 0.1  # seconds
-    INTENT_FILE = "/tmp/projectzeo.intent"  # optional external trigger
+    INTENT_FILE = "/tmp/projectzeo.intent"
 
-    def __init__(self, mode_controller):
+    def __init__(self, mode_controller, snapshot_provider):
         self.mode = mode_controller
+        self.snapshot_provider = snapshot_provider
         self._running = False
         self._thread: Optional[threading.Thread] = None
 
@@ -51,7 +53,7 @@ class IntentListener:
     def _listen_loop(self):
         while self._running:
             try:
-                # Only accept intent in OBSERVER mode
+                # Accept intent ONLY in OBSERVER mode
                 if self.mode.mode.name != "OBSERVER":
                     time.sleep(self.POLL_INTERVAL)
                     continue
@@ -62,12 +64,22 @@ class IntentListener:
                     time.sleep(self.POLL_INTERVAL)
                     continue
 
-                # Atomic authority transition
+                # ---- SNAPSHOT FIRST (ARCHITECTURE GUARANTEE) ----
+                try:
+                    snapshot_id = self.snapshot_provider.take_snapshot()
+                except Exception as e:
+                    print(f"[INTENT] Snapshot failed, rejecting: {e}")
+                    time.sleep(self.POLL_INTERVAL)
+                    continue
+
+                # Store snapshot boundary for main loop consumption
+                setattr(self.mode, "_snapshot_id", snapshot_id)
+
+                # ---- THEN ARM ----
                 self.mode.arm(intent=intent)
                 print(f"[INTENT] Armed: {intent}")
 
             except Exception as e:
-                # Illegal transition, mode violation, etc.
                 print(f"[INTENT] Rejected: {e}")
                 time.sleep(self.POLL_INTERVAL)
 
@@ -76,13 +88,6 @@ class IntentListener:
     # ==================================================
 
     def _read_intent(self) -> Optional[str]:
-        """
-        Tries multiple non-blocking intent sources:
-        1. Interactive stdin (TTY)
-        2. Intent file (non-interactive / automation)
-
-        Returns intent string or None.
-        """
 
         # ---- interactive stdin ----
         if sys.stdin and sys.stdin.isatty():
