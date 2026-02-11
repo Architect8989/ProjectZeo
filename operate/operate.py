@@ -1,5 +1,6 @@
 import time
 import math
+import hashlib
 from typing import Any, Dict, Optional
 
 from authority.authority_policy import AuthorityDecision
@@ -130,18 +131,8 @@ def _execute_plan(
             soc_confident=True,
         )
 
-        if decision == AuthorityDecision.RELEASE:
-            journal.record({"event": "authority_release"})
-            raise RuntimeError("Authority released control")
-
-        if decision == AuthorityDecision.ABORT:
-            journal.record({"event": "authority_abort"})
-            raise RuntimeError("Authority aborted execution")
-
-        if decision == AuthorityDecision.YIELD:
-            journal.record({"event": "authority_yield"})
-            time.sleep(0.5)
-            continue
+        if decision != AuthorityDecision.PROCEED:
+            _handle_authority(decision, journal)
 
         progress.start_step(step.id)
 
@@ -162,13 +153,8 @@ def _execute_plan(
                     soc_confident=True,
                 )
 
-                if decision == AuthorityDecision.RELEASE:
-                    journal.record({"event": "authority_release"})
-                    raise RuntimeError("Authority released control")
-
-                if decision == AuthorityDecision.ABORT:
-                    journal.record({"event": "authority_abort"})
-                    raise RuntimeError("Authority aborted execution")
+                if decision != AuthorityDecision.PROCEED:
+                    _handle_authority(decision, journal)
 
                 input_arbitrator.soc_action_started()
                 os_backend.heartbeat()
@@ -196,10 +182,12 @@ def _execute_plan(
                     raise RuntimeError(verification.reason)
 
                 progress.complete_step(step.id)
+
                 journal.record({
                     "event": "step_complete",
                     "step_id": step.id,
                 })
+
                 break
 
             except ActionTimeout as e:
@@ -210,23 +198,15 @@ def _execute_plan(
                 action = recovery.handle_failure(step, e, attempt_ctx)
 
             if action.action == "retry":
-                time.sleep(action.delay)
                 attempt_ctx = action.context or attempt_ctx
+                time.sleep(action.delay)
                 continue
-
-            if action.action == "alternative":
-                progress.fail_step(step.id, action.reason or "alternative_failed")
-                journal.record({
-                    "event": "step_failed",
-                    "step_id": step.id,
-                    "reason": "alternative_not_implemented",
-                })
-                raise RuntimeError("Execution aborted (alternative not implemented)")
 
             progress.fail_step(step.id, action.reason or "fatal")
             journal.record({
                 "event": "step_failed",
                 "step_id": step.id,
+                "reason": action.reason,
             })
             raise RuntimeError("Execution aborted")
 
@@ -305,7 +285,7 @@ def _execute_ui(ui: Dict[str, Any], os_backend: OperatingSystem):
 
 
 # ==================================================
-# SCREEN EXTRACTION
+# SCREEN EXTRACTION (HARDENED)
 # ==================================================
 
 def _extract_screen(observer):
@@ -313,20 +293,36 @@ def _extract_screen(observer):
         return None
 
     snap = observer.snapshot()
+
+    if not isinstance(snap, dict):
+        return None
+
     perception = snap.get("perception")
 
     if not isinstance(perception, dict):
-        return None
+        return {
+            "available": snap.get("available", False),
+            "text": "",
+            "hash": None,
+        }
 
     text_parts = []
+
     for el in perception.get("elements", []):
+        if not isinstance(el, dict):
+            continue
         t = el.get("text")
         if isinstance(t, str) and t.strip():
             text_parts.append(t.strip())
 
+    text = " ".join(text_parts)
+
+    text_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
+
     return {
         "available": snap.get("available", False),
-        "text": " ".join(text_parts),
+        "text": text,
+        "hash": text_hash,
     }
 
 
@@ -339,4 +335,19 @@ def _valid_coord(v: Any) -> bool:
         isinstance(v, (int, float))
         and not math.isnan(v)
         and 0.0 <= v <= 1.0
-)
+    )
+
+
+def _handle_authority(decision, journal):
+    if decision == AuthorityDecision.RELEASE:
+        journal.record({"event": "authority_release"})
+        raise RuntimeError("Authority released control")
+
+    if decision == AuthorityDecision.ABORT:
+        journal.record({"event": "authority_abort"})
+        raise RuntimeError("Authority aborted execution")
+
+    if decision == AuthorityDecision.YIELD:
+        journal.record({"event": "authority_yield"})
+        time.sleep(0.5)
+        return
