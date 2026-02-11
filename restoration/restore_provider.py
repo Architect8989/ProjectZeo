@@ -32,7 +32,9 @@ class RestoreProvider:
         self._completed_snapshot_id: Optional[str] = None
         self._lock = threading.Lock()
 
-    # -------------------------------------------------
+    # =========================================================
+    # PUBLIC
+    # =========================================================
 
     def restore_snapshot(self, snapshot_id: str) -> None:
         from restoration.snapshot_provider import SnapshotProvider
@@ -43,7 +45,9 @@ class RestoreProvider:
 
         self.restore(snapshot)
 
-    # -------------------------------------------------
+    # =========================================================
+    # CORE RESTORE
+    # =========================================================
 
     def restore(self, snapshot: RestorationSnapshot) -> None:
         snapshot_id = snapshot.snapshot_id
@@ -52,83 +56,53 @@ class RestoreProvider:
             if self._completed_snapshot_id == snapshot_id:
                 return
 
-            # HARD SAFETY
+            # -------------------------------------------------
+            # HARD SAFETY: Stop automation deterministically
+            # -------------------------------------------------
             try:
-                self._os.mark_automation_inactive()
-                self._os.force_release_all(reason="restoration")
                 self._os.stop_automated_input()
+                self._os.force_release_all(reason="restoration")
+                self._os.mark_automation_inactive()
             except Exception as e:
                 raise RestorationError(
                     f"Automation shutdown failed: {e}"
                 ) from e
 
-            if getattr(self._os, "_automation_active", False):
-                raise RestorationError(
-                    "Automation still active after shutdown"
-                )
-
-            # EXTENDED (best effort only)
-            meta = snapshot.metadata or {}
-            extended = meta.get("extended") or {}
-            self._restore_extended_state(snapshot, extended)
-
-            # CORE
+            # -------------------------------------------------
+            # CORE STATE RESTORE
+            # -------------------------------------------------
             self._restore_core_state(snapshot)
 
-            # MODE RESET
+            # -------------------------------------------------
+            # MODE RESET (authoritative)
+            # -------------------------------------------------
             try:
-                if self._mode.mode is not SystemMode.OBSERVER:
+                if self._mode.mode != SystemMode.OBSERVER:
                     self._mode.force_observer()
             except Exception as e:
                 raise RestorationError(
                     f"Mode reset failed: {e}"
                 ) from e
 
-            # VERIFY
+            # -------------------------------------------------
+            # VERIFY RESTORATION
+            # -------------------------------------------------
             self._verify(snapshot)
 
-            # COMMIT
+            # -------------------------------------------------
+            # COMMIT (idempotency seal)
+            # -------------------------------------------------
             self._completed_snapshot_id = snapshot_id
 
-    # -------------------------------------------------
-
-    def _restore_extended_state(
-        self,
-        snapshot: RestorationSnapshot,
-        extended: dict,
-    ) -> None:
-        # Disabled unless OS backend implements them
-        try:
-            if (
-                extended.get("window_geometry") is not None
-                and hasattr(self._os, "set_window_geometry")
-            ):
-                self._os.set_window_geometry(
-                    snapshot.focus.window_id,
-                    extended["window_geometry"],
-                )
-        except Exception:
-            pass
-
-        try:
-            if (
-                extended.get("window_z_order") is not None
-                and hasattr(self._os, "set_window_z_order")
-            ):
-                self._os.set_window_z_order(
-                    snapshot.focus.window_id,
-                    extended["window_z_order"],
-                )
-        except Exception:
-            pass
-
-    # -------------------------------------------------
+    # =========================================================
+    # CORE STATE
+    # =========================================================
 
     def _restore_core_state(
         self,
         snapshot: RestorationSnapshot,
     ) -> None:
-        # Cursor
+        # Cursor restore
         try:
             self._os.set_cursor_position(
                 {"x": snapshot.cursor.x, "y": snapshot.cursor.y}
@@ -138,7 +112,7 @@ class RestoreProvider:
                 f"Cursor restore failed: {e}"
             ) from e
 
-        # Focus window
+        # Focus window restore (schema aligned with OS backend)
         try:
             self._os.focus_window(
                 {"title": snapshot.focus.window_id}
@@ -148,12 +122,15 @@ class RestoreProvider:
                 f"Window focus restore failed: {e}"
             ) from e
 
-    # -------------------------------------------------
+    # =========================================================
+    # VERIFICATION (FAIL-CLOSED)
+    # =========================================================
 
     def _verify(self, snapshot: RestorationSnapshot) -> None:
+        # Allow OS to settle
         time.sleep(0.05)
 
-        if self._mode.mode is not SystemMode.OBSERVER:
+        if self._mode.mode != SystemMode.OBSERVER:
             raise RestorationError(
                 f"Post-restore mode invalid: {self._mode.mode}"
             )
@@ -166,19 +143,21 @@ class RestoreProvider:
                 f"Verification read failed: {e}"
             ) from e
 
+        # Cursor validation
         if not isinstance(cursor, dict):
             raise RestorationError("Cursor read invalid")
 
         if (
-            abs(cursor["x"] - snapshot.cursor.x)
+            abs(cursor.get("x", 0) - snapshot.cursor.x)
             > self.CURSOR_TOLERANCE_PX
-            or abs(cursor["y"] - snapshot.cursor.y)
+            or abs(cursor.get("y", 0) - snapshot.cursor.y)
             > self.CURSOR_TOLERANCE_PX
         ):
             raise RestorationError(
                 "Cursor position mismatch after restore"
             )
 
+        # Focus validation
         if (
             not isinstance(current_window, dict)
             or current_window.get("title")
@@ -186,4 +165,4 @@ class RestoreProvider:
         ):
             raise RestorationError(
                 "Focused window mismatch after restore"
-        )
+                )
