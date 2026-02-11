@@ -150,7 +150,6 @@ def main():
     vision_runtime.start()
     observer_loop.start()
 
-    # FIXED: correct constructor
     intent_listener = IntentListener(mode, SNAPSHOT_PROVIDER)
     intent_listener.start()
 
@@ -166,7 +165,6 @@ def main():
 
                 TASK_START = time.time()
 
-                # FIXED: consume snapshot taken in OBSERVER mode
                 snapshot_id: Optional[str] = mode.consume_snapshot()
                 if not snapshot_id:
                     raise RuntimeError("Missing snapshot at execution boundary")
@@ -206,7 +204,6 @@ def main():
 
                 try:
                     mode.execute()
-
                     consumed_intent = mode.consume_intent()
 
                     operate_main(
@@ -214,11 +211,14 @@ def main():
                         terminal_prompt=consumed_intent,
                         execution_plan=execution_plan,
                         observer=observer,
+                        world_graph=world_graph,
                         llm_callable=mode.get_llm_callable(),
                     )
 
                 finally:
-                    # FIXED: explicit restoration phase
+                    # --------------------------------------------------
+                    # RESTORATION PHASE
+                    # --------------------------------------------------
                     mode.begin_restoration()
 
                     try:
@@ -236,6 +236,10 @@ def main():
                     )
 
                     mode.complete_execution()
+
+                    # Prevent perception leakage across tasks
+                    observer.reset_for_new_task()
+
                     TASK_START = None
 
             # Hard time bound
