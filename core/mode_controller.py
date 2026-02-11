@@ -45,6 +45,9 @@ class ModeController:
         self._mode_entered_at: float = time.time()
         self._last_transition_reason: Optional[str] = None
 
+        # ---- SNAPSHOT BOUNDARY ----
+        self._snapshot_id: Optional[str] = None
+
         # ---- INTENT ----
         self._intent: Optional[str] = None
         self._intent_frozen: bool = False
@@ -83,13 +86,29 @@ class ModeController:
         with self._lock:
             return self._mode is SystemMode.ARMED
 
-    # --------------------------------------------------
-    # INTENT
-    # --------------------------------------------------
-
     def get_intent(self) -> Optional[str]:
         with self._lock:
             return self._intent
+
+    # --------------------------------------------------
+    # SNAPSHOT CONTRACT
+    # --------------------------------------------------
+
+    def attach_snapshot(self, snapshot_id: str) -> None:
+        with self._lock:
+            if self._mode is not SystemMode.OBSERVER:
+                raise ModeTransitionError(
+                    "Snapshot can only attach in OBSERVER mode"
+                )
+            if not snapshot_id:
+                raise ModeTransitionError("Invalid snapshot_id")
+            self._snapshot_id = snapshot_id
+
+    def consume_snapshot(self) -> Optional[str]:
+        with self._lock:
+            sid = self._snapshot_id
+            self._snapshot_id = None
+            return sid
 
     # --------------------------------------------------
     # LLM INJECTION
@@ -139,6 +158,11 @@ class ModeController:
                     "Cannot arm unless in OBSERVER"
                 )
 
+            if not self._snapshot_id:
+                raise ModeTransitionError(
+                    "Cannot arm without snapshot boundary"
+                )
+
             if not intent or not intent.strip():
                 raise ModeTransitionError(
                     "Intent must be non-empty"
@@ -181,10 +205,6 @@ class ModeController:
                 forced=False,
             )
 
-    # --------------------------------------------------
-    # PLANNING CONTRACT
-    # --------------------------------------------------
-
     def attach_execution_plan(self, plan_id: str) -> None:
         with self._lock:
             if self._mode is not SystemMode.PLANNING:
@@ -223,14 +243,10 @@ class ModeController:
                 )
 
             if not self._planning_completed:
-                raise ModeTransitionError(
-                    "Plan not completed"
-                )
+                raise ModeTransitionError("Plan not completed")
 
             if not self._vision_ok:
-                raise VisionUnavailableError(
-                    "vision unavailable"
-                )
+                raise VisionUnavailableError("vision unavailable")
 
             if not self._observer_healthy:
                 raise ObserverUnavailableError(
@@ -251,7 +267,20 @@ class ModeController:
                 raise ModeTransitionError(
                     "Intent consumed outside EXECUTING"
                 )
-            return self._intent  # no destruction here
+            return self._intent
+
+    def begin_restoration(self) -> None:
+        with self._lock:
+            if self._mode is not SystemMode.EXECUTING:
+                raise ModeTransitionError(
+                    "Restoration requires EXECUTING state"
+                )
+            # No intermediate RESTORE mode — linear contract
+            self._commit_transition(
+                SystemMode.OBSERVER,
+                reason="restoration started",
+                forced=False,
+            )
 
     # --------------------------------------------------
     # COMPLETION / RESET
@@ -288,6 +317,7 @@ class ModeController:
         self._execution_plan_attached = False
         self._execution_plan_id = None
         self._input_locked = False
+        self._snapshot_id = None
 
     # --------------------------------------------------
     # SINGLE COMMIT POINT
@@ -339,4 +369,4 @@ class ModeController:
                 "transition_history_depth": len(
                     self._transition_history
                 ),
-            }
+        }
