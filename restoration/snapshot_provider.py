@@ -25,15 +25,19 @@ class SnapshotProvider:
 
     HARD CONTRACT:
     - Snapshot MUST be taken in OBSERVER mode
-    - Vision MUST be live at capture time (integration point)
+    - Vision MUST be live at capture time
     - OS core state MUST be captured successfully
     - Any failure aborts execution immediately
     """
 
-    SNAPSHOT_SCHEMA_VERSION = "1.4"
+    SNAPSHOT_SCHEMA_VERSION = "1.5"
 
     _snapshots: Dict[str, RestorationSnapshot] = {}
     _lock = threading.Lock()
+
+    # =========================================================
+    # SNAPSHOT REGISTRY
+    # =========================================================
 
     @classmethod
     def store_snapshot(cls, snapshot: RestorationSnapshot) -> str:
@@ -52,7 +56,9 @@ class SnapshotProvider:
         with cls._lock:
             return cls._snapshots.get(snapshot_id)
 
-    # -------------------------------------------------
+    # =========================================================
+    # INIT
+    # =========================================================
 
     def __init__(
         self,
@@ -65,39 +71,52 @@ class SnapshotProvider:
         self._os = os_backend
         self._mode = mode_controller
 
-    # -------------------------------------------------
+    # =========================================================
+    # PUBLIC
+    # =========================================================
 
     def take_snapshot(self) -> str:
         snapshot = self._capture_snapshot()
         return self.store_snapshot(snapshot)
 
-    # -------------------------------------------------
+    # =========================================================
+    # INTERNAL CAPTURE
+    # =========================================================
 
     def _capture_snapshot(self) -> RestorationSnapshot:
+
         if self._observer is None:
             raise SnapshotProviderError(
                 "SnapshotProvider not wired: observer missing"
             )
 
-        # 1. MODE CHECK
-        if self._mode.mode is not SystemMode.OBSERVER:
+        # -----------------------------------------------------
+        # 1. MODE CHECK (STRICT)
+        # -----------------------------------------------------
+        if self._mode.mode != SystemMode.OBSERVER:
             raise SnapshotProviderError(
                 f"Snapshot attempted in {self._mode.mode.value}; "
                 "OBSERVER mode required"
             )
 
-        # 2. VISION CHECK (replace stub when wiring vision runtime)
-        screen_state: Dict[str, Any] = {
-            "available": True,
-            "frame_ts": time.time(),
-        }
+        # -----------------------------------------------------
+        # 2. VISION CHECK (REAL, NOT STUB)
+        # -----------------------------------------------------
+        vision_snapshot = self._observer.snapshot()
 
-        if not screen_state.get("available"):
+        if (
+            not isinstance(vision_snapshot, dict)
+            or not vision_snapshot.get("available")
+        ):
             raise SnapshotProviderError(
-                "Screen unavailable during snapshot"
+                "Vision unavailable during snapshot"
             )
 
+        frame_ts = vision_snapshot.get("frame_ts")
+
+        # -----------------------------------------------------
         # 3. OS CORE STATE (RETRY SAFE)
+        # -----------------------------------------------------
         last_error: Optional[Exception] = None
 
         for attempt in range(3):
@@ -110,12 +129,15 @@ class SnapshotProvider:
                 last_error = e
                 if attempt == 2:
                     raise SnapshotProviderError(
-                        f"OS state capture failed after retries: {e}"
+                        f"OS state capture failed: {e}"
                     ) from e
                 time.sleep(0.1)
 
-        # 4. STRICT VALIDATION (NEW UNIFIED SCHEMA)
+        # -----------------------------------------------------
+        # 4. STRICT SCHEMA VALIDATION
+        # -----------------------------------------------------
 
+        # Cursor must be {"x": int, "y": int}
         if (
             not isinstance(cursor, dict)
             or "x" not in cursor
@@ -123,67 +145,70 @@ class SnapshotProvider:
         ):
             raise SnapshotProviderError("Cursor state invalid")
 
+        try:
+            cursor_x = int(cursor["x"])
+            cursor_y = int(cursor["y"])
+        except Exception as e:
+            raise SnapshotProviderError(
+                f"Invalid cursor coordinates: {e}"
+            ) from e
+
+        # Focused window must provide title
         if (
             not isinstance(focused_window, dict)
             or not focused_window.get("title")
         ):
             raise SnapshotProviderError("Focused window invalid")
 
+        window_title = str(focused_window["title"])
+
+        # Active application must provide title (PID removed)
         if (
             not isinstance(active_app, dict)
             or not active_app.get("title")
         ):
             raise SnapshotProviderError("Active application invalid")
 
-        try:
-            cursor_state = CursorState(
-                x=int(cursor["x"]),
-                y=int(cursor["y"]),
-            )
-        except Exception as e:
-            raise SnapshotProviderError(
-                f"Invalid cursor position: {e}"
-            ) from e
+        app_title = str(active_app["title"])
 
-        try:
-            focus_state = FocusState(
-                window_id=str(focused_window["title"]),
-                title=focused_window["title"],
-            )
-        except Exception as e:
-            raise SnapshotProviderError(
-                f"Invalid focus state: {e}"
-            ) from e
+        # -----------------------------------------------------
+        # 5. STATE OBJECTS
+        # -----------------------------------------------------
 
-        try:
-            application_state = ApplicationState(
-                process_name=str(active_app["title"]),
-                pid=0,  # PID removed from OS backend contract
-            )
-        except Exception as e:
-            raise SnapshotProviderError(
-                f"Invalid application state: {e}"
-            ) from e
+        cursor_state = CursorState(
+            x=cursor_x,
+            y=cursor_y,
+        )
 
-        # 5. EXTENDED STATE DISABLED (OS backend incomplete)
-        extended: Dict[str, Any] = {}
+        focus_state = FocusState(
+            window_id=window_title,
+            title=window_title,
+        )
 
-        # 6. METADATA
+        application_state = ApplicationState(
+            process_name=app_title,
+            pid=0,  # PID intentionally removed from OS contract
+        )
+
+        # -----------------------------------------------------
+        # 6. METADATA (BOUNDARY FREEZE)
+        # -----------------------------------------------------
+
         metadata = {
             "schema_version": self.SNAPSHOT_SCHEMA_VERSION,
             "captured_at": time.time(),
             "execution_mode": self._mode.mode.value,
-            "screen": {
-                "frame_ts": screen_state.get("frame_ts"),
-            },
-            "extended": extended,
+            "vision_frame_ts": frame_ts,
         }
 
+        # -----------------------------------------------------
         # 7. CREATE SNAPSHOT
+        # -----------------------------------------------------
+
         return RestorationSnapshot.create(
             cursor=cursor_state,
             focus=focus_state,
             application=application_state,
             execution_mode=self._mode.mode.value,
             metadata=metadata,
-    )
+        )
