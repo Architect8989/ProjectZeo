@@ -26,17 +26,12 @@ from core.planner.execution_planner import ExecutionPlanner
 
 
 HEARTBEAT_INTERVAL = 2.0
-
-# ==================================================
-# EXECUTION TIME BOUND (HARD SAFETY)
-# ==================================================
-
 TASK_START = None
 MAX_TASK_SECONDS = 90 * 60  # 90 minutes hard cap
 
 
 # ==================================================
-# PROCESS SINGLETONS (COMPOSITION ROOT)
+# PROCESS SINGLETONS
 # ==================================================
 
 OS_BACKEND = OperatingSystem()
@@ -58,7 +53,7 @@ mode = ModeController()
 
 
 # ==================================================
-# LLM INJECTION (AUTHORITATIVE, FAIL-CLOSED)
+# LLM INJECTION
 # ==================================================
 
 def create_llm_callable() -> Callable[[str], str]:
@@ -84,7 +79,6 @@ def create_llm_callable() -> Callable[[str], str]:
     return llm_call
 
 
-# Inject exactly once, before any planning or execution
 mode.inject_llm_callable(create_llm_callable())
 
 
@@ -105,7 +99,7 @@ RESTORE_PROVIDER = RestoreProvider(
 
 
 # ==================================================
-# SAFE SHUTDOWN (FAIL-CLOSED)
+# SAFE SHUTDOWN
 # ==================================================
 
 def _force_safe_shutdown(reason: str):
@@ -143,14 +137,9 @@ def main():
 
     print("[BOOT] ProjectZeo kernel starting")
 
-    # --------------------------------------------------
-    # ENVIRONMENT FINGERPRINT
-    # --------------------------------------------------
     env_fingerprint = collect_environment_fingerprint()
 
-    # --------------------------------------------------
-    # CRASH RECOVERY GATE
-    # --------------------------------------------------
+    # Crash recovery
     persisted = AUTH_STATE.load()
     if persisted.get("dirty") or persisted.get("restore_required"):
         try:
@@ -161,29 +150,32 @@ def main():
         AUTH_STATE.force_safe_state()
         mode.force_observer()
 
-    # --------------------------------------------------
-    # START OBSERVER SUBSYSTEM
-    # --------------------------------------------------
+    # Start observer subsystem
     vision_runtime.start()
     observer_loop.start()
 
     intent_listener = IntentListener(mode)
     intent_listener.start()
 
-    # --------------------------------------------------
-    # MAIN ORCHESTRATION LOOP
-    # --------------------------------------------------
     while True:
         try:
-            # Health propagation (authoritative but mechanical)
             mode.update_observer_health(observer.is_healthy())
             mode.update_vision_status(vision_runtime.is_healthy())
 
-            # ---------------- EXECUTION TRIGGER ----------------
+            # --------------------------------------------------
+            # EXECUTION TRIGGER
+            # --------------------------------------------------
             if mode.is_armed():
+
+                if not mode.is_observer():
+                    raise RuntimeError("Snapshot attempted outside OBSERVER mode")
+
                 TASK_START = time.time()
 
+                # Snapshot BEFORE any mode transition
                 snapshot_id = SNAPSHOT_PROVIDER.take_snapshot()
+
+                # Now transition to planning
                 mode.begin_planning()
 
                 intent = mode.get_intent()
@@ -248,7 +240,7 @@ def main():
                     mode.force_observer()
                     TASK_START = None
 
-            # ---------------- HARD TIME BOUND ----------------
+            # Hard time bound
             if TASK_START and (time.time() - TASK_START) > MAX_TASK_SECONDS:
                 _force_safe_shutdown("task_timeout")
                 os._exit(1)
