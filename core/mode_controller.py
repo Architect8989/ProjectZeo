@@ -31,7 +31,8 @@ class ModeController:
     HARD GUARANTEES:
     - Linear lifecycle:
         OBSERVER → ARMED → PLANNING → EXECUTING → OBSERVER
-    - No automatic aborts from health signals
+    - Snapshot boundary enforced
+    - No hidden state mutation
     - Only explicit calls perform transitions
     """
 
@@ -47,6 +48,7 @@ class ModeController:
 
         # ---- SNAPSHOT BOUNDARY ----
         self._snapshot_id: Optional[str] = None
+        self._snapshot_consumed: bool = False
 
         # ---- INTENT ----
         self._intent: Optional[str] = None
@@ -57,7 +59,7 @@ class ModeController:
         self._execution_plan_attached: bool = False
         self._execution_plan_id: Optional[str] = None
 
-        # ---- HEALTH (SIGNALS ONLY) ----
+        # ---- HEALTH ----
         self._vision_ok: bool = False
         self._observer_healthy: bool = True
         self._failure_reason: Optional[str] = None
@@ -73,9 +75,9 @@ class ModeController:
             maxlen=self.MAX_TRANSITION_HISTORY
         )
 
-    # --------------------------------------------------
+    # ==================================================
     # READS
-    # --------------------------------------------------
+    # ==================================================
 
     @property
     def mode(self) -> SystemMode:
@@ -90,9 +92,9 @@ class ModeController:
         with self._lock:
             return self._intent
 
-    # --------------------------------------------------
+    # ==================================================
     # SNAPSHOT CONTRACT
-    # --------------------------------------------------
+    # ==================================================
 
     def attach_snapshot(self, snapshot_id: str) -> None:
         with self._lock:
@@ -100,19 +102,37 @@ class ModeController:
                 raise ModeTransitionError(
                     "Snapshot can only attach in OBSERVER mode"
                 )
+
             if not snapshot_id:
                 raise ModeTransitionError("Invalid snapshot_id")
+
+            if self._snapshot_id is not None:
+                raise ModeTransitionError(
+                    "Snapshot already attached for this cycle"
+                )
+
             self._snapshot_id = snapshot_id
+            self._snapshot_consumed = False
 
-    def consume_snapshot(self) -> Optional[str]:
+    def consume_snapshot(self) -> str:
         with self._lock:
-            sid = self._snapshot_id
-            self._snapshot_id = None
-            return sid
+            if self._mode is not SystemMode.ARMED:
+                raise ModeTransitionError(
+                    "Snapshot can only be consumed in ARMED state"
+                )
 
-    # --------------------------------------------------
+            if not self._snapshot_id:
+                raise ModeTransitionError("No snapshot attached")
+
+            if self._snapshot_consumed:
+                raise ModeTransitionError("Snapshot already consumed")
+
+            self._snapshot_consumed = True
+            return self._snapshot_id
+
+    # ==================================================
     # LLM INJECTION
-    # --------------------------------------------------
+    # ==================================================
 
     def inject_llm_callable(self, llm_call: Callable[[str], str]) -> None:
         if not callable(llm_call):
@@ -131,9 +151,9 @@ class ModeController:
                 )
             return self._llm_callable
 
-    # --------------------------------------------------
-    # HEALTH (SIGNAL ONLY — NO TRANSITIONS)
-    # --------------------------------------------------
+    # ==================================================
+    # HEALTH SIGNALS
+    # ==================================================
 
     def update_observer_health(
         self, healthy: bool, *, reason: Optional[str] = None
@@ -147,9 +167,9 @@ class ModeController:
         with self._lock:
             self._vision_ok = bool(ok)
 
-    # --------------------------------------------------
+    # ==================================================
     # TRANSITIONS
-    # --------------------------------------------------
+    # ==================================================
 
     def arm(self, intent: str) -> None:
         with self._lock:
@@ -170,7 +190,6 @@ class ModeController:
 
             self._intent = intent.strip()
             self._intent_frozen = False
-
             self._planning_completed = False
             self._execution_plan_attached = False
             self._execution_plan_id = None
@@ -261,12 +280,16 @@ class ModeController:
                 forced=False,
             )
 
-    def consume_intent(self) -> Optional[str]:
+    def consume_intent(self) -> str:
         with self._lock:
             if self._mode is not SystemMode.EXECUTING:
                 raise ModeTransitionError(
                     "Intent consumed outside EXECUTING"
                 )
+
+            if not self._intent:
+                raise ModeTransitionError("No intent available")
+
             return self._intent
 
     def begin_restoration(self) -> None:
@@ -275,21 +298,20 @@ class ModeController:
                 raise ModeTransitionError(
                     "Restoration requires EXECUTING state"
                 )
-            # No intermediate RESTORE mode — linear contract
-            self._commit_transition(
-                SystemMode.OBSERVER,
-                reason="restoration started",
-                forced=False,
-            )
 
-    # --------------------------------------------------
-    # COMPLETION / RESET
-    # --------------------------------------------------
+            # Remains in EXECUTING until restoration completes.
+            # Linear contract preserved.
+
+    # ==================================================
+    # COMPLETION
+    # ==================================================
 
     def complete_execution(self, reason: str = "execution complete") -> None:
         with self._lock:
             if self._mode is not SystemMode.EXECUTING:
-                return
+                raise ModeTransitionError(
+                    "Completion requires EXECUTING state"
+                )
 
             self._reset_internal_state()
 
@@ -318,10 +340,11 @@ class ModeController:
         self._execution_plan_id = None
         self._input_locked = False
         self._snapshot_id = None
+        self._snapshot_consumed = False
 
-    # --------------------------------------------------
+    # ==================================================
     # SINGLE COMMIT POINT
-    # --------------------------------------------------
+    # ==================================================
 
     def _commit_transition(
         self,
@@ -350,9 +373,9 @@ class ModeController:
             }
         )
 
-    # --------------------------------------------------
+    # ==================================================
     # FORENSICS
-    # --------------------------------------------------
+    # ==================================================
 
     def get_authority_snapshot(self) -> Dict[str, object]:
         with self._lock:
