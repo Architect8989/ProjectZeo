@@ -13,12 +13,6 @@ class ObserverCore:
     """
     Passive witness core.
 
-    ROLE:
-    - Maintains temporal coherence
-    - Tracks perception availability
-    - Records immutable snapshots
-    - NEVER interprets or acts
-
     HARD GUARANTEES:
     - Observer never mutates external state
     - Snapshot isolation (deep copies only)
@@ -55,13 +49,14 @@ class ObserverCore:
 
         self._lock = threading.RLock()
 
-        # ---- Descriptive observer state only ----
+        # ---- Authoritative state surface ----
         self._state: Dict[str, object] = {
             "uptime_seconds": 0.0,
             "tick_count": 0,
             "last_tick_ts": None,
             "perception_available": False,
             "perception_frame_ts": None,
+            "perception": None,  # FULL perception payload
         }
 
         self._history: Deque[Dict[str, object]] = deque(
@@ -99,6 +94,7 @@ class ObserverCore:
                 "last_tick_ts": None,
                 "perception_available": False,
                 "perception_frame_ts": None,
+                "perception": None,
             }
 
     # --------------------------------------------------
@@ -120,13 +116,12 @@ class ObserverCore:
     def tick(self) -> Dict[str, object]:
         """
         Advance observer clock.
-
         Raises ObserverBlindnessError if perception is unusable.
         """
         with self._lock:
             now = self._clock()
 
-            # ---- RECOVERY LOGIC (REQUIRES NEW PERCEPTION) ----
+            # ---- RECOVERY ----
             if (
                 not self.observer_healthy
                 and self.last_frame_seen is not None
@@ -181,8 +176,7 @@ class ObserverCore:
         self, perception_state: Dict[str, object]
     ) -> None:
         """
-        Attach perception availability metadata.
-
+        Attach full perception payload.
         Called by ObserverLoop after VisionRuntime output.
         """
         if not isinstance(perception_state, dict):
@@ -203,6 +197,7 @@ class ObserverCore:
 
             self._state["perception_available"] = available
             self._state["perception_frame_ts"] = frame_ts
+            self._state["perception"] = copy.deepcopy(perception_state)
 
             if (
                 not available
@@ -213,6 +208,21 @@ class ObserverCore:
                     f"Perception unavailable for "
                     f"{self._consecutive_misses} consecutive ticks"
                 )
+
+    # --------------------------------------------------
+    # AUTHORITATIVE SNAPSHOT (CRITICAL FIX)
+    # --------------------------------------------------
+
+    def snapshot(self) -> Dict[str, object]:
+        """
+        Full immutable observer snapshot.
+        Required by:
+        - SnapshotProvider
+        - Execution verification
+        - Screen extraction
+        """
+        with self._lock:
+            return copy.deepcopy(self._state)
 
     # --------------------------------------------------
     # INTROSPECTION
