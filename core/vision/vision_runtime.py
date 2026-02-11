@@ -6,51 +6,30 @@ from typing import Dict, Any, Optional, List
 import base64
 import io
 import json
+import copy
 
 from PIL import Image, ImageGrab
 import ollama
 
 
-# =================================================
-# ERRORS (AUTHORITATIVE)
-# =================================================
-
 class VisionUnavailableError(RuntimeError):
-    """Vision runtime cannot observe screen."""
+    pass
 
 
 class VisionDegradedError(RuntimeError):
-    """Vision runtime observing unstable or invalid frames."""
+    pass
 
-
-# =================================================
-# CONFIG (HARD LIMITS)
-# =================================================
 
 QWEN_MODEL = "qwen2.5-vl:7b-instruct"
 
 MAX_LATENCY_SECONDS = 1.5
-MAX_FRAME_BYTES = 4 * 1024 * 1024  # 4MB
+MAX_FRAME_BYTES = 4 * 1024 * 1024
 MAX_ELEMENTS = 128
 MAX_CONSECUTIVE_FAILURES = 5
-CAPTURE_INTERVAL_SECONDS = 0.5  # observer cadence
+CAPTURE_INTERVAL_SECONDS = 0.5
 
-
-# =================================================
-# VISION RUNTIME
-# =================================================
 
 class VisionRuntime:
-    """
-    Continuous local vision resident.
-
-    HARD CONTRACT:
-    - Runs independently of planner/executor
-    - Produces perception ONLY
-    - No intent, no suggestions, no actions
-    - Deterministic schema
-    - Fail-fast, fail-closed
-    """
 
     def __init__(self):
         self._lock = threading.RLock()
@@ -74,6 +53,9 @@ class VisionRuntime:
                 return
 
             self._running = True
+            self._healthy = True
+            self._consecutive_failures = 0
+
             self._thread = threading.Thread(
                 target=self._loop,
                 name="VisionRuntime",
@@ -90,18 +72,13 @@ class VisionRuntime:
             return self._healthy
 
     def get_latest(self) -> Optional[Dict[str, Any]]:
-        """
-        Observer-safe snapshot access.
-        """
         with self._lock:
-            return (
-                json.loads(json.dumps(self._last_output))
-                if self._last_output is not None
-                else None
-            )
+            if self._last_output is None:
+                return None
+            return copy.deepcopy(self._last_output)
 
     # -------------------------------------------------
-    # MAIN LOOP (RESIDENT)
+    # MAIN LOOP
     # -------------------------------------------------
 
     def _loop(self) -> None:
@@ -114,9 +91,13 @@ class VisionRuntime:
                 output = self._process_frame_internal()
 
                 with self._lock:
+                    if not self._running:
+                        return
+
                     self._last_output = output
                     self._last_frame_ts = output["frame_ts"]
                     self._consecutive_failures = 0
+                    self._healthy = True  # ✅ RECOVERY ON SUCCESS
 
             except Exception:
                 with self._lock:
@@ -127,14 +108,11 @@ class VisionRuntime:
             time.sleep(CAPTURE_INTERVAL_SECONDS)
 
     # -------------------------------------------------
-    # CORE FRAME PROCESSING (INTERNAL ONLY)
+    # FRAME PROCESSING
     # -------------------------------------------------
 
     def _process_frame_internal(self) -> Dict[str, Any]:
         start = time.monotonic()
-
-        if not self._healthy:
-            raise VisionUnavailableError("Vision runtime unhealthy")
 
         frame_ts = time.monotonic()
 
@@ -184,7 +162,7 @@ class VisionRuntime:
         return base64.b64encode(data).decode("utf-8")
 
     # -------------------------------------------------
-    # MODEL CALL (VISION ONLY)
+    # MODEL CALL
     # -------------------------------------------------
 
     def _call_qwen(self, image_b64: str) -> Dict[str, Any]:
@@ -192,24 +170,7 @@ class VisionRuntime:
             "You are a visual perception system.\n"
             "You do NOT infer intent.\n"
             "You do NOT suggest actions.\n"
-            "You ONLY describe what is visible.\n\n"
-            "Return ONLY valid JSON.\n\n"
-            "Schema:\n"
-            "{\n"
-            '  "elements": [\n'
-            "    {\"type\": \"button|text|input|menu|icon\", "
-            "\"text\": string, "
-            "\"x\": number, "
-            "\"y\": number}\n"
-            "  ],\n"
-            '  "dialogs": [],\n'
-            '  "apps": [],\n'
-            '  "focused_app": string|null\n'
-            "}\n\n"
-            "Rules:\n"
-            "- Coordinates normalized (0..1)\n"
-            "- Max 128 elements\n"
-            "- No hallucinated text\n"
+            "Return ONLY valid JSON.\n"
         )
 
         response = ollama.chat(
@@ -229,7 +190,7 @@ class VisionRuntime:
         return self._parse_json(content)
 
     # -------------------------------------------------
-    # NORMALIZATION (FAIL CLOSED)
+    # NORMALIZATION
     # -------------------------------------------------
 
     def _normalize_output(
@@ -282,11 +243,19 @@ class VisionRuntime:
 
     def _parse_json(self, raw: str) -> Dict[str, Any]:
         raw = raw.strip()
+
         if raw.startswith("```"):
-            raw = raw.split("```")[1]
+            parts = raw.split("```")
+            if len(parts) >= 3:
+                raw = parts[1]
+            else:
+                raw = parts[-1]
 
         try:
-            return json.loads(raw)
+            parsed = json.loads(raw)
+            if not isinstance(parsed, dict):
+                raise VisionDegradedError("Vision output not JSON object")
+            return parsed
         except Exception as e:
             raise VisionDegradedError(
                 f"Invalid JSON from vision model: {e}"
