@@ -29,9 +29,10 @@ class ModeController:
     Single authoritative lifecycle controller.
 
     HARD GUARANTEES:
-    - Linear lifecycle: OBSERVER → ARMED → PLANNING → EXECUTING → OBSERVER
-    - Kernel has ZERO intelligence
-    - All reasoning lives outside the kernel
+    - Linear lifecycle:
+        OBSERVER → ARMED → PLANNING → EXECUTING → OBSERVER
+    - No automatic aborts from health signals
+    - Only explicit calls perform transitions
     """
 
     MAX_TRANSITION_HISTORY = 2000
@@ -44,24 +45,24 @@ class ModeController:
         self._mode_entered_at: float = time.time()
         self._last_transition_reason: Optional[str] = None
 
-        # ---- HUMAN AUTHORITY ----
+        # ---- INTENT ----
         self._intent: Optional[str] = None
         self._intent_frozen: bool = False
 
-        # ---- PLANNING CONTRACT ----
+        # ---- PLANNING ----
         self._planning_completed: bool = False
         self._execution_plan_attached: bool = False
         self._execution_plan_id: Optional[str] = None
 
-        # ---- HEALTH ----
+        # ---- HEALTH (SIGNALS ONLY) ----
         self._vision_ok: bool = False
         self._observer_healthy: bool = True
         self._failure_reason: Optional[str] = None
 
-        # ---- INPUT / AUTHORITY ----
+        # ---- INPUT LOCK ----
         self._input_locked: bool = False
 
-        # ---- EXTERNAL INTELLIGENCE (INJECTED) ----
+        # ---- EXTERNAL INTELLIGENCE ----
         self._llm_callable: Optional[Callable[[str], str]] = None
 
         # ---- FORENSICS ----
@@ -80,7 +81,7 @@ class ModeController:
 
     def is_armed(self) -> bool:
         with self._lock:
-            return self._mode == SystemMode.ARMED
+            return self._mode is SystemMode.ARMED
 
     # --------------------------------------------------
     # INTENT
@@ -91,23 +92,16 @@ class ModeController:
             return self._intent
 
     # --------------------------------------------------
-    # BRAIN INTERFACE (INJECTED, NOT CREATED)
+    # LLM INJECTION
     # --------------------------------------------------
 
     def inject_llm_callable(self, llm_call: Callable[[str], str]) -> None:
-        """
-        Inject external intelligence.
-
-        Must be called exactly once during boot.
-        """
         if not callable(llm_call):
             raise TypeError("llm_call must be callable")
 
         with self._lock:
             if self._llm_callable is not None:
-                raise RuntimeError(
-                    "LLM callable already injected"
-                )
+                raise RuntimeError("LLM callable already injected")
             self._llm_callable = llm_call
 
     def get_llm_callable(self) -> Callable[[str], str]:
@@ -119,42 +113,20 @@ class ModeController:
             return self._llm_callable
 
     # --------------------------------------------------
-    # HEALTH (AUTHORITATIVE SOURCES ONLY)
+    # HEALTH (SIGNAL ONLY — NO TRANSITIONS)
     # --------------------------------------------------
 
     def update_observer_health(
         self, healthy: bool, *, reason: Optional[str] = None
     ) -> None:
         with self._lock:
-            if healthy:
-                self._observer_healthy = True
-                return
-
-            if not self._observer_healthy:
-                return
-
-            self._observer_healthy = False
-            self._failure_reason = reason or "observer failure"
-
-            if self._mode in (
-                SystemMode.PLANNING,
-                SystemMode.EXECUTING,
-            ):
-                self._abort_locked(
-                    "observer health lost during active task"
-                )
+            self._observer_healthy = bool(healthy)
+            if not healthy:
+                self._failure_reason = reason or "observer unhealthy"
 
     def update_vision_status(self, ok: bool) -> None:
-        """
-        Vision status updates must come ONLY from vision runtime.
-        """
         with self._lock:
             self._vision_ok = bool(ok)
-
-            if not ok and self._mode == SystemMode.EXECUTING:
-                self._abort_locked(
-                    "vision lost during execution"
-                )
 
     # --------------------------------------------------
     # TRANSITIONS
@@ -162,7 +134,7 @@ class ModeController:
 
     def arm(self, intent: str) -> None:
         with self._lock:
-            if self._mode != SystemMode.OBSERVER:
+            if self._mode is not SystemMode.OBSERVER:
                 raise ModeTransitionError(
                     "Cannot arm unless in OBSERVER"
                 )
@@ -188,7 +160,7 @@ class ModeController:
 
     def begin_planning(self) -> None:
         with self._lock:
-            if self._mode != SystemMode.ARMED:
+            if self._mode is not SystemMode.ARMED:
                 raise ModeTransitionError(
                     "Planning requires ARMED state"
                 )
@@ -215,9 +187,9 @@ class ModeController:
 
     def attach_execution_plan(self, plan_id: str) -> None:
         with self._lock:
-            if self._mode != SystemMode.PLANNING:
+            if self._mode is not SystemMode.PLANNING:
                 raise ModeTransitionError(
-                    "Execution plan can only be attached during PLANNING"
+                    "Execution plan can only attach during PLANNING"
                 )
 
             if not plan_id or not plan_id.strip():
@@ -233,26 +205,26 @@ class ModeController:
 
     def mark_planning_complete(self) -> None:
         with self._lock:
-            if self._mode != SystemMode.PLANNING:
+            if self._mode is not SystemMode.PLANNING:
                 raise ModeTransitionError("Planning not active")
 
             if not self._execution_plan_attached:
                 raise ModeTransitionError(
-                    "Cannot complete planning without attached plan"
+                    "Cannot complete planning without plan"
                 )
 
             self._planning_completed = True
 
     def execute(self) -> None:
         with self._lock:
-            if self._mode != SystemMode.PLANNING:
+            if self._mode is not SystemMode.PLANNING:
                 raise ModeTransitionError(
                     "Execute requires PLANNING state"
                 )
 
             if not self._planning_completed:
                 raise ModeTransitionError(
-                    "Cannot execute without completed plan"
+                    "Plan not completed"
                 )
 
             if not self._vision_ok:
@@ -275,22 +247,19 @@ class ModeController:
 
     def consume_intent(self) -> Optional[str]:
         with self._lock:
-            if self._mode != SystemMode.EXECUTING:
+            if self._mode is not SystemMode.EXECUTING:
                 raise ModeTransitionError(
                     "Intent consumed outside EXECUTING"
                 )
-
-            intent = self._intent
-            self._intent = None
-            return intent
+            return self._intent  # no destruction here
 
     # --------------------------------------------------
-    # COMPLETION / ABORT
+    # COMPLETION / RESET
     # --------------------------------------------------
 
     def complete_execution(self, reason: str = "execution complete") -> None:
         with self._lock:
-            if self._mode != SystemMode.EXECUTING:
+            if self._mode is not SystemMode.EXECUTING:
                 return
 
             self._reset_internal_state()
@@ -311,16 +280,6 @@ class ModeController:
                 reason="forced reset",
                 forced=True,
             )
-
-    def _abort_locked(self, reason: str) -> None:
-        self._failure_reason = reason
-        self._reset_internal_state()
-
-        self._commit_transition(
-            SystemMode.OBSERVER,
-            reason=reason,
-            forced=True,
-        )
 
     def _reset_internal_state(self) -> None:
         self._intent = None
@@ -380,4 +339,4 @@ class ModeController:
                 "transition_history_depth": len(
                     self._transition_history
                 ),
-        }
+            }
