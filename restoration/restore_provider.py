@@ -18,8 +18,8 @@ class RestoreProvider:
 
     Guarantees:
     - Idempotent per snapshot
-    - Concurrency-safe (single global lock)
-    - Fail-closed (never lies about success)
+    - Concurrency-safe
+    - Fail-closed
     - Single authority for mode reset
     """
 
@@ -33,8 +33,6 @@ class RestoreProvider:
         self._lock = threading.Lock()
 
     # -------------------------------------------------
-    # Public API
-    # -------------------------------------------------
 
     def restore_snapshot(self, snapshot_id: str) -> None:
         from restoration.snapshot_provider import SnapshotProvider
@@ -45,19 +43,16 @@ class RestoreProvider:
 
         self.restore(snapshot)
 
+    # -------------------------------------------------
+
     def restore(self, snapshot: RestorationSnapshot) -> None:
         snapshot_id = snapshot.snapshot_id
 
         with self._lock:
-            # -------------------------------------------------
-            # IDEMPOTENCY (SAFE EARLY EXIT)
-            # -------------------------------------------------
             if self._completed_snapshot_id == snapshot_id:
                 return
 
-            # -------------------------------------------------
-            # PHASE 0 — HARD SAFETY (FAIL-CLOSED)
-            # -------------------------------------------------
+            # HARD SAFETY
             try:
                 self._os.mark_automation_inactive()
                 self._os.force_release_all(reason="restoration")
@@ -72,22 +67,15 @@ class RestoreProvider:
                     "Automation still active after shutdown"
                 )
 
+            # EXTENDED (best effort only)
             meta = snapshot.metadata or {}
             extended = meta.get("extended") or {}
-
-            # -------------------------------------------------
-            # PHASE 1 — EXTENDED STATE (BEST-EFFORT, ISOLATED)
-            # -------------------------------------------------
             self._restore_extended_state(snapshot, extended)
 
-            # -------------------------------------------------
-            # PHASE 2 — CORE STATE (FAIL-CLOSED)
-            # -------------------------------------------------
+            # CORE
             self._restore_core_state(snapshot)
 
-            # -------------------------------------------------
-            # PHASE 3 — AUTHORITY RESET (ABSOLUTE)
-            # -------------------------------------------------
+            # MODE RESET
             try:
                 if self._mode.mode is not SystemMode.OBSERVER:
                     self._mode.force_observer()
@@ -96,18 +84,12 @@ class RestoreProvider:
                     f"Mode reset failed: {e}"
                 ) from e
 
-            # -------------------------------------------------
-            # PHASE 4 — VERIFICATION (TRUTHFUL)
-            # -------------------------------------------------
+            # VERIFY
             self._verify(snapshot)
 
-            # -------------------------------------------------
-            # PHASE 5 — COMMIT (IDEMPOTENCY SEAL)
-            # -------------------------------------------------
+            # COMMIT
             self._completed_snapshot_id = snapshot_id
 
-    # -------------------------------------------------
-    # Extended restore (best-effort)
     # -------------------------------------------------
 
     def _restore_extended_state(
@@ -115,6 +97,7 @@ class RestoreProvider:
         snapshot: RestorationSnapshot,
         extended: dict,
     ) -> None:
+        # Disabled unless OS backend implements them
         try:
             if (
                 extended.get("window_geometry") is not None
@@ -139,65 +122,32 @@ class RestoreProvider:
         except Exception:
             pass
 
-        try:
-            if (
-                extended.get("browser_state") is not None
-                and hasattr(self._os, "restore_browser_state")
-            ):
-                self._os.restore_browser_state(
-                    extended["browser_state"]
-                )
-        except Exception:
-            pass
-
-        try:
-            if (
-                extended.get("media_playback_position") is not None
-                and hasattr(self._os, "set_media_playback_position")
-            ):
-                self._os.set_media_playback_position(
-                    extended["media_playback_position"]
-                )
-        except Exception:
-            pass
-
-    # -------------------------------------------------
-    # Core restore (authoritative)
     # -------------------------------------------------
 
     def _restore_core_state(
         self,
         snapshot: RestorationSnapshot,
     ) -> None:
+        # Cursor
         try:
             self._os.set_cursor_position(
-                snapshot.cursor.x,
-                snapshot.cursor.y,
+                {"x": snapshot.cursor.x, "y": snapshot.cursor.y}
             )
         except Exception as e:
             raise RestorationError(
                 f"Cursor restore failed: {e}"
             ) from e
 
-        focused = False
+        # Focus window
         try:
-            focused = self._os.focus_window(
-                snapshot.focus.window_id
+            self._os.focus_window(
+                {"title": snapshot.focus.window_id}
             )
-        except Exception:
-            focused = False
+        except Exception as e:
+            raise RestorationError(
+                f"Window focus restore failed: {e}"
+            ) from e
 
-        if not focused:
-            try:
-                self._os.activate_application(
-                    snapshot.application.process_name,
-                    snapshot.application.pid,
-                )
-            except Exception:
-                pass
-
-    # -------------------------------------------------
-    # Verification (strict, identity-aware)
     # -------------------------------------------------
 
     def _verify(self, snapshot: RestorationSnapshot) -> None:
@@ -209,35 +159,31 @@ class RestoreProvider:
             )
 
         try:
-            x, y = self._os.get_cursor_position()
+            cursor = self._os.get_cursor_position()
             current_window = self._os.get_focused_window()
         except Exception as e:
             raise RestorationError(
                 f"Verification read failed: {e}"
             ) from e
 
+        if not isinstance(cursor, dict):
+            raise RestorationError("Cursor read invalid")
+
         if (
-            abs(x - snapshot.cursor.x) > self.CURSOR_TOLERANCE_PX
-            or abs(y - snapshot.cursor.y) > self.CURSOR_TOLERANCE_PX
+            abs(cursor["x"] - snapshot.cursor.x)
+            > self.CURSOR_TOLERANCE_PX
+            or abs(cursor["y"] - snapshot.cursor.y)
+            > self.CURSOR_TOLERANCE_PX
         ):
             raise RestorationError(
                 "Cursor position mismatch after restore"
             )
 
-        if not isinstance(current_window, dict):
-            raise RestorationError(
-                "Focused window invalid after restore"
-            )
-
         if (
-            current_window.get("process_name")
-            != snapshot.application.process_name
+            not isinstance(current_window, dict)
+            or current_window.get("title")
+            != snapshot.focus.window_id
         ):
             raise RestorationError(
-                "Focused application mismatch after restore"
-            )
-
-        if current_window.get("pid") != snapshot.application.pid:
-            raise RestorationError(
-                "Focused application PID mismatch after restore"
+                "Focused window mismatch after restore"
         )
