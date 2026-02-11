@@ -25,8 +25,8 @@ MAX_ENTITIES = 5000
 MAX_HISTORY = 2000
 ENTITY_STALE_SECONDS = 30.0
 
-# spatial quantization to reduce jitter but avoid collisions
-COORD_QUANT = 0.001  # ~0.1% of screen
+# finer spatial quantization (~0.01% of screen)
+COORD_QUANT = 0.0001
 
 
 # -------------------------------------------------
@@ -38,10 +38,10 @@ class WorldGraph:
     """
     Incremental semantic world model.
 
-    THINK OF THIS AS:
-    - The system's subconscious
-    - A continuously updated belief graph
-    - Evidence ledger for planners and verifiers
+    ARCHITECTURAL CONTRACT:
+    - Observer NEVER mutates this directly
+    - Planner ingests perception on-demand
+    - All mutation occurs under lock
     """
 
     def __init__(self):
@@ -54,14 +54,14 @@ class WorldGraph:
         self._history: List[Dict[str, Any]] = []
 
     # -------------------------------------------------
-    # INGESTION (VISION ONLY)
+    # INGESTION (PLANNER-DRIVEN)
     # -------------------------------------------------
 
     def ingest(self, perception: Dict[str, Any]) -> None:
         """
         Merge a new perception frame into the world graph.
 
-        Only VisionRuntime / ObserverLoop may call this.
+        Must be called under lock or via snapshot_from_perception().
         """
         if not isinstance(perception, dict):
             return
@@ -76,44 +76,40 @@ class WorldGraph:
 
         now = time.monotonic()
 
-        with self._lock:
-            self._last_frame_ts = frame_ts
-            self._focused_app = perception.get("focused_app")
+        self._last_frame_ts = frame_ts
+        self._focused_app = perception.get("focused_app")
 
-            for el in elements:
-                if not isinstance(el, dict):
-                    continue
+        for el in elements:
+            if not isinstance(el, dict):
+                continue
 
-                entity_id = self._stable_entity_id(el)
+            entity_id = self._stable_entity_id(el)
 
-                if entity_id not in self._entities:
-                    self._entities[entity_id] = {
-                        "id": entity_id,
-                        "type": el.get("type"),
-                        "text": el.get("text"),
-                        "x": el.get("x"),
-                        "y": el.get("y"),
-                        "first_seen": now,
-                        "last_seen": now,
-                        "confidence": 0.5,
-                    }
-                else:
-                    ent = self._entities[entity_id]
-                    ent["last_seen"] = now
-                    ent["x"] = el.get("x")
-                    ent["y"] = el.get("y")
-                    ent["confidence"] = min(
-                        ent.get("confidence", 0.5) + 0.05, 1.0
-                    )
+            if entity_id not in self._entities:
+                self._entities[entity_id] = {
+                    "id": entity_id,
+                    "type": el.get("type"),
+                    "text": el.get("text"),
+                    "x": el.get("x"),
+                    "y": el.get("y"),
+                    "first_seen": now,
+                    "last_seen": now,
+                    "confidence": 0.5,
+                }
+            else:
+                ent = self._entities[entity_id]
+                ent["last_seen"] = now
+                ent["x"] = el.get("x")
+                ent["y"] = el.get("y")
+                ent["confidence"] = min(
+                    ent.get("confidence", 0.5) + 0.05, 1.0
+                )
 
-            self._prune(now=now)
-            self._record_history()
+        self._prune(now=now)
+        self._record_history()
 
-    # ---- compatibility alias (CRITICAL) ----
+    # ---- compatibility alias ----
     def update(self, perception: Dict[str, Any]) -> None:
-        """
-        Compatibility alias.
-        """
         self.ingest(perception)
 
     # -------------------------------------------------
@@ -124,15 +120,28 @@ class WorldGraph:
         """
         Immutable snapshot for planner / verifier consumption.
         """
+        return copy.deepcopy(
+            {
+                "timestamp": self._last_frame_ts,
+                "focused_app": self._focused_app,
+                "entities": list(self._entities.values()),
+                "entity_count": len(self._entities),
+            }
+        )
+
+    def snapshot_from_perception(
+        self, perception: Optional[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        """
+        Atomic ingest + snapshot.
+
+        Planner calls this using latest perception from ObserverCore.
+        Observer must NOT mutate world graph directly.
+        """
         with self._lock:
-            return copy.deepcopy(
-                {
-                    "timestamp": self._last_frame_ts,
-                    "focused_app": self._focused_app,
-                    "entities": list(self._entities.values()),
-                    "entity_count": len(self._entities),
-                }
-            )
+            if isinstance(perception, dict):
+                self.ingest(perception)
+            return self.snapshot()
 
     # -------------------------------------------------
     # QUERIES (READ-ONLY)
@@ -141,9 +150,7 @@ class WorldGraph:
     def find_by_text(
         self, *, contains: Optional[str] = None, exact: Optional[str] = None
     ) -> List[Dict[str, Any]]:
-        """
-        Semantic lookup, not pixel search.
-        """
+
         if not contains and not exact:
             return []
 
@@ -188,8 +195,7 @@ class WorldGraph:
         """
         Deterministic identity across frames.
 
-        Uses quantized spatial buckets to avoid jitter
-        without introducing collisions.
+        Uses finer quantization to reduce collision risk.
         """
         try:
             x = float(el.get("x", 0.0))
@@ -209,9 +215,6 @@ class WorldGraph:
         return hashlib.sha256(raw.encode()).hexdigest()
 
     def _prune(self, *, now: float) -> None:
-        """
-        Remove stale or excessive entities.
-        """
         stale_ids = [
             eid
             for eid, ent in self._entities.items()
@@ -222,7 +225,6 @@ class WorldGraph:
             del self._entities[eid]
 
         if len(self._entities) > MAX_ENTITIES:
-            # drop lowest confidence first (deterministic)
             sorted_ids = sorted(
                 self._entities.items(),
                 key=lambda kv: kv[1].get("confidence", 0.0),
