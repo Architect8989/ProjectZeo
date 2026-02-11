@@ -35,10 +35,8 @@ def operate_main(
     if not isinstance(execution_plan, ExecutionPlan):
         raise ValueError("execution_plan must be ExecutionPlan")
 
-    # authoritative validation
     execution_plan.validate()
 
-    # ---- early validation for TOOL steps ----
     has_tool_steps = any(
         s.type == StepType.TOOL_INSTALLATION for s in execution_plan.steps
     )
@@ -48,14 +46,13 @@ def operate_main(
         )
 
     os_backend = OperatingSystem()
-
     accessibility_backend = AccessibilityBackend()
+
     if observer is not None:
         accessibility_backend.wire(observer=observer)
 
     journal = ActionJournal()
     input_arbitrator = InputArbitrator()
-
     verifier = StepVerifier()
     recovery = FailureRecoveryManager()
     progress = ProgressTracker(execution_plan)
@@ -110,28 +107,31 @@ def _execute_plan(
     )
 
     for step in execution_plan.steps:
-        # ---- wall-clock guard ----
+
         if time.time() - start_ts > max_wallclock_seconds:
             journal.record(event="execution_timeout")
             raise RuntimeError("Execution wall-clock timeout exceeded")
 
-        # ---- dependency enforcement ----
         for dep in step.dependencies:
             if not progress.is_completed(dep):
                 raise RuntimeError("Dependency not satisfied")
 
-        # ---- authority gate ----
         decision = input_arbitrator.evaluate(
             input_event_ts=time.monotonic(),
             high_risk=(step.type == StepType.TOOL_INSTALLATION),
             soc_confident=True,
         )
 
-        if decision in (AuthorityDecision.YIELD, AuthorityDecision.ABORT):
+        if decision in (
+            AuthorityDecision.YIELD,
+            AuthorityDecision.ABORT,
+            AuthorityDecision.RELEASE,
+        ):
             journal.record(event=f"authority_{decision.name.lower()}")
             raise RuntimeError("Authority aborted execution")
 
         progress.start_step(step.id)
+
         journal.record(
             event="step_start",
             step_id=step.id,
@@ -143,26 +143,30 @@ def _execute_plan(
 
         while True:
             try:
+                input_arbitrator.soc_action_started()
                 os_backend.heartbeat()
 
-                # ---- UI EVIDENCE CAPTURE (REMOVED) ----
-                before_screen = None  # TODO: vision model (future)
+                before_screen = (
+                    observer.snapshot() if observer else None
+                )
 
                 with action_timeout(step.estimated_duration or 30):
-                    _execute_step(
+                    result = _execute_step(
                         step=step,
                         os_backend=os_backend,
                         accessibility_backend=accessibility_backend,
                         installer=installer,
                     )
 
-                # ---- UI EVIDENCE CAPTURE (REMOVED) ----
-                after_screen = None  # TODO: vision model (future)
+                after_screen = (
+                    observer.snapshot() if observer else None
+                )
 
                 verification = verifier.verify_step(
                     step,
                     screenshot=after_screen,
                     previous_screenshot=before_screen,
+                    execution_result=result,
                 )
 
                 if not verification.success:
@@ -206,7 +210,9 @@ def _execute_step(
         cmd = step.action.get("command")
         if not cmd:
             raise ValueError("Missing command")
-        os_backend.exec(cmd, sudo=step.action.get("sudo", False))
+        return os_backend.exec(
+            cmd, sudo=step.action.get("sudo", False)
+        )
 
     elif step.type == StepType.FILE_CREATION:
         path = step.action.get("path")
@@ -214,17 +220,20 @@ def _execute_step(
         if not path:
             raise ValueError("Missing file path")
         os_backend.write_file(path, content)
+        return None
 
     elif step.type == StepType.UI_INTERACTION:
         _execute_ui(step.action, os_backend)
+        return None
 
     elif step.type == StepType.TOOL_INSTALLATION:
         if installer is None:
             raise RuntimeError("Installer unavailable")
         installer.install_tool(step.action)
+        return None
 
     elif step.type in (StepType.VERIFICATION, StepType.DONE):
-        return
+        return None
 
     else:
         raise ValueError(f"Unknown step type: {step.type}")
@@ -268,4 +277,4 @@ def _valid_coord(v: Any) -> bool:
         isinstance(v, (int, float))
         and not math.isnan(v)
         and 0.0 <= v <= 1.0
-       )
+)
