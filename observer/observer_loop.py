@@ -15,7 +15,7 @@ class ObserverLoop:
     ROLE:
     - Continuously pulls perception from VisionRuntime
     - Feeds ObserverCore with perception state only
-    - Optionally ingests perception into WorldGraph
+    - NEVER mutates WorldGraph
     - NEVER plans
     - NEVER acts
     - NEVER changes mode
@@ -33,7 +33,11 @@ class ObserverLoop:
     ):
         self._observer = observer
         self._vision = vision_runtime
+
+        # WorldGraph reference retained for compatibility,
+        # but intentionally NOT used here.
         self._world_graph = world_graph
+
         self._tick_interval = max(0.05, float(tick_interval))
 
         self._thread: Optional[threading.Thread] = None
@@ -88,7 +92,7 @@ class ObserverLoop:
                     isinstance(perception, dict)
                     and perception.get("available") is True
                 ):
-                    # Feed observer availability metadata only
+                    # Feed observer only (no world graph mutation)
                     self._observer.attach_perception_state(
                         {
                             "available": True,
@@ -96,14 +100,6 @@ class ObserverLoop:
                             "perception": perception,
                         }
                     )
-
-                    # Continuous world grounding (if enabled)
-                    if self._world_graph is not None:
-                        try:
-                            self._world_graph.ingest(perception)
-                        except Exception:
-                            traceback.print_exc()
-
                 else:
                     self._observer.attach_perception_state(
                         {
@@ -117,7 +113,7 @@ class ObserverLoop:
                 self._observer.tick()
 
             except ObserverBlindnessError:
-                # Blindness is authoritative inside ObserverCore
+                # Blindness handled internally by ObserverCore
                 pass
 
             except Exception:
