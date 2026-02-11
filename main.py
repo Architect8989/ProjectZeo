@@ -3,7 +3,7 @@ import os
 import signal
 import atexit
 import sys
-from typing import Callable
+from typing import Callable, Optional
 
 from core.mode_controller import ModeController
 from core.intent_listener import IntentListener
@@ -27,7 +27,7 @@ from core.planner.execution_planner import ExecutionPlanner
 
 HEARTBEAT_INTERVAL = 2.0
 TASK_START = None
-MAX_TASK_SECONDS = 90 * 60  # 90 minutes hard cap
+MAX_TASK_SECONDS = 90 * 60
 
 
 # ==================================================
@@ -57,10 +57,7 @@ mode = ModeController()
 # ==================================================
 
 def create_llm_callable() -> Callable[[str], str]:
-    try:
-        from anthropic import Anthropic
-    except ImportError:
-        raise RuntimeError("Anthropic SDK not installed")
+    from anthropic import Anthropic
 
     api_key = os.getenv("ANTHROPIC_API_KEY")
     if not api_key:
@@ -70,7 +67,7 @@ def create_llm_callable() -> Callable[[str], str]:
 
     def llm_call(prompt: str) -> str:
         response = client.messages.create(
-            model="claude-sonnet-4-20250514",
+            model="claude-sonnet-4-5-20250929",
             max_tokens=4096,
             messages=[{"role": "user", "content": prompt}],
         )
@@ -150,11 +147,11 @@ def main():
         AUTH_STATE.force_safe_state()
         mode.force_observer()
 
-    # Start observer subsystem
     vision_runtime.start()
     observer_loop.start()
 
-    intent_listener = IntentListener(mode)
+    # FIXED: correct constructor
+    intent_listener = IntentListener(mode, SNAPSHOT_PROVIDER)
     intent_listener.start()
 
     while True:
@@ -169,10 +166,11 @@ def main():
 
                 TASK_START = time.time()
 
-                # Snapshot captured while still logically in OBSERVER boundary
-                snapshot_id = SNAPSHOT_PROVIDER.take_snapshot()
+                # FIXED: consume snapshot taken in OBSERVER mode
+                snapshot_id: Optional[str] = mode.consume_snapshot()
+                if not snapshot_id:
+                    raise RuntimeError("Missing snapshot at execution boundary")
 
-                # Transition to planning
                 mode.begin_planning()
 
                 intent = mode.get_intent()
@@ -220,6 +218,9 @@ def main():
                     )
 
                 finally:
+                    # FIXED: explicit restoration phase
+                    mode.begin_restoration()
+
                     try:
                         RESTORE_PROVIDER.restore_snapshot(snapshot_id)
                     except Exception as e:
@@ -234,7 +235,7 @@ def main():
                         dirty=False,
                     )
 
-                    mode.force_observer()
+                    mode.complete_execution()
                     TASK_START = None
 
             # Hard time bound
