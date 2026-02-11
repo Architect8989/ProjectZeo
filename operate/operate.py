@@ -14,6 +14,7 @@ from audit.journal import ActionJournal
 
 from core.schemas.execution_plan import ExecutionPlan, ExecutionStep, StepType
 from core.verification.step_verifier import StepVerifier
+from core.verification.plan_verifier import PlanVerifier
 from core.execution.progress_tracker import ProgressTracker
 from core.execution.failure_recovery import FailureRecoveryManager
 from core.tools.autonomous_installer import AutonomousInstaller
@@ -36,6 +37,7 @@ def operate_main(
         raise ValueError("execution_plan must be ExecutionPlan")
 
     execution_plan.validate()
+    PlanVerifier().verify(execution_plan)
 
     has_tool_steps = any(
         s.type == StepType.TOOL_INSTALLATION for s in execution_plan.steps
@@ -46,10 +48,13 @@ def operate_main(
         )
 
     os_backend = OperatingSystem()
-    accessibility_backend = AccessibilityBackend()
 
-    if observer is not None:
-        accessibility_backend.wire(observer=observer)
+    try:
+        accessibility_backend = AccessibilityBackend()
+        if observer is not None:
+            accessibility_backend.wire(observer=observer)
+    except Exception:
+        accessibility_backend = None
 
     journal = ActionJournal()
     input_arbitrator = InputArbitrator()
@@ -91,7 +96,7 @@ def _execute_plan(
     execution_plan: ExecutionPlan,
     observer,
     os_backend: OperatingSystem,
-    accessibility_backend: AccessibilityBackend,
+    accessibility_backend: Optional[AccessibilityBackend],
     journal: ActionJournal,
     input_arbitrator: InputArbitrator,
     verifier: StepVerifier,
@@ -119,7 +124,6 @@ def _execute_plan(
             if not progress.is_completed(dep):
                 raise RuntimeError("Dependency not satisfied")
 
-        # ---- authority pre-check ----
         decision = input_arbitrator.evaluate(
             input_event_ts=time.monotonic(),
             high_risk=(step.type == StepType.TOOL_INSTALLATION),
@@ -137,7 +141,7 @@ def _execute_plan(
         if decision == AuthorityDecision.YIELD:
             journal.record({"event": "authority_yield"})
             time.sleep(0.5)
-            continue  # retry same step
+            continue
 
         progress.start_step(step.id)
 
@@ -192,7 +196,10 @@ def _execute_plan(
                     raise RuntimeError(verification.reason)
 
                 progress.complete_step(step.id)
-                journal.record({"event": "step_complete", "step_id": step.id})
+                journal.record({
+                    "event": "step_complete",
+                    "step_id": step.id,
+                })
                 break
 
             except ActionTimeout as e:
@@ -209,11 +216,18 @@ def _execute_plan(
 
             if action.action == "alternative":
                 progress.fail_step(step.id, action.reason or "alternative_failed")
-                journal.record({"event": "step_failed", "step_id": step.id})
+                journal.record({
+                    "event": "step_failed",
+                    "step_id": step.id,
+                    "reason": "alternative_not_implemented",
+                })
                 raise RuntimeError("Execution aborted (alternative not implemented)")
 
             progress.fail_step(step.id, action.reason or "fatal")
-            journal.record({"event": "step_failed", "step_id": step.id})
+            journal.record({
+                "event": "step_failed",
+                "step_id": step.id,
+            })
             raise RuntimeError("Execution aborted")
 
     journal.record({"event": "execution_complete"})
@@ -227,7 +241,7 @@ def _execute_step(
     *,
     step: ExecutionStep,
     os_backend: OperatingSystem,
-    accessibility_backend: AccessibilityBackend,
+    accessibility_backend: Optional[AccessibilityBackend],
     installer: Optional[AutonomousInstaller],
 ):
     if step.type == StepType.COMMAND_EXECUTION:
@@ -291,7 +305,7 @@ def _execute_ui(ui: Dict[str, Any], os_backend: OperatingSystem):
 
 
 # ==================================================
-# SCREEN EXTRACTION FIX
+# SCREEN EXTRACTION
 # ==================================================
 
 def _extract_screen(observer):
@@ -325,4 +339,4 @@ def _valid_coord(v: Any) -> bool:
         isinstance(v, (int, float))
         and not math.isnan(v)
         and 0.0 <= v <= 1.0
-       )
+)
