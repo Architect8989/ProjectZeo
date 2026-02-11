@@ -64,19 +64,22 @@ def operate_main(
             os_backend=os_backend,
         )
 
-    _execute_plan(
-        execution_plan=execution_plan,
-        observer=observer,
-        os_backend=os_backend,
-        accessibility_backend=accessibility_backend,
-        journal=journal,
-        input_arbitrator=input_arbitrator,
-        verifier=verifier,
-        recovery=recovery,
-        progress=progress,
-        installer=installer,
-        max_wallclock_seconds=max_wallclock_seconds,
-    )
+    try:
+        _execute_plan(
+            execution_plan=execution_plan,
+            observer=observer,
+            os_backend=os_backend,
+            accessibility_backend=accessibility_backend,
+            journal=journal,
+            input_arbitrator=input_arbitrator,
+            verifier=verifier,
+            recovery=recovery,
+            progress=progress,
+            installer=installer,
+            max_wallclock_seconds=max_wallclock_seconds,
+        )
+    finally:
+        input_arbitrator.shutdown()
 
 
 # ==================================================
@@ -116,19 +119,25 @@ def _execute_plan(
             if not progress.is_completed(dep):
                 raise RuntimeError("Dependency not satisfied")
 
+        # ---- authority pre-check ----
         decision = input_arbitrator.evaluate(
             input_event_ts=time.monotonic(),
             high_risk=(step.type == StepType.TOOL_INSTALLATION),
             soc_confident=True,
         )
 
-        if decision in (
-            AuthorityDecision.YIELD,
-            AuthorityDecision.ABORT,
-            AuthorityDecision.RELEASE,
-        ):
-            journal.record(event=f"authority_{decision.name.lower()}")
+        if decision == AuthorityDecision.RELEASE:
+            journal.record(event="authority_release")
+            raise RuntimeError("Authority released control")
+
+        if decision == AuthorityDecision.ABORT:
+            journal.record(event="authority_abort")
             raise RuntimeError("Authority aborted execution")
+
+        if decision == AuthorityDecision.YIELD:
+            journal.record(event="authority_yield")
+            time.sleep(0.5)
+            continue
 
         progress.start_step(step.id)
 
@@ -143,12 +152,31 @@ def _execute_plan(
 
         while True:
             try:
+                # ---- authority re-check inside retry loop ----
+                decision = input_arbitrator.evaluate(
+                    input_event_ts=time.monotonic(),
+                    high_risk=(step.type == StepType.TOOL_INSTALLATION),
+                    soc_confident=True,
+                )
+
+                if decision == AuthorityDecision.RELEASE:
+                    journal.record(event="authority_release")
+                    raise RuntimeError("Authority released control")
+
+                if decision == AuthorityDecision.ABORT:
+                    journal.record(event="authority_abort")
+                    raise RuntimeError("Authority aborted execution")
+
                 input_arbitrator.soc_action_started()
                 os_backend.heartbeat()
 
-                before_screen = (
-                    observer.snapshot() if observer else None
-                )
+                before_screen = None
+                if observer:
+                    snap = observer.snapshot()
+                    before_screen = {
+                        "available": bool(snap),
+                        "text": str(snap),
+                    }
 
                 with action_timeout(step.estimated_duration or 30):
                     result = _execute_step(
@@ -158,15 +186,19 @@ def _execute_plan(
                         installer=installer,
                     )
 
-                after_screen = (
-                    observer.snapshot() if observer else None
-                )
+                after_screen = None
+                if observer:
+                    snap = observer.snapshot()
+                    after_screen = {
+                        "available": bool(snap),
+                        "text": str(snap),
+                    }
 
                 verification = verifier.verify_step(
                     step,
+                    execution_result=result,
                     screenshot=after_screen,
                     previous_screenshot=before_screen,
-                    execution_result=result,
                 )
 
                 if not verification.success:
@@ -277,4 +309,4 @@ def _valid_coord(v: Any) -> bool:
         isinstance(v, (int, float))
         and not math.isnan(v)
         and 0.0 <= v <= 1.0
-)
+   )
