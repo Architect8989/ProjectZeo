@@ -5,6 +5,7 @@ from typing import Optional, Dict, Any
 
 from observer.observer_core import ObserverCore, ObserverBlindnessError
 from core.vision.vision_runtime import VisionRuntime
+from core.vision.world_graph import WorldGraph
 
 
 class ObserverLoop:
@@ -14,7 +15,7 @@ class ObserverLoop:
     ROLE:
     - Continuously pulls perception from VisionRuntime
     - Feeds ObserverCore with perception state only
-    - NEVER mutates world state
+    - Optionally ingests perception into WorldGraph
     - NEVER plans
     - NEVER acts
     - NEVER changes mode
@@ -27,10 +28,12 @@ class ObserverLoop:
         *,
         observer: ObserverCore,
         vision_runtime: VisionRuntime,
+        world_graph: Optional[WorldGraph] = None,
         tick_interval: float = DEFAULT_TICK_INTERVAL,
     ):
         self._observer = observer
         self._vision = vision_runtime
+        self._world_graph = world_graph
         self._tick_interval = max(0.05, float(tick_interval))
 
         self._thread: Optional[threading.Thread] = None
@@ -85,7 +88,7 @@ class ObserverLoop:
                     isinstance(perception, dict)
                     and perception.get("available") is True
                 ):
-                    # Observer receives RAW perception only.
+                    # Feed observer availability metadata only
                     self._observer.attach_perception_state(
                         {
                             "available": True,
@@ -93,6 +96,14 @@ class ObserverLoop:
                             "perception": perception,
                         }
                     )
+
+                    # Continuous world grounding (if enabled)
+                    if self._world_graph is not None:
+                        try:
+                            self._world_graph.ingest(perception)
+                        except Exception:
+                            traceback.print_exc()
+
                 else:
                     self._observer.attach_perception_state(
                         {
@@ -106,12 +117,11 @@ class ObserverLoop:
                 self._observer.tick()
 
             except ObserverBlindnessError:
-                # Blindness is authoritative inside ObserverCore.
+                # Blindness is authoritative inside ObserverCore
                 pass
 
             except Exception:
                 traceback.print_exc()
-
                 try:
                     self._observer.attach_perception_state(
                         {
