@@ -1,7 +1,7 @@
 import threading
 import time
 import traceback
-from typing import Optional
+from typing import Optional, Dict, Any
 
 from observer.observer_core import ObserverCore, ObserverBlindnessError
 from core.vision.vision_runtime import VisionRuntime
@@ -63,7 +63,6 @@ class ObserverLoop:
                 return
 
             self._stop_event.set()
-
             thread = self._thread
             self._thread = None
             self._running = False
@@ -80,25 +79,34 @@ class ObserverLoop:
             start_ts = time.monotonic()
 
             try:
-                perception = self._vision.get_latest()
+                perception: Optional[Dict[str, Any]] = self._vision.get_latest()
 
-                if isinstance(perception, dict) and perception.get("available"):
+                if (
+                    isinstance(perception, dict)
+                    and perception.get("available") is True
+                ):
+                    # Observer receives RAW perception only.
                     self._observer.attach_perception_state(
                         {
                             "available": True,
                             "frame_ts": perception.get("frame_ts"),
+                            "perception": perception,
                         }
                     )
                 else:
                     self._observer.attach_perception_state(
-                        {"available": False, "frame_ts": None}
+                        {
+                            "available": False,
+                            "frame_ts": None,
+                            "perception": None,
+                        }
                     )
 
+                # Authoritative tick
                 self._observer.tick()
 
             except ObserverBlindnessError:
-                # Blindness is authoritative state in ObserverCore.
-                # Loop continues; blindness state is handled upstream.
+                # Blindness is authoritative inside ObserverCore.
                 pass
 
             except Exception:
@@ -106,7 +114,11 @@ class ObserverLoop:
 
                 try:
                     self._observer.attach_perception_state(
-                        {"available": False, "frame_ts": None}
+                        {
+                            "available": False,
+                            "frame_ts": None,
+                            "perception": None,
+                        }
                     )
                 except Exception:
                     pass
