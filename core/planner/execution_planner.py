@@ -22,6 +22,7 @@ class ExecutionPlanner:
     - Planner is the ONLY place intelligence exists
     - LLM output must be structured and validated
     - No side effects, no execution, no guessing
+    - Planner operates on FROZEN snapshot only
     """
 
     LLM_TIMEOUT_SECONDS = 30.0
@@ -41,7 +42,19 @@ class ExecutionPlanner:
         self._llm_call = llm_call
         self._environment = environment_fingerprint or {}
         self._observer = observer
-        self._world_graph = world_graph
+
+        # --------------------------------------------------
+        # SNAPSHOT ISOLATION (CRITICAL FIX)
+        # --------------------------------------------------
+        self._world_snapshot: Optional[Dict[str, Any]] = None
+
+        if world_graph is not None:
+            try:
+                snap = world_graph.snapshot()
+                # Defensive copy to ensure immutability
+                self._world_snapshot = json.loads(json.dumps(snap))
+            except Exception:
+                self._world_snapshot = None
 
     # ==================================================
     # PUBLIC API
@@ -143,22 +156,21 @@ class ExecutionPlanner:
 
     def _read_screen_context(self) -> str:
         """
-        Read-only grounding context.
-
-        Uses world graph snapshot if available.
+        Read-only grounding context from FROZEN snapshot.
         Advisory only — never authoritative.
         """
-        if not self._world_graph:
-            return ""
-
-        try:
-            snapshot = self._world_graph.snapshot()
-        except Exception:
+        if not self._world_snapshot:
             return ""
 
         text_chunks: List[str] = []
 
-        for ent in snapshot.get("entities", []):
+        entities = self._world_snapshot.get("entities", [])
+        if not isinstance(entities, list):
+            return ""
+
+        for ent in entities:
+            if not isinstance(ent, dict):
+                continue
             label = ent.get("text")
             etype = ent.get("type")
             if isinstance(label, str) and label.strip():
@@ -175,12 +187,12 @@ class ExecutionPlanner:
         screen_context = self._read_screen_context()
 
         prompt = f"""
-You are the planning brain of a self-operating computer.
+You are the planning brain of a deterministic execution kernel.
 
 Environment fingerprint:
 {json.dumps(self._environment, indent=2)}
 
-Current screen state (may be empty):
+Frozen screen snapshot (advisory only):
 {screen_context}
 
 Task:
@@ -207,7 +219,6 @@ Rules:
 - Be conservative and explicit
 """
 
-        # ---- HARD TIMEOUT ENFORCEMENT ----
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
             future = executor.submit(self._llm_call, prompt)
             try:
