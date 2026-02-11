@@ -57,7 +57,7 @@ class RestoreProvider:
                 return
 
             # -------------------------------------------------
-            # HARD SAFETY: Stop automation deterministically
+            # HARD SAFETY: deterministic shutdown
             # -------------------------------------------------
             try:
                 self._os.stop_automated_input()
@@ -77,7 +77,7 @@ class RestoreProvider:
             # MODE RESET (authoritative)
             # -------------------------------------------------
             try:
-                if self._mode.mode != SystemMode.OBSERVER:
+                if self._mode.mode is not SystemMode.OBSERVER:
                     self._mode.force_observer()
             except Exception as e:
                 raise RestorationError(
@@ -102,7 +102,8 @@ class RestoreProvider:
         self,
         snapshot: RestorationSnapshot,
     ) -> None:
-        # Cursor restore
+
+        # ---- Cursor ----
         try:
             self._os.set_cursor_position(
                 {"x": snapshot.cursor.x, "y": snapshot.cursor.y}
@@ -112,7 +113,7 @@ class RestoreProvider:
                 f"Cursor restore failed: {e}"
             ) from e
 
-        # Focus window restore (schema aligned with OS backend)
+        # ---- Focus Window ----
         try:
             self._os.focus_window(
                 {"title": snapshot.focus.window_id}
@@ -127,10 +128,11 @@ class RestoreProvider:
     # =========================================================
 
     def _verify(self, snapshot: RestorationSnapshot) -> None:
-        # Allow OS to settle
+
+        # allow OS settle
         time.sleep(0.05)
 
-        if self._mode.mode != SystemMode.OBSERVER:
+        if self._mode.mode is not SystemMode.OBSERVER:
             raise RestorationError(
                 f"Post-restore mode invalid: {self._mode.mode}"
             )
@@ -143,26 +145,35 @@ class RestoreProvider:
                 f"Verification read failed: {e}"
             ) from e
 
-        # Cursor validation
-        if not isinstance(cursor, dict):
+        # ---- Cursor validation ----
+        if (
+            not isinstance(cursor, dict)
+            or "x" not in cursor
+            or "y" not in cursor
+        ):
             raise RestorationError("Cursor read invalid")
 
+        try:
+            current_x = int(cursor["x"])
+            current_y = int(cursor["y"])
+        except Exception:
+            raise RestorationError("Cursor coordinates invalid")
+
         if (
-            abs(cursor.get("x", 0) - snapshot.cursor.x)
+            abs(current_x - snapshot.cursor.x)
             > self.CURSOR_TOLERANCE_PX
-            or abs(cursor.get("y", 0) - snapshot.cursor.y)
+            or abs(current_y - snapshot.cursor.y)
             > self.CURSOR_TOLERANCE_PX
         ):
             raise RestorationError(
                 "Cursor position mismatch after restore"
             )
 
-        # Focus validation
+        # ---- Focus validation ----
         if (
             not isinstance(current_window, dict)
-            or current_window.get("title")
-            != snapshot.focus.window_id
+            or current_window.get("title") != snapshot.focus.window_id
         ):
             raise RestorationError(
                 "Focused window mismatch after restore"
-                )
+    )
