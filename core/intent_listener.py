@@ -64,7 +64,7 @@ class IntentListener:
                     time.sleep(self.POLL_INTERVAL)
                     continue
 
-                # ---- SNAPSHOT FIRST (ARCHITECTURE GUARANTEE) ----
+                # ---- SNAPSHOT FIRST (HARD GUARANTEE) ----
                 try:
                     snapshot_id = self.snapshot_provider.take_snapshot()
                 except Exception as e:
@@ -72,11 +72,27 @@ class IntentListener:
                     time.sleep(self.POLL_INTERVAL)
                     continue
 
-                # Store snapshot boundary for main loop consumption
-                setattr(self.mode, "_snapshot_id", snapshot_id)
+                if not snapshot_id:
+                    print("[INTENT] Snapshot returned invalid ID, rejecting")
+                    time.sleep(self.POLL_INTERVAL)
+                    continue
+
+                # ---- AUTHORITATIVE SNAPSHOT ATTACH ----
+                try:
+                    self.mode.attach_snapshot(snapshot_id)
+                except Exception as e:
+                    print(f"[INTENT] Snapshot attach failed: {e}")
+                    time.sleep(self.POLL_INTERVAL)
+                    continue
 
                 # ---- THEN ARM ----
-                self.mode.arm(intent=intent)
+                try:
+                    self.mode.arm(intent=intent)
+                except Exception as e:
+                    print(f"[INTENT] Arm rejected: {e}")
+                    time.sleep(self.POLL_INTERVAL)
+                    continue
+
                 print(f"[INTENT] Armed: {intent}")
 
             except Exception as e:
@@ -91,12 +107,15 @@ class IntentListener:
 
         # ---- interactive stdin ----
         if sys.stdin and sys.stdin.isatty():
-            ready, _, _ = select.select(
-                [sys.stdin],
-                [],
-                [],
-                0.0,
-            )
+            try:
+                ready, _, _ = select.select(
+                    [sys.stdin],
+                    [],
+                    [],
+                    0.0,
+                )
+            except Exception:
+                ready = []
 
             if ready:
                 line = sys.stdin.readline()
