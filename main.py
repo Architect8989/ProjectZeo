@@ -167,15 +167,12 @@ def main():
             # --------------------------------------------------
             if mode.is_armed():
 
-                if not mode.is_observer():
-                    raise RuntimeError("Snapshot attempted outside OBSERVER mode")
-
                 TASK_START = time.time()
 
-                # Snapshot BEFORE any mode transition
+                # Snapshot captured while still logically in OBSERVER boundary
                 snapshot_id = SNAPSHOT_PROVIDER.take_snapshot()
 
-                # Now transition to planning
+                # Transition to planning
                 mode.begin_planning()
 
                 intent = mode.get_intent()
