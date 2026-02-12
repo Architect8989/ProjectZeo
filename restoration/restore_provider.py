@@ -28,7 +28,6 @@ class RestoreProvider:
     def __init__(self, *, os_backend, mode_controller: ModeController):
         self._os = os_backend
         self._mode = mode_controller
-
         self._completed_snapshot_id: Optional[str] = None
         self._lock = threading.Lock()
 
@@ -56,9 +55,7 @@ class RestoreProvider:
             if self._completed_snapshot_id == snapshot_id:
                 return
 
-            # -------------------------------------------------
-            # HARD SAFETY: deterministic shutdown
-            # -------------------------------------------------
+            # HARD SAFETY: terminate automation
             try:
                 self._os.stop_automated_input()
                 self._os.force_release_all(reason="restoration")
@@ -68,14 +65,10 @@ class RestoreProvider:
                     f"Automation shutdown failed: {e}"
                 ) from e
 
-            # -------------------------------------------------
-            # CORE STATE RESTORE
-            # -------------------------------------------------
+            # Restore core state
             self._restore_core_state(snapshot)
 
-            # -------------------------------------------------
-            # MODE RESET (authoritative)
-            # -------------------------------------------------
+            # Authoritative mode reset
             try:
                 if self._mode.mode is not SystemMode.OBSERVER:
                     self._mode.force_observer()
@@ -84,14 +77,10 @@ class RestoreProvider:
                     f"Mode reset failed: {e}"
                 ) from e
 
-            # -------------------------------------------------
-            # VERIFY RESTORATION
-            # -------------------------------------------------
+            # Verify restoration
             self._verify(snapshot)
 
-            # -------------------------------------------------
-            # COMMIT (idempotency seal)
-            # -------------------------------------------------
+            # Seal idempotency
             self._completed_snapshot_id = snapshot_id
 
     # =========================================================
@@ -103,7 +92,6 @@ class RestoreProvider:
         snapshot: RestorationSnapshot,
     ) -> None:
 
-        # ---- Cursor ----
         try:
             self._os.set_cursor_position(
                 {"x": snapshot.cursor.x, "y": snapshot.cursor.y}
@@ -113,7 +101,6 @@ class RestoreProvider:
                 f"Cursor restore failed: {e}"
             ) from e
 
-        # ---- Focus Window ----
         try:
             self._os.focus_window(
                 {"title": snapshot.focus.window_id}
@@ -129,7 +116,6 @@ class RestoreProvider:
 
     def _verify(self, snapshot: RestorationSnapshot) -> None:
 
-        # allow OS settle
         time.sleep(0.05)
 
         if self._mode.mode is not SystemMode.OBSERVER:
@@ -145,7 +131,7 @@ class RestoreProvider:
                 f"Verification read failed: {e}"
             ) from e
 
-        # ---- Cursor validation ----
+        # Cursor validation
         if (
             not isinstance(cursor, dict)
             or "x" not in cursor
@@ -169,11 +155,11 @@ class RestoreProvider:
                 "Cursor position mismatch after restore"
             )
 
-        # ---- Focus validation ----
+        # Focus validation
         if (
             not isinstance(current_window, dict)
             or current_window.get("title") != snapshot.focus.window_id
         ):
             raise RestorationError(
                 "Focused window mismatch after restore"
-            )
+                )
