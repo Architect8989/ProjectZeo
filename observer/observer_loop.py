@@ -14,8 +14,8 @@ class ObserverLoop:
 
     ROLE:
     - Continuously pulls perception from VisionRuntime
-    - Feeds ObserverCore with perception state only
-    - NEVER mutates WorldGraph
+    - Feeds ObserverCore with perception state
+    - Updates WorldGraph incrementally (non-authoritative, non-blocking)
     - NEVER plans
     - NEVER acts
     - NEVER changes mode
@@ -33,10 +33,7 @@ class ObserverLoop:
     ):
         self._observer = observer
         self._vision = vision_runtime
-
-        # WorldGraph reference retained for compatibility,
-        # but intentionally NOT used here.
-        self._world_graph = world_graph
+        self._world_graph = world_graph  # Now actively used
 
         self._tick_interval = max(0.05, float(tick_interval))
 
@@ -92,7 +89,7 @@ class ObserverLoop:
                     isinstance(perception, dict)
                     and perception.get("available") is True
                 ):
-                    # Feed observer only (no world graph mutation)
+                    # Feed observer
                     self._observer.attach_perception_state(
                         {
                             "available": True,
@@ -100,6 +97,14 @@ class ObserverLoop:
                             "perception": perception,
                         }
                     )
+
+                    # Continuous world graph ingestion (non-blocking)
+                    if self._world_graph is not None:
+                        try:
+                            self._world_graph.ingest(perception)
+                        except Exception:
+                            # World graph failure must NEVER break observer loop
+                            pass
                 else:
                     self._observer.attach_perception_state(
                         {
