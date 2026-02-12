@@ -25,9 +25,14 @@ class ObserverUnavailableError(ModeTransitionError):
     pass
 
 
+class PlanningTimeoutError(ModeTransitionError):
+    pass
+
+
 class ModeController:
 
     MAX_TRANSITION_HISTORY = 2000
+    MAX_PLANNING_SECONDS = 60.0  # HARD FAIL-CLOSED LIMIT
 
     def __init__(self):
         self._lock = threading.RLock()
@@ -35,6 +40,8 @@ class ModeController:
         self._mode: SystemMode = SystemMode.OBSERVER
         self._mode_entered_at: float = time.time()
         self._last_transition_reason: Optional[str] = None
+
+        self._planning_started_at: Optional[float] = None
 
         self._snapshot_id: Optional[str] = None
         self._snapshot_consumed: bool = False
@@ -194,6 +201,7 @@ class ModeController:
                 raise VisionUnavailableError("vision unavailable")
 
             self._intent_frozen = True
+            self._planning_started_at = time.time()
 
             self._commit_transition(
                 SystemMode.PLANNING,
@@ -225,7 +233,19 @@ class ModeController:
                 raise ModeTransitionError(
                     "Cannot complete planning without plan"
                 )
+
+            if self._planning_started_at is None:
+                raise PlanningTimeoutError("Planning start timestamp missing")
+
+            elapsed = time.time() - self._planning_started_at
+            if elapsed > self.MAX_PLANNING_SECONDS:
+                self.force_observer()
+                raise PlanningTimeoutError(
+                    f"Planning exceeded {self.MAX_PLANNING_SECONDS}s"
+                )
+
             self._planning_completed = True
+            self._planning_started_at = None
 
     def execute(self) -> None:
         with self._lock:
@@ -296,6 +316,7 @@ class ModeController:
         with self._lock:
             self._reset_internal_state()
             self._failure_reason = None
+            self._planning_started_at = None
 
             self._commit_transition(
                 SystemMode.OBSERVER,
@@ -312,6 +333,7 @@ class ModeController:
         self._input_locked = False
         self._snapshot_id = None
         self._snapshot_consumed = False
+        self._planning_started_at = None
 
     # ==================================================
     # SINGLE COMMIT POINT
