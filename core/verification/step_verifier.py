@@ -2,7 +2,7 @@ import os
 import shutil
 import subprocess
 from dataclasses import dataclass
-from typing import Optional, Any, Dict, Tuple, List
+from typing import Optional, Any, Dict, Tuple
 
 from core.schemas.execution_plan import ExecutionStep, StepType
 
@@ -39,7 +39,7 @@ class StepVerifier:
         *,
         screenshot: Optional[Dict[str, Any]] = None,
         previous_screenshot: Optional[Dict[str, Any]] = None,
-        world_graph=None,  # accepted but intentionally unused (deterministic layer)
+        world_graph=None,  # accepted but unused
     ) -> VerificationResult:
 
         if not isinstance(step, ExecutionStep):
@@ -56,15 +56,15 @@ class StepVerifier:
                 ok, reason, details = self._verify_command(
                     step, execution_result
                 )
-                return VerificationResult(ok, reason if not ok else None, details)
+                return VerificationResult(ok, None if ok else reason, details)
 
             if step.type == StepType.FILE_CREATION:
                 ok, reason, details = self._verify_file(step)
-                return VerificationResult(ok, reason if not ok else None, details)
+                return VerificationResult(ok, None if ok else reason, details)
 
             if step.type == StepType.TOOL_INSTALLATION:
                 ok, reason, details = self._verify_tool(step)
-                return VerificationResult(ok, reason if not ok else None, details)
+                return VerificationResult(ok, None if ok else reason, details)
 
             if step.type == StepType.UI_INTERACTION:
                 ok, reason, details = self._verify_ui_change(
@@ -72,7 +72,7 @@ class StepVerifier:
                     screenshot=screenshot,
                     previous_screenshot=previous_screenshot,
                 )
-                return VerificationResult(ok, reason if not ok else None, details)
+                return VerificationResult(ok, None if ok else reason, details)
 
         except Exception as e:
             return VerificationResult(
@@ -117,13 +117,16 @@ class StepVerifier:
             if not isinstance(expected_output, list):
                 return False, "output_contains must be list", {}
 
-            combined = (result.stdout or "") + (result.stderr or "")
+            stdout = getattr(result, "stdout", "") or ""
+            stderr = getattr(result, "stderr", "") or ""
+            combined = stdout + stderr
+
             for token in expected_output:
                 if token not in combined:
                     return (
                         False,
                         f"expected output token missing: {token}",
-                        {"stdout": result.stdout, "stderr": result.stderr},
+                        {"stdout": stdout, "stderr": stderr},
                     )
 
         return True, "", {"returncode": result.returncode}
@@ -199,11 +202,13 @@ class StepVerifier:
         min_version = verification.get("min_version")
 
         if version_cmd:
+            if not isinstance(version_cmd, (list, tuple)):
+                return False, "version_command must be list/tuple", {}
+
             try:
                 out = subprocess.check_output(
                     version_cmd,
                     stderr=subprocess.STDOUT,
-                    shell=isinstance(version_cmd, str),
                     timeout=5,
                 ).decode(errors="ignore")
             except Exception as e:
@@ -230,18 +235,21 @@ class StepVerifier:
         previous_screenshot: Optional[Dict[str, Any]] = None,
     ) -> Tuple[bool, str, Dict[str, Any]]:
 
-        if not isinstance(screenshot, dict) or not screenshot.get("available"):
+        if not isinstance(screenshot, dict):
+            return False, "invalid screenshot structure", {}
+
+        if not screenshot.get("available"):
             return False, "no screenshot evidence available", {}
 
         verification = step.verification or {}
         expected_text = verification.get("screen_contains")
 
-        # --- Explicit text match path ---
+        # --- Explicit match path ---
         if expected_text:
             if not isinstance(expected_text, list):
                 return False, "screen_contains must be list", {}
 
-            screen_text = screenshot.get("text") or ""
+            screen_text = screenshot.get("text")
             if not isinstance(screen_text, str):
                 return False, "screenshot text unavailable", {}
 
@@ -255,17 +263,17 @@ class StepVerifier:
 
             return True, "", {"matched_tokens": expected_text}
 
-        # --- Fallback: hash change ---
+        # --- Deterministic fallback: strict hash comparison ---
         if (
             isinstance(previous_screenshot, dict)
-            and previous_screenshot.get("hash")
-            and screenshot.get("hash")
+            and isinstance(previous_screenshot.get("hash"), str)
+            and isinstance(screenshot.get("hash"), str)
         ):
-            if previous_screenshot.get("hash") != screenshot.get("hash"):
+            if previous_screenshot["hash"] != screenshot["hash"]:
                 return True, "", {"screen_changed": True}
 
         return (
             False,
             "ui verification requires screen_contains or detectable change",
             {},
-    )
+        )
