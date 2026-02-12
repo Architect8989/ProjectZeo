@@ -32,6 +32,7 @@ def operate_main(
     world_graph=None,
     max_wallclock_seconds: int = 90 * 60,
 ):
+
     if not isinstance(execution_plan, ExecutionPlan):
         raise ValueError("execution_plan must be ExecutionPlan")
 
@@ -98,6 +99,7 @@ def _execute_plan(
     installer: Optional[AutonomousInstaller],
     max_wallclock_seconds: int,
 ):
+
     start_ts = time.time()
     progress.start_execution()
 
@@ -142,15 +144,13 @@ def _execute_plan(
                 input_arbitrator.soc_action_started()
                 os_backend.heartbeat()
 
-                # Correct world graph unwrapping
+                # === FIXED WORLD GRAPH UPDATE (PRE-STEP) ===
                 if observer and world_graph:
                     try:
                         snap = observer.snapshot()
-                        wrapper = snap.get("perception")
-                        if isinstance(wrapper, dict):
-                            raw = wrapper.get("perception")
-                            if isinstance(raw, dict) and raw.get("available"):
-                                world_graph.update(raw)
+                        perception = snap.get("perception")
+                        if isinstance(perception, dict) and perception.get("available"):
+                            world_graph.update(perception)
                     except Exception:
                         pass
 
@@ -164,14 +164,13 @@ def _execute_plan(
                         installer=installer,
                     )
 
+                # === FIXED WORLD GRAPH UPDATE (POST-STEP) ===
                 if observer and world_graph:
                     try:
                         snap = observer.snapshot()
-                        wrapper = snap.get("perception")
-                        if isinstance(wrapper, dict):
-                            raw = wrapper.get("perception")
-                            if isinstance(raw, dict) and raw.get("available"):
-                                world_graph.update(raw)
+                        perception = snap.get("perception")
+                        if isinstance(perception, dict) and perception.get("available"):
+                            world_graph.update(perception)
                     except Exception:
                         pass
 
@@ -210,11 +209,13 @@ def _execute_plan(
                 continue
 
             progress.fail_step(step.id, action.reason or "fatal")
+
             journal.record({
                 "event": "step_failed",
                 "step_id": step.id,
                 "reason": action.reason,
             })
+
             raise RuntimeError("Execution aborted")
 
     journal.record({"event": "execution_complete"})
@@ -234,10 +235,7 @@ def _execute_step(
 
     action = step.action or {}
 
-    if step.type == StepType.DONE:
-        return None
-
-    if step.type == StepType.VERIFICATION:
+    if step.type in (StepType.DONE, StepType.VERIFICATION):
         return None
 
     if step.type == StepType.COMMAND_EXECUTION:
@@ -288,11 +286,9 @@ def _extract_screen(observer) -> Dict[str, Any]:
 
     try:
         snap = observer.snapshot()
-        wrapper = snap.get("perception")
-        if isinstance(wrapper, dict):
-            raw = wrapper.get("perception")
-            if isinstance(raw, dict):
-                return raw
+        perception = snap.get("perception")
+        if isinstance(perception, dict):
+            return perception
     except Exception:
         pass
 
