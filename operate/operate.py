@@ -109,6 +109,8 @@ def _execute_plan(
         "total_steps": len(execution_plan.steps),
     })
 
+    previous_snapshot = None
+
     for step in execution_plan.steps:
 
         if time.time() - start_ts > max_wallclock_seconds:
@@ -118,6 +120,35 @@ def _execute_plan(
         for dep in step.dependencies:
             if not progress.is_completed(dep):
                 raise RuntimeError("Dependency not satisfied")
+
+        # ---- Pre-step perception sync ----
+        if observer and world_graph:
+            try:
+                snap = observer.snapshot()
+                perception = snap.get("perception")
+                if isinstance(perception, dict) and perception.get("available"):
+                    world_graph.update(perception)
+            except Exception:
+                pass
+
+        # ---- Delta-based divergence detection ----
+        if world_graph:
+            current_snapshot = world_graph.snapshot()
+
+            if previous_snapshot is not None:
+                try:
+                    delta = world_graph.compute_delta(previous_snapshot)
+                    if delta.get("focus_changed"):
+                        journal.record({
+                            "event": "focus_changed",
+                            "step_id": step.id,
+                            "prev_focus": delta.get("prev_focus"),
+                            "curr_focus": delta.get("curr_focus"),
+                        })
+                except Exception:
+                    pass
+
+            previous_snapshot = current_snapshot
 
         decision = input_arbitrator.evaluate(
             input_event_ts=time.monotonic(),
@@ -144,16 +175,6 @@ def _execute_plan(
                 input_arbitrator.soc_action_started()
                 os_backend.heartbeat()
 
-                # === FIXED WORLD GRAPH UPDATE (PRE-STEP) ===
-                if observer and world_graph:
-                    try:
-                        snap = observer.snapshot()
-                        perception = snap.get("perception")
-                        if isinstance(perception, dict) and perception.get("available"):
-                            world_graph.update(perception)
-                    except Exception:
-                        pass
-
                 before_screen = _extract_screen(observer)
 
                 with action_timeout(step.estimated_duration or 30):
@@ -164,7 +185,7 @@ def _execute_plan(
                         installer=installer,
                     )
 
-                # === FIXED WORLD GRAPH UPDATE (POST-STEP) ===
+                # ---- Post-step perception sync ----
                 if observer and world_graph:
                     try:
                         snap = observer.snapshot()
