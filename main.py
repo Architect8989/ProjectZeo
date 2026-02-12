@@ -147,8 +147,12 @@ def main():
     while time.time() < warmup_deadline:
         if observer.is_healthy() and vision_runtime.is_healthy():
             snap = observer.snapshot()
-            if isinstance(snap, dict) and snap.get("perception"):
-                break
+            if isinstance(snap, dict):
+                wrapper = snap.get("perception")
+                if isinstance(wrapper, dict):
+                    raw = wrapper.get("perception")
+                    if isinstance(raw, dict) and raw.get("available"):
+                        break
         time.sleep(0.1)
 
     intent_listener = IntentListener(mode, SNAPSHOT_PROVIDER)
@@ -167,12 +171,15 @@ def main():
                 if not snapshot_id:
                     raise RuntimeError("Missing snapshot at execution boundary")
 
-                # Stabilize world graph once before planning
+                # FIX: Correct world graph ingestion (unwrap nested perception)
                 try:
                     obs_snap = observer.snapshot()
-                    perception = obs_snap.get("perception")
-                    if isinstance(perception, dict):
-                        world_graph.ingest(perception)
+                    if isinstance(obs_snap, dict):
+                        wrapper = obs_snap.get("perception")
+                        if isinstance(wrapper, dict):
+                            raw = wrapper.get("perception")
+                            if isinstance(raw, dict):
+                                world_graph.ingest(raw)
                 except Exception:
                     pass
 
@@ -183,7 +190,7 @@ def main():
                     raise RuntimeError("Armed without valid intent")
 
                 planner = ExecutionPlanner(
-                    llm_call=mode.get_llm_callable(),  # Allowed: PLANNING mode
+                    llm_call=mode.get_llm_callable(),
                     environment_fingerprint=env_fingerprint,
                     world_graph=world_graph,
                 )
@@ -213,7 +220,6 @@ def main():
                     mode.execute()
                     consumed_intent = mode.consume_intent()
 
-                    # FIX: No LLM passed to execution
                     operate_main(
                         model=None,
                         terminal_prompt=consumed_intent,
