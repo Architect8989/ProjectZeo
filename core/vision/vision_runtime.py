@@ -169,7 +169,13 @@ class VisionRuntime:
             "You are a visual perception system.\n"
             "You do NOT infer intent.\n"
             "You do NOT suggest actions.\n"
-            "Return ONLY valid JSON.\n"
+            "Return ONLY valid JSON in this schema:\n"
+            "{\n"
+            '  "elements": [{"type": "...", "text": "...", "x": 0.0-1.0, "y": 0.0-1.0}],\n'
+            '  "dialogs": [],\n'
+            '  "apps": [],\n'
+            '  "focused_app": "string or null"\n'
+            "}\n"
         )
 
         try:
@@ -211,9 +217,12 @@ class VisionRuntime:
         frame_ts: float,
     ) -> Dict[str, Any]:
 
+        if not isinstance(perception, dict):
+            raise VisionDegradedError("Perception not JSON object")
+
         elements = perception.get("elements")
         if not isinstance(elements, list):
-            elements = []
+            raise VisionDegradedError("Missing or invalid elements list")
 
         normalized_elements: List[Dict[str, Any]] = []
 
@@ -229,20 +238,36 @@ class VisionRuntime:
 
             normalized_elements.append(
                 {
-                    "type": str(el.get("type", "unknown")),
+                    "type": str(el.get("type", "unknown")).strip(),
                     "text": str(el.get("text", "")).strip(),
-                    "x": float(x),
-                    "y": float(y),
+                    "x": float(min(max(float(x), 0.0), 1.0)),
+                    "y": float(min(max(float(y), 0.0), 1.0)),
                 }
             )
+
+        dialogs = perception.get("dialogs")
+        if dialogs is None:
+            dialogs = []
+        if not isinstance(dialogs, list):
+            raise VisionDegradedError("Invalid dialogs structure")
+
+        apps = perception.get("apps")
+        if apps is None:
+            apps = []
+        if not isinstance(apps, list):
+            raise VisionDegradedError("Invalid apps structure")
+
+        focused_app = perception.get("focused_app")
+        if focused_app is not None and not isinstance(focused_app, str):
+            raise VisionDegradedError("Invalid focused_app type")
 
         return {
             "available": True,
             "frame_ts": frame_ts,
             "elements": normalized_elements,
-            "dialogs": perception.get("dialogs") or [],
-            "apps": perception.get("apps") or [],
-            "focused_app": perception.get("focused_app"),
+            "dialogs": dialogs,
+            "apps": apps,
+            "focused_app": focused_app,
         }
 
     # -------------------------------------------------
@@ -264,10 +289,14 @@ class VisionRuntime:
 
         try:
             parsed = json.loads(raw)
-            if not isinstance(parsed, dict):
-                raise VisionDegradedError("Vision output not JSON object")
-            return parsed
         except Exception as e:
             raise VisionDegradedError(
                 f"Invalid JSON from vision model: {e}"
-    )
+            )
+
+        if not isinstance(parsed, dict):
+            raise VisionDegradedError(
+                "Vision output must be JSON object"
+            )
+
+        return parsed
