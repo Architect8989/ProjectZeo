@@ -176,4 +176,4 @@ class RestoreProvider:
         ):
             raise RestorationError(
                 "Focused window mismatch after restore"
-    )
+            )
