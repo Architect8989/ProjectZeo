@@ -39,6 +39,7 @@ class StepVerifier:
         *,
         screenshot: Optional[Dict[str, Any]] = None,
         previous_screenshot: Optional[Dict[str, Any]] = None,
+        world_graph=None,
     ) -> VerificationResult:
 
         if not isinstance(step, ExecutionStep):
@@ -69,6 +70,7 @@ class StepVerifier:
                 ok, reason, details = self._verify_ui_change(
                     step=step,
                     screenshot=screenshot,
+                    previous_screenshot=previous_screenshot,
                 )
                 return VerificationResult(ok, reason if not ok else None, details)
 
@@ -118,9 +120,7 @@ class StepVerifier:
                         {"stdout": result.stdout, "stderr": result.stderr},
                     )
 
-        return True, "", {
-            "returncode": result.returncode,
-        }
+        return True, "", {"returncode": result.returncode}
 
     # =================================================
     # FILE VERIFICATION
@@ -218,6 +218,7 @@ class StepVerifier:
         *,
         step: ExecutionStep,
         screenshot: Optional[Dict[str, Any]],
+        previous_screenshot: Optional[Dict[str, Any]] = None,
     ) -> Tuple[bool, str, Dict[str, Any]]:
 
         if not screenshot or not screenshot.get("available"):
@@ -226,10 +227,17 @@ class StepVerifier:
         verification = step.verification or {}
         expected_text = verification.get("screen_contains")
 
+        # Fallback: allow verification if screen hash changed
         if not expected_text:
+            if previous_screenshot and screenshot:
+                prev_hash = previous_screenshot.get("hash")
+                curr_hash = screenshot.get("hash")
+                if prev_hash and curr_hash and prev_hash != curr_hash:
+                    return True, "", {"screen_changed": True}
+
             return (
                 False,
-                "ui verification requires explicit screen_contains condition",
+                "ui verification requires screen_contains or detectable change",
                 {},
             )
 
