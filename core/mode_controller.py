@@ -117,7 +117,7 @@ class ModeController:
             return self._snapshot_id
 
     # ==================================================
-    # LLM INJECTION (STRICT BOUNDARY)
+    # LLM INJECTION
     # ==================================================
 
     def inject_llm_callable(self, llm_call: Callable[[str], str]) -> None:
@@ -209,6 +209,26 @@ class ModeController:
                 forced=False,
             )
 
+    def check_planning_timeout(self) -> None:
+        with self._lock:
+            if self._mode is not SystemMode.PLANNING:
+                return
+
+            if self._planning_started_at is None:
+                raise PlanningTimeoutError("Planning start timestamp missing")
+
+            elapsed = time.time() - self._planning_started_at
+            if elapsed > self.MAX_PLANNING_SECONDS:
+                self._reset_internal_state()
+                self._commit_transition(
+                    SystemMode.OBSERVER,
+                    reason="planning timeout",
+                    forced=True,
+                )
+                raise PlanningTimeoutError(
+                    f"Planning exceeded {self.MAX_PLANNING_SECONDS}s"
+                )
+
     def attach_execution_plan(self, plan_id: str) -> None:
         with self._lock:
             if self._mode is not SystemMode.PLANNING:
@@ -232,16 +252,6 @@ class ModeController:
             if not self._execution_plan_attached:
                 raise ModeTransitionError(
                     "Cannot complete planning without plan"
-                )
-
-            if self._planning_started_at is None:
-                raise PlanningTimeoutError("Planning start timestamp missing")
-
-            elapsed = time.time() - self._planning_started_at
-            if elapsed > self.MAX_PLANNING_SECONDS:
-                self.force_observer()
-                raise PlanningTimeoutError(
-                    f"Planning exceeded {self.MAX_PLANNING_SECONDS}s"
                 )
 
             self._planning_completed = True
@@ -316,7 +326,6 @@ class ModeController:
         with self._lock:
             self._reset_internal_state()
             self._failure_reason = None
-            self._planning_started_at = None
 
             self._commit_transition(
                 SystemMode.OBSERVER,
@@ -336,7 +345,7 @@ class ModeController:
         self._planning_started_at = None
 
     # ==================================================
-    # SINGLE COMMIT POINT
+    # TRANSITION COMMIT
     # ==================================================
 
     def _commit_transition(
@@ -382,7 +391,5 @@ class ModeController:
                 "planning_completed": self._planning_completed,
                 "execution_plan_attached": self._execution_plan_attached,
                 "execution_plan_id": self._execution_plan_id,
-                "transition_history_depth": len(
-                    self._transition_history
-                ),
-        }
+                "transition_history_depth": len(self._transition_history),
+    }
