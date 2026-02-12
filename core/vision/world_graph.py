@@ -15,7 +15,7 @@ MAX_ENTITIES = 5000
 MAX_HISTORY = 2000
 ENTITY_STALE_SECONDS = 30.0
 COORD_QUANT = 0.0001
-SPATIAL_MATCH_THRESHOLD = 0.01  # fallback spatial continuity
+SPATIAL_MATCH_THRESHOLD = 0.01
 
 
 class WorldGraph:
@@ -89,12 +89,9 @@ class WorldGraph:
                 x = self._safe_float(el.get("x"))
                 y = self._safe_float(el.get("y"))
 
-                # Primary ID (type + quantized coords only)
-                entity_id = self._stable_entity_id(el, spatial_only=True)
+                entity_id = self._stable_entity_id(el)
 
-                # Fallback: match by proximity if ID not present
                 prev = self._entities.get(entity_id)
-
                 if not prev:
                     prev = self._find_spatial_match(x, y)
 
@@ -113,10 +110,8 @@ class WorldGraph:
                     "confidence": 1.0,
                 }
 
-            # Replace atomically
             self._entities = updated_entities
 
-            # Remove stale
             cutoff = now - ENTITY_STALE_SECONDS
             self._entities = {
                 eid: ent
@@ -124,7 +119,6 @@ class WorldGraph:
                 if ent["last_seen"] >= cutoff
             }
 
-            # Hard cap
             if len(self._entities) > MAX_ENTITIES:
                 self._entities = dict(
                     list(self._entities.items())[:MAX_ENTITIES]
@@ -150,12 +144,84 @@ class WorldGraph:
                 }
             )
 
-    def snapshot_from_perception(
-        self, perception: Optional[Dict[str, Any]]
+    # -------------------------------------------------
+    # DELTA COMPUTATION (NEW)
+    # -------------------------------------------------
+
+    def compute_delta(
+        self,
+        previous_snapshot: Dict[str, Any]
     ) -> Dict[str, Any]:
-        if isinstance(perception, dict):
-            self.ingest(perception)
-        return self.snapshot()
+
+        if not isinstance(previous_snapshot, dict):
+            raise WorldGraphError("Invalid previous snapshot")
+
+        with self._lock:
+            current_snapshot = self.snapshot()
+
+        prev_entities = {
+            e["id"]: e
+            for e in previous_snapshot.get("entities", [])
+        }
+
+        curr_entities = {
+            e["id"]: e
+            for e in current_snapshot.get("entities", [])
+        }
+
+        added_ids = set(curr_entities) - set(prev_entities)
+        removed_ids = set(prev_entities) - set(curr_entities)
+        common_ids = set(prev_entities) & set(curr_entities)
+
+        added = [curr_entities[eid] for eid in added_ids]
+        removed = [prev_entities[eid] for eid in removed_ids]
+
+        modified = []
+
+        for eid in common_ids:
+            prev_e = prev_entities[eid]
+            curr_e = curr_entities[eid]
+
+            changes = {}
+
+            if prev_e.get("text") != curr_e.get("text"):
+                changes["text"] = {
+                    "old": prev_e.get("text"),
+                    "new": curr_e.get("text"),
+                }
+
+            if prev_e.get("state") != curr_e.get("state"):
+                changes["state"] = {
+                    "old": prev_e.get("state"),
+                    "new": curr_e.get("state"),
+                }
+
+            if changes:
+                modified.append({
+                    "id": eid,
+                    "changes": changes,
+                    "entity": curr_e,
+                })
+
+        focus_changed = (
+            previous_snapshot.get("focused_app")
+            != current_snapshot.get("focused_app")
+        )
+
+        return {
+            "entities_added": added,
+            "entities_removed": removed,
+            "entities_modified": modified,
+            "focus_changed": focus_changed,
+            "prev_focus": previous_snapshot.get("focused_app"),
+            "curr_focus": current_snapshot.get("focused_app"),
+            "entity_count_delta": len(added) - len(removed),
+            "significant_change": (
+                len(added) > 5
+                or len(removed) > 5
+                or focus_changed
+            ),
+        }
 
     # -------------------------------------------------
     # QUERIES
@@ -189,14 +255,6 @@ class WorldGraph:
 
             return results
 
-    def find_by_type(self, entity_type: str) -> List[Dict[str, Any]]:
-        with self._lock:
-            return [
-                copy.deepcopy(ent)
-                for ent in self._entities.values()
-                if ent.get("type") == entity_type
-            ]
-
     def focused_application(self) -> Optional[str]:
         with self._lock:
             return self._focused_app
@@ -204,14 +262,6 @@ class WorldGraph:
     def entity_count(self) -> int:
         with self._lock:
             return len(self._entities)
-
-    # -------------------------------------------------
-    # HISTORY
-    # -------------------------------------------------
-
-    def history(self) -> List[Dict[str, Any]]:
-        with self._lock:
-            return copy.deepcopy(self._history)
 
     # -------------------------------------------------
     # INTERNALS
@@ -223,11 +273,12 @@ class WorldGraph:
         except Exception:
             return 0.0
 
-    def _stable_entity_id(
-        self,
-        el: Dict[str, Any],
-        spatial_only: bool = False,
-    ) -> str:
+    def _stable_entity_id(self, el: Dict[str, Any]) -> str:
+        """
+        Stable ID generation:
+        - If text is meaningful → include it
+        - If text short/empty → spatial only
+        """
 
         try:
             x = float(el.get("x", 0.0))
@@ -239,14 +290,13 @@ class WorldGraph:
         qx = int(x / COORD_QUANT)
         qy = int(y / COORD_QUANT)
 
-        if spatial_only:
-            raw = f"{el.get('type')}|{qx}|{qy}"
+        text = (el.get("text") or "").strip()
+        el_type = el.get("type")
+
+        if len(text) < 2:
+            raw = f"{el_type}|{qx}|{qy}"
         else:
-            raw = (
-                f"{el.get('type')}|"
-                f"{el.get('text')}|"
-                f"{qx}|{qy}"
-            )
+            raw = f"{el_type}|{text}|{qx}|{qy}"
 
         return hashlib.sha256(raw.encode()).hexdigest()
 
