@@ -130,13 +130,19 @@ class OperatingSystem:
         pyautogui.hotkey(*keys)
 
     def mouse(self, click_detail: dict) -> None:
+        if not isinstance(click_detail, dict):
+            raise RuntimeError("mouse(): invalid click_detail")
+
+        if "x" not in click_detail or "y" not in click_detail:
+            raise RuntimeError("mouse(): requires x and y")
+
         x = convert_percent_to_decimal(click_detail.get("x"))
         y = convert_percent_to_decimal(click_detail.get("y"))
 
         if not self._valid_coord(x) or not self._valid_coord(y):
             raise RuntimeError(f"Invalid click coordinates: {click_detail}")
 
-        self._click_at_percentage(x, y)
+        self._click_at_percentage(float(x), float(y))
 
     def _click_at_percentage(self, x_pct: float, y_pct: float) -> None:
         screen_w, screen_h = pyautogui.size()
@@ -223,7 +229,7 @@ class OperatingSystem:
         return self.get_focused_window()
 
     # =================================================
-    # CRITICAL: APPLICATION ACTIVATION
+    # APPLICATION ACTIVATION
     # =================================================
 
     def activate_application(self, app_spec: Dict[str, str]) -> None:
@@ -334,8 +340,10 @@ class OperatingSystem:
 
     @staticmethod
     def _valid_coord(v) -> bool:
-        return (
-            isinstance(v, float)
-            and not math.isnan(v)
-            and 0.0 <= v <= 1.0
-        )
+        if not isinstance(v, (int, float)):
+            return False
+        try:
+            v = float(v)
+        except Exception:
+            return False
+        return not math.isnan(v) and 0.0 <= v <= 1.0
