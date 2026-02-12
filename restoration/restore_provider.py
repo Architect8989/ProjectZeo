@@ -20,10 +20,12 @@ class RestoreProvider:
     - Idempotent per snapshot
     - Concurrency-safe
     - Fail-closed
-    - Single authority for mode reset
+    - Strict mode enforcement
+    - Deterministic restore order
     """
 
     CURSOR_TOLERANCE_PX = 5
+    POST_ACTION_DELAY = 0.08
 
     def __init__(self, *, os_backend, mode_controller: ModeController):
         self._os = os_backend
@@ -52,10 +54,17 @@ class RestoreProvider:
         snapshot_id = snapshot.snapshot_id
 
         with self._lock:
+
             if self._completed_snapshot_id == snapshot_id:
                 return
 
-            # HARD SAFETY: terminate automation
+            # STRICT MODE REQUIREMENT
+            if self._mode.mode is not SystemMode.RESTORING:
+                raise RestorationError(
+                    f"Restore attempted in invalid mode: {self._mode.mode}"
+                )
+
+            # HARD STOP AUTOMATION FIRST
             try:
                 self._os.stop_automated_input()
                 self._os.force_release_all(reason="restoration")
@@ -65,61 +74,62 @@ class RestoreProvider:
                     f"Automation shutdown failed: {e}"
                 ) from e
 
-            # Restore core state
-            self._restore_core_state(snapshot)
+            # Deterministic restore order:
+            # 1) Application
+            # 2) Window focus
+            # 3) Cursor
+            self._restore_application(snapshot)
+            self._restore_window(snapshot)
+            self._restore_cursor(snapshot)
 
-            # Authoritative mode reset
+            # Mode reset
             try:
-                if self._mode.mode is not SystemMode.OBSERVER:
-                    self._mode.force_observer()
+                self._mode.force_observer()
             except Exception as e:
                 raise RestorationError(
                     f"Mode reset failed: {e}"
                 ) from e
 
-            # Verify restoration
+            # Verification
             self._verify(snapshot)
 
-            # Seal idempotency
             self._completed_snapshot_id = snapshot_id
 
     # =========================================================
-    # CORE STATE
+    # RESTORE STEPS
     # =========================================================
 
-    def _restore_core_state(
-        self,
-        snapshot: RestorationSnapshot,
-    ) -> None:
-
-        # Restore cursor
+    def _restore_application(self, snapshot: RestorationSnapshot) -> None:
         try:
-            self._os.set_cursor_position(
-                {"x": snapshot.cursor.x, "y": snapshot.cursor.y}
+            self._os.activate_application(
+                {"title": snapshot.application.process_name}
             )
+            time.sleep(self.POST_ACTION_DELAY)
         except Exception as e:
             raise RestorationError(
-                f"Cursor restore failed: {e}"
+                f"Application activation failed: {e}"
             ) from e
 
-        # Restore window focus
+    def _restore_window(self, snapshot: RestorationSnapshot) -> None:
         try:
             self._os.focus_window(
                 {"title": snapshot.focus.window_id}
             )
+            time.sleep(self.POST_ACTION_DELAY)
         except Exception as e:
             raise RestorationError(
                 f"Window focus restore failed: {e}"
             ) from e
 
-        # Restore active application (CRITICAL FIX)
+    def _restore_cursor(self, snapshot: RestorationSnapshot) -> None:
         try:
-            self._os.activate_application(
-                {"title": snapshot.application.process_name}
+            self._os.set_cursor_position(
+                {"x": snapshot.cursor.x, "y": snapshot.cursor.y}
             )
+            time.sleep(self.POST_ACTION_DELAY)
         except Exception as e:
             raise RestorationError(
-                f"Application activation failed: {e}"
+                f"Cursor restore failed: {e}"
             ) from e
 
     # =========================================================
@@ -127,8 +137,6 @@ class RestoreProvider:
     # =========================================================
 
     def _verify(self, snapshot: RestorationSnapshot) -> None:
-
-        time.sleep(0.05)
 
         if self._mode.mode is not SystemMode.OBSERVER:
             raise RestorationError(
@@ -148,11 +156,7 @@ class RestoreProvider:
         # Cursor validation
         # -------------------------
 
-        if (
-            not isinstance(cursor, dict)
-            or "x" not in cursor
-            or "y" not in cursor
-        ):
+        if not isinstance(cursor, dict):
             raise RestorationError("Cursor read invalid")
 
         try:
@@ -177,21 +181,24 @@ class RestoreProvider:
 
         if (
             not isinstance(current_window, dict)
-            or current_window.get("title") != snapshot.focus.window_id
+            or not isinstance(current_window.get("title"), str)
+            or snapshot.focus.window_id.lower()
+            not in current_window["title"].lower()
         ):
             raise RestorationError(
                 "Focused window mismatch after restore"
             )
 
         # -------------------------
-        # Active application validation (CRITICAL FIX)
+        # Active application validation
         # -------------------------
 
         if (
             not isinstance(current_app, dict)
-            or current_app.get("title")
-            != snapshot.application.process_name
+            or not isinstance(current_app.get("title"), str)
+            or snapshot.application.process_name.lower()
+            not in current_app["title"].lower()
         ):
             raise RestorationError(
                 "Active application mismatch after restore"
-            )
+        )
