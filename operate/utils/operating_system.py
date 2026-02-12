@@ -21,6 +21,7 @@ class OperatingSystem:
     - Window schema: {"title": str}
     - Explicit failures only
     - No silent success
+    - Post-condition verification required
     """
 
     def __init__(self):
@@ -84,12 +85,14 @@ class OperatingSystem:
         if sudo and hasattr(os, "geteuid") and os.geteuid() != 0:
             full_cmd = f"sudo {cmd}"
 
-        return subprocess.run(
+        result = subprocess.run(
             full_cmd,
             shell=True,
             capture_output=True,
             text=True,
         )
+
+        return result
 
     def write_file(self, path: str, content: str) -> None:
         if not isinstance(path, str) or not path:
@@ -98,6 +101,7 @@ class OperatingSystem:
             raise RuntimeError("write_file(): content must be string")
 
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+
         with open(path, "w", encoding="utf-8") as f:
             f.write(content)
 
@@ -191,14 +195,17 @@ class OperatingSystem:
                     capture_output=True,
                     text=True,
                 )
-                if result.returncode == 0:
+                if result.returncode == 0 and result.stdout.strip():
                     return {"title": result.stdout.strip()}
 
             elif system == "Linux":
-                title = subprocess.check_output(
-                    ["xdotool", "getactivewindow", "getwindowname"],
-                    text=True,
-                ).strip()
+                try:
+                    title = subprocess.check_output(
+                        ["xdotool", "getactivewindow", "getwindowname"],
+                        text=True,
+                    ).strip()
+                except FileNotFoundError:
+                    raise OSError("xdotool not installed")
                 return {"title": title}
 
             elif system == "Windows":
@@ -212,42 +219,12 @@ class OperatingSystem:
 
         raise OSError("Focused window unavailable")
 
-    def focus_window(self, window_id: Dict[str, str]) -> None:
-        if not isinstance(window_id, dict):
-            raise RuntimeError("focus_window(): invalid window_id")
-
-        title = window_id.get("title")
-        if not isinstance(title, str) or not title:
-            raise RuntimeError("focus_window(): missing title")
-
-        system = platform.system()
-
-        try:
-            if system == "Darwin":
-                script = f'''
-                tell application "{title}"
-                    activate
-                end tell
-                '''
-                subprocess.run(["osascript", "-e", script], check=False)
-
-            elif system == "Linux":
-                subprocess.run(["wmctrl", "-a", title], check=False)
-
-            elif system == "Windows":
-                import win32gui
-
-                def enum_handler(hwnd, _):
-                    if win32gui.GetWindowText(hwnd) == title:
-                        win32gui.SetForegroundWindow(hwnd)
-
-                win32gui.EnumWindows(enum_handler, None)
-
-        except Exception as e:
-            raise OSError(f"Failed to focus window: {e}") from e
-
     def get_active_application(self) -> Dict[str, str]:
         return self.get_focused_window()
+
+    # =================================================
+    # CRITICAL: APPLICATION ACTIVATION
+    # =================================================
 
     def activate_application(self, app_spec: Dict[str, str]) -> None:
         if not isinstance(app_spec, dict):
@@ -276,12 +253,16 @@ class OperatingSystem:
                     raise OSError(result.stderr.strip() or "activation failed")
 
             elif system == "Linux":
-                result = subprocess.run(
-                    ["wmctrl", "-a", title],
-                    capture_output=True,
-                    text=True,
-                    timeout=5,
-                )
+                try:
+                    result = subprocess.run(
+                        ["wmctrl", "-a", title],
+                        capture_output=True,
+                        text=True,
+                        timeout=5,
+                    )
+                except FileNotFoundError:
+                    raise OSError("wmctrl not installed")
+
                 if result.returncode != 0:
                     raise OSError(result.stderr.strip() or "activation failed")
 
@@ -316,11 +297,11 @@ class OperatingSystem:
         except subprocess.TimeoutExpired:
             raise OSError(f"activate_application(): timeout for '{title}'")
 
-        time.sleep(0.1)
+        time.sleep(0.15)
 
         focused = self.get_focused_window()
         if title.lower() not in focused.get("title", "").lower():
-            raise OSError(f"activate_application(): verification failed")
+            raise OSError("activate_application(): verification failed")
 
     # =================================================
     # RESTORATION / SAFETY
@@ -357,4 +338,4 @@ class OperatingSystem:
             isinstance(v, float)
             and not math.isnan(v)
             and 0.0 <= v <= 1.0
-    )
+        )
