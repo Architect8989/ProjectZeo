@@ -27,13 +27,13 @@ class ExecutionPlanner:
 
     LLM_TIMEOUT_SECONDS = 30.0
     MAX_SCREEN_CHARS = 500
+    MAX_ESTIMATED_DURATION = 600.0  # 10 minutes hard cap
 
     def __init__(
         self,
         *,
         llm_call,
         environment_fingerprint: Optional[Dict[str, Any]] = None,
-        observer=None,
         world_graph=None,
     ):
         if not callable(llm_call):
@@ -41,7 +41,6 @@ class ExecutionPlanner:
 
         self._llm_call = llm_call
         self._environment = environment_fingerprint or {}
-        self._observer = observer
 
         # SNAPSHOT ISOLATION
         self._world_snapshot: Optional[Dict[str, Any]] = None
@@ -53,10 +52,14 @@ class ExecutionPlanner:
             except Exception:
                 raise PlanningError("Failed to snapshot world_graph")
 
+        # ---- SAFE FALLBACK (audit requirement) ----
         if self._world_snapshot is None:
-            raise PlanningError(
-                "Planner requires non-empty world snapshot"
-            )
+            self._world_snapshot = {
+                "entities": [],
+                "focused_app": None,
+                "entity_count": 0,
+                "timestamp": None,
+            }
 
     # ==================================================
     # PUBLIC API
@@ -90,6 +93,7 @@ class ExecutionPlanner:
                 raise PlanningError(f"Goal produced no steps: {goal}")
 
             for spec in expanded:
+
                 description = spec["description"].strip()
                 if not description:
                     raise PlanningError(
@@ -116,6 +120,7 @@ class ExecutionPlanner:
         if not execution_steps:
             raise PlanningError("No executable steps generated")
 
+        # ---- Planner controls DONE, not LLM ----
         execution_steps.append(
             ExecutionStep(
                 id=step_id,
@@ -213,9 +218,10 @@ Schema:
 ]
 
 Rules:
+- Do NOT emit DONE
 - No hallucinated tools
 - If a tool is required, emit tool_installation step
-- Every step must be verifiable
+- Every executable step must include verification criteria
 - Be conservative and explicit
 """
 
@@ -237,8 +243,13 @@ Rules:
             raise PlanningError("LLM produced empty or invalid step list")
 
         validated: List[Dict[str, Any]] = []
-
-        allowed_types = {t.value for t in StepType}
+        allowed_types = {
+            StepType.UI_INTERACTION.value,
+            StepType.COMMAND_EXECUTION.value,
+            StepType.FILE_CREATION.value,
+            StepType.TOOL_INSTALLATION.value,
+            StepType.VERIFICATION.value,
+        }
 
         for idx, step in enumerate(data):
             if not isinstance(step, dict):
@@ -248,15 +259,15 @@ Rules:
             if step_type not in allowed_types:
                 raise PlanningError(f"Invalid step type: {step_type}")
 
-            description = step.get("description", "")
-            if not isinstance(description, str):
-                raise PlanningError("Step description must be string")
+            description = step.get("description")
+            if not isinstance(description, str) or not description.strip():
+                raise PlanningError("Step description must be non-empty string")
 
-            action = step.get("action", {})
+            action = step.get("action")
             if not isinstance(action, dict):
                 raise PlanningError("Step action must be object")
 
-            verification = step.get("verification", {})
+            verification = step.get("verification")
             if not isinstance(verification, dict):
                 raise PlanningError("Step verification must be object")
 
@@ -265,12 +276,15 @@ Rules:
             except Exception:
                 raise PlanningError("Invalid estimated_duration")
 
+            if duration < 0 or duration > self.MAX_ESTIMATED_DURATION:
+                raise PlanningError("estimated_duration out of bounds")
+
             retryable = bool(step.get("retryable", True))
 
             validated.append(
                 {
                     "type": StepType(step_type),
-                    "description": description,
+                    "description": description.strip(),
                     "action": action,
                     "verification": verification,
                     "estimated_duration": duration,
