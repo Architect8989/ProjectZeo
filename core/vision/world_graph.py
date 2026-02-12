@@ -15,6 +15,7 @@ MAX_ENTITIES = 5000
 MAX_HISTORY = 2000
 ENTITY_STALE_SECONDS = 30.0
 COORD_QUANT = 0.0001
+SPATIAL_MATCH_THRESHOLD = 0.01  # fallback spatial continuity
 
 
 class WorldGraph:
@@ -66,7 +67,6 @@ class WorldGraph:
 
         with self._lock:
 
-            # Reject stale frames
             if (
                 self._last_frame_ts is not None
                 and frame_ts <= self._last_frame_ts
@@ -74,37 +74,49 @@ class WorldGraph:
                 return
 
             self._last_frame_ts = frame_ts
-            self._focused_app = perception.get("focused_app")
+            self._focused_app = (
+                perception.get("focused_app")
+                if isinstance(perception.get("focused_app"), str)
+                else None
+            )
 
-            new_entities: Dict[str, Dict[str, Any]] = {}
+            updated_entities: Dict[str, Dict[str, Any]] = {}
 
             for el in elements:
                 if not isinstance(el, dict):
                     continue
 
-                entity_id = self._stable_entity_id(el)
+                x = self._safe_float(el.get("x"))
+                y = self._safe_float(el.get("y"))
 
-                # Preserve temporal continuity
+                # Primary ID (type + quantized coords only)
+                entity_id = self._stable_entity_id(el, spatial_only=True)
+
+                # Fallback: match by proximity if ID not present
                 prev = self._entities.get(entity_id)
+
+                if not prev:
+                    prev = self._find_spatial_match(x, y)
+
                 first_seen = prev["first_seen"] if prev else now
 
-                new_entities[entity_id] = {
+                updated_entities[entity_id] = {
                     "id": entity_id,
                     "type": el.get("type"),
                     "text": el.get("text"),
-                    "x": self._safe_float(el.get("x")),
-                    "y": self._safe_float(el.get("y")),
-                    "interactable": el.get("interactable"),
+                    "x": x,
+                    "y": y,
+                    "interactable": bool(el.get("interactable")),
                     "state": el.get("state"),
                     "first_seen": first_seen,
                     "last_seen": now,
                     "confidence": 1.0,
                 }
 
-            # Replace frame atomically
-            self._entities = new_entities
+            # Replace atomically
+            self._entities = updated_entities
 
-            # Remove stale entities (temporal guard)
+            # Remove stale
             cutoff = now - ENTITY_STALE_SECONDS
             self._entities = {
                 eid: ent
@@ -112,7 +124,7 @@ class WorldGraph:
                 if ent["last_seen"] >= cutoff
             }
 
-            # Hard cap enforcement
+            # Hard cap
             if len(self._entities) > MAX_ENTITIES:
                 self._entities = dict(
                     list(self._entities.items())[:MAX_ENTITIES]
@@ -211,7 +223,12 @@ class WorldGraph:
         except Exception:
             return 0.0
 
-    def _stable_entity_id(self, el: Dict[str, Any]) -> str:
+    def _stable_entity_id(
+        self,
+        el: Dict[str, Any],
+        spatial_only: bool = False,
+    ) -> str:
+
         try:
             x = float(el.get("x", 0.0))
             y = float(el.get("y", 0.0))
@@ -222,12 +239,31 @@ class WorldGraph:
         qx = int(x / COORD_QUANT)
         qy = int(y / COORD_QUANT)
 
-        raw = (
-            f"{el.get('type')}|"
-            f"{el.get('text')}|"
-            f"{qx}|{qy}"
-        )
+        if spatial_only:
+            raw = f"{el.get('type')}|{qx}|{qy}"
+        else:
+            raw = (
+                f"{el.get('type')}|"
+                f"{el.get('text')}|"
+                f"{qx}|{qy}"
+            )
+
         return hashlib.sha256(raw.encode()).hexdigest()
+
+    def _find_spatial_match(
+        self,
+        x: float,
+        y: float,
+    ) -> Optional[Dict[str, Any]]:
+
+        for ent in self._entities.values():
+            if (
+                abs(ent["x"] - x) <= SPATIAL_MATCH_THRESHOLD
+                and abs(ent["y"] - y) <= SPATIAL_MATCH_THRESHOLD
+            ):
+                return ent
+
+        return None
 
     def _record_history_locked(self) -> None:
         snapshot = {
