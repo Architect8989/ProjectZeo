@@ -11,7 +11,7 @@ from core.schemas.execution_plan import (
 
 
 class PlanningError(RuntimeError):
-    """Authoritative planning failure."""
+    pass
 
 
 class ExecutionPlanner:
@@ -19,15 +19,16 @@ class ExecutionPlanner:
     Deterministic execution planner.
 
     HARD CONTRACT:
-    - Planner is the ONLY place intelligence exists
-    - LLM output must be structured and validated
+    - Only intelligence boundary
     - No side effects
-    - Planner operates on FROZEN snapshot only
+    - Strict validation
+    - Snapshot always frozen
     """
 
     LLM_TIMEOUT_SECONDS = 30.0
     MAX_SCREEN_CHARS = 500
-    MAX_ESTIMATED_DURATION = 600.0  # 10 minutes hard cap
+    MAX_ESTIMATED_DURATION = 600.0
+    MAX_STEPS_PER_GOAL = 25
 
     def __init__(
         self,
@@ -59,7 +60,7 @@ class ExecutionPlanner:
             }
 
     # ==================================================
-    # PUBLIC API
+    # PLAN CREATION
     # ==================================================
 
     def create_plan(
@@ -89,17 +90,16 @@ class ExecutionPlanner:
             if not expanded:
                 raise PlanningError(f"Goal produced no steps: {goal}")
 
-            for spec in expanded:
-                description = spec["description"].strip()
-                if not description:
-                    raise PlanningError("LLM produced step without description")
+            if len(expanded) > self.MAX_STEPS_PER_GOAL:
+                raise PlanningError("LLM produced too many steps")
 
+            for spec in expanded:
                 deps = [last_step_id] if last_step_id else []
 
                 step = ExecutionStep(
                     id=step_id,
                     type=spec["type"],
-                    description=description,
+                    description=spec["description"],
                     action=spec["action"],
                     verification=spec["verification"],
                     dependencies=deps,
@@ -119,10 +119,7 @@ class ExecutionPlanner:
                 id=step_id,
                 type=StepType.DONE,
                 description="Objective complete",
-                action={
-                    "operation": "done",
-                    "summary": objective.strip(),
-                },
+                action={"operation": "done", "summary": objective.strip()},
                 verification={},
                 dependencies=[last_step_id] if last_step_id else [],
                 estimated_duration=0.0,
@@ -143,15 +140,10 @@ class ExecutionPlanner:
         return plan
 
     # ==================================================
-    # NEW: SNAPSHOT UPDATE
+    # SNAPSHOT UPDATE
     # ==================================================
 
     def update_world_snapshot(self, new_snapshot: Dict[str, Any]) -> None:
-        """
-        Replace frozen snapshot with new world snapshot.
-        Deep-copied to preserve isolation.
-        """
-
         if not isinstance(new_snapshot, dict):
             raise PlanningError("Invalid world snapshot")
 
@@ -161,7 +153,7 @@ class ExecutionPlanner:
             raise PlanningError("Failed to freeze new snapshot")
 
     # ==================================================
-    # NEW: REPLAN DECISION ENGINE
+    # REPLAN DECISION (FAIL-CLOSED)
     # ==================================================
 
     def should_replan(
@@ -170,11 +162,6 @@ class ExecutionPlanner:
         current_step_id: int,
         execution_history: List[Dict[str, Any]],
     ) -> Dict[str, Any]:
-        """
-        Decide whether re-planning is required.
-
-        Returns structured decision.
-        """
 
         if not isinstance(current_step_id, int):
             raise PlanningError("Invalid step id")
@@ -186,19 +173,19 @@ class ExecutionPlanner:
             return {
                 "replan_required": False,
                 "confidence": 0.0,
-                "reason": "No world snapshot available",
+                "reason": "No snapshot available",
             }
 
         prompt = f"""
-You are validating whether a deterministic execution plan must be revised.
+Validate whether deterministic execution must replan.
 
-Original snapshot:
-{json.dumps(self._world_snapshot, indent=2)[:1000]}
+Snapshot:
+{json.dumps(self._world_snapshot)[:1000]}
 
-Execution state:
+Execution:
 - current_step_id: {current_step_id}
 - recent_history:
-{json.dumps(execution_history[-5:], indent=2)}
+{json.dumps(execution_history[-5:])}
 
 Return JSON only:
 {{
@@ -207,21 +194,17 @@ Return JSON only:
   "reason": "short explanation"
 }}
 
-Rules:
-- Replan only if snapshot divergence makes continuation unsafe.
-- Be conservative.
+Be conservative.
 """
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(self._llm_call, prompt)
-            try:
-                raw = future.result(timeout=self.LLM_TIMEOUT_SECONDS)
-            except concurrent.futures.TimeoutError:
-                return {
-                    "replan_required": False,
-                    "confidence": 0.0,
-                    "reason": "LLM timeout",
-                }
+        try:
+            raw = self._call_llm_with_timeout(prompt)
+        except PlanningError:
+            return {
+                "replan_required": False,
+                "confidence": 0.0,
+                "reason": "LLM timeout",
+            }
 
         try:
             decision = json.loads(raw.strip())
@@ -232,15 +215,36 @@ Rules:
                 "reason": "Invalid LLM response",
             }
 
+        confidence = decision.get("confidence", 0.0)
+        try:
+            confidence = float(confidence)
+        except Exception:
+            confidence = 0.0
+
+        confidence = max(0.0, min(confidence, 1.0))
+
         return {
             "replan_required": bool(decision.get("replan_required", False)),
-            "confidence": float(decision.get("confidence", 0.0)),
-            "reason": decision.get("reason", "LLM decision"),
+            "confidence": confidence,
+            "reason": str(decision.get("reason", "LLM decision"))[:300],
         }
 
     # ==================================================
     # INTERNAL HELPERS
     # ==================================================
+
+    def _call_llm_with_timeout(self, prompt: str) -> str:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(self._llm_call, prompt)
+            try:
+                result = future.result(timeout=self.LLM_TIMEOUT_SECONDS)
+            except concurrent.futures.TimeoutError:
+                raise PlanningError("LLM call timeout")
+
+        if not isinstance(result, str):
+            raise PlanningError("LLM must return string")
+
+        return result
 
     def _extract_required_tools(
         self, requirements: Dict[str, Any]
@@ -263,10 +267,8 @@ Rules:
         for ent in entities:
             if not isinstance(ent, dict):
                 continue
-
             label = ent.get("text")
             etype = ent.get("type")
-
             if isinstance(label, str) and label.strip():
                 text_chunks.append(f"{etype}: {label}")
 
@@ -274,17 +276,17 @@ Rules:
         return context[: self.MAX_SCREEN_CHARS]
 
     # ==================================================
-    # LLM EXPANSION
+    # GOAL EXPANSION
     # ==================================================
 
     def _expand_goal(self, goal: str) -> List[Dict[str, Any]]:
         screen_context = self._read_screen_context()
 
         prompt = f"""
-You are the planning brain of a deterministic execution kernel.
+You are the deterministic planning brain.
 
 Environment:
-{json.dumps(self._environment, indent=2)}
+{json.dumps(self._environment)}
 
 Frozen screen:
 {screen_context}
@@ -307,36 +309,30 @@ Schema:
 ]
 
 Rules:
-- Do NOT emit DONE
-- Do NOT emit tool_installation
-- Every step must include verification
-- Conservative estimates
+- No DONE
+- No tool_installation
+- Must include verification
+- Conservative
 """
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(self._llm_call, prompt)
-            try:
-                raw = future.result(timeout=self.LLM_TIMEOUT_SECONDS)
-            except concurrent.futures.TimeoutError:
-                raise PlanningError(
-                    f"LLM call timed out after {self.LLM_TIMEOUT_SECONDS}s"
-                )
+        raw = self._call_llm_with_timeout(prompt)
 
         try:
             data = json.loads(raw)
         except Exception as e:
-            raise PlanningError(f"LLM returned invalid JSON: {e}")
+            raise PlanningError(f"Invalid JSON from LLM: {e}")
 
         if not isinstance(data, list) or not data:
-            raise PlanningError("LLM produced empty or invalid step list")
+            raise PlanningError("LLM produced invalid step list")
 
-        validated: List[Dict[str, Any]] = []
         allowed_types = {
             StepType.UI_INTERACTION.value,
             StepType.COMMAND_EXECUTION.value,
             StepType.FILE_CREATION.value,
             StepType.VERIFICATION.value,
         }
+
+        validated: List[Dict[str, Any]] = []
 
         for idx, step in enumerate(data):
             if not isinstance(step, dict):
@@ -348,7 +344,7 @@ Rules:
 
             description = step.get("description")
             if not isinstance(description, str) or not description.strip():
-                raise PlanningError("Step description must be non-empty string")
+                raise PlanningError("Invalid step description")
 
             action = step.get("action")
             if not isinstance(action, dict):
