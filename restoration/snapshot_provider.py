@@ -79,10 +79,7 @@ class SnapshotProvider:
     def take_snapshot(self) -> str:
         snapshot = self._capture_snapshot()
         snapshot_id = self.store_snapshot(snapshot)
-
-        # Attach snapshot boundary to mode controller
         self._mode.attach_snapshot(snapshot_id)
-
         return snapshot_id
 
     # =========================================================
@@ -96,26 +93,19 @@ class SnapshotProvider:
                 "SnapshotProvider not wired: observer missing"
             )
 
-        # -----------------------------------------------------
-        # 1. MODE CHECK (STRICT)
-        # -----------------------------------------------------
+        # 1. MODE CHECK
         if self._mode.mode is not SystemMode.OBSERVER:
             raise SnapshotProviderError(
-                f"Snapshot attempted in {self._mode.mode.value}; "
-                "OBSERVER mode required"
+                f"Snapshot attempted in {self._mode.mode.value}; OBSERVER mode required"
             )
 
-        # -----------------------------------------------------
-        # 2. OBSERVER HEALTH CHECK
-        # -----------------------------------------------------
+        # 2. OBSERVER HEALTH
         if not self._observer.is_healthy():
             raise SnapshotProviderError(
                 "Observer unhealthy during snapshot"
             )
 
-        # -----------------------------------------------------
-        # 3. VISION CHECK (AUTHORITATIVE)
-        # -----------------------------------------------------
+        # 3. VISION CHECK
         vision_state = self._observer.snapshot()
 
         if not isinstance(vision_state, dict):
@@ -129,14 +119,15 @@ class SnapshotProvider:
             )
 
         frame_ts = vision_state.get("frame_ts")
+        if frame_ts is not None and not isinstance(frame_ts, (int, float)):
+            raise SnapshotProviderError(
+                "Invalid vision frame timestamp"
+            )
 
-        # -----------------------------------------------------
         # 4. OS CORE STATE (RETRY SAFE)
-        # -----------------------------------------------------
         cursor = None
         focused_window = None
         active_app = None
-
         last_error: Optional[Exception] = None
 
         for _ in range(3):
@@ -154,11 +145,8 @@ class SnapshotProvider:
                 f"OS state capture failed: {last_error}"
             )
 
-        # -----------------------------------------------------
-        # 5. STRICT SCHEMA VALIDATION
-        # -----------------------------------------------------
+        # 5. STRICT VALIDATION
 
-        # Cursor validation
         if not isinstance(cursor, dict):
             raise SnapshotProviderError("Cursor state invalid")
 
@@ -173,7 +161,6 @@ class SnapshotProvider:
                 f"Invalid cursor coordinates: {e}"
             ) from e
 
-        # Focused window validation
         if (
             not isinstance(focused_window, dict)
             or not isinstance(focused_window.get("title"), str)
@@ -183,7 +170,6 @@ class SnapshotProvider:
 
         window_title = focused_window["title"].strip()
 
-        # Active application validation
         if (
             not isinstance(active_app, dict)
             or not isinstance(active_app.get("title"), str)
@@ -193,9 +179,7 @@ class SnapshotProvider:
 
         app_title = active_app["title"].strip()
 
-        # -----------------------------------------------------
         # 6. STATE OBJECTS
-        # -----------------------------------------------------
 
         cursor_state = CursorState(
             x=cursor_x,
@@ -209,12 +193,10 @@ class SnapshotProvider:
 
         application_state = ApplicationState(
             process_name=app_title,
-            pid=0,  # PID intentionally omitted
+            pid=0,
         )
 
-        # -----------------------------------------------------
-        # 7. METADATA (BOUNDARY FREEZE)
-        # -----------------------------------------------------
+        # 7. METADATA
 
         metadata = {
             "schema_version": self.SNAPSHOT_SCHEMA_VERSION,
@@ -224,9 +206,7 @@ class SnapshotProvider:
             "vision_frame_ts": frame_ts,
         }
 
-        # -----------------------------------------------------
         # 8. CREATE SNAPSHOT
-        # -----------------------------------------------------
 
         return RestorationSnapshot.create(
             cursor=cursor_state,
@@ -234,4 +214,4 @@ class SnapshotProvider:
             application=application_state,
             execution_mode=self._mode.mode.value,
             metadata=metadata,
-        )
+    )
