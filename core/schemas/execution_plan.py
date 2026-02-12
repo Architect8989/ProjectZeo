@@ -1,6 +1,6 @@
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Dict, Any, List, Set
+from typing import Dict, Any, List, Set, Optional
 import time
 
 
@@ -18,7 +18,7 @@ class StepType(str, Enum):
 
 
 # =================================================
-# UI ACTION SCHEMA (SOC-COMPAT, STRICT)
+# UI ACTION SCHEMA (STRICT)
 # =================================================
 
 ALLOWED_OPERATIONS = {"click", "write", "press", "done"}
@@ -54,6 +54,7 @@ class ExecutionStep:
     dependencies: List[int] = field(default_factory=list)
     estimated_duration: float = 0.0
     retryable: bool = True
+    preconditions: Optional[Dict[str, Any]] = None  # NEW
 
 
 # =================================================
@@ -67,13 +68,15 @@ class ExecutionPlan:
     required_tools: List[str] = field(default_factory=list)
     created_at: float = field(default_factory=time.time)
 
+    # -------------------------------------------------
+
     def validate(self) -> bool:
         try:
             if not isinstance(self.objective, str) or not self.objective.strip():
-                return False
+                raise ValueError("Invalid objective")
 
-            if not self.steps or not isinstance(self.steps, list):
-                return False
+            if not isinstance(self.steps, list) or not self.steps:
+                raise ValueError("Steps must be non-empty list")
 
             self._validate_step_ids()
             self._validate_step_order()
@@ -82,6 +85,7 @@ class ExecutionPlan:
             self._validate_done_step()
 
             return True
+
         except Exception:
             return False
 
@@ -89,6 +93,9 @@ class ExecutionPlan:
 
     def _validate_step_ids(self) -> None:
         ids = [s.id for s in self.steps]
+        if not all(isinstance(i, int) for i in ids):
+            raise ValueError("Step IDs must be integers")
+
         if len(ids) != len(set(ids)):
             raise ValueError("Duplicate step IDs detected")
 
@@ -105,6 +112,8 @@ class ExecutionPlan:
                 raise ValueError(f"Step {step.id} dependencies must be list")
 
             for dep in step.dependencies:
+                if not isinstance(dep, int):
+                    raise ValueError("Dependency must be int")
                 if dep not in ids:
                     raise ValueError(
                         f"Step {step.id} depends on missing step {dep}"
@@ -139,8 +148,31 @@ class ExecutionPlan:
 
     def _validate_steps(self) -> None:
         for step in self.steps:
+
+            if not isinstance(step.type, StepType):
+                raise ValueError(f"Invalid StepType in step {step.id}")
+
+            if not isinstance(step.description, str) or not step.description.strip():
+                raise ValueError(f"Invalid description in step {step.id}")
+
             if not isinstance(step.action, dict):
                 raise ValueError(f"Step {step.id} action must be dict")
+
+            if not isinstance(step.verification, dict):
+                raise ValueError(f"Step {step.id} verification must be dict")
+
+            if not isinstance(step.estimated_duration, (int, float)):
+                raise ValueError("estimated_duration must be numeric")
+
+            if step.estimated_duration < 0 or step.estimated_duration > 600:
+                raise ValueError("estimated_duration out of bounds")
+
+            if not isinstance(step.retryable, bool):
+                raise ValueError("retryable must be boolean")
+
+            if step.preconditions is not None:
+                if not isinstance(step.preconditions, dict):
+                    raise ValueError("preconditions must be dict if present")
 
             if step.type == StepType.UI_INTERACTION:
                 if not validate_action(step.action):
@@ -156,12 +188,14 @@ class ExecutionPlan:
 
     def _validate_done_step(self) -> None:
         done_steps = [s for s in self.steps if s.type == StepType.DONE]
+
         if len(done_steps) != 1:
             raise ValueError("ExecutionPlan must contain exactly one DONE step")
 
         done_step = done_steps[0]
+
         if done_step.id != max(s.id for s in self.steps):
-            raise ValueError("DONE step must be the final step")
+            raise ValueError("DONE step must be final step")
 
 
 # =================================================
