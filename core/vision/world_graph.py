@@ -7,50 +7,32 @@ from typing import Dict, Any, List, Optional
 import copy
 
 
-# -------------------------------------------------
-# ERRORS
-# -------------------------------------------------
-
-
 class WorldGraphError(RuntimeError):
     pass
-
-
-# -------------------------------------------------
-# CONFIG
-# -------------------------------------------------
 
 
 MAX_ENTITIES = 5000
 MAX_HISTORY = 2000
 ENTITY_STALE_SECONDS = 30.0
-
-# finer spatial quantization (~0.01% of screen)
 COORD_QUANT = 0.0001
-
-
-# -------------------------------------------------
-# WORLD GRAPH
-# -------------------------------------------------
 
 
 class WorldGraph:
     """
     Incremental semantic world model.
 
-    ARCHITECTURAL CONTRACT:
-    - Observer NEVER mutates this directly
-    - Planner ingests perception on-demand
-    - All mutation occurs under lock
+    CONTRACT:
+    - All mutation under lock
+    - Snapshot is immutable copy
+    - Ingestion reflects authoritative latest frame
+    - No unbounded growth
     """
 
     def __init__(self):
         self._lock = threading.RLock()
-
         self._entities: Dict[str, Dict[str, Any]] = {}
         self._focused_app: Optional[str] = None
         self._last_frame_ts: Optional[float] = None
-
         self._history: List[Dict[str, Any]] = []
 
     # -------------------------------------------------
@@ -58,12 +40,6 @@ class WorldGraph:
     # -------------------------------------------------
 
     def reset(self) -> None:
-        """
-        Clear all world graph state.
-
-        Must be called at task boundary to prevent
-        entity leakage across executions.
-        """
         with self._lock:
             self._entities.clear()
             self._focused_app = None
@@ -71,29 +47,36 @@ class WorldGraph:
             self._history.clear()
 
     # -------------------------------------------------
-    # INGESTION (PLANNER-DRIVEN)
+    # INGESTION
     # -------------------------------------------------
 
     def ingest(self, perception: Dict[str, Any]) -> None:
-        """
-        Merge a new perception frame into the world graph.
-        """
         if not isinstance(perception, dict):
             return
 
         frame_ts = perception.get("frame_ts")
+        elements = perception.get("elements")
+
         if not isinstance(frame_ts, (int, float)):
             return
-
-        elements = perception.get("elements")
         if not isinstance(elements, list):
             return
 
         now = time.monotonic()
 
         with self._lock:
+            # Ignore stale frames
+            if (
+                self._last_frame_ts is not None
+                and frame_ts <= self._last_frame_ts
+            ):
+                return
+
             self._last_frame_ts = frame_ts
             self._focused_app = perception.get("focused_app")
+
+            # Build fresh entity map for this frame
+            new_entities: Dict[str, Dict[str, Any]] = {}
 
             for el in elements:
                 if not isinstance(el, dict):
@@ -101,41 +84,36 @@ class WorldGraph:
 
                 entity_id = self._stable_entity_id(el)
 
-                if entity_id not in self._entities:
-                    self._entities[entity_id] = {
-                        "id": entity_id,
-                        "type": el.get("type"),
-                        "text": el.get("text"),
-                        "x": el.get("x"),
-                        "y": el.get("y"),
-                        "first_seen": now,
-                        "last_seen": now,
-                        "confidence": 0.5,
-                    }
-                else:
-                    ent = self._entities[entity_id]
-                    ent["last_seen"] = now
-                    ent["x"] = el.get("x")
-                    ent["y"] = el.get("y")
-                    ent["confidence"] = min(
-                        ent.get("confidence", 0.5) + 0.05, 1.0
-                    )
+                new_entities[entity_id] = {
+                    "id": entity_id,
+                    "type": el.get("type"),
+                    "text": el.get("text"),
+                    "x": el.get("x"),
+                    "y": el.get("y"),
+                    "first_seen": now,
+                    "last_seen": now,
+                    "confidence": 1.0,
+                }
 
-            self._prune(now=now)
-            self._record_history()
+            # Replace entire frame atomically
+            self._entities = new_entities
 
-    # ---- compatibility alias ----
+            # Enforce hard cap
+            if len(self._entities) > MAX_ENTITIES:
+                self._entities = dict(
+                    list(self._entities.items())[:MAX_ENTITIES]
+                )
+
+            self._record_history_locked()
+
     def update(self, perception: Dict[str, Any]) -> None:
         self.ingest(perception)
 
     # -------------------------------------------------
-    # SNAPSHOT API
+    # SNAPSHOT
     # -------------------------------------------------
 
     def snapshot(self) -> Dict[str, Any]:
-        """
-        Immutable snapshot for planner / verifier consumption.
-        """
         with self._lock:
             return copy.deepcopy(
                 {
@@ -149,16 +127,12 @@ class WorldGraph:
     def snapshot_from_perception(
         self, perception: Optional[Dict[str, Any]]
     ) -> Dict[str, Any]:
-        """
-        Atomic ingest + snapshot.
-        """
-        with self._lock:
-            if isinstance(perception, dict):
-                self.ingest(perception)
-            return self.snapshot()
+        if isinstance(perception, dict):
+            self.ingest(perception)
+        return self.snapshot()
 
     # -------------------------------------------------
-    # QUERIES (READ-ONLY)
+    # QUERIES
     # -------------------------------------------------
 
     def find_by_text(
@@ -173,6 +147,7 @@ class WorldGraph:
 
         with self._lock:
             results = []
+
             for ent in self._entities.values():
                 text = (ent.get("text") or "").lower()
 
@@ -194,7 +169,7 @@ class WorldGraph:
             return len(self._entities)
 
     # -------------------------------------------------
-    # HISTORY (FORENSICS)
+    # HISTORY
     # -------------------------------------------------
 
     def history(self) -> List[Dict[str, Any]]:
@@ -223,31 +198,13 @@ class WorldGraph:
         )
         return hashlib.sha256(raw.encode()).hexdigest()
 
-    def _prune(self, *, now: float) -> None:
-        stale_ids = [
-            eid
-            for eid, ent in self._entities.items()
-            if now - ent.get("last_seen", now) > ENTITY_STALE_SECONDS
-        ]
-
-        for eid in stale_ids:
-            del self._entities[eid]
-
-        if len(self._entities) > MAX_ENTITIES:
-            sorted_ids = sorted(
-                self._entities.items(),
-                key=lambda kv: kv[1].get("confidence", 0.0),
-            )
-            overflow = len(self._entities) - MAX_ENTITIES
-            for eid, _ in sorted_ids[:overflow]:
-                del self._entities[eid]
-
-    def _record_history(self) -> None:
+    def _record_history_locked(self) -> None:
         snapshot = {
             "ts": self._last_frame_ts,
             "entity_count": len(self._entities),
             "focused_app": self._focused_app,
         }
+
         self._history.append(snapshot)
 
         if len(self._history) > MAX_HISTORY:
