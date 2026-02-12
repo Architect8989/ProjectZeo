@@ -162,26 +162,16 @@ class VisionRuntime:
 
     def _call_qwen(self, image_b64: str) -> Dict[str, Any]:
         prompt = (
-            "You are a deterministic visual perception system.\n"
-            "You do NOT infer intent.\n"
-            "You do NOT suggest actions.\n"
-            "Return ONLY valid JSON in this exact schema:\n"
+            "Return ONLY valid JSON in this schema:\n"
             "{\n"
-            '  "elements": [\n'
-            '    {\n'
-            '      "type": "button|link|input|label|text|icon|window|menu|unknown",\n'
-            '      "text": "visible text",\n'
-            '      "x": 0.0-1.0,\n'
-            '      "y": 0.0-1.0,\n'
-            '      "state": "enabled|disabled|checked|unchecked|null"\n'
-            '    }\n'
-            "  ],\n"
+            '  "elements": [{ "type": string, "text": string, '
+            '"x": 0.0-1.0, "y": 0.0-1.0, '
+            '"state": string|null }],\n'
             '  "dialogs": [],\n'
             '  "apps": [],\n'
-            '  "focused_app": "string or null"\n'
+            '  "focused_app": string|null\n'
             "}\n"
-            "Coordinates are normalized.\n"
-            "Be precise.\n"
+            "No explanation. No markdown."
         )
 
         try:
@@ -207,7 +197,7 @@ class VisionRuntime:
             content = response["message"]["content"]
         except Exception:
             raise VisionDegradedError(
-                "Unexpected response format from vision model"
+                "Unexpected response format"
             )
 
         return self._parse_json(content)
@@ -224,11 +214,11 @@ class VisionRuntime:
     ) -> Dict[str, Any]:
 
         if not isinstance(perception, dict):
-            raise VisionDegradedError("Perception not JSON object")
+            raise VisionDegradedError("Perception not object")
 
-        elements = perception.get("elements")
+        elements = perception.get("elements", [])
         if not isinstance(elements, list):
-            raise VisionDegradedError("Missing or invalid elements list")
+            raise VisionDegradedError("Invalid elements")
 
         normalized_elements: List[Dict[str, Any]] = []
 
@@ -239,51 +229,45 @@ class VisionRuntime:
             x = el.get("x")
             y = el.get("y")
 
-            if not self._valid_coord(x) or not self._valid_coord(y):
+            if not isinstance(x, (int, float)) or not isinstance(y, (int, float)):
                 continue
+
+            x = float(min(max(float(x), 0.0), 1.0))
+            y = float(min(max(float(y), 0.0), 1.0))
 
             normalized_elements.append(
                 {
                     "type": str(el.get("type", "unknown")).strip(),
                     "text": str(el.get("text", "")).strip(),
-                    "x": float(min(max(float(x), 0.0), 1.0)),
-                    "y": float(min(max(float(y), 0.0), 1.0)),
+                    "x": x,
+                    "y": y,
                     "interactable": self._is_interactable(el),
                     "state": el.get("state"),
                 }
             )
 
-        dialogs = perception.get("dialogs")
-        if dialogs is None:
-            dialogs = []
-        if not isinstance(dialogs, list):
-            raise VisionDegradedError("Invalid dialogs structure")
-
-        apps = perception.get("apps")
-        if apps is None:
-            apps = []
-        if not isinstance(apps, list):
-            raise VisionDegradedError("Invalid apps structure")
-
         focused_app = perception.get("focused_app")
         if focused_app is not None and not isinstance(focused_app, str):
-            raise VisionDegradedError("Invalid focused_app type")
+            focused_app = None
+
+        # Ensure monotonic frame_ts
+        with self._lock:
+            if self._last_frame_ts is not None:
+                if frame_ts <= self._last_frame_ts:
+                    frame_ts = self._last_frame_ts + 1e-6
 
         return {
             "available": True,
             "frame_ts": frame_ts,
             "elements": normalized_elements,
-            "dialogs": dialogs,
-            "apps": apps,
+            "dialogs": perception.get("dialogs", []) if isinstance(perception.get("dialogs", []), list) else [],
+            "apps": perception.get("apps", []) if isinstance(perception.get("apps", []), list) else [],
             "focused_app": focused_app,
         }
 
     # -------------------------------------------------
     # UTILS
     # -------------------------------------------------
-
-    def _valid_coord(self, v: Any) -> bool:
-        return isinstance(v, (int, float)) and 0.0 <= float(v) <= 1.0
 
     def _is_interactable(self, element: Dict[str, Any]) -> bool:
         element_type = str(element.get("type", "")).lower()
