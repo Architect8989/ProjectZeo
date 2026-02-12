@@ -139,10 +139,10 @@ def _execute_plan(
         # -------------------------------------------------
 
         if world_graph:
-            try:
-                current_snapshot = world_graph.snapshot()
+            current_snapshot = world_graph.snapshot()
 
-                if previous_snapshot is not None:
+            if previous_snapshot is not None:
+                try:
                     delta = world_graph.compute_delta(previous_snapshot)
 
                     if delta.get("significant_change"):
@@ -161,10 +161,10 @@ def _execute_plan(
                             "curr_focus": delta.get("curr_focus"),
                         })
 
-                previous_snapshot = current_snapshot
+                except Exception as e:
+                    raise RuntimeError(f"Divergence check failed: {e}")
 
-            except Exception as e:
-                raise RuntimeError(f"Divergence check failed: {e}")
+            previous_snapshot = current_snapshot
 
         # -------------------------------------------------
         # AUTHORITY CHECK
@@ -264,94 +264,3 @@ def _execute_plan(
             raise RuntimeError("Execution aborted")
 
     journal.record({"event": "execution_complete"})
-
-
-# ==================================================
-# INTERNAL EXECUTION HELPERS
-# ==================================================
-
-def _execute_step(
-    *,
-    step: ExecutionStep,
-    os_backend: OperatingSystem,
-    accessibility_backend: Optional[AccessibilityBackend],
-    installer: Optional[AutonomousInstaller],
-) -> Any:
-
-    action = step.action or {}
-
-    if step.type in (StepType.DONE, StepType.VERIFICATION):
-        return None
-
-    if step.type == StepType.COMMAND_EXECUTION:
-        cmd = action.get("command")
-        if not cmd:
-            raise RuntimeError("Missing command")
-        return os_backend.exec(cmd)
-
-    if step.type == StepType.FILE_CREATION:
-        path = action.get("path")
-        content = action.get("content", "")
-        if not path:
-            raise RuntimeError("Missing file path")
-        os_backend.write_file(path, content)
-        return None
-
-    if step.type == StepType.TOOL_INSTALLATION:
-        if not installer:
-            raise RuntimeError("Installer unavailable")
-        tool = action.get("tool")
-        if not tool:
-            raise RuntimeError("Missing tool name")
-        return installer.install(tool)
-
-    if step.type == StepType.UI_INTERACTION:
-        op = action.get("operation")
-
-        if op == "click":
-            os_backend.mouse(action)
-            return None
-
-        if op == "write":
-            os_backend.write(action.get("content", ""))
-            return None
-
-        if op == "press":
-            os_backend.press(action.get("keys", []))
-            return None
-
-        raise RuntimeError(f"Unknown UI operation: {op}")
-
-    raise RuntimeError(f"Unhandled step type: {step.type}")
-
-
-def _extract_screen(observer) -> Dict[str, Any]:
-    if observer is None:
-        return {"available": False, "elements": []}
-
-    try:
-        snap = observer.snapshot()
-        perception = snap.get("perception")
-        if isinstance(perception, dict):
-            return perception
-    except Exception:
-        pass
-
-    return {"available": False, "elements": []}
-
-
-def _handle_authority(decision: AuthorityDecision, journal: ActionJournal) -> None:
-    if decision == AuthorityDecision.YIELD:
-        journal.record({"event": "authority_yield"})
-        raise RuntimeError("Authority yielded to human")
-
-    if decision == AuthorityDecision.ABORT:
-        journal.record({"event": "authority_abort"})
-        raise RuntimeError("Execution aborted by authority")
-
-    if decision == AuthorityDecision.RELEASE:
-        journal.record({"event": "authority_release"})
-        raise RuntimeError("Emergency release activated")
-
-    journal.record({"event": "authority_unknown", "decision": str(decision)})
-    raise RuntimeError("Unknown authority decision")
