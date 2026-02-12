@@ -49,14 +49,14 @@ class ObserverCore:
 
         self._lock = threading.RLock()
 
-        # ---- Authoritative state surface ----
+        # Authoritative state surface (flat perception)
         self._state: Dict[str, object] = {
             "uptime_seconds": 0.0,
             "tick_count": 0,
             "last_tick_ts": None,
             "perception_available": False,
             "perception_frame_ts": None,
-            "perception": None,  # FULL perception payload
+            "perception": None,  # RAW perception payload only
         }
 
         self._history: Deque[Dict[str, object]] = deque(
@@ -70,9 +70,6 @@ class ObserverCore:
     # --------------------------------------------------
 
     def reset_for_new_task(self) -> None:
-        """
-        Hard observer amnesia between executions.
-        """
         with self._lock:
             self._history.clear()
 
@@ -114,10 +111,6 @@ class ObserverCore:
     # --------------------------------------------------
 
     def tick(self) -> Dict[str, object]:
-        """
-        Advance observer clock.
-        Raises ObserverBlindnessError if perception is unusable.
-        """
         with self._lock:
             now = self._clock()
 
@@ -169,35 +162,51 @@ class ObserverCore:
             return snapshot
 
     # --------------------------------------------------
-    # PERCEPTION ATTACHMENT
+    # PERCEPTION ATTACHMENT (FIXED)
     # --------------------------------------------------
 
     def attach_perception_state(
         self, perception_state: Dict[str, object]
     ) -> None:
         """
-        Attach full perception payload.
-        Called by ObserverLoop after VisionRuntime output.
+        Attach perception from ObserverLoop.
+
+        perception_state structure:
+        {
+            "available": bool,
+            "frame_ts": float,
+            "perception": { ... raw perception payload ... }
+        }
         """
+
         if not isinstance(perception_state, dict):
             return
 
         with self._lock:
             available = bool(perception_state.get("available"))
             frame_ts = perception_state.get("frame_ts")
+            raw_payload = perception_state.get("perception")
 
-            if available:
+            if available and isinstance(raw_payload, dict):
                 now = self._clock()
                 self.last_frame_seen = now
+
                 if self.first_frame_seen is None:
                     self.first_frame_seen = now
+
                 self._consecutive_misses = 0
             else:
                 self._consecutive_misses += 1
 
             self._state["perception_available"] = available
             self._state["perception_frame_ts"] = frame_ts
-            self._state["perception"] = copy.deepcopy(perception_state)
+
+            # CRITICAL FIX:
+            # Store ONLY the raw perception payload.
+            if isinstance(raw_payload, dict):
+                self._state["perception"] = copy.deepcopy(raw_payload)
+            else:
+                self._state["perception"] = None
 
             if (
                 not available
@@ -210,17 +219,10 @@ class ObserverCore:
                 )
 
     # --------------------------------------------------
-    # AUTHORITATIVE SNAPSHOT (CRITICAL FIX)
+    # AUTHORITATIVE SNAPSHOT
     # --------------------------------------------------
 
     def snapshot(self) -> Dict[str, object]:
-        """
-        Full immutable observer snapshot.
-        Required by:
-        - SnapshotProvider
-        - Execution verification
-        - Screen extraction
-        """
         with self._lock:
             return copy.deepcopy(self._state)
 
@@ -242,12 +244,9 @@ class ObserverCore:
             return {
                 "observer_healthy": self.observer_healthy,
                 "blind_reason": self.blind_reason,
-                "uptime_seconds": round(
-                    now - self.start_time, 2
-                ),
+                "uptime_seconds": round(now - self.start_time, 2),
                 "ticks": self.tick_count,
-                "first_perception_seen": self.first_frame_seen
-                is not None,
+                "first_perception_seen": self.first_frame_seen is not None,
                 "consecutive_misses": self._consecutive_misses,
                 "history_depth": len(self._history),
         }
