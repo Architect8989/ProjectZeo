@@ -92,6 +92,7 @@ class RestoreProvider:
         snapshot: RestorationSnapshot,
     ) -> None:
 
+        # Restore cursor
         try:
             self._os.set_cursor_position(
                 {"x": snapshot.cursor.x, "y": snapshot.cursor.y}
@@ -101,6 +102,7 @@ class RestoreProvider:
                 f"Cursor restore failed: {e}"
             ) from e
 
+        # Restore window focus
         try:
             self._os.focus_window(
                 {"title": snapshot.focus.window_id}
@@ -108,6 +110,16 @@ class RestoreProvider:
         except Exception as e:
             raise RestorationError(
                 f"Window focus restore failed: {e}"
+            ) from e
+
+        # Restore active application (CRITICAL FIX)
+        try:
+            self._os.activate_application(
+                {"title": snapshot.application.process_name}
+            )
+        except Exception as e:
+            raise RestorationError(
+                f"Application activation failed: {e}"
             ) from e
 
     # =========================================================
@@ -126,12 +138,16 @@ class RestoreProvider:
         try:
             cursor = self._os.get_cursor_position()
             current_window = self._os.get_focused_window()
+            current_app = self._os.get_active_application()
         except Exception as e:
             raise RestorationError(
                 f"Verification read failed: {e}"
             ) from e
 
+        # -------------------------
         # Cursor validation
+        # -------------------------
+
         if (
             not isinstance(cursor, dict)
             or "x" not in cursor
@@ -155,11 +171,27 @@ class RestoreProvider:
                 "Cursor position mismatch after restore"
             )
 
+        # -------------------------
         # Focus validation
+        # -------------------------
+
         if (
             not isinstance(current_window, dict)
             or current_window.get("title") != snapshot.focus.window_id
         ):
             raise RestorationError(
                 "Focused window mismatch after restore"
-                )
+            )
+
+        # -------------------------
+        # Active application validation (CRITICAL FIX)
+        # -------------------------
+
+        if (
+            not isinstance(current_app, dict)
+            or current_app.get("title")
+            != snapshot.application.process_name
+        ):
+            raise RestorationError(
+                "Active application mismatch after restore"
+            )
