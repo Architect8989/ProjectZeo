@@ -31,7 +31,7 @@ def operate_main(
     terminal_prompt: str,
     execution_plan: ExecutionPlan,
     observer=None,
-    world_graph=None,              # NEW
+    world_graph=None,
     max_wallclock_seconds: int = 90 * 60,
     llm_callable=None,
 ):
@@ -164,24 +164,12 @@ def _execute_plan(
 
                 after_screen = _extract_screen(observer)
 
-                # ==================================================
-                # WORLD GRAPH UPDATE (NEW)
-                # ==================================================
-                if world_graph and observer:
-                    snap = observer.snapshot()
-                    perception = snap.get("perception")
-                    if isinstance(perception, dict):
-                        try:
-                            world_graph.ingest(perception)
-                        except Exception:
-                            pass
-
                 verification = verifier.verify_step(
                     step,
                     execution_result=result,
                     screenshot=after_screen,
                     previous_screenshot=before_screen,
-                    world_graph=world_graph,      # NEW
+                    world_graph=world_graph,
                 )
 
                 if not verification.success:
@@ -194,17 +182,13 @@ def _execute_plan(
                     "step_id": step.id,
                 })
 
-                # ==================================================
-                # RE-EVALUATION CHECKPOINT (HOOK)
-                # ==================================================
+                # Replan heuristic hook (non-mutating)
                 if world_graph and llm_callable:
-                    if _should_replan(step, world_graph):
+                    if _should_replan(world_graph):
                         journal.record({
                             "event": "replan_triggered",
                             "step_id": step.id,
                         })
-                        # Replanning logic intentionally delegated
-                        # to higher orchestration layer.
 
                 break
 
@@ -232,13 +216,13 @@ def _execute_plan(
 
 
 # ==================================================
-# REPLAN HEURISTIC (MINIMAL SAFE)
+# REPLAN HEURISTIC (SAFE)
 # ==================================================
 
-def _should_replan(step: ExecutionStep, world_graph) -> bool:
+def _should_replan(world_graph) -> bool:
     try:
         snapshot = world_graph.snapshot()
-        if snapshot.get("dialogs"):
+        if isinstance(snapshot, dict) and snapshot.get("dialogs"):
             return True
     except Exception:
         pass
@@ -262,7 +246,7 @@ def _execute_step(
             raise ValueError("Missing command")
         return os_backend.exec(cmd, sudo=step.action.get("sudo", False))
 
-    elif step.type == StepType.FILE_CREATION:
+    if step.type == StepType.FILE_CREATION:
         path = step.action.get("path")
         content = step.action.get("content", "")
         if not path:
@@ -270,11 +254,11 @@ def _execute_step(
         os_backend.write_file(path, content)
         return None
 
-    elif step.type == StepType.UI_INTERACTION:
+    if step.type == StepType.UI_INTERACTION:
         _execute_ui(step.action, os_backend)
         return None
 
-    elif step.type == StepType.TOOL_INSTALLATION:
+    if step.type == StepType.TOOL_INSTALLATION:
         if installer is None:
             raise RuntimeError("Installer unavailable")
         installer.install_tool(step.action)
@@ -325,20 +309,22 @@ def _extract_screen(observer):
         return None
 
     perception = snap.get("perception")
+    if not isinstance(perception, dict):
+        return None
+
     text_parts = []
 
-    if isinstance(perception, dict):
-        for el in perception.get("elements", []):
-            if isinstance(el, dict):
-                t = el.get("text")
-                if isinstance(t, str) and t.strip():
-                    text_parts.append(t.strip())
+    for el in perception.get("elements", []):
+        if isinstance(el, dict):
+            t = el.get("text")
+            if isinstance(t, str) and t.strip():
+                text_parts.append(t.strip())
 
     text = " ".join(text_parts)
     text_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
 
     return {
-        "available": snap.get("available", False),
+        "available": True,
         "text": text,
         "hash": text_hash,
     }
@@ -349,7 +335,11 @@ def _extract_screen(observer):
 # ==================================================
 
 def _valid_coord(v: Any) -> bool:
-    return isinstance(v, (int, float)) and not math.isnan(v) and 0.0 <= v <= 1.0
+    return (
+        isinstance(v, (int, float))
+        and not math.isnan(v)
+        and 0.0 <= v <= 1.0
+    )
 
 
 def _handle_authority(decision, journal):
