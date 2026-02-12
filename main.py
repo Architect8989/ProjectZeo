@@ -30,10 +30,6 @@ TASK_START = None
 MAX_TASK_SECONDS = 90 * 60
 
 
-# ==================================================
-# PROCESS SINGLETONS
-# ==================================================
-
 OS_BACKEND = OperatingSystem()
 
 STATE_PATH = os.path.join(os.getcwd(), ".authority_state.json")
@@ -78,10 +74,6 @@ def create_llm_callable() -> Callable[[str], str]:
 
 mode.inject_llm_callable(create_llm_callable())
 
-
-# ==================================================
-# PROVIDERS
-# ==================================================
 
 SNAPSHOT_PROVIDER = SnapshotProvider(
     observer=observer,
@@ -136,7 +128,6 @@ def main():
 
     env_fingerprint = collect_environment_fingerprint()
 
-    # Crash recovery
     persisted = AUTH_STATE.load()
     if persisted.get("dirty") or persisted.get("restore_required"):
         try:
@@ -150,6 +141,12 @@ def main():
     vision_runtime.start()
     observer_loop.start()
 
+    # --------------------------------------------------
+    # Vision warm-up
+    # --------------------------------------------------
+    print("[BOOT] Waiting for vision to stabilize...")
+    time.sleep(2.0)
+
     intent_listener = IntentListener(mode, SNAPSHOT_PROVIDER)
     intent_listener.start()
 
@@ -158,9 +155,6 @@ def main():
             mode.update_observer_health(observer.is_healthy())
             mode.update_vision_status(vision_runtime.is_healthy())
 
-            # --------------------------------------------------
-            # EXECUTION TRIGGER
-            # --------------------------------------------------
             if mode.is_armed():
 
                 TASK_START = time.time()
@@ -168,6 +162,15 @@ def main():
                 snapshot_id: Optional[str] = mode.consume_snapshot()
                 if not snapshot_id:
                     raise RuntimeError("Missing snapshot at execution boundary")
+
+                # --------------------------------------------------
+                # Ingest latest perception BEFORE planning
+                # --------------------------------------------------
+                obs_snap = observer.snapshot()
+                perception = obs_snap.get("perception")
+                if perception and isinstance(perception, dict):
+                    world_graph.ingest(perception)
+                    time.sleep(0.1)
 
                 mode.begin_planning()
 
@@ -216,9 +219,6 @@ def main():
                     )
 
                 finally:
-                    # --------------------------------------------------
-                    # RESTORATION PHASE
-                    # --------------------------------------------------
                     mode.begin_restoration()
 
                     try:
@@ -237,12 +237,12 @@ def main():
 
                     mode.complete_execution()
 
-                    # Prevent perception leakage across tasks
+                    # Prevent perception + world graph leakage
                     observer.reset_for_new_task()
+                    world_graph.reset()
 
                     TASK_START = None
 
-            # Hard time bound
             if TASK_START and (time.time() - TASK_START) > MAX_TASK_SECONDS:
                 _force_safe_shutdown("task_timeout")
                 os._exit(1)
