@@ -54,14 +54,29 @@ class WorldGraph:
         self._history: List[Dict[str, Any]] = []
 
     # -------------------------------------------------
+    # TASK ISOLATION
+    # -------------------------------------------------
+
+    def reset(self) -> None:
+        """
+        Clear all world graph state.
+
+        Must be called at task boundary to prevent
+        entity leakage across executions.
+        """
+        with self._lock:
+            self._entities.clear()
+            self._focused_app = None
+            self._last_frame_ts = None
+            self._history.clear()
+
+    # -------------------------------------------------
     # INGESTION (PLANNER-DRIVEN)
     # -------------------------------------------------
 
     def ingest(self, perception: Dict[str, Any]) -> None:
         """
         Merge a new perception frame into the world graph.
-
-        Must be called under lock or via snapshot_from_perception().
         """
         if not isinstance(perception, dict):
             return
@@ -76,37 +91,38 @@ class WorldGraph:
 
         now = time.monotonic()
 
-        self._last_frame_ts = frame_ts
-        self._focused_app = perception.get("focused_app")
+        with self._lock:
+            self._last_frame_ts = frame_ts
+            self._focused_app = perception.get("focused_app")
 
-        for el in elements:
-            if not isinstance(el, dict):
-                continue
+            for el in elements:
+                if not isinstance(el, dict):
+                    continue
 
-            entity_id = self._stable_entity_id(el)
+                entity_id = self._stable_entity_id(el)
 
-            if entity_id not in self._entities:
-                self._entities[entity_id] = {
-                    "id": entity_id,
-                    "type": el.get("type"),
-                    "text": el.get("text"),
-                    "x": el.get("x"),
-                    "y": el.get("y"),
-                    "first_seen": now,
-                    "last_seen": now,
-                    "confidence": 0.5,
-                }
-            else:
-                ent = self._entities[entity_id]
-                ent["last_seen"] = now
-                ent["x"] = el.get("x")
-                ent["y"] = el.get("y")
-                ent["confidence"] = min(
-                    ent.get("confidence", 0.5) + 0.05, 1.0
-                )
+                if entity_id not in self._entities:
+                    self._entities[entity_id] = {
+                        "id": entity_id,
+                        "type": el.get("type"),
+                        "text": el.get("text"),
+                        "x": el.get("x"),
+                        "y": el.get("y"),
+                        "first_seen": now,
+                        "last_seen": now,
+                        "confidence": 0.5,
+                    }
+                else:
+                    ent = self._entities[entity_id]
+                    ent["last_seen"] = now
+                    ent["x"] = el.get("x")
+                    ent["y"] = el.get("y")
+                    ent["confidence"] = min(
+                        ent.get("confidence", 0.5) + 0.05, 1.0
+                    )
 
-        self._prune(now=now)
-        self._record_history()
+            self._prune(now=now)
+            self._record_history()
 
     # ---- compatibility alias ----
     def update(self, perception: Dict[str, Any]) -> None:
@@ -120,23 +136,21 @@ class WorldGraph:
         """
         Immutable snapshot for planner / verifier consumption.
         """
-        return copy.deepcopy(
-            {
-                "timestamp": self._last_frame_ts,
-                "focused_app": self._focused_app,
-                "entities": list(self._entities.values()),
-                "entity_count": len(self._entities),
-            }
-        )
+        with self._lock:
+            return copy.deepcopy(
+                {
+                    "timestamp": self._last_frame_ts,
+                    "focused_app": self._focused_app,
+                    "entities": list(self._entities.values()),
+                    "entity_count": len(self._entities),
+                }
+            )
 
     def snapshot_from_perception(
         self, perception: Optional[Dict[str, Any]]
     ) -> Dict[str, Any]:
         """
         Atomic ingest + snapshot.
-
-        Planner calls this using latest perception from ObserverCore.
-        Observer must NOT mutate world graph directly.
         """
         with self._lock:
             if isinstance(perception, dict):
@@ -192,11 +206,6 @@ class WorldGraph:
     # -------------------------------------------------
 
     def _stable_entity_id(self, el: Dict[str, Any]) -> str:
-        """
-        Deterministic identity across frames.
-
-        Uses finer quantization to reduce collision risk.
-        """
         try:
             x = float(el.get("x", 0.0))
             y = float(el.get("y", 0.0))
