@@ -26,8 +26,9 @@ from core.planner.execution_planner import ExecutionPlanner
 
 
 HEARTBEAT_INTERVAL = 2.0
-TASK_START = None
 MAX_TASK_SECONDS = 90 * 60
+
+TASK_START = None
 
 
 OS_BACKEND = OperatingSystem()
@@ -49,7 +50,7 @@ mode = ModeController()
 
 
 # ==================================================
-# LLM INJECTION
+# LLM INJECTION (SAFE)
 # ==================================================
 
 def create_llm_callable() -> Callable[[str], str]:
@@ -72,7 +73,11 @@ def create_llm_callable() -> Callable[[str], str]:
     return llm_call
 
 
-mode.inject_llm_callable(create_llm_callable())
+try:
+    mode.inject_llm_callable(create_llm_callable())
+except Exception as e:
+    print(f"[BOOT] LLM injection failed: {e}", file=sys.stderr)
+    sys.exit(1)
 
 
 SNAPSHOT_PROVIDER = SnapshotProvider(
@@ -137,7 +142,7 @@ def _ingest_latest_perception():
 
 
 # ==================================================
-# ROOT MAIN
+# MAIN LOOP
 # ==================================================
 
 def main():
@@ -160,17 +165,13 @@ def main():
     vision_runtime.start()
     observer_loop.start()
 
-    print("[BOOT] Waiting for first valid perception frame...")
+    # Warmup perception
     warmup_deadline = time.time() + 5.0
-
     while time.time() < warmup_deadline:
         if observer.is_healthy() and vision_runtime.is_healthy():
-            try:
-                _ingest_latest_perception()
-                if world_graph.entity_count() > 0:
-                    break
-            except Exception:
-                pass
+            _ingest_latest_perception()
+            if world_graph.entity_count() > 0:
+                break
         time.sleep(0.1)
 
     intent_listener = IntentListener(mode, SNAPSHOT_PROVIDER)
@@ -182,11 +183,15 @@ def main():
             mode.update_vision_status(vision_runtime.is_healthy())
 
             # -------------------------------------------------
-            # PLANNING TIMEOUT ENFORCEMENT
+            # PLANNING TIMEOUT (FAIL-CLOSED)
             # -------------------------------------------------
 
             if mode.mode == SystemMode.PLANNING:
-                mode.check_planning_timeout()
+                try:
+                    mode.check_planning_timeout()
+                except Exception as e:
+                    _force_safe_shutdown(f"planning_timeout:{e}")
+                    os._exit(1)
 
             # -------------------------------------------------
             # EXECUTION ENTRY
