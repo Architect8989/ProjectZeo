@@ -225,7 +225,7 @@ class StepVerifier:
         return True, "", {"tool_path": tool_path}
 
     # =================================================
-    # UI VERIFICATION (HARDENED)
+    # UI VERIFICATION (CORRECTED)
     # =================================================
 
     def _verify_ui_change(
@@ -240,21 +240,18 @@ class StepVerifier:
         if not isinstance(screenshot, dict):
             return False, "invalid screenshot structure", {}
 
-        if not screenshot.get("available"):
-            return False, "no screenshot evidence available", {}
+        elements = screenshot.get("elements")
+        if not isinstance(elements, list):
+            return False, "no perception elements available", {}
+
+        if world_graph is None:
+            return False, "world_graph required for UI verification", {}
 
         verification = step.verification or {}
         action = step.action or {}
 
         # -------------------------------------------------
-        # 1. World graph required for UI verification
-        # -------------------------------------------------
-
-        if world_graph is None:
-            return False, "world_graph required for UI verification", {}
-
-        # -------------------------------------------------
-        # 2. Text grounding
+        # 1. Text grounding
         # -------------------------------------------------
 
         expected_text = verification.get("screen_contains")
@@ -268,7 +265,7 @@ class StepVerifier:
                     return False, f"text not found in world graph: {token}", {}
 
         # -------------------------------------------------
-        # 3. Focused application validation
+        # 2. Focused application validation
         # -------------------------------------------------
 
         expected_focus = verification.get("focused_app_equals")
@@ -282,7 +279,7 @@ class StepVerifier:
                 )
 
         # -------------------------------------------------
-        # 4. Entity type existence
+        # 3. Entity type existence
         # -------------------------------------------------
 
         expected_type = verification.get("entity_type_exists")
@@ -296,7 +293,7 @@ class StepVerifier:
                 )
 
         # -------------------------------------------------
-        # 5. Interactable grounding for clicks
+        # 4. Click grounding
         # -------------------------------------------------
 
         if action.get("operation") == "click":
@@ -306,12 +303,20 @@ class StepVerifier:
             if x is None or y is None:
                 return False, "click missing coordinates", {}
 
-            nearby = world_graph.find_by_type("button") + world_graph.find_by_type("link")
+            candidates = (
+                world_graph.find_by_type("button")
+                + world_graph.find_by_type("link")
+                + world_graph.find_by_type("input")
+            )
 
             grounded = False
-            for ent in nearby:
-                ex = ent.get("x", 0.0)
-                ey = ent.get("y", 0.0)
+
+            for ent in candidates:
+                ex = ent.get("x")
+                ey = ent.get("y")
+                if ex is None or ey is None:
+                    continue
+
                 if abs(ex - x) <= 0.05 and abs(ey - y) <= 0.05:
                     if ent.get("interactable") is False:
                         return False, "clicked element not interactable", {}
@@ -322,16 +327,16 @@ class StepVerifier:
                 return False, "click not grounded in world graph", {}
 
         # -------------------------------------------------
-        # 6. Entity count delta check
+        # 5. Entity count delta
         # -------------------------------------------------
 
         min_delta = verification.get("entity_count_delta_min")
-        if min_delta is not None and previous_screenshot:
-            before_count = previous_screenshot.get("entity_count")
-            after_count = world_graph.entity_count()
-
-            if isinstance(before_count, int):
-                if (after_count - before_count) < min_delta:
+        if min_delta is not None and isinstance(previous_screenshot, dict):
+            before_elements = previous_screenshot.get("elements")
+            if isinstance(before_elements, list):
+                before_count = len(before_elements)
+                after_count = world_graph.entity_count()
+                if (after_count - before_count) < int(min_delta):
                     return (
                         False,
                         "entity count delta below expectation",
@@ -339,18 +344,14 @@ class StepVerifier:
                     )
 
         # -------------------------------------------------
-        # If explicit criteria provided, and none failed → success
+        # Fail closed if no explicit criteria
         # -------------------------------------------------
 
         if verification:
             return True, "", {"world_graph_verified": True}
 
-        # -------------------------------------------------
-        # Fail closed if no verification criteria
-        # -------------------------------------------------
-
         return (
             False,
             "ui verification requires explicit verification criteria",
             {},
-    )
+                )
