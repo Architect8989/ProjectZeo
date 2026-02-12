@@ -97,7 +97,7 @@ class VisionRuntime:
                     self._last_output = output
                     self._last_frame_ts = output["frame_ts"]
                     self._consecutive_failures = 0
-                    self._healthy = True  # ✅ RECOVERY ON SUCCESS
+                    self._healthy = True
 
             except Exception:
                 with self._lock:
@@ -113,7 +113,6 @@ class VisionRuntime:
 
     def _process_frame_internal(self) -> Dict[str, Any]:
         start = time.monotonic()
-
         frame_ts = time.monotonic()
 
         image = self._capture_frame()
@@ -173,20 +172,32 @@ class VisionRuntime:
             "Return ONLY valid JSON.\n"
         )
 
-        response = ollama.chat(
-            model=QWEN_MODEL,
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {"type": "image", "image": image_b64},
-                    ],
-                }
-            ],
-        )
+        try:
+            response = ollama.chat(
+                model=QWEN_MODEL,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt},
+                            {"type": "image", "image": image_b64},
+                        ],
+                    }
+                ],
+                options={"timeout": MAX_LATENCY_SECONDS},
+            )
+        except Exception as e:
+            raise VisionUnavailableError(
+                f"Vision model call failed: {e}"
+            )
 
-        content = response["message"]["content"]
+        try:
+            content = response["message"]["content"]
+        except Exception:
+            raise VisionDegradedError(
+                "Unexpected response format from vision model"
+            )
+
         return self._parse_json(content)
 
     # -------------------------------------------------
