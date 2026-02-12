@@ -21,12 +21,12 @@ class ExecutionPlanner:
     HARD CONTRACT:
     - Planner is the ONLY place intelligence exists
     - LLM output must be structured and validated
-    - No side effects, no execution, no guessing
+    - No side effects
     - Planner operates on FROZEN snapshot only
     """
 
     LLM_TIMEOUT_SECONDS = 30.0
-    MAX_SCREEN_CHARS = 500  # bounded advisory context
+    MAX_SCREEN_CHARS = 500
 
     def __init__(
         self,
@@ -43,18 +43,20 @@ class ExecutionPlanner:
         self._environment = environment_fingerprint or {}
         self._observer = observer
 
-        # --------------------------------------------------
-        # SNAPSHOT ISOLATION (CRITICAL FIX)
-        # --------------------------------------------------
+        # SNAPSHOT ISOLATION
         self._world_snapshot: Optional[Dict[str, Any]] = None
 
         if world_graph is not None:
             try:
                 snap = world_graph.snapshot()
-                # Defensive copy to ensure immutability
                 self._world_snapshot = json.loads(json.dumps(snap))
             except Exception:
-                self._world_snapshot = None
+                raise PlanningError("Failed to snapshot world_graph")
+
+        if self._world_snapshot is None:
+            raise PlanningError(
+                "Planner requires non-empty world snapshot"
+            )
 
     # ==================================================
     # PUBLIC API
@@ -67,6 +69,7 @@ class ExecutionPlanner:
         requirements: Dict[str, Any],
         high_level_steps: List[Dict[str, Any]],
     ) -> ExecutionPlan:
+
         if not isinstance(objective, str) or not objective.strip():
             raise PlanningError("Objective must be non-empty string")
 
@@ -87,7 +90,7 @@ class ExecutionPlanner:
                 raise PlanningError(f"Goal produced no steps: {goal}")
 
             for spec in expanded:
-                description = spec.get("description", "").strip()
+                description = spec["description"].strip()
                 if not description:
                     raise PlanningError(
                         "LLM produced step without description"
@@ -99,11 +102,11 @@ class ExecutionPlanner:
                     id=step_id,
                     type=spec["type"],
                     description=description,
-                    action=spec.get("action", {}),
-                    verification=spec.get("verification", {}),
+                    action=spec["action"],
+                    verification=spec["verification"],
                     dependencies=deps,
-                    estimated_duration=spec.get("estimated_duration", 0.0),
-                    retryable=spec.get("retryable", True),
+                    estimated_duration=spec["estimated_duration"],
+                    retryable=spec["retryable"],
                 )
 
                 execution_steps.append(step)
@@ -113,7 +116,6 @@ class ExecutionPlanner:
         if not execution_steps:
             raise PlanningError("No executable steps generated")
 
-        # ---- mandatory DONE step ----
         execution_steps.append(
             ExecutionStep(
                 id=step_id,
@@ -155,10 +157,6 @@ class ExecutionPlanner:
         return [t for t in tools if isinstance(t, str) and t.strip()]
 
     def _read_screen_context(self) -> str:
-        """
-        Read-only grounding context from FROZEN snapshot.
-        Advisory only — never authoritative.
-        """
         if not self._world_snapshot:
             return ""
 
@@ -171,8 +169,10 @@ class ExecutionPlanner:
         for ent in entities:
             if not isinstance(ent, dict):
                 continue
+
             label = ent.get("text")
             etype = ent.get("type")
+
             if isinstance(label, str) and label.strip():
                 text_chunks.append(f"{etype}: {label}")
 
@@ -180,7 +180,7 @@ class ExecutionPlanner:
         return context[: self.MAX_SCREEN_CHARS]
 
     # ==================================================
-    # LLM-POWERED GOAL EXPANSION (TIME-BOUNDED)
+    # LLM EXPANSION
     # ==================================================
 
     def _expand_goal(self, goal: str) -> List[Dict[str, Any]]:
@@ -238,24 +238,43 @@ Rules:
 
         validated: List[Dict[str, Any]] = []
 
+        allowed_types = {t.value for t in StepType}
+
         for idx, step in enumerate(data):
             if not isinstance(step, dict):
                 raise PlanningError(f"Invalid step at index {idx}")
 
             step_type = step.get("type")
-            if step_type not in {t.value for t in StepType}:
+            if step_type not in allowed_types:
                 raise PlanningError(f"Invalid step type: {step_type}")
+
+            description = step.get("description", "")
+            if not isinstance(description, str):
+                raise PlanningError("Step description must be string")
+
+            action = step.get("action", {})
+            if not isinstance(action, dict):
+                raise PlanningError("Step action must be object")
+
+            verification = step.get("verification", {})
+            if not isinstance(verification, dict):
+                raise PlanningError("Step verification must be object")
+
+            try:
+                duration = float(step.get("estimated_duration", 0.0))
+            except Exception:
+                raise PlanningError("Invalid estimated_duration")
+
+            retryable = bool(step.get("retryable", True))
 
             validated.append(
                 {
                     "type": StepType(step_type),
-                    "description": step.get("description", ""),
-                    "action": step.get("action", {}),
-                    "verification": step.get("verification", {}),
-                    "estimated_duration": float(
-                        step.get("estimated_duration", 0.0)
-                    ),
-                    "retryable": bool(step.get("retryable", True)),
+                    "description": description,
+                    "action": action,
+                    "verification": verification,
+                    "estimated_duration": duration,
+                    "retryable": retryable,
                 }
             )
 
