@@ -41,8 +41,6 @@ class ExecutionPlanner:
 
         self._llm_call = llm_call
         self._environment = environment_fingerprint or {}
-
-        # SNAPSHOT ISOLATION
         self._world_snapshot: Optional[Dict[str, Any]] = None
 
         if world_graph is not None:
@@ -52,7 +50,6 @@ class ExecutionPlanner:
             except Exception:
                 raise PlanningError("Failed to snapshot world_graph")
 
-        # SAFE FALLBACK
         if self._world_snapshot is None:
             self._world_snapshot = {
                 "entities": [],
@@ -93,12 +90,9 @@ class ExecutionPlanner:
                 raise PlanningError(f"Goal produced no steps: {goal}")
 
             for spec in expanded:
-
                 description = spec["description"].strip()
                 if not description:
-                    raise PlanningError(
-                        "LLM produced step without description"
-                    )
+                    raise PlanningError("LLM produced step without description")
 
                 deps = [last_step_id] if last_step_id else []
 
@@ -120,7 +114,6 @@ class ExecutionPlanner:
         if not execution_steps:
             raise PlanningError("No executable steps generated")
 
-        # Planner controls DONE
         execution_steps.append(
             ExecutionStep(
                 id=step_id,
@@ -150,6 +143,102 @@ class ExecutionPlanner:
         return plan
 
     # ==================================================
+    # NEW: SNAPSHOT UPDATE
+    # ==================================================
+
+    def update_world_snapshot(self, new_snapshot: Dict[str, Any]) -> None:
+        """
+        Replace frozen snapshot with new world snapshot.
+        Deep-copied to preserve isolation.
+        """
+
+        if not isinstance(new_snapshot, dict):
+            raise PlanningError("Invalid world snapshot")
+
+        try:
+            self._world_snapshot = json.loads(json.dumps(new_snapshot))
+        except Exception:
+            raise PlanningError("Failed to freeze new snapshot")
+
+    # ==================================================
+    # NEW: REPLAN DECISION ENGINE
+    # ==================================================
+
+    def should_replan(
+        self,
+        *,
+        current_step_id: int,
+        execution_history: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """
+        Decide whether re-planning is required.
+
+        Returns structured decision.
+        """
+
+        if not isinstance(current_step_id, int):
+            raise PlanningError("Invalid step id")
+
+        if not isinstance(execution_history, list):
+            execution_history = []
+
+        if not self._world_snapshot:
+            return {
+                "replan_required": False,
+                "confidence": 0.0,
+                "reason": "No world snapshot available",
+            }
+
+        prompt = f"""
+You are validating whether a deterministic execution plan must be revised.
+
+Original snapshot:
+{json.dumps(self._world_snapshot, indent=2)[:1000]}
+
+Execution state:
+- current_step_id: {current_step_id}
+- recent_history:
+{json.dumps(execution_history[-5:], indent=2)}
+
+Return JSON only:
+{{
+  "replan_required": boolean,
+  "confidence": 0.0-1.0,
+  "reason": "short explanation"
+}}
+
+Rules:
+- Replan only if snapshot divergence makes continuation unsafe.
+- Be conservative.
+"""
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(self._llm_call, prompt)
+            try:
+                raw = future.result(timeout=self.LLM_TIMEOUT_SECONDS)
+            except concurrent.futures.TimeoutError:
+                return {
+                    "replan_required": False,
+                    "confidence": 0.0,
+                    "reason": "LLM timeout",
+                }
+
+        try:
+            decision = json.loads(raw.strip())
+        except Exception:
+            return {
+                "replan_required": False,
+                "confidence": 0.0,
+                "reason": "Invalid LLM response",
+            }
+
+        return {
+            "replan_required": bool(decision.get("replan_required", False)),
+            "confidence": float(decision.get("confidence", 0.0)),
+            "reason": decision.get("reason", "LLM decision"),
+        }
+
+    # ==================================================
     # INTERNAL HELPERS
     # ==================================================
 
@@ -166,8 +255,8 @@ class ExecutionPlanner:
             return ""
 
         text_chunks: List[str] = []
-
         entities = self._world_snapshot.get("entities", [])
+
         if not isinstance(entities, list):
             return ""
 
@@ -194,16 +283,16 @@ class ExecutionPlanner:
         prompt = f"""
 You are the planning brain of a deterministic execution kernel.
 
-Environment fingerprint:
+Environment:
 {json.dumps(self._environment, indent=2)}
 
-Frozen screen snapshot (advisory only):
+Frozen screen:
 {screen_context}
 
-Task:
+Goal:
 "{goal}"
 
-Return ONLY valid JSON.
+Return JSON list only.
 
 Schema:
 [
@@ -220,9 +309,8 @@ Schema:
 Rules:
 - Do NOT emit DONE
 - Do NOT emit tool_installation
-- No hallucinated tools
-- Every executable step must include verification criteria
-- Be conservative and explicit
+- Every step must include verification
+- Conservative estimates
 """
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
