@@ -225,7 +225,7 @@ class StepVerifier:
         return True, "", {"tool_path": tool_path}
 
     # =================================================
-    # UI VERIFICATION (CORRECTED)
+    # UI VERIFICATION (HARDENED)
     # =================================================
 
     def _verify_ui_change(
@@ -250,24 +250,17 @@ class StepVerifier:
         verification = step.verification or {}
         action = step.action or {}
 
-        # -------------------------------------------------
-        # 1. Text grounding
-        # -------------------------------------------------
-
+        # Text grounding
         expected_text = verification.get("screen_contains")
         if expected_text:
             if not isinstance(expected_text, list):
                 return False, "screen_contains must be list", {}
-
             for token in expected_text:
                 matches = world_graph.find_by_text(contains=token)
                 if not matches:
                     return False, f"text not found in world graph: {token}", {}
 
-        # -------------------------------------------------
-        # 2. Focused application validation
-        # -------------------------------------------------
-
+        # Focus validation
         expected_focus = verification.get("focused_app_equals")
         if expected_focus:
             current_focus = world_graph.focused_application()
@@ -278,46 +271,32 @@ class StepVerifier:
                     {"focused_app": current_focus},
                 )
 
-        # -------------------------------------------------
-        # 3. Entity type existence
-        # -------------------------------------------------
-
+        # Entity type existence
         expected_type = verification.get("entity_type_exists")
         if expected_type:
             found = world_graph.find_by_type(expected_type)
             if not found:
-                return (
-                    False,
-                    f"entity type not found: {expected_type}",
-                    {},
-                )
+                return False, f"entity type not found: {expected_type}", {}
 
-        # -------------------------------------------------
-        # 4. Click grounding
-        # -------------------------------------------------
-
+        # Click grounding
         if action.get("operation") == "click":
             x = action.get("x")
             y = action.get("y")
 
-            if x is None or y is None:
-                return False, "click missing coordinates", {}
+            if not isinstance(x, (int, float)) or not isinstance(y, (int, float)):
+                return False, "click missing or invalid coordinates", {}
 
-            candidates = (
-                world_graph.find_by_type("button")
-                + world_graph.find_by_type("link")
-                + world_graph.find_by_type("input")
-            )
-
+            candidates = world_graph.snapshot().get("entities", [])
             grounded = False
 
             for ent in candidates:
                 ex = ent.get("x")
                 ey = ent.get("y")
-                if ex is None or ey is None:
+
+                if not isinstance(ex, (int, float)) or not isinstance(ey, (int, float)):
                     continue
 
-                if abs(ex - x) <= 0.05 and abs(ey - y) <= 0.05:
+                if abs(ex - x) <= 0.02 and abs(ey - y) <= 0.02:
                     if ent.get("interactable") is False:
                         return False, "clicked element not interactable", {}
                     grounded = True
@@ -326,10 +305,7 @@ class StepVerifier:
             if not grounded:
                 return False, "click not grounded in world graph", {}
 
-        # -------------------------------------------------
-        # 5. Entity count delta
-        # -------------------------------------------------
-
+        # Entity count delta
         min_delta = verification.get("entity_count_delta_min")
         if min_delta is not None and isinstance(previous_screenshot, dict):
             before_elements = previous_screenshot.get("elements")
@@ -340,13 +316,10 @@ class StepVerifier:
                     return (
                         False,
                         "entity count delta below expectation",
-                        {},
+                        {"before": before_count, "after": after_count},
                     )
 
-        # -------------------------------------------------
-        # Fail closed if no explicit criteria
-        # -------------------------------------------------
-
+        # Explicit criteria required
         if verification:
             return True, "", {"world_graph_verified": True}
 
@@ -354,4 +327,4 @@ class StepVerifier:
             False,
             "ui verification requires explicit verification criteria",
             {},
-                )
+            )
