@@ -79,7 +79,7 @@ class SnapshotProvider:
     def take_snapshot(self) -> str:
         snapshot = self._capture_snapshot()
         snapshot_id = self.store_snapshot(snapshot)
-        self._mode.attach_snapshot(snapshot_id)
+        # attach_snapshot REMOVED — caller is responsible
         return snapshot_id
 
     # =========================================================
@@ -106,19 +106,20 @@ class SnapshotProvider:
             )
 
         # 3. VISION CHECK
-        vision_state = self._observer.snapshot()
+        observer_state = self._observer.snapshot()
 
-        if not isinstance(vision_state, dict):
+        if not isinstance(observer_state, dict):
             raise SnapshotProviderError(
                 "Observer snapshot invalid structure"
             )
 
-        if not vision_state.get("available"):
+        # Correct keys from ObserverCore
+        if not observer_state.get("perception_available"):
             raise SnapshotProviderError(
                 "Vision unavailable during snapshot"
             )
 
-        frame_ts = vision_state.get("frame_ts")
+        frame_ts = observer_state.get("perception_frame_ts")
         if frame_ts is not None and not isinstance(frame_ts, (int, float)):
             raise SnapshotProviderError(
                 "Invalid vision frame timestamp"
