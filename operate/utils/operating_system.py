@@ -192,8 +192,7 @@ class OperatingSystem:
                     text=True,
                 )
                 if result.returncode == 0:
-                    title = result.stdout.strip()
-                    return {"title": title}
+                    return {"title": result.stdout.strip()}
 
             elif system == "Linux":
                 title = subprocess.check_output(
@@ -226,9 +225,8 @@ class OperatingSystem:
         try:
             if system == "Darwin":
                 script = f'''
-                tell application "System Events"
-                    set frontApp to first application process whose name is "{title}"
-                    set frontmost of frontApp to true
+                tell application "{title}"
+                    activate
                 end tell
                 '''
                 subprocess.run(["osascript", "-e", script], check=False)
@@ -250,6 +248,79 @@ class OperatingSystem:
 
     def get_active_application(self) -> Dict[str, str]:
         return self.get_focused_window()
+
+    def activate_application(self, app_spec: Dict[str, str]) -> None:
+        if not isinstance(app_spec, dict):
+            raise RuntimeError("activate_application(): invalid app_spec")
+
+        title = app_spec.get("title")
+        if not isinstance(title, str) or not title.strip():
+            raise RuntimeError("activate_application(): missing title")
+
+        system = platform.system()
+
+        try:
+            if system == "Darwin":
+                script = f'''
+                tell application "{title}"
+                    activate
+                end tell
+                '''
+                result = subprocess.run(
+                    ["osascript", "-e", script],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                if result.returncode != 0:
+                    raise OSError(result.stderr.strip() or "activation failed")
+
+            elif system == "Linux":
+                result = subprocess.run(
+                    ["wmctrl", "-a", title],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                if result.returncode != 0:
+                    raise OSError(result.stderr.strip() or "activation failed")
+
+            elif system == "Windows":
+                import win32gui
+                import win32con
+
+                target_hwnd = None
+
+                def enum_handler(hwnd, _):
+                    nonlocal target_hwnd
+                    if win32gui.IsWindowVisible(hwnd):
+                        if title.lower() in win32gui.GetWindowText(hwnd).lower():
+                            target_hwnd = hwnd
+                            return False
+                    return True
+
+                win32gui.EnumWindows(enum_handler, None)
+
+                if target_hwnd is None:
+                    raise OSError(f"Application '{title}' not found")
+
+                if win32gui.IsIconic(target_hwnd):
+                    win32gui.ShowWindow(target_hwnd, win32con.SW_RESTORE)
+
+                win32gui.SetForegroundWindow(target_hwnd)
+                win32gui.BringWindowToTop(target_hwnd)
+
+            else:
+                raise OSError(f"Unsupported platform: {system}")
+
+        except subprocess.TimeoutExpired:
+            raise OSError(f"activate_application(): timeout for '{title}'")
+
+        time.sleep(0.1)
+
+        focused = self.get_focused_window()
+        if title.lower() not in focused.get("title", "").lower():
+            raise OSError(f"activate_application(): verification failed")
 
     # =================================================
     # RESTORATION / SAFETY
@@ -286,4 +357,4 @@ class OperatingSystem:
             isinstance(v, float)
             and not math.isnan(v)
             and 0.0 <= v <= 1.0
-            )
+    )
