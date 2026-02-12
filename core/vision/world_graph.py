@@ -65,7 +65,8 @@ class WorldGraph:
         now = time.monotonic()
 
         with self._lock:
-            # Ignore stale frames
+
+            # Reject stale frames
             if (
                 self._last_frame_ts is not None
                 and frame_ts <= self._last_frame_ts
@@ -75,7 +76,6 @@ class WorldGraph:
             self._last_frame_ts = frame_ts
             self._focused_app = perception.get("focused_app")
 
-            # Build fresh entity map for this frame
             new_entities: Dict[str, Dict[str, Any]] = {}
 
             for el in elements:
@@ -84,21 +84,35 @@ class WorldGraph:
 
                 entity_id = self._stable_entity_id(el)
 
+                # Preserve temporal continuity
+                prev = self._entities.get(entity_id)
+                first_seen = prev["first_seen"] if prev else now
+
                 new_entities[entity_id] = {
                     "id": entity_id,
                     "type": el.get("type"),
                     "text": el.get("text"),
-                    "x": el.get("x"),
-                    "y": el.get("y"),
-                    "first_seen": now,
+                    "x": self._safe_float(el.get("x")),
+                    "y": self._safe_float(el.get("y")),
+                    "interactable": el.get("interactable"),
+                    "state": el.get("state"),
+                    "first_seen": first_seen,
                     "last_seen": now,
                     "confidence": 1.0,
                 }
 
-            # Replace entire frame atomically
+            # Replace frame atomically
             self._entities = new_entities
 
-            # Enforce hard cap
+            # Remove stale entities (temporal guard)
+            cutoff = now - ENTITY_STALE_SECONDS
+            self._entities = {
+                eid: ent
+                for eid, ent in self._entities.items()
+                if ent["last_seen"] >= cutoff
+            }
+
+            # Hard cap enforcement
             if len(self._entities) > MAX_ENTITIES:
                 self._entities = dict(
                     list(self._entities.items())[:MAX_ENTITIES]
@@ -136,7 +150,10 @@ class WorldGraph:
     # -------------------------------------------------
 
     def find_by_text(
-        self, *, contains: Optional[str] = None, exact: Optional[str] = None
+        self,
+        *,
+        contains: Optional[str] = None,
+        exact: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
 
         if not contains and not exact:
@@ -160,6 +177,14 @@ class WorldGraph:
 
             return results
 
+    def find_by_type(self, entity_type: str) -> List[Dict[str, Any]]:
+        with self._lock:
+            return [
+                copy.deepcopy(ent)
+                for ent in self._entities.values()
+                if ent.get("type") == entity_type
+            ]
+
     def focused_application(self) -> Optional[str]:
         with self._lock:
             return self._focused_app
@@ -179,6 +204,12 @@ class WorldGraph:
     # -------------------------------------------------
     # INTERNALS
     # -------------------------------------------------
+
+    def _safe_float(self, value: Any) -> float:
+        try:
+            return float(value)
+        except Exception:
+            return 0.0
 
     def _stable_entity_id(self, el: Dict[str, Any]) -> str:
         try:
