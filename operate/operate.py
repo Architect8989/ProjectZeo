@@ -33,7 +33,6 @@ def operate_main(
     observer=None,
     world_graph=None,
     max_wallclock_seconds: int = 90 * 60,
-    llm_callable=None,
 ):
     if not isinstance(execution_plan, ExecutionPlan):
         raise ValueError("execution_plan must be ExecutionPlan")
@@ -54,10 +53,8 @@ def operate_main(
     input_arbitrator = InputArbitrator()
     verifier = StepVerifier()
 
-    recovery = FailureRecoveryManager(
-        llm_callable=llm_callable,
-        world_graph=world_graph,
-    )
+    # FIX: deterministic recovery only
+    recovery = FailureRecoveryManager()
 
     progress = ProgressTracker(execution_plan)
 
@@ -81,7 +78,6 @@ def operate_main(
             recovery=recovery,
             progress=progress,
             installer=installer,
-            llm_callable=llm_callable,
             max_wallclock_seconds=max_wallclock_seconds,
         )
     finally:
@@ -105,7 +101,6 @@ def _execute_plan(
     recovery: FailureRecoveryManager,
     progress: ProgressTracker,
     installer: Optional[AutonomousInstaller],
-    llm_callable,
     max_wallclock_seconds: int,
 ):
     start_ts = time.time()
@@ -152,6 +147,16 @@ def _execute_plan(
                 input_arbitrator.soc_action_started()
                 os_backend.heartbeat()
 
+                # FIX: refresh world graph BEFORE execution
+                if observer and world_graph:
+                    try:
+                        snap = observer.snapshot()
+                        perception = snap.get("perception")
+                        if isinstance(perception, dict):
+                            world_graph.update(perception)
+                    except Exception:
+                        pass
+
                 before_screen = _extract_screen(observer)
 
                 with action_timeout(step.estimated_duration or 30):
@@ -161,6 +166,16 @@ def _execute_plan(
                         accessibility_backend=accessibility_backend,
                         installer=installer,
                     )
+
+                # FIX: refresh world graph BEFORE verification
+                if observer and world_graph:
+                    try:
+                        snap = observer.snapshot()
+                        perception = snap.get("perception")
+                        if isinstance(perception, dict):
+                            world_graph.update(perception)
+                    except Exception:
+                        pass
 
                 after_screen = _extract_screen(observer)
 
@@ -181,14 +196,6 @@ def _execute_plan(
                     "event": "step_complete",
                     "step_id": step.id,
                 })
-
-                # Safe replan signal
-                if world_graph and llm_callable:
-                    if _should_replan(world_graph):
-                        journal.record({
-                            "event": "replan_triggered",
-                            "step_id": step.id,
-                        })
 
                 break
 
@@ -213,169 +220,3 @@ def _execute_plan(
             raise RuntimeError("Execution aborted")
 
     journal.record({"event": "execution_complete"})
-
-
-# ==================================================
-# REPLAN HEURISTIC (FIXED)
-# ==================================================
-
-def _should_replan(world_graph) -> bool:
-    try:
-        snapshot = world_graph.snapshot()
-        if not isinstance(snapshot, dict):
-            return False
-
-        # Trigger if focused app changed or entity count drops sharply
-        entity_count = snapshot.get("entity_count", 0)
-        focused = snapshot.get("focused_app")
-
-        if entity_count == 0:
-            return True
-
-        if focused is None:
-            return True
-
-    except Exception:
-        return False
-
-    return False
-
-
-# ==================================================
-# STEP EXECUTION
-# ==================================================
-
-def _execute_step(
-    *,
-    step: ExecutionStep,
-    os_backend: OperatingSystem,
-    accessibility_backend: Optional[AccessibilityBackend],
-    installer: Optional[AutonomousInstaller],
-):
-    if not isinstance(step.action, dict):
-        raise ValueError("Invalid step action structure")
-
-    if step.type == StepType.COMMAND_EXECUTION:
-        cmd = step.action.get("command")
-        if not isinstance(cmd, str) or not cmd.strip():
-            raise ValueError("Missing command")
-        return os_backend.exec(cmd, sudo=bool(step.action.get("sudo", False)))
-
-    if step.type == StepType.FILE_CREATION:
-        path = step.action.get("path")
-        content = step.action.get("content", "")
-        if not isinstance(path, str) or not path:
-            raise ValueError("Missing file path")
-        os_backend.write_file(path, content)
-        return None
-
-    if step.type == StepType.UI_INTERACTION:
-        _execute_ui(step.action, os_backend)
-        return None
-
-    if step.type == StepType.TOOL_INSTALLATION:
-        if installer is None:
-            raise RuntimeError("Installer unavailable")
-        installer.install_tool(step.action)
-        return None
-
-    return None
-
-
-# ==================================================
-# UI EXECUTION
-# ==================================================
-
-def _execute_ui(ui: Dict[str, Any], os_backend: OperatingSystem):
-    if not isinstance(ui, dict):
-        raise ValueError("Invalid UI action")
-
-    op = ui.get("operation")
-
-    if op == "click":
-        x, y = ui.get("x"), ui.get("y")
-        if not _valid_coord(x) or not _valid_coord(y):
-            raise ValueError("Invalid coordinates")
-        os_backend.mouse({"x": x, "y": y})
-
-    elif op == "write":
-        text = ui.get("content")
-        if not isinstance(text, str):
-            raise ValueError("Invalid text")
-        os_backend.write(text)
-
-    elif op == "press":
-        keys = ui.get("keys")
-        if not keys:
-            raise ValueError("Missing keys")
-        os_backend.press(keys)
-
-    else:
-        raise ValueError(f"Unknown UI op: {op}")
-
-
-# ==================================================
-# SCREEN EXTRACTION (FIXED)
-# ==================================================
-
-def _extract_screen(observer):
-    if not observer:
-        return None
-
-    snap = observer.snapshot()
-    if not isinstance(snap, dict):
-        return None
-
-    if not snap.get("available"):
-        return {"available": False}
-
-    perception = snap.get("perception")
-    if not isinstance(perception, dict):
-        return {"available": False}
-
-    elements = perception.get("elements")
-    if not isinstance(elements, list):
-        return {"available": False}
-
-    text_parts = []
-
-    for el in elements:
-        if isinstance(el, dict):
-            t = el.get("text")
-            if isinstance(t, str) and t.strip():
-                text_parts.append(t.strip())
-
-    text = " ".join(text_parts)
-    text_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
-
-    return {
-        "available": True,
-        "text": text,
-        "hash": text_hash,
-    }
-
-
-# ==================================================
-# HELPERS
-# ==================================================
-
-def _valid_coord(v: Any) -> bool:
-    return (
-        isinstance(v, (int, float))
-        and not math.isnan(v)
-        and 0.0 <= v <= 1.0
-    )
-
-
-def _handle_authority(decision, journal):
-    if decision == AuthorityDecision.RELEASE:
-        journal.record({"event": "authority_release"})
-        raise RuntimeError("Authority released control")
-
-    if decision == AuthorityDecision.ABORT:
-        journal.record({"event": "authority_abort"})
-        raise RuntimeError("Authority aborted execution")
-
-    if decision == AuthorityDecision.YIELD:
-        journal.record({"event": "authority_yield"})
-        time.sleep(0.5)
