@@ -2,7 +2,7 @@ import os
 import shutil
 import subprocess
 from dataclasses import dataclass
-from typing import Optional, Any, Dict, Tuple
+from typing import Optional, Any, Dict, Tuple, List
 
 from core.schemas.execution_plan import ExecutionStep, StepType
 
@@ -39,7 +39,7 @@ class StepVerifier:
         *,
         screenshot: Optional[Dict[str, Any]] = None,
         previous_screenshot: Optional[Dict[str, Any]] = None,
-        world_graph=None,
+        world_graph=None,  # accepted but intentionally unused (deterministic layer)
     ) -> VerificationResult:
 
         if not isinstance(step, ExecutionStep):
@@ -102,6 +102,9 @@ class StepVerifier:
         verification = step.verification or {}
         expected_codes = verification.get("expected_return_codes", [0])
 
+        if not isinstance(expected_codes, list):
+            return False, "expected_return_codes must be list", {}
+
         if result.returncode not in expected_codes:
             return (
                 False,
@@ -111,6 +114,9 @@ class StepVerifier:
 
         expected_output = verification.get("output_contains")
         if expected_output:
+            if not isinstance(expected_output, list):
+                return False, "output_contains must be list", {}
+
             combined = (result.stdout or "") + (result.stderr or "")
             for token in expected_output:
                 if token not in combined:
@@ -135,7 +141,7 @@ class StepVerifier:
         verification = step.verification or {}
 
         path = action.get("path")
-        if not isinstance(path, str):
+        if not isinstance(path, str) or not path:
             return False, "file path missing or invalid", {}
 
         if not os.path.exists(path):
@@ -151,6 +157,9 @@ class StepVerifier:
 
         expected = verification.get("content_contains")
         if expected:
+            if not isinstance(expected, list):
+                return False, "content_contains must be list", {}
+
             try:
                 with open(path, "r", encoding="utf-8", errors="ignore") as f:
                     content = f.read()
@@ -179,7 +188,7 @@ class StepVerifier:
         verification = step.verification or {}
 
         tool = action.get("tool")
-        if not isinstance(tool, str):
+        if not isinstance(tool, str) or not tool:
             return False, "tool name missing or invalid", {}
 
         tool_path = shutil.which(tool)
@@ -221,36 +230,42 @@ class StepVerifier:
         previous_screenshot: Optional[Dict[str, Any]] = None,
     ) -> Tuple[bool, str, Dict[str, Any]]:
 
-        if not screenshot or not screenshot.get("available"):
+        if not isinstance(screenshot, dict) or not screenshot.get("available"):
             return False, "no screenshot evidence available", {}
 
         verification = step.verification or {}
         expected_text = verification.get("screen_contains")
 
-        # Fallback: allow verification if screen hash changed
-        if not expected_text:
-            if previous_screenshot and screenshot:
-                prev_hash = previous_screenshot.get("hash")
-                curr_hash = screenshot.get("hash")
-                if prev_hash and curr_hash and prev_hash != curr_hash:
-                    return True, "", {"screen_changed": True}
+        # --- Explicit text match path ---
+        if expected_text:
+            if not isinstance(expected_text, list):
+                return False, "screen_contains must be list", {}
 
-            return (
-                False,
-                "ui verification requires screen_contains or detectable change",
-                {},
-            )
+            screen_text = screenshot.get("text") or ""
+            if not isinstance(screen_text, str):
+                return False, "screenshot text unavailable", {}
 
-        screen_text = screenshot.get("text") or ""
-        if not isinstance(screen_text, str):
-            return False, "screenshot text unavailable", {}
+            for token in expected_text:
+                if token not in screen_text:
+                    return (
+                        False,
+                        f"expected screen text not found: {token}",
+                        {},
+                    )
 
-        for token in expected_text:
-            if token not in screen_text:
-                return (
-                    False,
-                    f"expected screen text not found: {token}",
-                    {},
-                )
+            return True, "", {"matched_tokens": expected_text}
 
-        return True, "", {"matched_tokens": expected_text}
+        # --- Fallback: hash change ---
+        if (
+            isinstance(previous_screenshot, dict)
+            and previous_screenshot.get("hash")
+            and screenshot.get("hash")
+        ):
+            if previous_screenshot.get("hash") != screenshot.get("hash"):
+                return True, "", {"screen_changed": True}
+
+        return (
+            False,
+            "ui verification requires screen_contains or detectable change",
+            {},
+    )
