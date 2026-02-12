@@ -33,14 +33,11 @@ class VisionRuntime:
 
     def __init__(self):
         self._lock = threading.RLock()
-
         self._last_output: Optional[Dict[str, Any]] = None
         self._last_frame_ts: Optional[float] = None
-
         self._consecutive_failures: int = 0
         self._healthy: bool = True
         self._running: bool = False
-
         self._thread: Optional[threading.Thread] = None
 
     # -------------------------------------------------
@@ -117,7 +114,6 @@ class VisionRuntime:
 
         image = self._capture_frame()
         encoded = self._encode_image(image)
-
         perception = self._call_qwen(encoded)
 
         output = self._normalize_output(
@@ -166,16 +162,26 @@ class VisionRuntime:
 
     def _call_qwen(self, image_b64: str) -> Dict[str, Any]:
         prompt = (
-            "You are a visual perception system.\n"
+            "You are a deterministic visual perception system.\n"
             "You do NOT infer intent.\n"
             "You do NOT suggest actions.\n"
-            "Return ONLY valid JSON in this schema:\n"
+            "Return ONLY valid JSON in this exact schema:\n"
             "{\n"
-            '  "elements": [{"type": "...", "text": "...", "x": 0.0-1.0, "y": 0.0-1.0}],\n'
+            '  "elements": [\n'
+            '    {\n'
+            '      "type": "button|link|input|label|text|icon|window|menu|unknown",\n'
+            '      "text": "visible text",\n'
+            '      "x": 0.0-1.0,\n'
+            '      "y": 0.0-1.0,\n'
+            '      "state": "enabled|disabled|checked|unchecked|null"\n'
+            '    }\n'
+            "  ],\n"
             '  "dialogs": [],\n'
             '  "apps": [],\n'
             '  "focused_app": "string or null"\n'
             "}\n"
+            "Coordinates are normalized.\n"
+            "Be precise.\n"
         )
 
         try:
@@ -242,6 +248,8 @@ class VisionRuntime:
                     "text": str(el.get("text", "")).strip(),
                     "x": float(min(max(float(x), 0.0), 1.0)),
                     "y": float(min(max(float(y), 0.0), 1.0)),
+                    "interactable": self._is_interactable(el),
+                    "state": el.get("state"),
                 }
             )
 
@@ -276,6 +284,24 @@ class VisionRuntime:
 
     def _valid_coord(self, v: Any) -> bool:
         return isinstance(v, (int, float)) and 0.0 <= float(v) <= 1.0
+
+    def _is_interactable(self, element: Dict[str, Any]) -> bool:
+        element_type = str(element.get("type", "")).lower()
+
+        interactive_types = {
+            "button", "link", "input", "checkbox",
+            "radio", "select", "textarea",
+            "slider", "tab", "menu",
+            "menuitem", "switch", "combobox",
+        }
+
+        if element_type in interactive_types:
+            return True
+
+        if element.get("state") is not None:
+            return True
+
+        return False
 
     def _parse_json(self, raw: str) -> Dict[str, Any]:
         raw = raw.strip()
