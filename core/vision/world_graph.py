@@ -24,8 +24,8 @@ class WorldGraph:
 
     CONTRACT:
     - All mutation under lock
-    - Snapshot is immutable copy
-    - Ingestion reflects authoritative latest frame
+    - Snapshot immutable
+    - No nested lock re-entry for delta
     - No unbounded growth
     """
 
@@ -36,9 +36,9 @@ class WorldGraph:
         self._last_frame_ts: Optional[float] = None
         self._history: List[Dict[str, Any]] = []
 
-    # -------------------------------------------------
-    # TASK ISOLATION
-    # -------------------------------------------------
+    # =================================================
+    # RESET
+    # =================================================
 
     def reset(self) -> None:
         with self._lock:
@@ -47,9 +47,9 @@ class WorldGraph:
             self._last_frame_ts = None
             self._history.clear()
 
-    # -------------------------------------------------
+    # =================================================
     # INGESTION
-    # -------------------------------------------------
+    # =================================================
 
     def ingest(self, perception: Dict[str, Any]) -> None:
         if not isinstance(perception, dict):
@@ -67,20 +67,14 @@ class WorldGraph:
 
         with self._lock:
 
-            if (
-                self._last_frame_ts is not None
-                and frame_ts <= self._last_frame_ts
-            ):
+            if self._last_frame_ts is not None and frame_ts <= self._last_frame_ts:
                 return
 
             self._last_frame_ts = frame_ts
-            self._focused_app = (
-                perception.get("focused_app")
-                if isinstance(perception.get("focused_app"), str)
-                else None
-            )
+            focused = perception.get("focused_app")
+            self._focused_app = focused if isinstance(focused, str) else None
 
-            updated_entities: Dict[str, Dict[str, Any]] = {}
+            new_entities: Dict[str, Dict[str, Any]] = {}
 
             for el in elements:
                 if not isinstance(el, dict):
@@ -88,19 +82,26 @@ class WorldGraph:
 
                 x = self._safe_float(el.get("x"))
                 y = self._safe_float(el.get("y"))
+                etype = self._normalize_type(el.get("type"))
+                text = (el.get("text") or "").strip()
 
-                entity_id = self._stable_entity_id(el)
+                candidate_id = self._stable_entity_id(
+                    etype=etype,
+                    text=text,
+                    x=x,
+                    y=y,
+                )
 
-                prev = self._entities.get(entity_id)
+                prev = self._entities.get(candidate_id)
                 if not prev:
-                    prev = self._find_spatial_match(x, y)
+                    prev = self._find_spatial_match_locked(x, y, etype)
 
                 first_seen = prev["first_seen"] if prev else now
 
-                updated_entities[entity_id] = {
-                    "id": entity_id,
-                    "type": el.get("type"),
-                    "text": el.get("text"),
+                new_entities[candidate_id] = {
+                    "id": candidate_id,
+                    "type": etype,
+                    "text": text,
                     "x": x,
                     "y": y,
                     "interactable": bool(el.get("interactable")),
@@ -110,64 +111,61 @@ class WorldGraph:
                     "confidence": 1.0,
                 }
 
-            self._entities = updated_entities
-
             cutoff = now - ENTITY_STALE_SECONDS
-            self._entities = {
+
+            pruned = {
                 eid: ent
-                for eid, ent in self._entities.items()
+                for eid, ent in new_entities.items()
                 if ent["last_seen"] >= cutoff
             }
 
-            if len(self._entities) > MAX_ENTITIES:
-                self._entities = dict(
-                    list(self._entities.items())[:MAX_ENTITIES]
-                )
+            if len(pruned) > MAX_ENTITIES:
+                pruned = dict(list(pruned.items())[:MAX_ENTITIES])
+
+            self._entities = pruned
 
             self._record_history_locked()
 
     def update(self, perception: Dict[str, Any]) -> None:
         self.ingest(perception)
 
-    # -------------------------------------------------
-    # SNAPSHOT
-    # -------------------------------------------------
+    # =================================================
+    # SNAPSHOT (ATOMIC COPY)
+    # =================================================
 
     def snapshot(self) -> Dict[str, Any]:
         with self._lock:
-            return copy.deepcopy(
-                {
-                    "timestamp": self._last_frame_ts,
-                    "focused_app": self._focused_app,
-                    "entities": list(self._entities.values()),
-                    "entity_count": len(self._entities),
-                }
-            )
+            return {
+                "timestamp": self._last_frame_ts,
+                "focused_app": self._focused_app,
+                "entities": copy.deepcopy(list(self._entities.values())),
+                "entity_count": len(self._entities),
+            }
 
-    # -------------------------------------------------
-    # DELTA COMPUTATION (NEW)
-    # -------------------------------------------------
+    # =================================================
+    # DELTA (NO NESTED LOCKING)
+    # =================================================
 
     def compute_delta(
         self,
-        previous_snapshot: Dict[str, Any]
+        previous_snapshot: Dict[str, Any],
     ) -> Dict[str, Any]:
 
         if not isinstance(previous_snapshot, dict):
             raise WorldGraphError("Invalid previous snapshot")
 
         with self._lock:
-            current_snapshot = self.snapshot()
+            current_entities = copy.deepcopy(list(self._entities.values()))
+            current_focus = self._focused_app
 
-        prev_entities = {
-            e["id"]: e
-            for e in previous_snapshot.get("entities", [])
-        }
+        prev_entities_list = previous_snapshot.get("entities", [])
+        prev_focus = previous_snapshot.get("focused_app")
 
-        curr_entities = {
-            e["id"]: e
-            for e in current_snapshot.get("entities", [])
-        }
+        if not isinstance(prev_entities_list, list):
+            raise WorldGraphError("Invalid previous snapshot structure")
+
+        prev_entities = {e["id"]: e for e in prev_entities_list if "id" in e}
+        curr_entities = {e["id"]: e for e in current_entities if "id" in e}
 
         added_ids = set(curr_entities) - set(prev_entities)
         removed_ids = set(prev_entities) - set(curr_entities)
@@ -197,24 +195,23 @@ class WorldGraph:
                 }
 
             if changes:
-                modified.append({
-                    "id": eid,
-                    "changes": changes,
-                    "entity": curr_e,
-                })
+                modified.append(
+                    {
+                        "id": eid,
+                        "changes": changes,
+                        "entity": curr_e,
+                    }
+                )
 
-        focus_changed = (
-            previous_snapshot.get("focused_app")
-            != current_snapshot.get("focused_app")
-        )
+        focus_changed = prev_focus != current_focus
 
         return {
             "entities_added": added,
             "entities_removed": removed,
             "entities_modified": modified,
             "focus_changed": focus_changed,
-            "prev_focus": previous_snapshot.get("focused_app"),
-            "curr_focus": current_snapshot.get("focused_app"),
+            "prev_focus": prev_focus,
+            "curr_focus": current_focus,
             "entity_count_delta": len(added) - len(removed),
             "significant_change": (
                 len(added) > 5
@@ -223,9 +220,9 @@ class WorldGraph:
             ),
         }
 
-    # -------------------------------------------------
+    # =================================================
     # QUERIES
-    # -------------------------------------------------
+    # =================================================
 
     def find_by_text(
         self,
@@ -263,9 +260,9 @@ class WorldGraph:
         with self._lock:
             return len(self._entities)
 
-    # -------------------------------------------------
+    # =================================================
     # INTERNALS
-    # -------------------------------------------------
+    # =================================================
 
     def _safe_float(self, value: Any) -> float:
         try:
@@ -273,40 +270,41 @@ class WorldGraph:
         except Exception:
             return 0.0
 
-    def _stable_entity_id(self, el: Dict[str, Any]) -> str:
-        """
-        Stable ID generation:
-        - If text is meaningful → include it
-        - If text short/empty → spatial only
-        """
+    def _normalize_type(self, value: Any) -> str:
+        if not isinstance(value, str):
+            return "unknown"
+        return value.strip().lower()
 
-        try:
-            x = float(el.get("x", 0.0))
-            y = float(el.get("y", 0.0))
-        except Exception:
-            x = 0.0
-            y = 0.0
+    def _stable_entity_id(
+        self,
+        *,
+        etype: str,
+        text: str,
+        x: float,
+        y: float,
+    ) -> str:
 
         qx = int(x / COORD_QUANT)
         qy = int(y / COORD_QUANT)
 
-        text = (el.get("text") or "").strip()
-        el_type = el.get("type")
-
         if len(text) < 2:
-            raw = f"{el_type}|{qx}|{qy}"
+            raw = f"{etype}|{qx}|{qy}"
         else:
-            raw = f"{el_type}|{text}|{qx}|{qy}"
+            raw = f"{etype}|{text}|{qx}|{qy}"
 
         return hashlib.sha256(raw.encode()).hexdigest()
 
-    def _find_spatial_match(
+    def _find_spatial_match_locked(
         self,
         x: float,
         y: float,
+        etype: str,
     ) -> Optional[Dict[str, Any]]:
 
         for ent in self._entities.values():
+            if ent.get("type") != etype:
+                continue
+
             if (
                 abs(ent["x"] - x) <= SPATIAL_MATCH_THRESHOLD
                 and abs(ent["y"] - y) <= SPATIAL_MATCH_THRESHOLD
