@@ -49,7 +49,7 @@ mode = ModeController()
 
 
 # ==================================================
-# LLM INJECTION
+# LLM INJECTION (PLANNING ONLY)
 # ==================================================
 
 def create_llm_callable() -> Callable[[str], str]:
@@ -141,17 +141,11 @@ def main():
     vision_runtime.start()
     observer_loop.start()
 
-    # --------------------------------------------------
-    # Deterministic Vision Warm-up (health + perception)
-    # --------------------------------------------------
     print("[BOOT] Waiting for first valid perception frame...")
     warmup_deadline = time.time() + 5.0
 
     while time.time() < warmup_deadline:
-        if (
-            observer.is_healthy()
-            and vision_runtime.is_healthy()
-        ):
+        if observer.is_healthy() and vision_runtime.is_healthy():
             snap = observer.snapshot()
             if isinstance(snap, dict) and snap.get("perception"):
                 break
@@ -173,9 +167,7 @@ def main():
                 if not snapshot_id:
                     raise RuntimeError("Missing snapshot at execution boundary")
 
-                # --------------------------------------------------
-                # Pre-planning world graph stabilization
-                # --------------------------------------------------
+                # Stabilize world graph once before planning
                 try:
                     obs_snap = observer.snapshot()
                     perception = obs_snap.get("perception")
@@ -191,7 +183,7 @@ def main():
                     raise RuntimeError("Armed without valid intent")
 
                 planner = ExecutionPlanner(
-                    llm_call=mode.get_llm_callable(),
+                    llm_call=mode.get_llm_callable(),  # Allowed: PLANNING mode
                     environment_fingerprint=env_fingerprint,
                     world_graph=world_graph,
                 )
@@ -221,13 +213,13 @@ def main():
                     mode.execute()
                     consumed_intent = mode.consume_intent()
 
+                    # FIX: No LLM passed to execution
                     operate_main(
                         model=None,
                         terminal_prompt=consumed_intent,
                         execution_plan=execution_plan,
                         observer=observer,
                         world_graph=world_graph,
-                        llm_callable=mode.get_llm_callable(),
                     )
 
                 finally:
@@ -249,7 +241,6 @@ def main():
 
                     mode.complete_execution()
 
-                    # Task boundary isolation
                     try:
                         observer.reset_for_new_task()
                     except Exception:
