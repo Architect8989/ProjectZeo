@@ -121,6 +121,25 @@ if hasattr(signal, "SIGQUIT"):
 # ROOT MAIN
 # ==================================================
 
+def _ingest_latest_perception():
+    """
+    Strict perception unwrap.
+    ObserverCore now stores flat perception payload.
+    """
+    snap = observer.snapshot()
+    if not isinstance(snap, dict):
+        return
+
+    perception = snap.get("perception")
+    if not isinstance(perception, dict):
+        return
+
+    if not perception.get("available"):
+        return
+
+    world_graph.ingest(perception)
+
+
 def main():
     global TASK_START
 
@@ -146,13 +165,12 @@ def main():
 
     while time.time() < warmup_deadline:
         if observer.is_healthy() and vision_runtime.is_healthy():
-            snap = observer.snapshot()
-            if isinstance(snap, dict):
-                wrapper = snap.get("perception")
-                if isinstance(wrapper, dict):
-                    raw = wrapper.get("perception")
-                    if isinstance(raw, dict) and raw.get("available"):
-                        break
+            try:
+                _ingest_latest_perception()
+                if world_graph.entity_count() > 0:
+                    break
+            except Exception:
+                pass
         time.sleep(0.1)
 
     intent_listener = IntentListener(mode, SNAPSHOT_PROVIDER)
@@ -171,17 +189,8 @@ def main():
                 if not snapshot_id:
                     raise RuntimeError("Missing snapshot at execution boundary")
 
-                # FIX: Correct world graph ingestion (unwrap nested perception)
-                try:
-                    obs_snap = observer.snapshot()
-                    if isinstance(obs_snap, dict):
-                        wrapper = obs_snap.get("perception")
-                        if isinstance(wrapper, dict):
-                            raw = wrapper.get("perception")
-                            if isinstance(raw, dict):
-                                world_graph.ingest(raw)
-                except Exception:
-                    pass
+                # Correct ingestion before planning
+                _ingest_latest_perception()
 
                 mode.begin_planning()
 
@@ -254,8 +263,8 @@ def main():
 
                     try:
                         world_graph.reset()
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        print(f"[WARN] world_graph reset failed: {e}", file=sys.stderr)
 
                     TASK_START = None
 
