@@ -5,7 +5,7 @@ import atexit
 import sys
 from typing import Callable, Optional
 
-from core.mode_controller import ModeController
+from core.mode_controller import ModeController, SystemMode
 from core.intent_listener import IntentListener
 from core.environment_fingerprint import collect_environment_fingerprint
 
@@ -49,7 +49,7 @@ mode = ModeController()
 
 
 # ==================================================
-# LLM INJECTION (PLANNING ONLY)
+# LLM INJECTION
 # ==================================================
 
 def create_llm_callable() -> Callable[[str], str]:
@@ -118,14 +118,10 @@ if hasattr(signal, "SIGQUIT"):
 
 
 # ==================================================
-# ROOT MAIN
+# PERCEPTION INGESTION
 # ==================================================
 
 def _ingest_latest_perception():
-    """
-    Strict perception unwrap.
-    ObserverCore now stores flat perception payload.
-    """
     snap = observer.snapshot()
     if not isinstance(snap, dict):
         return
@@ -139,6 +135,10 @@ def _ingest_latest_perception():
 
     world_graph.ingest(perception)
 
+
+# ==================================================
+# ROOT MAIN
+# ==================================================
 
 def main():
     global TASK_START
@@ -181,6 +181,17 @@ def main():
             mode.update_observer_health(observer.is_healthy())
             mode.update_vision_status(vision_runtime.is_healthy())
 
+            # -------------------------------------------------
+            # PLANNING TIMEOUT ENFORCEMENT
+            # -------------------------------------------------
+
+            if mode.mode == SystemMode.PLANNING:
+                mode.check_planning_timeout()
+
+            # -------------------------------------------------
+            # EXECUTION ENTRY
+            # -------------------------------------------------
+
             if mode.is_armed():
 
                 TASK_START = time.time()
@@ -189,7 +200,6 @@ def main():
                 if not snapshot_id:
                     raise RuntimeError("Missing snapshot at execution boundary")
 
-                # Correct ingestion before planning
                 _ingest_latest_perception()
 
                 mode.begin_planning()
@@ -263,10 +273,14 @@ def main():
 
                     try:
                         world_graph.reset()
-                    except Exception as e:
-                        print(f"[WARN] world_graph reset failed: {e}", file=sys.stderr)
+                    except Exception:
+                        pass
 
                     TASK_START = None
+
+            # -------------------------------------------------
+            # HARD TASK TIMEOUT
+            # -------------------------------------------------
 
             if TASK_START and (time.time() - TASK_START) > MAX_TASK_SECONDS:
                 _force_safe_shutdown("task_timeout")
