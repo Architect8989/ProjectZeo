@@ -27,14 +27,16 @@ class SnapshotProvider:
     - Snapshot MUST be taken in OBSERVER mode
     - Observer MUST be healthy
     - Vision MUST be live at capture time
-    - OS core state MUST be captured successfully
+    - OS core state MUST be captured atomically
     - Any failure aborts execution immediately
     """
 
-    SNAPSHOT_SCHEMA_VERSION = "1.7"
+    SNAPSHOT_SCHEMA_VERSION = "1.8"
 
     _snapshots: Dict[str, RestorationSnapshot] = {}
     _lock = threading.Lock()
+
+    ATOMIC_WINDOW_SECONDS = 0.02  # 20ms max capture window
 
     # =========================================================
     # SNAPSHOT REGISTRY
@@ -79,7 +81,6 @@ class SnapshotProvider:
     def take_snapshot(self) -> str:
         snapshot = self._capture_snapshot()
         snapshot_id = self.store_snapshot(snapshot)
-        # attach_snapshot REMOVED — caller is responsible
         return snapshot_id
 
     # =========================================================
@@ -113,7 +114,6 @@ class SnapshotProvider:
                 "Observer snapshot invalid structure"
             )
 
-        # Correct keys from ObserverCore
         if not observer_state.get("perception_available"):
             raise SnapshotProviderError(
                 "Vision unavailable during snapshot"
@@ -125,25 +125,23 @@ class SnapshotProvider:
                 "Invalid vision frame timestamp"
             )
 
-        # 4. OS CORE STATE (RETRY SAFE)
-        cursor = None
-        focused_window = None
-        active_app = None
-        last_error: Optional[Exception] = None
+        # 4. ATOMIC OS STATE CAPTURE (single-pass, bounded window)
+        t_start = time.monotonic()
 
-        for _ in range(3):
-            try:
-                cursor = self._os.get_cursor_position()
-                focused_window = self._os.get_focused_window()
-                active_app = self._os.get_active_application()
-                break
-            except Exception as e:
-                last_error = e
-                time.sleep(0.1)
-
-        if cursor is None or focused_window is None or active_app is None:
+        try:
+            cursor = self._os.get_cursor_position()
+            focused_window = self._os.get_focused_window()
+            active_app = self._os.get_active_application()
+        except Exception as e:
             raise SnapshotProviderError(
-                f"OS state capture failed: {last_error}"
+                f"OS state capture failed: {e}"
+            ) from e
+
+        t_end = time.monotonic()
+
+        if (t_end - t_start) > self.ATOMIC_WINDOW_SECONDS:
+            raise SnapshotProviderError(
+                "OS state capture exceeded atomic window"
             )
 
         # 5. STRICT VALIDATION
@@ -201,10 +199,13 @@ class SnapshotProvider:
 
         metadata = {
             "schema_version": self.SNAPSHOT_SCHEMA_VERSION,
-            "captured_at_monotonic": time.monotonic(),
+            "captured_at_monotonic": t_end,
             "captured_at_wallclock": time.time(),
             "execution_mode": self._mode.mode.value,
             "vision_frame_ts": frame_ts,
+            "capture_duration_ms": round(
+                (t_end - t_start) * 1000, 3
+            ),
         }
 
         # 8. CREATE SNAPSHOT
@@ -215,4 +216,4 @@ class SnapshotProvider:
             application=application_state,
             execution_mode=self._mode.mode.value,
             metadata=metadata,
-    )
+        )
