@@ -52,7 +52,7 @@ class ExecutionPlanner:
             except Exception:
                 raise PlanningError("Failed to snapshot world_graph")
 
-        # ---- SAFE FALLBACK (audit requirement) ----
+        # SAFE FALLBACK
         if self._world_snapshot is None:
             self._world_snapshot = {
                 "entities": [],
@@ -120,7 +120,7 @@ class ExecutionPlanner:
         if not execution_steps:
             raise PlanningError("No executable steps generated")
 
-        # ---- Planner controls DONE, not LLM ----
+        # Planner controls DONE
         execution_steps.append(
             ExecutionStep(
                 id=step_id,
@@ -208,7 +208,7 @@ Return ONLY valid JSON.
 Schema:
 [
   {{
-    "type": "ui_interaction" | "command_execution" | "file_creation" | "tool_installation" | "verification",
+    "type": "ui_interaction" | "command_execution" | "file_creation" | "verification",
     "description": "...",
     "action": {{ }},
     "verification": {{ }},
@@ -219,8 +219,8 @@ Schema:
 
 Rules:
 - Do NOT emit DONE
+- Do NOT emit tool_installation
 - No hallucinated tools
-- If a tool is required, emit tool_installation step
 - Every executable step must include verification criteria
 - Be conservative and explicit
 """
@@ -247,7 +247,6 @@ Rules:
             StepType.UI_INTERACTION.value,
             StepType.COMMAND_EXECUTION.value,
             StepType.FILE_CREATION.value,
-            StepType.TOOL_INSTALLATION.value,
             StepType.VERIFICATION.value,
         }
 
