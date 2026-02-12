@@ -109,7 +109,7 @@ def _execute_plan(
         "total_steps": len(execution_plan.steps),
     })
 
-    previous_snapshot = None
+    previous_snapshot: Optional[Dict[str, Any]] = None
 
     for step in execution_plan.steps:
 
@@ -119,9 +119,12 @@ def _execute_plan(
 
         for dep in step.dependencies:
             if not progress.is_completed(dep):
-                raise RuntimeError("Dependency not satisfied")
+                raise RuntimeError(f"Dependency {dep} not satisfied")
 
-        # ---- Pre-step perception sync ----
+        # -------------------------------------------------
+        # PERCEPTION SYNC (PRE-STEP)
+        # -------------------------------------------------
+
         if observer and world_graph:
             try:
                 snap = observer.snapshot()
@@ -131,13 +134,25 @@ def _execute_plan(
             except Exception:
                 pass
 
-        # ---- Delta-based divergence detection ----
-        if world_graph:
-            current_snapshot = world_graph.snapshot()
+        # -------------------------------------------------
+        # DIVERGENCE DETECTION
+        # -------------------------------------------------
 
-            if previous_snapshot is not None:
-                try:
+        if world_graph:
+            try:
+                current_snapshot = world_graph.snapshot()
+
+                if previous_snapshot is not None:
                     delta = world_graph.compute_delta(previous_snapshot)
+
+                    if delta.get("significant_change"):
+                        journal.record({
+                            "event": "significant_divergence",
+                            "step_id": step.id,
+                            "delta": delta,
+                        })
+                        raise RuntimeError("World divergence detected")
+
                     if delta.get("focus_changed"):
                         journal.record({
                             "event": "focus_changed",
@@ -145,10 +160,15 @@ def _execute_plan(
                             "prev_focus": delta.get("prev_focus"),
                             "curr_focus": delta.get("curr_focus"),
                         })
-                except Exception:
-                    pass
 
-            previous_snapshot = current_snapshot
+                previous_snapshot = current_snapshot
+
+            except Exception as e:
+                raise RuntimeError(f"Divergence check failed: {e}")
+
+        # -------------------------------------------------
+        # AUTHORITY CHECK
+        # -------------------------------------------------
 
         decision = input_arbitrator.evaluate(
             input_event_ts=time.monotonic(),
@@ -170,6 +190,10 @@ def _execute_plan(
 
         attempt_ctx = {"attempt": 0}
 
+        # -------------------------------------------------
+        # STEP EXECUTION LOOP
+        # -------------------------------------------------
+
         while True:
             try:
                 input_arbitrator.soc_action_started()
@@ -185,7 +209,7 @@ def _execute_plan(
                         installer=installer,
                     )
 
-                # ---- Post-step perception sync ----
+                # POST-STEP PERCEPTION SYNC
                 if observer and world_graph:
                     try:
                         snap = observer.snapshot()
