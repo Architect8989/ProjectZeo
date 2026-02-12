@@ -142,10 +142,20 @@ def main():
     observer_loop.start()
 
     # --------------------------------------------------
-    # Vision warm-up
+    # Deterministic Vision Warm-up (health + perception)
     # --------------------------------------------------
-    print("[BOOT] Waiting for vision to stabilize...")
-    time.sleep(2.0)
+    print("[BOOT] Waiting for first valid perception frame...")
+    warmup_deadline = time.time() + 5.0
+
+    while time.time() < warmup_deadline:
+        if (
+            observer.is_healthy()
+            and vision_runtime.is_healthy()
+        ):
+            snap = observer.snapshot()
+            if isinstance(snap, dict) and snap.get("perception"):
+                break
+        time.sleep(0.1)
 
     intent_listener = IntentListener(mode, SNAPSHOT_PROVIDER)
     intent_listener.start()
@@ -164,13 +174,15 @@ def main():
                     raise RuntimeError("Missing snapshot at execution boundary")
 
                 # --------------------------------------------------
-                # Ingest latest perception BEFORE planning
+                # Pre-planning world graph stabilization
                 # --------------------------------------------------
-                obs_snap = observer.snapshot()
-                perception = obs_snap.get("perception")
-                if perception and isinstance(perception, dict):
-                    world_graph.ingest(perception)
-                    time.sleep(0.1)
+                try:
+                    obs_snap = observer.snapshot()
+                    perception = obs_snap.get("perception")
+                    if isinstance(perception, dict):
+                        world_graph.ingest(perception)
+                except Exception:
+                    pass
 
                 mode.begin_planning()
 
@@ -237,9 +249,16 @@ def main():
 
                     mode.complete_execution()
 
-                    # Prevent perception + world graph leakage
-                    observer.reset_for_new_task()
-                    world_graph.reset()
+                    # Task boundary isolation
+                    try:
+                        observer.reset_for_new_task()
+                    except Exception:
+                        pass
+
+                    try:
+                        world_graph.reset()
+                    except Exception:
+                        pass
 
                     TASK_START = None
 
