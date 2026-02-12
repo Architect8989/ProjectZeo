@@ -182,7 +182,7 @@ def _execute_plan(
                     "step_id": step.id,
                 })
 
-                # Replan heuristic hook (non-mutating)
+                # Safe replan signal
                 if world_graph and llm_callable:
                     if _should_replan(world_graph):
                         journal.record({
@@ -216,16 +216,28 @@ def _execute_plan(
 
 
 # ==================================================
-# REPLAN HEURISTIC (SAFE)
+# REPLAN HEURISTIC (FIXED)
 # ==================================================
 
 def _should_replan(world_graph) -> bool:
     try:
         snapshot = world_graph.snapshot()
-        if isinstance(snapshot, dict) and snapshot.get("dialogs"):
+        if not isinstance(snapshot, dict):
+            return False
+
+        # Trigger if focused app changed or entity count drops sharply
+        entity_count = snapshot.get("entity_count", 0)
+        focused = snapshot.get("focused_app")
+
+        if entity_count == 0:
             return True
+
+        if focused is None:
+            return True
+
     except Exception:
-        pass
+        return False
+
     return False
 
 
@@ -240,16 +252,19 @@ def _execute_step(
     accessibility_backend: Optional[AccessibilityBackend],
     installer: Optional[AutonomousInstaller],
 ):
+    if not isinstance(step.action, dict):
+        raise ValueError("Invalid step action structure")
+
     if step.type == StepType.COMMAND_EXECUTION:
         cmd = step.action.get("command")
-        if not cmd:
+        if not isinstance(cmd, str) or not cmd.strip():
             raise ValueError("Missing command")
-        return os_backend.exec(cmd, sudo=step.action.get("sudo", False))
+        return os_backend.exec(cmd, sudo=bool(step.action.get("sudo", False)))
 
     if step.type == StepType.FILE_CREATION:
         path = step.action.get("path")
         content = step.action.get("content", "")
-        if not path:
+        if not isinstance(path, str) or not path:
             raise ValueError("Missing file path")
         os_backend.write_file(path, content)
         return None
@@ -272,6 +287,9 @@ def _execute_step(
 # ==================================================
 
 def _execute_ui(ui: Dict[str, Any], os_backend: OperatingSystem):
+    if not isinstance(ui, dict):
+        raise ValueError("Invalid UI action")
+
     op = ui.get("operation")
 
     if op == "click":
@@ -297,7 +315,7 @@ def _execute_ui(ui: Dict[str, Any], os_backend: OperatingSystem):
 
 
 # ==================================================
-# SCREEN EXTRACTION
+# SCREEN EXTRACTION (FIXED)
 # ==================================================
 
 def _extract_screen(observer):
@@ -308,13 +326,20 @@ def _extract_screen(observer):
     if not isinstance(snap, dict):
         return None
 
+    if not snap.get("available"):
+        return {"available": False}
+
     perception = snap.get("perception")
     if not isinstance(perception, dict):
-        return None
+        return {"available": False}
+
+    elements = perception.get("elements")
+    if not isinstance(elements, list):
+        return {"available": False}
 
     text_parts = []
 
-    for el in perception.get("elements", []):
+    for el in elements:
         if isinstance(el, dict):
             t = el.get("text")
             if isinstance(t, str) and t.strip():
