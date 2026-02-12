@@ -10,6 +10,7 @@ class SystemMode(str, Enum):
     ARMED = "ARMED"
     PLANNING = "PLANNING"
     EXECUTING = "EXECUTING"
+    RESTORING = "RESTORING"  # NEW
 
 
 class ModeTransitionError(Exception):
@@ -30,7 +31,7 @@ class ModeController:
 
     HARD GUARANTEES:
     - Linear lifecycle:
-        OBSERVER → ARMED → PLANNING → EXECUTING → OBSERVER
+        OBSERVER → ARMED → PLANNING → EXECUTING → RESTORING → OBSERVER
     - Snapshot boundary enforced
     - No hidden state mutation
     - Only explicit calls perform transitions
@@ -184,9 +185,7 @@ class ModeController:
                 )
 
             if not intent or not intent.strip():
-                raise ModeTransitionError(
-                    "Intent must be non-empty"
-                )
+                raise ModeTransitionError("Intent must be non-empty")
 
             self._intent = intent.strip()
             self._intent_frozen = False
@@ -299,8 +298,11 @@ class ModeController:
                     "Restoration requires EXECUTING state"
                 )
 
-            # Remains in EXECUTING until restoration completes.
-            # Linear contract preserved.
+            self._commit_transition(
+                SystemMode.RESTORING,
+                reason="restoration started",
+                forced=False,
+            )
 
     # ==================================================
     # COMPLETION
@@ -308,9 +310,9 @@ class ModeController:
 
     def complete_execution(self, reason: str = "execution complete") -> None:
         with self._lock:
-            if self._mode is not SystemMode.EXECUTING:
+            if self._mode is not SystemMode.RESTORING:
                 raise ModeTransitionError(
-                    "Completion requires EXECUTING state"
+                    "Completion requires RESTORING state"
                 )
 
             self._reset_internal_state()
