@@ -10,7 +10,7 @@ class SystemMode(str, Enum):
     ARMED = "ARMED"
     PLANNING = "PLANNING"
     EXECUTING = "EXECUTING"
-    RESTORING = "RESTORING"  # NEW
+    RESTORING = "RESTORING"
 
 
 class ModeTransitionError(Exception):
@@ -26,52 +26,34 @@ class ObserverUnavailableError(ModeTransitionError):
 
 
 class ModeController:
-    """
-    Single authoritative lifecycle controller.
-
-    HARD GUARANTEES:
-    - Linear lifecycle:
-        OBSERVER → ARMED → PLANNING → EXECUTING → RESTORING → OBSERVER
-    - Snapshot boundary enforced
-    - No hidden state mutation
-    - Only explicit calls perform transitions
-    """
 
     MAX_TRANSITION_HISTORY = 2000
 
     def __init__(self):
         self._lock = threading.RLock()
 
-        # ---- MODE ----
         self._mode: SystemMode = SystemMode.OBSERVER
         self._mode_entered_at: float = time.time()
         self._last_transition_reason: Optional[str] = None
 
-        # ---- SNAPSHOT BOUNDARY ----
         self._snapshot_id: Optional[str] = None
         self._snapshot_consumed: bool = False
 
-        # ---- INTENT ----
         self._intent: Optional[str] = None
         self._intent_frozen: bool = False
 
-        # ---- PLANNING ----
         self._planning_completed: bool = False
         self._execution_plan_attached: bool = False
         self._execution_plan_id: Optional[str] = None
 
-        # ---- HEALTH ----
         self._vision_ok: bool = False
         self._observer_healthy: bool = True
         self._failure_reason: Optional[str] = None
 
-        # ---- INPUT LOCK ----
         self._input_locked: bool = False
 
-        # ---- EXTERNAL INTELLIGENCE ----
         self._llm_callable: Optional[Callable[[str], str]] = None
 
-        # ---- FORENSICS ----
         self._transition_history: Deque[Dict[str, object]] = deque(
             maxlen=self.MAX_TRANSITION_HISTORY
         )
@@ -103,10 +85,8 @@ class ModeController:
                 raise ModeTransitionError(
                     "Snapshot can only attach in OBSERVER mode"
                 )
-
             if not snapshot_id:
                 raise ModeTransitionError("Invalid snapshot_id")
-
             if self._snapshot_id is not None:
                 raise ModeTransitionError(
                     "Snapshot already attached for this cycle"
@@ -121,10 +101,8 @@ class ModeController:
                 raise ModeTransitionError(
                     "Snapshot can only be consumed in ARMED state"
                 )
-
             if not self._snapshot_id:
                 raise ModeTransitionError("No snapshot attached")
-
             if self._snapshot_consumed:
                 raise ModeTransitionError("Snapshot already consumed")
 
@@ -132,7 +110,7 @@ class ModeController:
             return self._snapshot_id
 
     # ==================================================
-    # LLM INJECTION
+    # LLM INJECTION (STRICT BOUNDARY)
     # ==================================================
 
     def inject_llm_callable(self, llm_call: Callable[[str], str]) -> None:
@@ -146,6 +124,10 @@ class ModeController:
 
     def get_llm_callable(self) -> Callable[[str], str]:
         with self._lock:
+            if self._mode is not SystemMode.PLANNING:
+                raise RuntimeError(
+                    f"LLM callable only accessible during PLANNING (current: {self._mode.value})"
+                )
             if self._llm_callable is None:
                 raise RuntimeError(
                     "No LLM callable injected into ModeController"
@@ -175,15 +157,11 @@ class ModeController:
     def arm(self, intent: str) -> None:
         with self._lock:
             if self._mode is not SystemMode.OBSERVER:
-                raise ModeTransitionError(
-                    "Cannot arm unless in OBSERVER"
-                )
-
+                raise ModeTransitionError("Cannot arm unless in OBSERVER")
             if not self._snapshot_id:
                 raise ModeTransitionError(
                     "Cannot arm without snapshot boundary"
                 )
-
             if not intent or not intent.strip():
                 raise ModeTransitionError("Intent must be non-empty")
 
@@ -206,14 +184,14 @@ class ModeController:
                 raise ModeTransitionError(
                     "Planning requires ARMED state"
                 )
-
             if not self._intent:
                 raise ModeTransitionError("No intent available")
-
             if not self._observer_healthy:
                 raise ObserverUnavailableError(
                     self._failure_reason
                 )
+            if not self._vision_ok:
+                raise VisionUnavailableError("vision unavailable")
 
             self._intent_frozen = True
 
@@ -229,10 +207,8 @@ class ModeController:
                 raise ModeTransitionError(
                     "Execution plan can only attach during PLANNING"
                 )
-
             if not plan_id or not plan_id.strip():
                 raise ModeTransitionError("Invalid plan_id")
-
             if self._execution_plan_attached:
                 raise ModeTransitionError(
                     "Execution plan already attached"
@@ -245,12 +221,10 @@ class ModeController:
         with self._lock:
             if self._mode is not SystemMode.PLANNING:
                 raise ModeTransitionError("Planning not active")
-
             if not self._execution_plan_attached:
                 raise ModeTransitionError(
                     "Cannot complete planning without plan"
                 )
-
             self._planning_completed = True
 
     def execute(self) -> None:
@@ -259,13 +233,10 @@ class ModeController:
                 raise ModeTransitionError(
                     "Execute requires PLANNING state"
                 )
-
             if not self._planning_completed:
                 raise ModeTransitionError("Plan not completed")
-
             if not self._vision_ok:
                 raise VisionUnavailableError("vision unavailable")
-
             if not self._observer_healthy:
                 raise ObserverUnavailableError(
                     self._failure_reason
@@ -285,10 +256,8 @@ class ModeController:
                 raise ModeTransitionError(
                     "Intent consumed outside EXECUTING"
                 )
-
             if not self._intent:
                 raise ModeTransitionError("No intent available")
-
             return self._intent
 
     def begin_restoration(self) -> None:
