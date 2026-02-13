@@ -30,7 +30,6 @@ MAX_TASK_SECONDS = 90 * 60
 
 TASK_START = None
 
-
 OS_BACKEND = OperatingSystem()
 
 STATE_PATH = os.path.join(os.getcwd(), ".authority_state.json")
@@ -47,49 +46,6 @@ observer_loop = ObserverLoop(
 )
 
 mode = ModeController()
-
-
-# ==================================================
-# LLM INJECTION (SAFE)
-# ==================================================
-
-def create_llm_callable() -> Callable[[str], str]:
-    from anthropic import Anthropic
-
-    api_key = os.getenv("ANTHROPIC_API_KEY")
-    if not api_key:
-        raise RuntimeError("ANTHROPIC_API_KEY not set")
-
-    client = Anthropic(api_key=api_key)
-
-    def llm_call(prompt: str) -> str:
-        response = client.messages.create(
-            model="claude-sonnet-4-5-20250929",
-            max_tokens=4096,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        return response.content[0].text
-
-    return llm_call
-
-
-try:
-    mode.inject_llm_callable(create_llm_callable())
-except Exception as e:
-    print(f"[BOOT] LLM injection failed: {e}", file=sys.stderr)
-    sys.exit(1)
-
-
-SNAPSHOT_PROVIDER = SnapshotProvider(
-    observer=observer,
-    os_backend=OS_BACKEND,
-    mode_controller=mode,
-)
-
-RESTORE_PROVIDER = RestoreProvider(
-    os_backend=OS_BACKEND,
-    mode_controller=mode,
-)
 
 
 # ==================================================
@@ -123,7 +79,7 @@ if hasattr(signal, "SIGQUIT"):
 
 
 # ==================================================
-# PERCEPTION INGESTION
+# PERCEPTION INGESTION (FIXED)
 # ==================================================
 
 def _ingest_latest_perception():
@@ -131,11 +87,12 @@ def _ingest_latest_perception():
     if not isinstance(snap, dict):
         return
 
-    perception = snap.get("perception")
-    if not isinstance(perception, dict):
+    # Correct availability check
+    if not snap.get("perception_available"):
         return
 
-    if not perception.get("available"):
+    perception = snap.get("perception")
+    if not isinstance(perception, dict):
         return
 
     world_graph.ingest(perception)
@@ -145,8 +102,13 @@ def _ingest_latest_perception():
 # MAIN LOOP
 # ==================================================
 
-def main():
+def main(llm_callable: Callable[[str], str]):
     global TASK_START
+
+    if not callable(llm_callable):
+        raise RuntimeError("LLM callable must be provided to kernel")
+
+    mode.inject_llm_callable(llm_callable)
 
     print("[BOOT] ProjectZeo kernel starting")
 
@@ -174,17 +136,22 @@ def main():
                 break
         time.sleep(0.1)
 
-    intent_listener = IntentListener(mode, SNAPSHOT_PROVIDER)
+    intent_listener = IntentListener(mode, SnapshotProvider(
+        observer=observer,
+        os_backend=OS_BACKEND,
+        mode_controller=mode,
+    ))
     intent_listener.start()
+
+    restore_provider = RestoreProvider(
+        os_backend=OS_BACKEND,
+        mode_controller=mode,
+    )
 
     while True:
         try:
             mode.update_observer_health(observer.is_healthy())
             mode.update_vision_status(vision_runtime.is_healthy())
-
-            # -------------------------------------------------
-            # PLANNING TIMEOUT (FAIL-CLOSED)
-            # -------------------------------------------------
 
             if mode.mode == SystemMode.PLANNING:
                 try:
@@ -192,10 +159,6 @@ def main():
                 except Exception as e:
                     _force_safe_shutdown(f"planning_timeout:{e}")
                     os._exit(1)
-
-            # -------------------------------------------------
-            # EXECUTION ENTRY
-            # -------------------------------------------------
 
             if mode.is_armed():
 
@@ -245,7 +208,6 @@ def main():
                     consumed_intent = mode.consume_intent()
 
                     operate_main(
-                        model=None,
                         terminal_prompt=consumed_intent,
                         execution_plan=execution_plan,
                         observer=observer,
@@ -256,7 +218,7 @@ def main():
                     mode.begin_restoration()
 
                     try:
-                        RESTORE_PROVIDER.restore_snapshot(snapshot_id)
+                        restore_provider.restore_snapshot(snapshot_id)
                     except Exception as e:
                         _force_safe_shutdown(f"restoration_failed:{e}")
                         os._exit(1)
@@ -283,10 +245,6 @@ def main():
 
                     TASK_START = None
 
-            # -------------------------------------------------
-            # HARD TASK TIMEOUT
-            # -------------------------------------------------
-
             if TASK_START and (time.time() - TASK_START) > MAX_TASK_SECONDS:
                 _force_safe_shutdown("task_timeout")
                 os._exit(1)
@@ -300,7 +258,3 @@ def main():
             os._exit(1)
 
         time.sleep(HEARTBEAT_INTERVAL)
-
-
-if __name__ == "__main__":
-    main()
