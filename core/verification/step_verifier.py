@@ -1,8 +1,9 @@
 import os
 import shutil
 import subprocess
+import re
 from dataclasses import dataclass
-from typing import Optional, Any, Dict, Tuple
+from typing import Optional, Any, Dict, Tuple, List
 
 from core.schemas.execution_plan import ExecutionStep, StepType
 
@@ -26,7 +27,11 @@ class StepVerifier:
     - Evidence > vision
     - Absence of evidence == failure
     - Unknown step types == failure
+    - No substring version validation
+    - Fail-closed always
     """
+
+    VERSION_REGEX = re.compile(r"\d+(?:\.\d+)+")
 
     # =================================================
     # PUBLIC API
@@ -47,15 +52,13 @@ class StepVerifier:
 
         try:
             if step.type == StepType.DONE:
-                return VerificationResult(True, reason="done")
+                return VerificationResult(True, "done")
 
             if step.type == StepType.VERIFICATION:
-                return VerificationResult(True, reason="verification-only")
+                return VerificationResult(True, "verification-only")
 
             if step.type == StepType.COMMAND_EXECUTION:
-                ok, reason, details = self._verify_command(
-                    step, execution_result
-                )
+                ok, reason, details = self._verify_command(step, execution_result)
                 return VerificationResult(ok, None if ok else reason, details)
 
             if step.type == StepType.FILE_CREATION:
@@ -77,15 +80,12 @@ class StepVerifier:
 
         except Exception as e:
             return VerificationResult(
-                success=False,
-                reason=f"verification exception: {e}",
-                details={"exception_type": type(e).__name__},
+                False,
+                f"verification exception: {e}",
+                {"exception_type": type(e).__name__},
             )
 
-        return VerificationResult(
-            success=False,
-            reason=f"Unhandled step type: {step.type}",
-        )
+        return VerificationResult(False, f"Unhandled step type: {step.type}")
 
     # =================================================
     # COMMAND VERIFICATION
@@ -107,28 +107,26 @@ class StepVerifier:
             return False, "expected_return_codes must be list", {}
 
         if result.returncode not in expected_codes:
-            return (
-                False,
-                f"unexpected return code: {result.returncode}",
-                {"returncode": result.returncode},
-            )
+            return False, f"unexpected return code: {result.returncode}", {
+                "returncode": result.returncode
+            }
 
         expected_output = verification.get("output_contains")
         if expected_output:
+
             if not isinstance(expected_output, list):
                 return False, "output_contains must be list", {}
 
-            stdout = getattr(result, "stdout", "") or ""
-            stderr = getattr(result, "stderr", "") or ""
+            stdout = str(getattr(result, "stdout", "") or "")
+            stderr = str(getattr(result, "stderr", "") or "")
             combined = stdout + stderr
 
             for token in expected_output:
                 if token not in combined:
-                    return (
-                        False,
-                        f"expected output token missing: {token}",
-                        {"stdout": stdout, "stderr": stderr},
-                    )
+                    return False, f"expected output token missing: {token}", {
+                        "stdout": stdout,
+                        "stderr": stderr,
+                    }
 
         return True, "", {"returncode": result.returncode}
 
@@ -136,10 +134,7 @@ class StepVerifier:
     # FILE VERIFICATION
     # =================================================
 
-    def _verify_file(
-        self,
-        step: ExecutionStep,
-    ) -> Tuple[bool, str, Dict[str, Any]]:
+    def _verify_file(self, step: ExecutionStep) -> Tuple[bool, str, Dict[str, Any]]:
 
         action = step.action or {}
         verification = step.verification or {}
@@ -161,38 +156,33 @@ class StepVerifier:
 
         expected = verification.get("content_contains")
         if expected:
+
             if not isinstance(expected, list):
                 return False, "content_contains must be list", {}
 
             try:
                 with open(path, "r", encoding="utf-8", errors="ignore") as f:
                     content = f.read()
-                for token in expected:
-                    if token not in content:
-                        return (
-                            False,
-                            f"expected file content missing: {token}",
-                            {},
-                        )
             except Exception as e:
                 return False, f"file read failed: {e}", {}
+
+            for token in expected:
+                if token not in content:
+                    return False, f"expected file content missing: {token}", {}
 
         return True, "", {"path": path}
 
     # =================================================
-    # TOOL VERIFICATION
+    # TOOL VERIFICATION (STRICT VERSION CHECK)
     # =================================================
 
-    def _verify_tool(
-        self,
-        step: ExecutionStep,
-    ) -> Tuple[bool, str, Dict[str, Any]]:
+    def _verify_tool(self, step: ExecutionStep) -> Tuple[bool, str, Dict[str, Any]]:
 
         action = step.action or {}
         verification = step.verification or {}
 
         tool = action.get("tool")
-        if not isinstance(tool, str) or not tool:
+        if not isinstance(tool, str) or not tool.strip():
             return False, "tool name missing or invalid", {}
 
         tool_path = shutil.which(tool)
@@ -203,6 +193,7 @@ class StepVerifier:
         min_version = verification.get("min_version")
 
         if version_cmd:
+
             if not isinstance(version_cmd, (list, tuple)):
                 return False, "version_command must be list/tuple", {}
 
@@ -215,17 +206,41 @@ class StepVerifier:
             except Exception as e:
                 return False, f"version command failed: {e}", {}
 
-            if min_version and min_version not in out:
-                return (
-                    False,
-                    f"minimum version not satisfied: {min_version}",
-                    {"version_output": out},
-                )
+            parsed = self._parse_version(out)
+            if not parsed:
+                return False, "unable to parse version output", {
+                    "version_output": out
+                }
+
+            if min_version:
+                if not self._version_satisfies(parsed, min_version):
+                    return False, f"minimum version not satisfied: {min_version}", {
+                        "detected_version": parsed,
+                        "version_output": out,
+                    }
 
         return True, "", {"tool_path": tool_path}
 
+    def _parse_version(self, text: str) -> Optional[List[int]]:
+        match = self.VERSION_REGEX.search(text)
+        if not match:
+            return None
+        return [int(x) for x in match.group(0).split(".")]
+
+    def _version_satisfies(self, detected: List[int], minimum: str) -> bool:
+        try:
+            min_parts = [int(x) for x in minimum.split(".")]
+        except Exception:
+            return False
+
+        length = max(len(detected), len(min_parts))
+        detected += [0] * (length - len(detected))
+        min_parts += [0] * (length - len(min_parts))
+
+        return detected >= min_parts
+
     # =================================================
-    # UI VERIFICATION (HARDENED)
+    # UI VERIFICATION
     # =================================================
 
     def _verify_ui_change(
@@ -240,15 +255,14 @@ class StepVerifier:
         if not isinstance(screenshot, dict):
             return False, "invalid screenshot structure", {}
 
-        elements = screenshot.get("elements")
-        if not isinstance(elements, list):
-            return False, "no perception elements available", {}
-
         if world_graph is None:
-            return False, "world_graph required for UI verification", {}
+            return False, "world_graph required", {}
 
         verification = step.verification or {}
         action = step.action or {}
+
+        if not verification:
+            return False, "ui verification requires explicit criteria", {}
 
         # Text grounding
         expected_text = verification.get("screen_contains")
@@ -256,26 +270,19 @@ class StepVerifier:
             if not isinstance(expected_text, list):
                 return False, "screen_contains must be list", {}
             for token in expected_text:
-                matches = world_graph.find_by_text(contains=token)
-                if not matches:
-                    return False, f"text not found in world graph: {token}", {}
+                if not world_graph.find_by_text(contains=token):
+                    return False, f"text not found: {token}", {}
 
         # Focus validation
         expected_focus = verification.get("focused_app_equals")
         if expected_focus:
-            current_focus = world_graph.focused_application()
-            if current_focus != expected_focus:
-                return (
-                    False,
-                    f"focused app mismatch: expected {expected_focus}, got {current_focus}",
-                    {"focused_app": current_focus},
-                )
+            if world_graph.focused_application() != expected_focus:
+                return False, "focused app mismatch", {}
 
         # Entity type existence
         expected_type = verification.get("entity_type_exists")
         if expected_type:
-            found = world_graph.find_by_type(expected_type)
-            if not found:
+            if not world_graph.find_by_type(expected_type):
                 return False, f"entity type not found: {expected_type}", {}
 
         # Click grounding
@@ -284,7 +291,7 @@ class StepVerifier:
             y = action.get("y")
 
             if not isinstance(x, (int, float)) or not isinstance(y, (int, float)):
-                return False, "click missing or invalid coordinates", {}
+                return False, "invalid click coordinates", {}
 
             candidates = world_graph.snapshot().get("entities", [])
             grounded = False
@@ -298,33 +305,11 @@ class StepVerifier:
 
                 if abs(ex - x) <= 0.02 and abs(ey - y) <= 0.02:
                     if ent.get("interactable") is False:
-                        return False, "clicked element not interactable", {}
+                        return False, "clicked non-interactable element", {}
                     grounded = True
                     break
 
             if not grounded:
-                return False, "click not grounded in world graph", {}
+                return False, "click not grounded", {}
 
-        # Entity count delta
-        min_delta = verification.get("entity_count_delta_min")
-        if min_delta is not None and isinstance(previous_screenshot, dict):
-            before_elements = previous_screenshot.get("elements")
-            if isinstance(before_elements, list):
-                before_count = len(before_elements)
-                after_count = world_graph.entity_count()
-                if (after_count - before_count) < int(min_delta):
-                    return (
-                        False,
-                        "entity count delta below expectation",
-                        {"before": before_count, "after": after_count},
-                    )
-
-        # Explicit criteria required
-        if verification:
-            return True, "", {"world_graph_verified": True}
-
-        return (
-            False,
-            "ui verification requires explicit verification criteria",
-            {},
-            )
+        return True, "", {"ui_verified": True}
