@@ -1,21 +1,5 @@
 # core/execution/failure_recovery.py
 
-"""
-Failure Recovery Manager
-
-Purpose:
-Deterministic failure handling during execution.
-
-This module:
-- DOES NOT execute steps
-- DOES NOT touch OS
-- DOES NOT read screen directly
-- DOES NOT mutate external state
-
-It is a bounded policy engine that decides:
-retry | alternative | abort
-"""
-
 from dataclasses import dataclass
 from typing import Dict, Any, Optional, List
 import json
@@ -46,9 +30,10 @@ class FailureRecoveryManager:
 
     HARD CONTRACT:
     - No execution
-    - No randomness
+    - No OS access
+    - No world mutation
     - Deterministic fallback always available
-    - Retry ceiling cannot be exceeded
+    - Retry ceiling strictly enforced
     """
 
     MAX_RETRIES = 3
@@ -56,10 +41,10 @@ class FailureRecoveryManager:
     MAX_LLM_DELAY_SECONDS = 5.0
     MAX_SNAPSHOT_ENTITIES = 10
 
-    _VALID_ACTIONS = {"retry", "alternative", "abort"}
+    _VALID_ACTIONS = {"retry", "abort"}
 
     # ==================================================
-    # PRIMARY ENTRYPOINT (Deterministic)
+    # PRIMARY ENTRYPOINT (Deterministic Core)
     # ==================================================
 
     def handle_failure(
@@ -85,12 +70,9 @@ class FailureRecoveryManager:
 
         # ---- bounded retry ----
         if attempt < self.MAX_RETRIES:
-            return self._retry(
-                attempt=attempt,
-                error=error,
-            )
+            return self._retry(attempt=attempt, error=error)
 
-        # ---- explicit alternatives ----
+        # ---- explicit alternatives only if defined ----
         alternatives = self._extract_alternatives(step)
         if alternatives:
             return RecoveryAction(
@@ -102,13 +84,13 @@ class FailureRecoveryManager:
                 alternative_operations=alternatives,
             )
 
-        # ---- fail-closed abort ----
+        # ---- fail-closed ----
         return self._abort(
             reason=f"Max retries exceeded for step {step.id}: {error}"
         )
 
     # ==================================================
-    # PERCEPTION-AWARE RECOVERY (BOUNDED)
+    # LLM-BOUNDED RECOVERY (SAFE EXTENSION)
     # ==================================================
 
     def handle_failure_with_perception(
@@ -121,12 +103,13 @@ class FailureRecoveryManager:
         llm_callable=None,
     ) -> RecoveryAction:
         """
-        Perception-aware recovery.
+        Bounded LLM-assisted recovery.
 
         Strict guarantees:
-        - Cannot exceed MAX_RETRIES
-        - Cannot introduce alternatives dynamically
-        - Falls back to deterministic policy on any failure
+        - Never exceeds MAX_RETRIES
+        - Never injects new alternatives
+        - Falls back deterministically on any failure
+        - LLM may only choose: retry | abort
         """
 
         deterministic = self.handle_failure(step, error, attempt_ctx)
@@ -146,6 +129,7 @@ class FailureRecoveryManager:
 
         try:
             snapshot = world_graph.snapshot()
+
             prompt = self._build_llm_prompt(
                 step=step,
                 error=error,
@@ -160,22 +144,25 @@ class FailureRecoveryManager:
             decision = json.loads(raw.strip())
 
             action = decision.get("action")
-            if action not in ("retry", "abort"):
+            if action not in self._VALID_ACTIONS:
                 return deterministic
 
+            # ---- ABORT ----
             if action == "abort":
                 return RecoveryAction(
                     action="abort",
-                    reason=f"LLM: {decision.get('reason', 'abort advised')}",
+                    reason=f"LLM advised abort: {decision.get('reason', '')}",
                 )
 
-            # Retry path — still bounded
+            # ---- RETRY (STRICTLY BOUNDED) ----
             if action == "retry":
                 if attempt + 1 > self.MAX_RETRIES:
                     return deterministic
 
                 try:
-                    delay = float(decision.get("suggested_delay", self.RETRY_DELAY_SECONDS))
+                    delay = float(
+                        decision.get("suggested_delay", self.RETRY_DELAY_SECONDS)
+                    )
                 except Exception:
                     delay = self.RETRY_DELAY_SECONDS
 
@@ -183,7 +170,7 @@ class FailureRecoveryManager:
 
                 return RecoveryAction(
                     action="retry",
-                    reason=f"LLM: {decision.get('reason', 'retry advised')}",
+                    reason=f"LLM advised retry: {decision.get('reason', '')}",
                     delay=delay,
                     context={"attempt": attempt + 1},
                 )
@@ -243,7 +230,7 @@ class FailureRecoveryManager:
         entities = snapshot.get("entities", [])[: self.MAX_SNAPSHOT_ENTITIES]
 
         return f"""
-You are a bounded recovery policy engine.
+You are a strictly bounded recovery policy engine.
 
 FAILED STEP:
 - id: {step.id}
@@ -270,5 +257,6 @@ Rules:
 - Retry only if temporary failure likely.
 - Abort if impossible in current state.
 - Never suggest alternatives.
+- Never exceed retry ceiling.
 - Be conservative.
 """
