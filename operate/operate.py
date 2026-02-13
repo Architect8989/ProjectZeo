@@ -25,9 +25,9 @@ from core.tools.autonomous_installer import AutonomousInstaller
 
 def operate_main(
     *,
-    model: Optional[str],
     terminal_prompt: str,
     execution_plan: ExecutionPlan,
+    planner=None,  # <-- NEW
     observer=None,
     world_graph=None,
     max_wallclock_seconds: int = 90 * 60,
@@ -64,6 +64,7 @@ def operate_main(
     try:
         _execute_plan(
             execution_plan=execution_plan,
+            planner=planner,  # <-- NEW
             observer=observer,
             world_graph=world_graph,
             os_backend=os_backend,
@@ -87,6 +88,7 @@ def operate_main(
 def _execute_plan(
     *,
     execution_plan: ExecutionPlan,
+    planner,  # <-- NEW
     observer,
     world_graph,
     os_backend: OperatingSystem,
@@ -122,47 +124,62 @@ def _execute_plan(
                 raise RuntimeError(f"Dependency {dep} not satisfied")
 
         # -------------------------------------------------
-        # PERCEPTION SYNC (PRE-STEP)
+        # PERCEPTION SYNC
         # -------------------------------------------------
 
         if observer and world_graph:
             try:
                 snap = observer.snapshot()
                 perception = snap.get("perception")
-                if isinstance(perception, dict) and perception.get("available"):
+                if isinstance(perception, dict):
                     world_graph.update(perception)
             except Exception:
                 pass
 
         # -------------------------------------------------
-        # DIVERGENCE DETECTION
+        # CLOSED-LOOP RE-EVALUATION
+        # -------------------------------------------------
+
+        if planner and world_graph:
+            current_world = world_graph.snapshot()
+
+            planner.update_world_snapshot(current_world)
+
+            decision = planner.should_replan(
+                current_step_id=step.id,
+                execution_history=progress.get_history(),
+            )
+
+            journal.record({
+                "event": "replan_check",
+                "step_id": step.id,
+                "decision": decision,
+            })
+
+            if decision.get("replan_required"):
+                raise RuntimeError("REPLAN_REQUIRED")
+
+        # -------------------------------------------------
+        # DIVERGENCE CHECK (NOW NON-FATAL)
         # -------------------------------------------------
 
         if world_graph:
             current_snapshot = world_graph.snapshot()
 
             if previous_snapshot is not None:
-                try:
-                    delta = world_graph.compute_delta(previous_snapshot)
+                delta = world_graph.compute_delta(previous_snapshot)
 
-                    if delta.get("significant_change"):
-                        journal.record({
-                            "event": "significant_divergence",
-                            "step_id": step.id,
-                            "delta": delta,
-                        })
+                if delta.get("significant_change"):
+                    journal.record({
+                        "event": "divergence_detected",
+                        "step_id": step.id,
+                        "delta": delta,
+                    })
+
+                    if planner:
+                        raise RuntimeError("REPLAN_REQUIRED")
+                    else:
                         raise RuntimeError("World divergence detected")
-
-                    if delta.get("focus_changed"):
-                        journal.record({
-                            "event": "focus_changed",
-                            "step_id": step.id,
-                            "prev_focus": delta.get("prev_focus"),
-                            "curr_focus": delta.get("curr_focus"),
-                        })
-
-                except Exception as e:
-                    raise RuntimeError(f"Divergence check failed: {e}")
 
             previous_snapshot = current_snapshot
 
@@ -177,7 +194,7 @@ def _execute_plan(
         )
 
         if decision != AuthorityDecision.CONTINUE:
-            _handle_authority(decision, journal)
+            raise RuntimeError("Authority interrupted execution")
 
         progress.start_step(step.id)
 
@@ -209,12 +226,11 @@ def _execute_plan(
                         installer=installer,
                     )
 
-                # POST-STEP PERCEPTION SYNC
                 if observer and world_graph:
                     try:
                         snap = observer.snapshot()
                         perception = snap.get("perception")
-                        if isinstance(perception, dict) and perception.get("available"):
+                        if isinstance(perception, dict):
                             world_graph.update(perception)
                     except Exception:
                         pass
@@ -233,6 +249,10 @@ def _execute_plan(
                     raise RuntimeError(verification.reason)
 
                 progress.complete_step(step.id)
+
+                # Update planner belief AFTER successful step
+                if planner and world_graph:
+                    planner.update_world_snapshot(world_graph.snapshot())
 
                 journal.record({
                     "event": "step_complete",
