@@ -27,7 +27,7 @@ def operate_main(
     *,
     terminal_prompt: str,
     execution_plan: ExecutionPlan,
-    planner=None,  # <-- NEW
+    planner=None,
     observer=None,
     world_graph=None,
     max_wallclock_seconds: int = 90 * 60,
@@ -64,7 +64,7 @@ def operate_main(
     try:
         _execute_plan(
             execution_plan=execution_plan,
-            planner=planner,  # <-- NEW
+            planner=planner,
             observer=observer,
             world_graph=world_graph,
             os_backend=os_backend,
@@ -88,7 +88,7 @@ def operate_main(
 def _execute_plan(
     *,
     execution_plan: ExecutionPlan,
-    planner,  # <-- NEW
+    planner,
     observer,
     world_graph,
     os_backend: OperatingSystem,
@@ -137,12 +137,11 @@ def _execute_plan(
                 pass
 
         # -------------------------------------------------
-        # CLOSED-LOOP RE-EVALUATION
+        # CLOSED LOOP REPLAN CHECK
         # -------------------------------------------------
 
         if planner and world_graph:
             current_world = world_graph.snapshot()
-
             planner.update_world_snapshot(current_world)
 
             decision = planner.should_replan(
@@ -160,7 +159,7 @@ def _execute_plan(
                 raise RuntimeError("REPLAN_REQUIRED")
 
         # -------------------------------------------------
-        # DIVERGENCE CHECK (NOW NON-FATAL)
+        # DIVERGENCE CHECK
         # -------------------------------------------------
 
         if world_graph:
@@ -208,7 +207,7 @@ def _execute_plan(
         attempt_ctx = {"attempt": 0}
 
         # -------------------------------------------------
-        # STEP EXECUTION LOOP
+        # STEP LOOP
         # -------------------------------------------------
 
         while True:
@@ -250,7 +249,6 @@ def _execute_plan(
 
                 progress.complete_step(step.id)
 
-                # Update planner belief AFTER successful step
                 if planner and world_graph:
                     planner.update_world_snapshot(world_graph.snapshot())
 
@@ -263,10 +261,32 @@ def _execute_plan(
 
             except ActionTimeout as e:
                 log_warn(f"[EXEC] timeout on step {step.id}")
-                action = recovery.handle_failure(step, e, attempt_ctx)
+
+                if planner and world_graph:
+                    action = recovery.handle_failure_with_perception(
+                        step=step,
+                        error=e,
+                        attempt_ctx=attempt_ctx,
+                        world_graph=world_graph,
+                        llm_callable=planner._llm_call,
+                    )
+                else:
+                    action = recovery.handle_failure(step, e, attempt_ctx)
 
             except Exception as e:
-                action = recovery.handle_failure(step, e, attempt_ctx)
+                if str(e) == "REPLAN_REQUIRED":
+                    raise
+
+                if planner and world_graph:
+                    action = recovery.handle_failure_with_perception(
+                        step=step,
+                        error=e,
+                        attempt_ctx=attempt_ctx,
+                        world_graph=world_graph,
+                        llm_callable=planner._llm_call,
+                    )
+                else:
+                    action = recovery.handle_failure(step, e, attempt_ctx)
 
             if action.action == "retry":
                 attempt_ctx = action.context or attempt_ctx
