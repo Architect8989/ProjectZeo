@@ -2,6 +2,7 @@ from typing import List, Dict, Any, Optional
 import json
 import time
 import concurrent.futures
+import hashlib
 
 from core.schemas.execution_plan import (
     ExecutionPlan,
@@ -23,6 +24,7 @@ class ExecutionPlanner:
     - No side effects
     - Strict validation
     - Snapshot always frozen
+    - Replan bounded and storm-protected
     """
 
     LLM_TIMEOUT_SECONDS = 30.0
@@ -43,15 +45,11 @@ class ExecutionPlanner:
         self._llm_call = llm_call
         self._environment = environment_fingerprint or {}
         self._world_snapshot: Optional[Dict[str, Any]] = None
+        self._last_replan_snapshot_hash: Optional[str] = None
 
         if world_graph is not None:
-            try:
-                snap = world_graph.snapshot()
-                self._world_snapshot = json.loads(json.dumps(snap))
-            except Exception:
-                raise PlanningError("Failed to snapshot world_graph")
-
-        if self._world_snapshot is None:
+            self.update_world_snapshot(world_graph.snapshot())
+        else:
             self._world_snapshot = {
                 "entities": [],
                 "focused_app": None,
@@ -87,8 +85,6 @@ class ExecutionPlanner:
                 raise PlanningError("Invalid high-level goal entry")
 
             expanded = self._expand_goal(goal.strip())
-            if not expanded:
-                raise PlanningError(f"Goal produced no steps: {goal}")
 
             if len(expanded) > self.MAX_STEPS_PER_GOAL:
                 raise PlanningError("LLM produced too many steps")
@@ -110,9 +106,6 @@ class ExecutionPlanner:
                 execution_steps.append(step)
                 last_step_id = step_id
                 step_id += 1
-
-        if not execution_steps:
-            raise PlanningError("No executable steps generated")
 
         execution_steps.append(
             ExecutionStep(
@@ -148,12 +141,14 @@ class ExecutionPlanner:
             raise PlanningError("Invalid world snapshot")
 
         try:
-            self._world_snapshot = json.loads(json.dumps(new_snapshot))
+            frozen = json.loads(json.dumps(new_snapshot))
         except Exception:
             raise PlanningError("Failed to freeze new snapshot")
 
+        self._world_snapshot = frozen
+
     # ==================================================
-    # REPLAN DECISION (FAIL-CLOSED)
+    # REPLAN DECISION (HARDENED)
     # ==================================================
 
     def should_replan(
@@ -170,21 +165,22 @@ class ExecutionPlanner:
             execution_history = []
 
         if not self._world_snapshot:
-            return {
-                "replan_required": False,
-                "confidence": 0.0,
-                "reason": "No snapshot available",
-            }
+            return self._no_replan("No snapshot available")
+
+        snapshot_hash = self._hash_snapshot(self._world_snapshot)
+
+        # Prevent replan storm for identical snapshot
+        if snapshot_hash == self._last_replan_snapshot_hash:
+            return self._no_replan("Snapshot unchanged")
 
         prompt = f"""
-Validate whether deterministic execution must replan.
+Determine if replanning is required.
 
-Snapshot:
+World snapshot:
 {json.dumps(self._world_snapshot)[:1000]}
 
-Execution:
-- current_step_id: {current_step_id}
-- recent_history:
+Current step: {current_step_id}
+Recent history:
 {json.dumps(execution_history[-5:])}
 
 Return JSON only:
@@ -199,39 +195,50 @@ Be conservative.
 
         try:
             raw = self._call_llm_with_timeout(prompt)
-        except PlanningError:
-            return {
-                "replan_required": False,
-                "confidence": 0.0,
-                "reason": "LLM timeout",
-            }
-
-        try:
             decision = json.loads(raw.strip())
         except Exception:
-            return {
-                "replan_required": False,
-                "confidence": 0.0,
-                "reason": "Invalid LLM response",
-            }
+            return self._no_replan("LLM failure")
 
-        confidence = decision.get("confidence", 0.0)
+        if not isinstance(decision, dict):
+            return self._no_replan("Invalid schema")
+
+        replan_required = bool(decision.get("replan_required", False))
+
         try:
-            confidence = float(confidence)
+            confidence = float(decision.get("confidence", 0.0))
         except Exception:
             confidence = 0.0
 
         confidence = max(0.0, min(confidence, 1.0))
 
+        reason = str(decision.get("reason", ""))[:300]
+
+        if replan_required:
+            self._last_replan_snapshot_hash = snapshot_hash
+
         return {
-            "replan_required": bool(decision.get("replan_required", False)),
+            "replan_required": replan_required,
             "confidence": confidence,
-            "reason": str(decision.get("reason", "LLM decision"))[:300],
+            "reason": reason,
         }
 
     # ==================================================
     # INTERNAL HELPERS
     # ==================================================
+
+    def _no_replan(self, reason: str) -> Dict[str, Any]:
+        return {
+            "replan_required": False,
+            "confidence": 0.0,
+            "reason": reason[:300],
+        }
+
+    def _hash_snapshot(self, snapshot: Dict[str, Any]) -> str:
+        try:
+            raw = json.dumps(snapshot, sort_keys=True)
+        except Exception:
+            raw = str(snapshot)
+        return hashlib.sha256(raw.encode()).hexdigest()
 
     def _call_llm_with_timeout(self, prompt: str) -> str:
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
@@ -272,8 +279,7 @@ Be conservative.
             if isinstance(label, str) and label.strip():
                 text_chunks.append(f"{etype}: {label}")
 
-        context = "\n".join(text_chunks)
-        return context[: self.MAX_SCREEN_CHARS]
+        return "\n".join(text_chunks)[: self.MAX_SCREEN_CHARS]
 
     # ==================================================
     # GOAL EXPANSION
@@ -319,8 +325,8 @@ Rules:
 
         try:
             data = json.loads(raw)
-        except Exception as e:
-            raise PlanningError(f"Invalid JSON from LLM: {e}")
+        except Exception:
+            raise PlanningError("Invalid JSON from LLM")
 
         if not isinstance(data, list) or not data:
             raise PlanningError("LLM produced invalid step list")
@@ -334,35 +340,34 @@ Rules:
 
         validated: List[Dict[str, Any]] = []
 
-        for idx, step in enumerate(data):
+        for step in data:
             if not isinstance(step, dict):
-                raise PlanningError(f"Invalid step at index {idx}")
+                raise PlanningError("Invalid step format")
 
             step_type = step.get("type")
             if step_type not in allowed_types:
-                raise PlanningError(f"Invalid step type: {step_type}")
+                raise PlanningError("Invalid step type")
 
             description = step.get("description")
-            if not isinstance(description, str) or not description.strip():
-                raise PlanningError("Invalid step description")
-
             action = step.get("action")
-            if not isinstance(action, dict):
-                raise PlanningError("Step action must be object")
-
             verification = step.get("verification")
+
+            if not isinstance(description, str) or not description.strip():
+                raise PlanningError("Invalid description")
+
+            if not isinstance(action, dict):
+                raise PlanningError("Invalid action")
+
             if not isinstance(verification, dict):
-                raise PlanningError("Step verification must be object")
+                raise PlanningError("Invalid verification")
 
             try:
                 duration = float(step.get("estimated_duration", 0.0))
             except Exception:
-                raise PlanningError("Invalid estimated_duration")
+                raise PlanningError("Invalid duration")
 
             if duration < 0 or duration > self.MAX_ESTIMATED_DURATION:
-                raise PlanningError("estimated_duration out of bounds")
-
-            retryable = bool(step.get("retryable", True))
+                raise PlanningError("Duration out of bounds")
 
             validated.append(
                 {
@@ -371,7 +376,7 @@ Rules:
                     "action": action,
                     "verification": verification,
                     "estimated_duration": duration,
-                    "retryable": retryable,
+                    "retryable": bool(step.get("retryable", True)),
                 }
             )
 
