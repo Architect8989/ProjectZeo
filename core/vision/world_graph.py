@@ -252,6 +252,25 @@ class WorldGraph:
 
             return results
 
+    def find_by_type(
+        self,
+        entity_type: str,
+    ) -> List[Dict[str, Any]]:
+        """Find entities by type (case-insensitive)."""
+        if not isinstance(entity_type, str) or not entity_type:
+            return []
+
+        type_lower = entity_type.lower().strip()
+
+        with self._lock:
+            results = [
+                copy.deepcopy(ent)
+                for ent in self._entities.values()
+                if (ent.get("type") or "").lower() == type_lower
+            ]
+
+            return results
+
     def focused_application(self) -> Optional[str]:
         with self._lock:
             return self._focused_app
