@@ -31,58 +31,42 @@ MAX_REPLANS = 3
 
 TASK_START = None
 
-OS_BACKEND = OperatingSystem()
-STATE_PATH = os.path.join(os.getcwd(), ".authority_state.json")
-AUTH_STATE = AuthorityStateSerializer(STATE_PATH)
-
-observer = ObserverCore()
-vision_runtime = VisionRuntime()
-world_graph = WorldGraph()
-
-observer_loop = ObserverLoop(
-    observer=observer,
-    vision_runtime=vision_runtime,
-    world_graph=world_graph,
-)
-
-mode = ModeController()
-
 
 # ==================================================
 # SAFE SHUTDOWN
 # ==================================================
 
-def _force_safe_shutdown(reason: str):
+def _force_safe_shutdown(os_backend, auth_state, reason: str):
     try:
-        OS_BACKEND.force_release_all(reason=reason)
+        os_backend.force_release_all(reason=reason)
     except Exception:
         pass
 
     try:
-        AUTH_STATE.force_safe_state()
+        auth_state.force_safe_state()
     except Exception:
         pass
 
     print(f"[SAFE-SHUTDOWN] {reason}", file=sys.stderr)
 
 
-def _signal_handler(signum, frame):
-    _force_safe_shutdown(f"signal-{signum}")
-    os._exit(1)
+def _install_signal_handlers(os_backend, auth_state):
+    def _signal_handler(signum, frame):
+        _force_safe_shutdown(os_backend, auth_state, f"signal-{signum}")
+        os._exit(1)
 
-
-atexit.register(_force_safe_shutdown, "atexit")
-signal.signal(signal.SIGINT, _signal_handler)
-signal.signal(signal.SIGTERM, _signal_handler)
-if hasattr(signal, "SIGQUIT"):
-    signal.signal(signal.SIGQUIT, _signal_handler)
+    atexit.register(_force_safe_shutdown, os_backend, auth_state, "atexit")
+    signal.signal(signal.SIGINT, _signal_handler)
+    signal.signal(signal.SIGTERM, _signal_handler)
+    if hasattr(signal, "SIGQUIT"):
+        signal.signal(signal.SIGQUIT, _signal_handler)
 
 
 # ==================================================
 # PERCEPTION INGESTION
 # ==================================================
 
-def _ingest_latest_perception():
+def _ingest_latest_perception(observer, world_graph):
     snap = observer.snapshot()
     if not isinstance(snap, dict):
         return
@@ -107,19 +91,37 @@ def main(llm_callable: Callable[[str], str]):
     if not callable(llm_callable):
         raise RuntimeError("LLM callable must be provided")
 
+    # Runtime-owned dependencies (moved from global scope)
+    os_backend = OperatingSystem()
+    state_path = os.path.join(os.getcwd(), ".authority_state.json")
+    auth_state = AuthorityStateSerializer(state_path)
+
+    observer = ObserverCore()
+    vision_runtime = VisionRuntime()
+    world_graph = WorldGraph()
+
+    observer_loop = ObserverLoop(
+        observer=observer,
+        vision_runtime=vision_runtime,
+        world_graph=world_graph,
+    )
+
+    mode = ModeController()
     mode.inject_llm_callable(llm_callable)
+
+    _install_signal_handlers(os_backend, auth_state)
 
     print("[BOOT] ProjectZeo kernel starting")
 
     env_fingerprint = collect_environment_fingerprint()
 
-    persisted = AUTH_STATE.load()
+    persisted = auth_state.load()
     if persisted.get("dirty") or persisted.get("restore_required"):
         try:
-            OS_BACKEND.force_release_all(reason="crash_recovery")
+            os_backend.force_release_all(reason="crash_recovery")
         except Exception:
             pass
-        AUTH_STATE.force_safe_state()
+        auth_state.force_safe_state()
         mode.force_observer()
 
     vision_runtime.start()
@@ -129,19 +131,19 @@ def main(llm_callable: Callable[[str], str]):
     warmup_deadline = time.time() + 5.0
     while time.time() < warmup_deadline:
         if observer.is_healthy() and vision_runtime.is_healthy():
-            _ingest_latest_perception()
+            _ingest_latest_perception(observer, world_graph)
             if world_graph.entity_count() > 0:
                 break
         time.sleep(0.1)
 
     snapshot_provider = SnapshotProvider(
         observer=observer,
-        os_backend=OS_BACKEND,
+        os_backend=os_backend,
         mode_controller=mode,
     )
 
     restore_provider = RestoreProvider(
-        os_backend=OS_BACKEND,
+        os_backend=os_backend,
         mode_controller=mode,
     )
 
@@ -165,7 +167,7 @@ def main(llm_callable: Callable[[str], str]):
                 if not snapshot_id:
                     raise RuntimeError("Missing snapshot")
 
-                _ingest_latest_perception()
+                _ingest_latest_perception(observer, world_graph)
                 mode.begin_planning()
 
                 intent = mode.get_intent()
@@ -190,7 +192,7 @@ def main(llm_callable: Callable[[str], str]):
                 mode.attach_execution_plan(f"plan_{int(time.time())}")
                 mode.mark_planning_complete()
 
-                AUTH_STATE.persist(
+                auth_state.persist(
                     execution_mode="EXECUTING",
                     automation_active=True,
                     restore_required=True,
@@ -211,7 +213,7 @@ def main(llm_callable: Callable[[str], str]):
                                 observer=observer,
                                 world_graph=world_graph,
                             )
-                            break  # success
+                            break
 
                         except RuntimeError as e:
                             if str(e) != "REPLAN_REQUIRED":
@@ -221,7 +223,7 @@ def main(llm_callable: Callable[[str], str]):
                             if replan_count > MAX_REPLANS:
                                 raise RuntimeError("Max replans exceeded")
 
-                            _ingest_latest_perception()
+                            _ingest_latest_perception(observer, world_graph)
                             planner.update_world_snapshot(world_graph.snapshot())
 
                             execution_plan = planner.create_plan(
@@ -245,7 +247,7 @@ def main(llm_callable: Callable[[str], str]):
 
                     restore_provider.restore_snapshot(snapshot_id)
 
-                    AUTH_STATE.persist(
+                    auth_state.persist(
                         execution_mode="OBSERVER",
                         automation_active=False,
                         restore_required=False,
@@ -263,11 +265,11 @@ def main(llm_callable: Callable[[str], str]):
                 raise RuntimeError("task_timeout")
 
         except ObserverBlindnessError:
-            _force_safe_shutdown("observer_blindness")
+            _force_safe_shutdown(os_backend, auth_state, "observer_blindness")
             os._exit(1)
 
         except Exception as e:
-            _force_safe_shutdown(f"main_loop_failure:{e}")
+            _force_safe_shutdown(os_backend, auth_state, f"main_loop_failure:{e}")
             os._exit(1)
 
         time.sleep(HEARTBEAT_INTERVAL)
