@@ -1,5 +1,3 @@
-# adapters/factory.py
-
 from typing import Callable, List, Dict, Any
 
 from operate.models.apis import (
@@ -31,7 +29,7 @@ _MODEL_REGISTRY: Dict[str, Callable] = {
     "claude-3": call_claude_3_with_ocr,
     "gemini-pro-vision": call_gemini_pro_vision,
     "llava": call_ollama_llava,
-    "gpt-4_1-with-ocr": call_gpt_4_1_with_ocr,
+    "gpt-4.1-with-ocr": call_gpt_4_1_with_ocr,  # FIXED KEY
     "gpt-4o-labeled": call_gpt_4o_labeled,
 }
 
@@ -55,9 +53,6 @@ class AdapterFactory:
 
     @staticmethod
     def create_llm_callable(model_name: str) -> Callable:
-        """
-        Returns raw model function from registry.
-        """
         model_fn = _MODEL_REGISTRY.get(model_name)
         if model_fn is None:
             raise ModelNotRecognizedException(
@@ -71,14 +66,6 @@ class AdapterFactory:
 
     @staticmethod
     def build_llm(model_name: str) -> Callable:
-        """
-        Returns normalized LLM callable using PureLLMWrapper.
-
-        Unified signature:
-            llm_callable(messages, objective=None, session_id=None)
-
-        This isolates the kernel from apis.py signature inconsistencies.
-        """
         if model_name not in _MODEL_REGISTRY:
             raise ModelNotRecognizedException(
                 f"Model '{model_name}' not recognized."
@@ -97,12 +84,7 @@ class AdapterFactory:
         objective: str,
         session_id: str,
     ) -> Any:
-        """
-        Backward-compatible action fetcher.
 
-        Uses original get_next_action() from apis.py
-        which expects model_name as string.
-        """
         if model_name not in _MODEL_REGISTRY:
             raise ModelNotRecognizedException(
                 f"Model '{model_name}' not recognized."
@@ -117,11 +99,8 @@ class AdapterFactory:
 
 
 # ==================================================
-# MODULE-LEVEL EXPORTS (CRITICAL FIX)
+# MODULE-LEVEL EXPORTS
 # ==================================================
-
-# Required for:
-# from adapters.factory import build_llm
 
 build_llm = AdapterFactory.build_llm
 create_llm_callable = AdapterFactory.create_llm_callable
