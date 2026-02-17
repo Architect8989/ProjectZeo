@@ -10,7 +10,7 @@ except Exception:
 
 
 # -------------------------------------------------
-# OCR (best-effort, secondary signal)
+# OCR (best-effort, weak signal only)
 # -------------------------------------------------
 
 def _extract_text(image) -> List[str]:
@@ -19,13 +19,17 @@ def _extract_text(image) -> List[str]:
 
     try:
         result = _reader.readtext(image)
-        return [r[1].lower() for r in result if isinstance(r, list) and len(r) >= 2]
+        return [
+            r[1].strip().lower()
+            for r in result
+            if isinstance(r, list) and len(r) >= 2 and isinstance(r[1], str)
+        ]
     except Exception:
         return []
 
 
 # -------------------------------------------------
-# Main Verifier
+# Main Verifier (HARDENED)
 # -------------------------------------------------
 
 def verify_execution(
@@ -39,44 +43,45 @@ def verify_execution(
     Contract:
     - Vision must be available
     - Screen must not be blind
-    - Screen hash or timestamp must advance
-    - OCR text presence used only as weak fallback
+    - Hash change required for strong signal
+    - OCR only used as secondary fallback
+    - Timestamp advancement alone is NOT evidence
     """
 
-    if screenshot is None:
+    if not isinstance(screenshot, dict):
         return False
 
-    # Screenpipe style contract
     if not screenshot.get("available"):
         return False
 
     if screenshot.get("blind"):
         return False
 
-    frame_ts = screenshot.get("frame_ts")
     screen_hash = screenshot.get("screen_text_hash")
-
-    if frame_ts is None or screen_hash is None:
+    if not isinstance(screen_hash, str) or not screen_hash:
         return False
 
-    # If first verification, accept
+    # First observation — cannot prove change yet
     if previous_screenshot is None:
-        return True
+        return False
 
     prev_hash = previous_screenshot.get("screen_text_hash")
-    prev_ts = previous_screenshot.get("frame_ts")
 
-    # Strong signal: hash changed
-    if screen_hash != prev_hash:
+    # -----------------------------
+    # STRONG SIGNAL: content changed
+    # -----------------------------
+    if isinstance(prev_hash, str) and screen_hash != prev_hash:
         return True
 
-    # Medium signal: timestamp advanced
-    if prev_ts is not None and frame_ts > prev_ts:
+    # -----------------------------
+    # WEAK SIGNAL: OCR delta
+    # -----------------------------
+    current_texts = set(_extract_text(screenshot.get("image")))
+    prev_texts = set(_extract_text(previous_screenshot.get("image")))
+
+    # Require real delta, not just presence
+    if current_texts and current_texts != prev_texts:
         return True
 
-    # Weak fallback: OCR detects visible text
-    texts = _extract_text(screenshot.get("image"))
-    if len(texts) > 0:
-        return True
-
+    # No evidence of change
     return False
