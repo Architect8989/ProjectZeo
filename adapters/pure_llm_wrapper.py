@@ -19,7 +19,12 @@ class PureLLMWrapper:
     """
 
     def __init__(self, model_name: str):
-        self.model_name = model_name
+        from adapters.apis_safety_layer
+        import apply_patches
+
+    apply_patches()  # activate containment layer
+
+    self.model_name = model_name
 
     # ==================================================
     # MODEL RESOLUTION
