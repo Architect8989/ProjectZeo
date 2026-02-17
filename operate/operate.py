@@ -62,7 +62,7 @@ def operate_main(
         )
 
     try:
-        _execute_plan(
+        _execute_autonomous_loop(
             execution_plan=execution_plan,
             planner=planner,
             observer=observer,
@@ -82,10 +82,10 @@ def operate_main(
 
 
 # ==================================================
-# PLAN EXECUTION
+# AUTONOMOUS PERCEPTION–ACTION LOOP
 # ==================================================
 
-def _execute_plan(
+def _execute_autonomous_loop(
     *,
     execution_plan: ExecutionPlan,
     planner,
@@ -108,192 +108,159 @@ def _execute_plan(
     journal.record({
         "event": "execution_start",
         "objective": execution_plan.objective,
-        "total_steps": len(execution_plan.steps),
     })
 
-    previous_snapshot: Optional[Dict[str, Any]] = None
+    llm_callable = getattr(planner, "_llm_call", None)
 
-    for step in execution_plan.steps:
+    iteration = 0
+    MAX_ITERATIONS = max(len(execution_plan.steps) * 3, 10)
+
+    while iteration < MAX_ITERATIONS:
 
         if time.time() - start_ts > max_wallclock_seconds:
             journal.record({"event": "execution_timeout"})
             raise RuntimeError("Execution wall-clock timeout exceeded")
 
-        for dep in step.dependencies:
-            if not progress.is_completed(dep):
-                raise RuntimeError(f"Dependency {dep} not satisfied")
+        iteration += 1
 
-        # ---------------- PERCEPTION SYNC ----------------
+        # ---------------- PERCEPTION ----------------
 
-        if observer and world_graph:
+        perception_snapshot = None
+        if observer:
             try:
                 snap = observer.snapshot()
-                perception = snap.get("perception")
-                if isinstance(perception, dict):
-                    world_graph.update(perception)
+                perception_snapshot = snap.get("perception")
+                if world_graph and isinstance(perception_snapshot, dict):
+                    world_graph.update(perception_snapshot)
             except Exception:
                 pass
 
-        # ---------------- REPLAN CHECK ----------------
+        # ---------------- LLM DECISION ----------------
 
-        if planner and world_graph:
-            current_world = world_graph.snapshot()
-            planner.update_world_snapshot(current_world)
-
-            decision = planner.should_replan(
-                current_step_id=step.id,
-                execution_history=progress.get_history(),
+        if llm_callable:
+            decision = llm_callable(
+                messages=[{
+                    "role": "system",
+                    "content": f"Objective: {execution_plan.objective}"
+                }],
+                objective=execution_plan.objective,
+                session_id="execution",
             )
+        else:
+            # fallback: follow static plan
+            if iteration - 1 >= len(execution_plan.steps):
+                break
+            step = execution_plan.steps[iteration - 1]
+            decision = {"operation": "execute_step", "step_id": step.id}
 
-            journal.record({
-                "event": "replan_check",
-                "step_id": step.id,
-                "decision": decision,
-            })
-
-            if decision.get("replan_required"):
-                raise RuntimeError("REPLAN_REQUIRED")
-
-        # ---------------- DIVERGENCE CHECK ----------------
-
-        if world_graph:
-            current_snapshot = world_graph.snapshot()
-
-            if previous_snapshot is not None:
-                delta = world_graph.compute_delta(previous_snapshot)
-
-                if delta.get("significant_change"):
-                    journal.record({
-                        "event": "divergence_detected",
-                        "step_id": step.id,
-                        "delta": delta,
-                    })
-
-                    if planner:
-                        raise RuntimeError("REPLAN_REQUIRED")
-                    else:
-                        raise RuntimeError("World divergence detected")
-
-            previous_snapshot = current_snapshot
+        if decision.get("operation") == "done":
+            journal.record({"event": "execution_complete"})
+            return
 
         # ---------------- AUTHORITY CHECK ----------------
 
-        decision = input_arbitrator.evaluate(
+        authority = input_arbitrator.evaluate(
             input_event_ts=time.monotonic(),
-            high_risk=(step.type == StepType.TOOL_INSTALLATION),
+            high_risk=False,
             soc_confident=True,
         )
 
-        if decision != AuthorityDecision.CONTINUE:
+        if authority != AuthorityDecision.CONTINUE:
             raise RuntimeError("Authority interrupted execution")
 
-        progress.start_step(step.id)
+        # ---------------- ACTION EXECUTION ----------------
 
-        journal.record({
-            "event": "step_start",
-            "step_id": step.id,
-            "step_type": step.type.value,
-            "description": step.description,
-        })
+        try:
+            input_arbitrator.soc_action_started()
+            os_backend.heartbeat()
 
-        attempt_ctx = {"attempt": 0}
-
-        while True:
-            try:
-                input_arbitrator.soc_action_started()
-                os_backend.heartbeat()
-
-                before_screen = _extract_screen(observer)
-
-                with action_timeout(step.estimated_duration or 30):
-                    result = _execute_step(
-                        step=step,
-                        os_backend=os_backend,
-                        accessibility_backend=accessibility_backend,
-                        installer=installer,
-                    )
-
-                if observer and world_graph:
-                    try:
-                        snap = observer.snapshot()
-                        perception = snap.get("perception")
-                        if isinstance(perception, dict):
-                            world_graph.update(perception)
-                    except Exception:
-                        pass
-
-                after_screen = _extract_screen(observer)
-
-                verification = verifier.verify_step(
-                    step,
-                    execution_result=result,
-                    screenshot=after_screen,
-                    previous_screenshot=before_screen,
-                    world_graph=world_graph,
+            with action_timeout(30):
+                result = _execute_decision(
+                    decision=decision,
+                    execution_plan=execution_plan,
+                    os_backend=os_backend,
+                    accessibility_backend=accessibility_backend,
+                    installer=installer,
                 )
 
-                if not verification.success:
-                    raise RuntimeError(verification.reason)
+        except ActionTimeout as e:
+            log_warn("[EXEC] timeout during action")
+            raise RuntimeError(str(e))
 
-                progress.complete_step(step.id)
+        # ---------------- VERIFICATION ----------------
 
-                if planner and world_graph:
-                    planner.update_world_snapshot(world_graph.snapshot())
+        verification = verifier.verify_step(
+            step=None,
+            execution_result=result,
+            screenshot=perception_snapshot,
+            previous_screenshot=None,
+            world_graph=world_graph,
+        )
 
-                journal.record({
-                    "event": "step_complete",
-                    "step_id": step.id,
-                })
-
-                break
-
-            except ActionTimeout as e:
-                log_warn(f"[EXEC] timeout on step {step.id}")
-                if planner and world_graph:
-                    action = recovery.handle_failure_with_perception(
-                        step=step,
-                        error=e,
-                        attempt_ctx=attempt_ctx,
-                        world_graph=world_graph,
-                        llm_callable=planner._llm_call,
-                    )
-                else:
-                    action = recovery.handle_failure(step, e, attempt_ctx)
-
-            except Exception as e:
-                if str(e) == "REPLAN_REQUIRED":
-                    raise
-                if planner and world_graph:
-                    action = recovery.handle_failure_with_perception(
-                        step=step,
-                        error=e,
-                        attempt_ctx=attempt_ctx,
-                        world_graph=world_graph,
-                        llm_callable=planner._llm_call,
-                    )
-                else:
-                    action = recovery.handle_failure(step, e, attempt_ctx)
-
-            if action.action == "retry":
-                attempt_ctx = action.context or attempt_ctx
-                time.sleep(action.delay)
-                continue
-
-            progress.fail_step(step.id, action.reason or "fatal")
-
-            journal.record({
-                "event": "step_failed",
-                "step_id": step.id,
-                "reason": action.reason,
-            })
-
-            raise RuntimeError("Execution aborted")
+        if not verification.success:
+            raise RuntimeError(verification.reason)
 
     journal.record({"event": "execution_complete"})
 
 
 # ==================================================
-# EXECUTION HELPERS (NEW – MINIMUM FIX)
+# DECISION EXECUTION
+# ==================================================
+
+def _execute_decision(
+    *,
+    decision: Dict[str, Any],
+    execution_plan: ExecutionPlan,
+    os_backend: OperatingSystem,
+    accessibility_backend: Optional[AccessibilityBackend],
+    installer: Optional[AutonomousInstaller],
+) -> Dict[str, Any]:
+
+    op = decision.get("operation")
+
+    if op == "execute_step":
+        step_id = decision.get("step_id")
+        step = next(
+            (s for s in execution_plan.steps if s.id == step_id),
+            None,
+        )
+        if not step:
+            raise RuntimeError(f"Step {step_id} not found")
+        return _execute_step(
+            step=step,
+            os_backend=os_backend,
+            accessibility_backend=accessibility_backend,
+            installer=installer,
+        )
+
+    if op == "click":
+        os_backend.click(decision.get("target"))
+        return {"status": "clicked"}
+
+    if op == "type":
+        os_backend.type_text(decision.get("text", ""))
+        return {"status": "typed"}
+
+    if op == "hotkey":
+        os_backend.press_keys(decision.get("keys", []))
+        return {"status": "hotkey"}
+
+    if op == "command":
+        return os_backend.execute_command(decision.get("command"))
+
+    if op == "install":
+        if installer is None:
+            raise RuntimeError("Installer unavailable")
+        return installer.install(decision.get("tool"))
+
+    if op == "done":
+        return {"status": "complete"}
+
+    raise RuntimeError(f"Unknown operation: {op}")
+
+
+# ==================================================
+# LEGACY STEP EXECUTION (REUSED)
 # ==================================================
 
 def _execute_step(
@@ -309,9 +276,8 @@ def _execute_step(
         op = action.get("operation")
 
         if op == "click":
-            target = action.get("target")
-            os_backend.click(target)
-            return {"status": "clicked", "target": target}
+            os_backend.click(action.get("target"))
+            return {"status": "clicked"}
 
         if op == "type":
             os_backend.type_text(action.get("text", ""))
@@ -321,55 +287,31 @@ def _execute_step(
             os_backend.press_keys(action.get("keys", []))
             return {"status": "hotkey"}
 
-        if op == "move":
-            os_backend.move_cursor(action.get("target"))
-            return {"status": "moved"}
-
-        if op == "scroll":
-            os_backend.scroll(
-                action.get("direction", "down"),
-                action.get("amount", 3),
-            )
-            return {"status": "scrolled"}
-
         raise RuntimeError(f"Unknown UI operation: {op}")
 
     elif step.type == StepType.COMMAND_EXECUTION:
         action = step.action
-        command = action.get("command")
-        result = os_backend.execute_command(
-            command,
+        return os_backend.execute_command(
+            action.get("command"),
             cwd=action.get("cwd"),
             timeout=action.get("timeout", 30),
             shell=action.get("shell", True),
         )
-        return result
 
     elif step.type == StepType.FILE_CREATION:
         action = step.action
-        path = action.get("path")
-        content = action.get("content", "")
-        os_backend.write_file(path, content)
-        return {"status": "file_written", "path": path}
+        os_backend.write_file(
+            action.get("path"),
+            action.get("content", ""),
+        )
+        return {"status": "file_written"}
 
     elif step.type == StepType.TOOL_INSTALLATION:
         if installer is None:
             raise RuntimeError("Installer not available")
-        tool = step.action.get("tool")
-        return installer.install(tool)
+        return installer.install(step.action.get("tool"))
 
     elif step.type == StepType.DONE:
         return {"status": "complete"}
 
-    else:
-        raise RuntimeError(f"Unsupported step type: {step.type}")
-
-
-def _extract_screen(observer) -> Optional[Dict[str, Any]]:
-    if observer is None:
-        return None
-    try:
-        snap = observer.snapshot()
-        return snap.get("perception")
-    except Exception:
-        return None
+    raise RuntimeError(f"Unsupported step type: {step.type}")
