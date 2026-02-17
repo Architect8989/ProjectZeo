@@ -22,6 +22,7 @@ class RestoreProvider:
     - Fail-closed
     - Strict mode enforcement
     - Deterministic restore order
+    - No internal mode transitions
     """
 
     CURSOR_TOLERANCE_PX = 5
@@ -57,15 +58,17 @@ class RestoreProvider:
 
         with self._lock:
 
+            # Idempotency guard
             if self._completed_snapshot_id == snapshot_id:
                 return
 
+            # Strict mode enforcement — must already be RESTORING
             if self._mode.mode is not SystemMode.RESTORING:
                 raise RestorationError(
                     f"Restore attempted in invalid mode: {self._mode.mode}"
                 )
 
-            # HARD STOP AUTOMATION
+            # HARD STOP AUTOMATION (fail-closed)
             try:
                 self._os.stop_automated_input()
                 self._os.force_release_all(reason="restoration")
@@ -80,12 +83,11 @@ class RestoreProvider:
             self._restore_window(snapshot)
             self._restore_cursor(snapshot)
 
-            # Strict verification
+            # Strict verification (still in RESTORING state)
             self._verify(snapshot)
 
             # DO NOT mutate mode here.
-            # Caller must call mode.complete_execution()
-
+            # Caller (main.py) must call mode.complete_execution()
             self._completed_snapshot_id = snapshot_id
 
     # =========================================================
@@ -131,7 +133,13 @@ class RestoreProvider:
 
     def _verify(self, snapshot: RestorationSnapshot) -> None:
 
-        for attempt in range(self.MAX_VERIFY_ATTEMPTS):
+        # Mode must still be RESTORING during verification
+        if self._mode.mode is not SystemMode.RESTORING:
+            raise RestorationError(
+                f"Verification attempted outside RESTORING mode: {self._mode.mode}"
+            )
+
+        for _ in range(self.MAX_VERIFY_ATTEMPTS):
 
             try:
                 cursor = self._os.get_cursor_position()
