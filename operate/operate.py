@@ -1,5 +1,5 @@
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List
 
 from authority.authority_policy import AuthorityDecision
 from authority.input_arbitrator import InputArbitrator
@@ -17,6 +17,12 @@ from core.verification.plan_verifier import PlanVerifier
 from core.execution.progress_tracker import ProgressTracker
 from core.execution.failure_recovery import FailureRecoveryManager
 from core.tools.autonomous_installer import AutonomousInstaller
+
+# --- COGNITION STACK ---
+from core.cognition.belief_state import BeliefState
+from core.cognition.reasoning_engine import ReasoningEngine
+from core.cognition.action_ranker import ActionRanker
+from core.vision.semantic_resolver import SemanticResolver
 
 
 # ==================================================
@@ -55,10 +61,13 @@ def operate_main(
     progress = ProgressTracker(execution_plan)
 
     installer: Optional[AutonomousInstaller] = None
+    llm_callable = getattr(planner, "_llm_call", None)
+
     if observer is not None:
         installer = AutonomousInstaller(
             observer=observer,
             os_backend=os_backend,
+            llm_callable=llm_callable,
         )
 
     try:
@@ -82,7 +91,7 @@ def operate_main(
 
 
 # ==================================================
-# AUTONOMOUS PERCEPTION–ACTION LOOP
+# COGNITIVE AUTONOMOUS LOOP
 # ==================================================
 
 def _execute_autonomous_loop(
@@ -112,8 +121,13 @@ def _execute_autonomous_loop(
 
     llm_callable = getattr(planner, "_llm_call", None)
 
+    belief = BeliefState()
+    reasoning_engine = ReasoningEngine(llm_callable)
+    action_ranker = ActionRanker()
+    semantic_resolver = SemanticResolver(world_graph)
+
     iteration = 0
-    MAX_ITERATIONS = max(len(execution_plan.steps) * 3, 10)
+    MAX_ITERATIONS = max(len(execution_plan.steps) * 5, 15)
 
     while iteration < MAX_ITERATIONS:
 
@@ -135,57 +149,74 @@ def _execute_autonomous_loop(
             except Exception:
                 pass
 
-        # ---------------- LLM DECISION ----------------
+        world_snapshot = world_graph.snapshot() if world_graph else {}
+        belief.update_entities(world_snapshot)
 
-        if llm_callable:
-            decision = llm_callable(
-                messages=[{
-                    "role": "system",
-                    "content": f"Objective: {execution_plan.objective}"
-                }],
-                objective=execution_plan.objective,
-                session_id="execution",
-            )
-        else:
-            # fallback: follow static plan
-            if iteration - 1 >= len(execution_plan.steps):
-                break
-            step = execution_plan.steps[iteration - 1]
-            decision = {"operation": "execute_step", "step_id": step.id}
+        # ---------------- REASONING ----------------
 
-        if decision.get("operation") == "done":
-            journal.record({"event": "execution_complete"})
-            return
-
-        # ---------------- AUTHORITY CHECK ----------------
-
-        authority = input_arbitrator.evaluate(
-            input_event_ts=time.monotonic(),
-            high_risk=False,
-            soc_confident=True,
+        candidates: List[Dict[str, Any]] = reasoning_engine.propose_actions(
+            objective=execution_plan.objective,
+            belief_summary=belief.summary(),
+            perception=world_snapshot,
+            k=3,
         )
 
-        if authority != AuthorityDecision.CONTINUE:
-            raise RuntimeError("Authority interrupted execution")
+        ranked_actions = action_ranker.rank(
+            candidates,
+            belief.summary(),
+        )
 
-        # ---------------- ACTION EXECUTION ----------------
+        selected_action = None
+        result = None
 
-        try:
-            input_arbitrator.soc_action_started()
-            os_backend.heartbeat()
+        for action in ranked_actions:
 
-            with action_timeout(30):
-                result = _execute_decision(
-                    decision=decision,
-                    execution_plan=execution_plan,
-                    os_backend=os_backend,
-                    accessibility_backend=accessibility_backend,
-                    installer=installer,
+            # semantic grounding
+            if action.get("operation") == "click":
+                resolution = semantic_resolver.resolve(
+                    action.get("target", "")
                 )
 
-        except ActionTimeout as e:
-            log_warn("[EXEC] timeout during action")
-            raise RuntimeError(str(e))
+                if resolution.get("confidence", 0) < 0.5:
+                    belief.record_failure(action, "low_confidence_target")
+                    continue
+
+                entity = resolution.get("entity", {})
+                action["target"] = entity.get("coordinates")
+
+            # authority check
+            authority = input_arbitrator.evaluate(
+                input_event_ts=time.monotonic(),
+                high_risk=False,
+                soc_confident=True,
+            )
+
+            if authority != AuthorityDecision.CONTINUE:
+                raise RuntimeError("Authority interrupted execution")
+
+            try:
+                input_arbitrator.soc_action_started()
+                os_backend.heartbeat()
+
+                with action_timeout(30):
+                    result = _execute_decision(
+                        decision=action,
+                        execution_plan=execution_plan,
+                        os_backend=os_backend,
+                        accessibility_backend=accessibility_backend,
+                        installer=installer,
+                    )
+
+                belief.record_action(action, result)
+                selected_action = action
+                break
+
+            except Exception as e:
+                belief.record_failure(action, str(e))
+                continue
+
+        if selected_action is None:
+            raise RuntimeError("All candidate actions failed")
 
         # ---------------- VERIFICATION ----------------
 
@@ -198,120 +229,14 @@ def _execute_autonomous_loop(
         )
 
         if not verification.success:
-            raise RuntimeError(verification.reason)
+            belief.record_failure(selected_action, verification.reason)
+            continue
+
+        # success path
+        belief.progress_score += 0.1
+
+        if selected_action.get("operation") == "done":
+            journal.record({"event": "execution_complete"})
+            return
 
     journal.record({"event": "execution_complete"})
-
-
-# ==================================================
-# DECISION EXECUTION
-# ==================================================
-
-def _execute_decision(
-    *,
-    decision: Dict[str, Any],
-    execution_plan: ExecutionPlan,
-    os_backend: OperatingSystem,
-    accessibility_backend: Optional[AccessibilityBackend],
-    installer: Optional[AutonomousInstaller],
-) -> Dict[str, Any]:
-
-    op = decision.get("operation")
-
-    if op == "execute_step":
-        step_id = decision.get("step_id")
-        step = next(
-            (s for s in execution_plan.steps if s.id == step_id),
-            None,
-        )
-        if not step:
-            raise RuntimeError(f"Step {step_id} not found")
-        return _execute_step(
-            step=step,
-            os_backend=os_backend,
-            accessibility_backend=accessibility_backend,
-            installer=installer,
-        )
-
-    if op == "click":
-        os_backend.click(decision.get("target"))
-        return {"status": "clicked"}
-
-    if op == "type":
-        os_backend.type_text(decision.get("text", ""))
-        return {"status": "typed"}
-
-    if op == "hotkey":
-        os_backend.press_keys(decision.get("keys", []))
-        return {"status": "hotkey"}
-
-    if op == "command":
-        return os_backend.execute_command(decision.get("command"))
-
-    if op == "install":
-        if installer is None:
-            raise RuntimeError("Installer unavailable")
-        return installer.install(decision.get("tool"))
-
-    if op == "done":
-        return {"status": "complete"}
-
-    raise RuntimeError(f"Unknown operation: {op}")
-
-
-# ==================================================
-# LEGACY STEP EXECUTION (REUSED)
-# ==================================================
-
-def _execute_step(
-    *,
-    step: ExecutionStep,
-    os_backend: OperatingSystem,
-    accessibility_backend: Optional[AccessibilityBackend],
-    installer: Optional[AutonomousInstaller],
-) -> Dict[str, Any]:
-
-    if step.type == StepType.UI_INTERACTION:
-        action = step.action
-        op = action.get("operation")
-
-        if op == "click":
-            os_backend.click(action.get("target"))
-            return {"status": "clicked"}
-
-        if op == "type":
-            os_backend.type_text(action.get("text", ""))
-            return {"status": "typed"}
-
-        if op == "hotkey":
-            os_backend.press_keys(action.get("keys", []))
-            return {"status": "hotkey"}
-
-        raise RuntimeError(f"Unknown UI operation: {op}")
-
-    elif step.type == StepType.COMMAND_EXECUTION:
-        action = step.action
-        return os_backend.execute_command(
-            action.get("command"),
-            cwd=action.get("cwd"),
-            timeout=action.get("timeout", 30),
-            shell=action.get("shell", True),
-        )
-
-    elif step.type == StepType.FILE_CREATION:
-        action = step.action
-        os_backend.write_file(
-            action.get("path"),
-            action.get("content", ""),
-        )
-        return {"status": "file_written"}
-
-    elif step.type == StepType.TOOL_INSTALLATION:
-        if installer is None:
-            raise RuntimeError("Installer not available")
-        return installer.install(step.action.get("tool"))
-
-    elif step.type == StepType.DONE:
-        return {"status": "complete"}
-
-    raise RuntimeError(f"Unsupported step type: {step.type}")
