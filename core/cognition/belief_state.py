@@ -5,18 +5,22 @@ import math
 import random
 import hashlib
 import json
+import struct
 
 
 class BeliefState:
     """
     Decision-theoretic cognitive belief engine.
+    Production-hardened and convergence-safe.
     """
 
     EXPLORATION_C = 1.4
     RISK_LAMBDA = 0.3
     SOFTMAX_TAU = 0.5
     REWARD_WINDOW = 100
-    REGRET_SCALE = 0.05  # how strongly regret penalizes selection
+    REGRET_SCALE = 0.05
+    PRIOR_ALPHA = 0.001  # Dirichlet prior floor
+    REGRET_DECAY = 0.995  # prevents unbounded regret growth
 
     def __init__(self):
         self.created_at = time.time()
@@ -34,7 +38,7 @@ class BeliefState:
         self.commitment_hash: str = "GENESIS"
 
     # ==================================================
-    # BAYESIAN UPDATE (UNION-SAFE)
+    # BAYESIAN UPDATE (DIRICHLET SAFE)
     # ==================================================
 
     def bayesian_update(self, likelihoods: Dict[str, float]) -> None:
@@ -44,9 +48,10 @@ class BeliefState:
         total = 0.0
 
         for state in all_states:
-            prior = self.state_probabilities.get(state, 0.01)
-            likelihood = likelihoods.get(state, 0.01)
-            posterior = prior * likelihood
+            prior = self.state_probabilities.get(state, self.PRIOR_ALPHA)
+            likelihood = likelihoods.get(state, self.PRIOR_ALPHA)
+
+            posterior = prior * max(likelihood, self.PRIOR_ALPHA)
             new_belief[state] = posterior
             total += posterior
 
@@ -58,7 +63,7 @@ class BeliefState:
         }
 
     # ==================================================
-    # ENTROPY (NUMERICALLY STABLE)
+    # ENTROPY
     # ==================================================
 
     def entropy(self) -> float:
@@ -69,7 +74,7 @@ class BeliefState:
         return total
 
     # ==================================================
-    # EXPECTED UTILITY (RISK-AWARE)
+    # EXPECTED UTILITY
     # ==================================================
 
     def expected_utility(self, action: str) -> float:
@@ -84,7 +89,7 @@ class BeliefState:
         return mean - self.RISK_LAMBDA * variance
 
     # ==================================================
-    # UCB (NO DOUBLE EU)
+    # UCB
     # ==================================================
 
     def ucb_score(self, action: str) -> float:
@@ -101,7 +106,7 @@ class BeliefState:
         return mean_reward + exploration
 
     # ==================================================
-    # THOMPSON SAMPLING (GAUSSIAN ±3σ)
+    # THOMPSON SAMPLING (BETA STABLE)
     # ==================================================
 
     def thompson_sample(self, action: str) -> float:
@@ -109,25 +114,21 @@ class BeliefState:
         if not rewards:
             return random.random()
 
-        n = len(rewards)
-        mean = sum(rewards) / n
-        variance = (
-            sum((r - mean) ** 2 for r in rewards) / n
-        ) + 1e-6
+        # Map rewards to success/failure
+        successes = sum(1 for r in rewards if r > 0) + 1
+        failures = sum(1 for r in rewards if r <= 0) + 1
 
-        sigma = math.sqrt(variance)
-        sample = random.gauss(mean, sigma)
-
-        lower = mean - 3 * sigma
-        upper = mean + 3 * sigma
-
-        return max(lower, min(upper, sample))
+        return random.betavariate(successes, failures)
 
     # ==================================================
-    # REGRET UPDATE (POSITIVE ONLY)
+    # REGRET UPDATE (DECAYED)
     # ==================================================
 
     def update_regret(self, action: str, reward: float, best_reward: float):
+        # Apply decay to all regret values
+        for k in list(self.regret.keys()):
+            self.regret[k] *= self.REGRET_DECAY
+
         regret_value = best_reward - reward
         if regret_value > 0:
             self.regret[action] = (
@@ -135,7 +136,7 @@ class BeliefState:
             )
 
     # ==================================================
-    # SOFTMAX SELECTION (REGRET-AWARE)
+    # SOFTMAX SELECTION (NUMERICALLY SAFE)
     # ==================================================
 
     def softmax_select(self, actions: List[str]) -> str:
@@ -155,7 +156,9 @@ class BeliefState:
         tau = max(0.15, self.SOFTMAX_TAU)
 
         shifted = [(s - max_score) / tau for s in scores]
-        exp_scores = [math.exp(s) for s in shifted]
+
+        # Overflow protection
+        exp_scores = [math.exp(min(50, s)) for s in shifted]
         total = sum(exp_scores)
 
         if total <= 0:
@@ -166,7 +169,7 @@ class BeliefState:
         return random.choices(actions, weights=probabilities, k=1)[0]
 
     # ==================================================
-    # RECORD ACTION (BOUNDED MEMORY)
+    # RECORD ACTION
     # ==================================================
 
     def record_action(self, action: str, reward: float):
@@ -195,46 +198,70 @@ class BeliefState:
                 self.environment_stability + 0.05,
             )
 
+        # Clamp to [0,1]
+        self.environment_stability = max(
+            0.0,
+            min(1.0, self.environment_stability),
+        )
+
     # ==================================================
-    # COMMITMENT HASH CHAIN
+    # COMMITMENT HASH (DETERMINISTIC)
     # ==================================================
 
+    def _stable_float_bytes(self, d: Dict[str, float]) -> bytes:
+        parts = []
+        for k in sorted(d):
+            parts.append(k.encode())
+            parts.append(struct.pack("!d", float(d[k])))
+        return b"".join(parts)
+
     def commit(self, action: str, observation: Dict[str, Any]) -> None:
+        obs_bytes = json.dumps(
+            observation,
+            sort_keys=True,
+            default=str,
+        ).encode()
+
+        prob_bytes = self._stable_float_bytes(
+            self.state_probabilities
+        )
+
         payload = (
-            self.commitment_hash
-            + action
-            + json.dumps(observation, sort_keys=True, default=str)
-            + json.dumps(self.state_probabilities, sort_keys=True)
+            self.commitment_hash.encode()
+            + action.encode()
+            + obs_bytes
+            + prob_bytes
         )
 
         self.commitment_hash = hashlib.sha256(
-            payload.encode()
+            payload
         ).hexdigest()
 
     # ==================================================
-    # CONVERGENCE (SHORT-TASK SAFE)
+    # CONVERGENCE (PLAN-BOUND)
     # ==================================================
 
     def converged(
         self,
+        *,
         min_iterations: int = 0,
         current_iteration: int = 0,
+        plan_steps_total: int = 0,
+        steps_completed: int = 0,
     ) -> bool:
 
         if current_iteration < min_iterations:
             return False
 
+        # Require full plan completion if plan provided
+        if plan_steps_total > 0:
+            if steps_completed < plan_steps_total:
+                return False
+
         low_entropy = self.entropy() < 0.1
         stable_env = self.environment_stability > 0.9
 
-        dynamic_threshold = min(
-            0.5,
-            0.1 * max(1, current_iteration),
-        )
-
-        high_progress = self.progress_score > dynamic_threshold
-
-        return low_entropy and stable_env and high_progress
+        return low_entropy and stable_env
 
     # ==================================================
     # SUMMARY
