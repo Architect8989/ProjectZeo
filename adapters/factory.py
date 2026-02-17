@@ -1,37 +1,46 @@
 from typing import Callable, List, Dict, Any
 
-from operate.models.apis import (
-    get_next_action,
-    call_gpt_4o,
-    call_qwen_vl_with_ocr,
-    call_gpt_4o_with_ocr,
-    call_o1_with_ocr,
-    call_claude_3_with_ocr,
-    call_gemini_pro_vision,
-    call_ollama_llava,
-    call_gpt_4_1_with_ocr,
-    call_gpt_4o_labeled,
-)
-
 from operate.exceptions import ModelNotRecognizedException
 from adapters.pure_llm_wrapper import PureLLMWrapper
 
 
 # ==================================================
-# MODEL REGISTRY
+# MODEL REGISTRY (STRING → FUNCTION NAME)
 # ==================================================
 
-_MODEL_REGISTRY: Dict[str, Callable] = {
-    "gpt-4o": call_gpt_4o,
-    "qwen-vl": call_qwen_vl_with_ocr,
-    "gpt-4o-with-ocr": call_gpt_4o_with_ocr,
-    "o1-with-ocr": call_o1_with_ocr,
-    "claude-3": call_claude_3_with_ocr,
-    "gemini-pro-vision": call_gemini_pro_vision,
-    "llava": call_ollama_llava,
-    "gpt-4.1-with-ocr": call_gpt_4_1_with_ocr,  # FIXED KEY
-    "gpt-4o-labeled": call_gpt_4o_labeled,
+_MODEL_REGISTRY: Dict[str, str] = {
+    "gpt-4o": "call_gpt_4o",
+    "qwen-vl": "call_qwen_vl_with_ocr",
+    "gpt-4o-with-ocr": "call_gpt_4o_with_ocr",
+    "o1-with-ocr": "call_o1_with_ocr",
+    "claude-3": "call_claude_3_with_ocr",
+    "gemini-pro-vision": "call_gemini_pro_vision",
+    "llava": "call_ollama_llava",
+    "gpt-4.1-with-ocr": "call_gpt_4_1_with_ocr",
+    "gpt-4o-labeled": "call_gpt_4o_labeled",
 }
+
+
+# ==================================================
+# INTERNAL RESOLUTION
+# ==================================================
+
+def _resolve_provider(model_name: str) -> Callable:
+    fn_name = _MODEL_REGISTRY.get(model_name)
+    if fn_name is None:
+        raise ModelNotRecognizedException(
+            f"Model '{model_name}' not recognized."
+        )
+
+    # Lazy import — prevents heavy dependency loading at module import time
+    from operate.models import apis
+
+    if not hasattr(apis, fn_name):
+        raise RuntimeError(
+            f"Provider '{fn_name}' not found in operate.models.apis"
+        )
+
+    return getattr(apis, fn_name)
 
 
 # ==================================================
@@ -53,12 +62,7 @@ class AdapterFactory:
 
     @staticmethod
     def create_llm_callable(model_name: str) -> Callable:
-        model_fn = _MODEL_REGISTRY.get(model_name)
-        if model_fn is None:
-            raise ModelNotRecognizedException(
-                f"Model '{model_name}' not recognized."
-            )
-        return model_fn
+        return _resolve_provider(model_name)
 
     # --------------------------------------------------
     # NORMALIZED KERNEL-FACING BUILDER
@@ -71,6 +75,7 @@ class AdapterFactory:
                 f"Model '{model_name}' not recognized."
             )
 
+        # PureLLMWrapper internally resolves provider via apis
         return PureLLMWrapper(model_name)
 
     # --------------------------------------------------
@@ -90,7 +95,12 @@ class AdapterFactory:
                 f"Model '{model_name}' not recognized."
             )
 
-        return get_next_action(
+        from operate.models import apis  # lazy import
+
+        if not hasattr(apis, "get_next_action"):
+            raise RuntimeError("get_next_action not available in apis")
+
+        return apis.get_next_action(
             model_name,
             messages,
             objective,
