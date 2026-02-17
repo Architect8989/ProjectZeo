@@ -16,15 +16,18 @@ class PureLLMWrapper:
         - Unified callable interface
         - Safe coroutine handling
         - Deterministic failure behavior
+        - Idempotent patch activation
     """
 
+    _patch_applied = False
+
     def __init__(self, model_name: str):
-        from adapters.apis_safety_layer
-        import apply_patches
+        if not PureLLMWrapper._patch_applied:
+            from adapters.apis_safety_layer import apply_patches
+            apply_patches()
+            PureLLMWrapper._patch_applied = True
 
-    apply_patches()  # activate containment layer
-
-    self.model_name = model_name
+        self.model_name = model_name
 
     # ==================================================
     # MODEL RESOLUTION
@@ -63,16 +66,8 @@ class PureLLMWrapper:
 
         model_fn = self._resolve_model_function()
 
-        # ----------------------------
-        # 1. Freeze inputs
-        # ----------------------------
-
         original_snapshot = copy.deepcopy(messages)
         messages_copy = copy.deepcopy(messages)
-
-        # ----------------------------
-        # 2. Execute safely
-        # ----------------------------
 
         try:
             result = self._execute_model(
@@ -87,18 +82,11 @@ class PureLLMWrapper:
                 f"Model execution failed for {self.model_name}: {e}"
             ) from e
 
-        # ----------------------------
-        # 3. Mutation detection
-        # ----------------------------
-
+        # Strict mutation detection
         if messages_copy != original_snapshot:
             raise RuntimeError(
                 f"Model '{self.model_name}' mutated input messages."
             )
-
-        # ----------------------------
-        # 4. Normalize output
-        # ----------------------------
 
         return self._normalize_output(result)
 
@@ -116,22 +104,6 @@ class PureLLMWrapper:
     ) -> Any:
 
         if inspect.iscoroutinefunction(model_fn):
-            try:
-                loop = asyncio.get_running_loop()
-                if loop.is_running():
-                    # Running inside existing loop (e.g. notebook)
-                    return asyncio.create_task(
-                        self._call_with_signature(
-                            model_fn,
-                            messages,
-                            objective,
-                            session_id,
-                            screen_image,
-                        )
-                    )
-            except RuntimeError:
-                pass
-
             return asyncio.run(
                 self._call_with_signature(
                     model_fn,
@@ -142,13 +114,19 @@ class PureLLMWrapper:
                 )
             )
 
-        return self._call_with_signature(
+        result = self._call_with_signature(
             model_fn,
             messages,
             objective,
             session_id,
             screen_image,
         )
+
+        # If sync function accidentally returns coroutine, resolve it
+        if inspect.iscoroutine(result):
+            return asyncio.run(result)
+
+        return result
 
     def _call_with_signature(
         self,
@@ -193,23 +171,18 @@ class PureLLMWrapper:
                 f"Model '{self.model_name}' returned None."
             )
 
-        if isinstance(result, dict):
+        if isinstance(result, (dict, list)):
             return result
-
-        if isinstance(result, list):
-            return result  # allow action arrays (llava, etc.)
 
         if isinstance(result, str):
             try:
-                parsed = json.loads(result)
-            except Exception:
+                return json.loads(result)
+            except Exception as e:
                 raise RuntimeError(
                     f"Model '{self.model_name}' returned non-JSON string."
-                )
-
-            return parsed
+                ) from e
 
         raise RuntimeError(
             f"Model '{self.model_name}' returned unsupported type: "
             f"{type(result)}"
-            )
+        )
