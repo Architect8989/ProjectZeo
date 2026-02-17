@@ -26,6 +26,7 @@ class RestoreProvider:
 
     CURSOR_TOLERANCE_PX = 5
     POST_ACTION_DELAY = 0.08
+    MAX_VERIFY_ATTEMPTS = 3
 
     def __init__(self, *, os_backend, mode_controller: ModeController):
         self._os = os_backend
@@ -51,6 +52,7 @@ class RestoreProvider:
     # =========================================================
 
     def restore(self, snapshot: RestorationSnapshot) -> None:
+
         snapshot_id = snapshot.snapshot_id
 
         with self._lock:
@@ -58,13 +60,12 @@ class RestoreProvider:
             if self._completed_snapshot_id == snapshot_id:
                 return
 
-            # STRICT MODE REQUIREMENT
             if self._mode.mode is not SystemMode.RESTORING:
                 raise RestorationError(
                     f"Restore attempted in invalid mode: {self._mode.mode}"
                 )
 
-            # HARD STOP AUTOMATION FIRST
+            # HARD STOP AUTOMATION
             try:
                 self._os.stop_automated_input()
                 self._os.force_release_all(reason="restoration")
@@ -74,24 +75,16 @@ class RestoreProvider:
                     f"Automation shutdown failed: {e}"
                 ) from e
 
-            # Deterministic restore order:
-            # 1) Application
-            # 2) Window focus
-            # 3) Cursor
+            # Deterministic restore order
             self._restore_application(snapshot)
             self._restore_window(snapshot)
             self._restore_cursor(snapshot)
 
-            # Mode reset
-            try:
-                self._mode.force_observer()
-            except Exception as e:
-                raise RestorationError(
-                    f"Mode reset failed: {e}"
-                ) from e
-
-            # Verification
+            # Strict verification
             self._verify(snapshot)
+
+            # DO NOT mutate mode here.
+            # Caller must call mode.complete_execution()
 
             self._completed_snapshot_id = snapshot_id
 
@@ -133,72 +126,85 @@ class RestoreProvider:
             ) from e
 
     # =========================================================
-    # VERIFICATION (FAIL-CLOSED)
+    # VERIFICATION (STRICT + DETERMINISTIC)
     # =========================================================
 
     def _verify(self, snapshot: RestorationSnapshot) -> None:
 
-        if self._mode.mode is not SystemMode.OBSERVER:
-            raise RestorationError(
-                f"Post-restore mode invalid: {self._mode.mode}"
-            )
+        for attempt in range(self.MAX_VERIFY_ATTEMPTS):
 
-        try:
-            cursor = self._os.get_cursor_position()
-            current_window = self._os.get_focused_window()
-            current_app = self._os.get_active_application()
-        except Exception as e:
-            raise RestorationError(
-                f"Verification read failed: {e}"
-            ) from e
+            try:
+                cursor = self._os.get_cursor_position()
+                current_window = self._os.get_focused_window()
+                current_app = self._os.get_active_application()
+            except Exception as e:
+                raise RestorationError(
+                    f"Verification read failed: {e}"
+                ) from e
 
-        # -------------------------
-        # Cursor validation
-        # -------------------------
+            if not self._validate_cursor(cursor, snapshot):
+                time.sleep(self.POST_ACTION_DELAY)
+                continue
+
+            if not self._validate_window(current_window, snapshot):
+                time.sleep(self.POST_ACTION_DELAY)
+                continue
+
+            if not self._validate_application(current_app, snapshot):
+                time.sleep(self.POST_ACTION_DELAY)
+                continue
+
+            return  # success
+
+        raise RestorationError("Post-restore verification failed")
+
+    # =========================================================
+    # STRICT VALIDATION HELPERS
+    # =========================================================
+
+    def _validate_cursor(self, cursor, snapshot) -> bool:
 
         if not isinstance(cursor, dict):
-            raise RestorationError("Cursor read invalid")
+            return False
 
         try:
             current_x = int(cursor["x"])
             current_y = int(cursor["y"])
         except Exception:
-            raise RestorationError("Cursor coordinates invalid")
+            return False
 
-        if (
+        return (
             abs(current_x - snapshot.cursor.x)
-            > self.CURSOR_TOLERANCE_PX
-            or abs(current_y - snapshot.cursor.y)
-            > self.CURSOR_TOLERANCE_PX
-        ):
-            raise RestorationError(
-                "Cursor position mismatch after restore"
-            )
+            <= self.CURSOR_TOLERANCE_PX
+            and abs(current_y - snapshot.cursor.y)
+            <= self.CURSOR_TOLERANCE_PX
+        )
 
-        # -------------------------
-        # Focus validation
-        # -------------------------
+    def _normalize(self, text: str) -> str:
+        return text.strip().lower()
+
+    def _validate_window(self, current_window, snapshot) -> bool:
 
         if (
             not isinstance(current_window, dict)
             or not isinstance(current_window.get("title"), str)
-            or snapshot.focus.window_id.lower()
-            not in current_window["title"].lower()
         ):
-            raise RestorationError(
-                "Focused window mismatch after restore"
-            )
+            return False
 
-        # -------------------------
-        # Active application validation
-        # -------------------------
+        expected = self._normalize(snapshot.focus.window_id)
+        actual = self._normalize(current_window["title"])
+
+        return expected == actual
+
+    def _validate_application(self, current_app, snapshot) -> bool:
 
         if (
             not isinstance(current_app, dict)
             or not isinstance(current_app.get("title"), str)
-            or snapshot.application.process_name.lower()
-            not in current_app["title"].lower()
         ):
-            raise RestorationError(
-                "Active application mismatch after restore"
-        )
+            return False
+
+        expected = self._normalize(snapshot.application.process_name)
+        actual = self._normalize(current_app["title"])
+
+        return expected == actual
