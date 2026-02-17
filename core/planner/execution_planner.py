@@ -32,6 +32,16 @@ class ExecutionPlanner:
     MAX_ESTIMATED_DURATION = 600.0
     MAX_STEPS_PER_GOAL = 25
 
+    SAFE_ENV_FIELDS = {
+        "os",
+        "architecture",
+        "display_available",
+        "tools",
+        "running_in_container",
+        "running_in_wsl",
+        "ci_environment",
+    }
+
     def __init__(
         self,
         *,
@@ -148,128 +158,65 @@ class ExecutionPlanner:
         self._world_snapshot = frozen
 
     # ==================================================
-    # REPLAN DECISION
-    # ==================================================
-
-    def should_replan(
-        self,
-        *,
-        current_step_id: int,
-        execution_history: List[Dict[str, Any]],
-    ) -> Dict[str, Any]:
-
-        if not isinstance(current_step_id, int):
-            raise PlanningError("Invalid step id")
-
-        if not self._world_snapshot:
-            return self._no_replan("No snapshot available")
-
-        snapshot_hash = self._hash_snapshot(self._world_snapshot)
-
-        if snapshot_hash == self._last_replan_snapshot_hash:
-            return self._no_replan("Snapshot unchanged")
-
-        prompt = f"""
-Determine if replanning is required.
-
-World snapshot:
-{json.dumps(self._world_snapshot)[:1000]}
-
-Current step: {current_step_id}
-Recent history:
-{json.dumps(execution_history[-5:])}
-
-Return JSON only:
-{{
-  "replan_required": boolean,
-  "confidence": 0.0-1.0,
-  "reason": "short explanation"
-}}
-Be conservative.
-"""
-
-        raw = self._call_llm_with_timeout(prompt)
-
-        try:
-            decision = json.loads(raw)
-        except Exception:
-            return self._no_replan("Invalid JSON")
-
-        if not isinstance(decision, dict):
-            return self._no_replan("Invalid schema")
-
-        replan_required = bool(decision.get("replan_required", False))
-
-        try:
-            confidence = float(decision.get("confidence", 0.0))
-        except Exception:
-            confidence = 0.0
-
-        confidence = max(0.0, min(confidence, 1.0))
-        reason = str(decision.get("reason", ""))[:300]
-
-        if replan_required:
-            self._last_replan_snapshot_hash = snapshot_hash
-
-        return {
-            "replan_required": replan_required,
-            "confidence": confidence,
-            "reason": reason,
-        }
-
-    # ==================================================
-    # INTERNAL HELPERS
+    # LLM CALL (HARDENED)
     # ==================================================
 
     def _call_llm_with_timeout(self, prompt: str) -> str:
-        """
-        FIXED:
-        - Wrap prompt in message structure
-        - Accept dict or string return
-        - Enforce timeout
-        """
-
         message_payload = [
             {"role": "system", "content": "You are a deterministic planner."},
             {"role": "user", "content": prompt},
         ]
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(
-                self._llm_call,
+        def _invoke():
+            return self._llm_call(
                 message_payload,
                 None,
                 "planning",
             )
 
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(_invoke)
             try:
                 result = future.result(timeout=self.LLM_TIMEOUT_SECONDS)
             except concurrent.futures.TimeoutError:
                 raise PlanningError("LLM call timeout")
 
-        # Normalize output
+        # Normalize return type safely
         if isinstance(result, dict):
             content = result.get("content")
             if not isinstance(content, str):
                 raise PlanningError("LLM returned invalid dict structure")
             return content.strip()
 
-        if not isinstance(result, str):
-            raise PlanningError("LLM must return string or dict")
+        if isinstance(result, str):
+            return result.strip()
 
-        return result.strip()
+        if isinstance(result, list):
+            return json.dumps(result)
+
+        raise PlanningError(f"Unsupported LLM return type: {type(result)}")
+
+    # ==================================================
+    # HASHING
+    # ==================================================
 
     def _hash_snapshot(self, snapshot: Dict[str, Any]) -> str:
         raw = json.dumps(snapshot, sort_keys=True)
         return hashlib.sha256(raw.encode()).hexdigest()
 
-    def _extract_required_tools(
-        self, requirements: Dict[str, Any]
-    ) -> List[str]:
+    # ==================================================
+    # TOOL EXTRACTION
+    # ==================================================
+
+    def _extract_required_tools(self, requirements: Dict[str, Any]) -> List[str]:
         tools = requirements.get("tools", [])
         if not isinstance(tools, list):
             return []
         return [t.strip() for t in tools if isinstance(t, str) and t.strip()]
+
+    # ==================================================
+    # SCREEN CONTEXT
+    # ==================================================
 
     def _read_screen_context(self) -> str:
         if not self._world_snapshot:
@@ -298,11 +245,17 @@ Be conservative.
     def _expand_goal(self, goal: str) -> List[Dict[str, Any]]:
         screen_context = self._read_screen_context()
 
+        # Strip PII from environment
+        safe_env = {
+            k: v for k, v in self._environment.items()
+            if k in self.SAFE_ENV_FIELDS
+        }
+
         prompt = f"""
 You are the deterministic planning brain.
 
 Environment:
-{json.dumps(self._environment)}
+{json.dumps(safe_env)}
 
 Frozen screen:
 {screen_context}
