@@ -97,19 +97,22 @@ def _enforce_task_timeout(os_backend, auth_state):
 # MAIN LOOP
 # ==================================================
 
-def main(llm_callable: Callable):
+def main(llm_callable: Callable, model_name: str):
 
     global TASK_START
 
     if not callable(llm_callable):
         raise RuntimeError("LLM callable must be provided")
 
+    if not isinstance(model_name, str) or not model_name.strip():
+        raise RuntimeError("model_name must be provided")
+
     os_backend = OperatingSystem()
     state_path = os.path.join(os.getcwd(), ".authority_state.json")
     auth_state = AuthorityStateSerializer(state_path)
 
     observer = ObserverCore()
-    vision_runtime = VisionRuntime()
+    vision_runtime = VisionRuntime(model_name=model_name)
     world_graph = WorldGraph()
 
     observer_loop = ObserverLoop(
@@ -216,8 +219,8 @@ def main(llm_callable: Callable):
                     dirty=True,
                 )
 
+                consumed_intent = intent
                 mode.execute()
-                consumed_intent = mode.consume_intent()
 
                 try:
 
@@ -237,14 +240,15 @@ def main(llm_callable: Callable):
 
                         except RuntimeError as e:
 
-                            _enforce_task_timeout(os_backend, auth_state)
-
                             if str(e) != "REPLAN_REQUIRED":
                                 raise
 
                             replan_count += 1
                             if replan_count > MAX_REPLANS:
                                 raise RuntimeError("Max replans exceeded")
+
+                            # ---- replan guard begin ----
+                            mode.begin_replan_sequence()
 
                             mode.force_observer()
                             mode.attach_snapshot(snapshot_id)
@@ -269,6 +273,9 @@ def main(llm_callable: Callable):
                             )
                             mode.mark_planning_complete()
                             mode.execute()
+
+                            mode.end_replan_sequence()
+                            # ---- replan guard end ----
 
                 finally:
 
