@@ -23,7 +23,7 @@ from adapters.pure_llm_wrapper import PureLLMWrapper
 # MODEL REGISTRY
 # ==================================================
 
-_MODEL_REGISTRY = {
+_MODEL_REGISTRY: Dict[str, Callable] = {
     "gpt-4o": call_gpt_4o,
     "qwen-vl": call_qwen_vl_with_ocr,
     "gpt-4o-with-ocr": call_gpt_4o_with_ocr,
@@ -43,6 +43,10 @@ _MODEL_REGISTRY = {
 class AdapterFactory:
     """
     Adapter Factory for dynamic model selection.
+    Responsible for:
+        - Registry validation
+        - Raw model access (legacy)
+        - Kernel-facing normalized builder
     """
 
     # --------------------------------------------------
@@ -55,9 +59,9 @@ class AdapterFactory:
         Returns raw model function from registry.
         """
         model_fn = _MODEL_REGISTRY.get(model_name)
-        if not model_fn:
+        if model_fn is None:
             raise ModelNotRecognizedException(
-                f"Model '{model_name}' not recognized!"
+                f"Model '{model_name}' not recognized."
             )
         return model_fn
 
@@ -73,11 +77,11 @@ class AdapterFactory:
         Unified signature:
             llm_callable(messages, objective=None, session_id=None)
 
-        This isolates kernel from apis.py signature inconsistencies.
+        This isolates the kernel from apis.py signature inconsistencies.
         """
         if model_name not in _MODEL_REGISTRY:
             raise ModelNotRecognizedException(
-                f"Model '{model_name}' not recognized!"
+                f"Model '{model_name}' not recognized."
             )
 
         return PureLLMWrapper(model_name)
@@ -92,20 +96,33 @@ class AdapterFactory:
         messages: List[Dict[str, Any]],
         objective: str,
         session_id: str,
-    ):
+    ) -> Any:
         """
         Backward-compatible action fetcher.
 
         Uses original get_next_action() from apis.py
         which expects model_name as string.
         """
-        try:
-            return get_next_action(
-                model_name,
-                messages,
-                objective,
-                session_id,
+        if model_name not in _MODEL_REGISTRY:
+            raise ModelNotRecognizedException(
+                f"Model '{model_name}' not recognized."
             )
-        except ModelNotRecognizedException as e:
-            print(f"Error: {str(e)}")
-            raise
+
+        return get_next_action(
+            model_name,
+            messages,
+            objective,
+            session_id,
+        )
+
+
+# ==================================================
+# MODULE-LEVEL EXPORTS (CRITICAL FIX)
+# ==================================================
+
+# Required for:
+# from adapters.factory import build_llm
+
+build_llm = AdapterFactory.build_llm
+create_llm_callable = AdapterFactory.create_llm_callable
+get_action = AdapterFactory.get_action
