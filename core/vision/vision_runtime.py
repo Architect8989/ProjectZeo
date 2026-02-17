@@ -32,13 +32,16 @@ CAPTURE_INTERVAL_SECONDS = 0.5
 class VisionRuntime:
 
     def __init__(self):
-        self._lock = threading.RLock()
+        self._lock = threading.Lock()
         self._last_output: Optional[Dict[str, Any]] = None
         self._last_frame_ts: Optional[float] = None
         self._consecutive_failures: int = 0
         self._healthy: bool = True
         self._running: bool = False
         self._thread: Optional[threading.Thread] = None
+
+        # Real network-level timeout enforcement
+        self._ollama_client = ollama.Client(timeout=MAX_LATENCY_SECONDS)
 
     # -------------------------------------------------
     # LIFECYCLE
@@ -70,8 +73,6 @@ class VisionRuntime:
 
     def get_latest(self) -> Optional[Dict[str, Any]]:
         with self._lock:
-            if self._last_output is None:
-                return None
             return copy.deepcopy(self._last_output)
 
     # -------------------------------------------------
@@ -80,6 +81,7 @@ class VisionRuntime:
 
     def _loop(self) -> None:
         while True:
+
             with self._lock:
                 if not self._running:
                     return
@@ -116,18 +118,16 @@ class VisionRuntime:
         encoded = self._encode_image(image)
         perception = self._call_qwen(encoded)
 
-        output = self._normalize_output(
-            perception=perception,
-            frame_ts=frame_ts,
-        )
-
         latency = time.monotonic() - start
         if latency > MAX_LATENCY_SECONDS:
             raise VisionDegradedError(
                 f"Vision latency exceeded: {latency:.2f}s"
             )
 
-        return output
+        return self._normalize_output(
+            perception=perception,
+            frame_ts=frame_ts,
+        )
 
     # -------------------------------------------------
     # FRAME CAPTURE
@@ -157,10 +157,11 @@ class VisionRuntime:
         return base64.b64encode(data).decode("utf-8")
 
     # -------------------------------------------------
-    # MODEL CALL
+    # MODEL CALL (HARDENED)
     # -------------------------------------------------
 
     def _call_qwen(self, image_b64: str) -> Dict[str, Any]:
+
         prompt = (
             "Return ONLY valid JSON in this schema:\n"
             "{\n"
@@ -175,7 +176,7 @@ class VisionRuntime:
         )
 
         try:
-            response = ollama.chat(
+            response = self._ollama_client.chat(
                 model=QWEN_MODEL,
                 messages=[
                     {
@@ -186,18 +187,23 @@ class VisionRuntime:
                         ],
                     }
                 ],
-                options={"timeout": MAX_LATENCY_SECONDS},
+                options={
+                    "temperature": 0,
+                },
             )
         except Exception as e:
             raise VisionUnavailableError(
                 f"Vision model call failed: {e}"
             )
 
+        if not isinstance(response, dict):
+            raise VisionDegradedError("Invalid vision response type")
+
         try:
             content = response["message"]["content"]
         except Exception:
             raise VisionDegradedError(
-                "Unexpected response format"
+                "Unexpected response structure"
             )
 
         return self._parse_json(content)
@@ -250,7 +256,7 @@ class VisionRuntime:
         if focused_app is not None and not isinstance(focused_app, str):
             focused_app = None
 
-        # Ensure monotonic frame_ts
+        # monotonic timestamp enforcement
         with self._lock:
             if self._last_frame_ts is not None:
                 if frame_ts <= self._last_frame_ts:
@@ -260,8 +266,8 @@ class VisionRuntime:
             "available": True,
             "frame_ts": frame_ts,
             "elements": normalized_elements,
-            "dialogs": perception.get("dialogs", []) if isinstance(perception.get("dialogs", []), list) else [],
-            "apps": perception.get("apps", []) if isinstance(perception.get("apps", []), list) else [],
+            "dialogs": perception.get("dialogs", []) if isinstance(perception.get("dialogs"), list) else [],
+            "apps": perception.get("apps", []) if isinstance(perception.get("apps"), list) else [],
             "focused_app": focused_app,
         }
 
