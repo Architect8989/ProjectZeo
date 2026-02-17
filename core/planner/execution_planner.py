@@ -3,6 +3,7 @@ import json
 import time
 import concurrent.futures
 import hashlib
+import re
 
 from core.schemas.execution_plan import (
     ExecutionPlan,
@@ -24,7 +25,7 @@ class ExecutionPlanner:
     - No side effects
     - Strict validation
     - Snapshot always frozen
-    - Replan bounded and storm-protected
+    - Replan bounded
     """
 
     LLM_TIMEOUT_SECONDS = 30.0
@@ -41,6 +42,10 @@ class ExecutionPlanner:
         "running_in_wsl",
         "ci_environment",
     }
+
+    # ==================================================
+    # INIT
+    # ==================================================
 
     def __init__(
         self,
@@ -158,7 +163,7 @@ class ExecutionPlanner:
         self._world_snapshot = frozen
 
     # ==================================================
-    # LLM CALL (HARDENED)
+    # LLM CALL (FIXED CONTRACT)
     # ==================================================
 
     def _call_llm_with_timeout(self, prompt: str) -> str:
@@ -168,31 +173,45 @@ class ExecutionPlanner:
         ]
 
         def _invoke():
-            return self._llm_call(
+            result = self._llm_call(
                 message_payload,
                 None,
                 "planning",
             )
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(_invoke)
-            try:
-                result = future.result(timeout=self.LLM_TIMEOUT_SECONDS)
-            except concurrent.futures.TimeoutError:
-                raise PlanningError("LLM call timeout")
+            # Support adapter returning (ops, err)
+            if isinstance(result, tuple) and len(result) == 2:
+                ops, err = result
+                if err:
+                    raise PlanningError(f"LLM adapter error: {err}")
+                return ops
 
-        # Normalize return type safely
-        if isinstance(result, dict):
-            content = result.get("content")
-            if not isinstance(content, str):
-                raise PlanningError("LLM returned invalid dict structure")
-            return content.strip()
+            return result
+
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        future = executor.submit(_invoke)
+
+        try:
+            result = future.result(timeout=self.LLM_TIMEOUT_SECONDS)
+        except concurrent.futures.TimeoutError:
+            executor.shutdown(cancel_futures=True)
+            raise PlanningError("LLM call timeout")
+        finally:
+            executor.shutdown(wait=False)
+
+        # Normalize return
 
         if isinstance(result, str):
             return result.strip()
 
         if isinstance(result, list):
             return json.dumps(result)
+
+        if isinstance(result, dict):
+            content = result.get("content")
+            if not isinstance(content, str):
+                raise PlanningError("LLM returned invalid dict structure")
+            return content.strip()
 
         raise PlanningError(f"Unsupported LLM return type: {type(result)}")
 
@@ -239,13 +258,30 @@ class ExecutionPlanner:
         return "\n".join(text_chunks)[: self.MAX_SCREEN_CHARS]
 
     # ==================================================
+    # JSON EXTRACTION (ROBUST)
+    # ==================================================
+
+    def _extract_json(self, raw: str) -> Any:
+        raw = raw.strip()
+        raw = re.sub(r"^```(?:json)?", "", raw)
+        raw = re.sub(r"```$", "", raw).strip()
+
+        try:
+            return json.loads(raw)
+        except Exception:
+            # fallback: attempt first JSON block
+            match = re.search(r"\{.*\}|\[.*\]", raw, re.DOTALL)
+            if match:
+                return json.loads(match.group())
+            raise PlanningError("Invalid JSON from LLM")
+
+    # ==================================================
     # GOAL EXPANSION
     # ==================================================
 
     def _expand_goal(self, goal: str) -> List[Dict[str, Any]]:
         screen_context = self._read_screen_context()
 
-        # Strip PII from environment
         safe_env = {
             k: v for k, v in self._environment.items()
             if k in self.SAFE_ENV_FIELDS
@@ -264,32 +300,10 @@ Goal:
 "{goal}"
 
 Return JSON list only.
-
-Schema:
-[
-  {{
-    "type": "ui_interaction" | "command_execution" | "file_creation" | "verification",
-    "description": "...",
-    "action": {{ }},
-    "verification": {{ }},
-    "estimated_duration": number,
-    "retryable": boolean
-  }}
-]
-
-Rules:
-- No DONE
-- No tool_installation
-- Must include verification
-- Conservative
 """
 
         raw = self._call_llm_with_timeout(prompt)
-
-        try:
-            data = json.loads(raw)
-        except Exception:
-            raise PlanningError("Invalid JSON from LLM")
+        data = self._extract_json(raw)
 
         if not isinstance(data, list) or not data:
             raise PlanningError("LLM produced invalid step list")
