@@ -60,8 +60,10 @@ def operate_main(
     progress = ProgressTracker(execution_plan)
 
     llm_callable = getattr(planner, "_llm_call", None)
-    if llm_callable is None:
-        raise RuntimeError("Planner LLM callable unavailable")
+    if llm_callable is None or not callable(llm_callable):
+        raise RuntimeError(
+            "ExecutionPlanner has no valid _llm_call — cannot construct ReasoningEngine"
+        )
 
     installer: Optional[AutonomousInstaller] = None
     if observer is not None:
@@ -121,6 +123,8 @@ def _execute_autonomous_loop(
     })
 
     llm_callable = getattr(planner, "_llm_call", None)
+    if llm_callable is None:
+        raise RuntimeError("Planner LLM callable unavailable")
 
     belief = BeliefState()
     reasoning_engine = ReasoningEngine(llm_callable)
@@ -156,11 +160,39 @@ def _execute_autonomous_loop(
 
         # ---------------- BELIEF UPDATE ----------------
 
+        delta = None
         if previous_snapshot and world_graph:
             delta = world_graph.compute_delta(previous_snapshot)
             belief.compute_environment_stability(delta)
 
         previous_snapshot = world_snapshot
+
+        # ---- Bayesian multi-hypothesis update (FIX-15) ----
+
+        likelihoods: Dict[str, float] = {}
+
+        if world_snapshot:
+            focused_app = world_snapshot.get("focused_app")
+            entity_count = world_snapshot.get("entity_count", 0)
+
+            if focused_app:
+                key = f"app:{str(focused_app).lower().replace(' ', '_')}"
+                likelihoods[key] = 0.9
+
+            if entity_count > 10:
+                likelihoods["ui_rich"] = 0.8
+            elif entity_count > 0:
+                likelihoods["ui_sparse"] = 0.7
+            else:
+                likelihoods["ui_empty"] = 0.5
+
+            likelihoods["neutral"] = 0.5 if delta else 0.9
+
+            for hyp in likelihoods:
+                if hyp not in belief.state_probabilities:
+                    belief.state_probabilities[hyp] = 0.1
+
+            belief.bayesian_update(likelihoods)
 
         # ---------------- ACTION PROPOSAL ----------------
 
@@ -203,17 +235,15 @@ def _execute_autonomous_loop(
 
             selected_action["target"] = {"x": float(x), "y": float(y)}
 
-        # ---------------- AUTHORITY CHECK ----------------
+        # ---------------- AUTHORITY CHECK (FIX-25) ----------------
 
-        high_risk = selected_action.get("operation") in {
-            "command",
-            "install",
-        }
+        HIGH_RISK_OPERATIONS = {"command", "install"}
+        is_high_risk = selected_action.get("operation") in HIGH_RISK_OPERATIONS
 
         authority = input_arbitrator.evaluate(
             input_event_ts=time.monotonic(),
-            high_risk=high_risk,
-            soc_confident=True,
+            high_risk=is_high_risk,
+            soc_confident=belief.environment_stability > 0.7,
         )
 
         if authority != AuthorityDecision.CONTINUE:
@@ -235,9 +265,19 @@ def _execute_autonomous_loop(
                 )
 
         except Exception as e:
-            log_warn(f"Execution failure: {e}")
+            log_warn(
+                f"Action execution failed (iter={iteration}): "
+                f"{type(e).__name__}: {e}"
+            )
+            journal.record({
+                "event": "action_failed",
+                "iteration": iteration,
+                "action_key": action_key,
+                "error": str(e),
+                "error_type": type(e).__name__,
+            })
             belief.record_action(action_key, reward=-0.5)
-            belief.update_regret(action_key, reward=-0.5, best_reward=0.0)
+            recovery.record_failure(action_key, str(e))
             continue
 
         # ---------------- VERIFICATION ----------------
@@ -253,16 +293,20 @@ def _execute_autonomous_loop(
         reward = float(verification.confidence) - 0.5
         belief.record_action(action_key, reward=reward)
 
-        # Compute best possible reward among candidate estimates
-        best_estimate = max(
-            belief.expected_utility(action_ranker._action_key(a))
-            for a in candidates
+        # ---- Regret update using actual reward (FIX-14) ----
+
+        candidate_keys = [
+            action_ranker._action_key(a) for a in candidates
+        ]
+
+        best_reward = max(
+            belief.expected_utility(k) for k in candidate_keys
         )
 
         belief.update_regret(
             action_key,
             reward=reward,
-            best_reward=best_estimate,
+            best_reward=best_reward,
         )
 
         belief.commit(action_key, perception_snapshot or {})
@@ -276,6 +320,15 @@ def _execute_autonomous_loop(
 
         if selected_action.get("operation") == "done":
             journal.record({"event": "execution_complete"})
+            return
+
+        # ---- Convergence guard (FIX-16) ----
+
+        if belief.converged(
+            min_iterations=3,
+            current_iteration=iteration,
+        ):
+            journal.record({"event": "execution_converged"})
             return
 
     journal.record({"event": "execution_complete"})
