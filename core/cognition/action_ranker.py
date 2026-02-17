@@ -3,6 +3,8 @@
 from typing import List, Dict, Any
 import math
 import random
+import hashlib
+import json
 
 
 class ActionRanker:
@@ -11,13 +13,11 @@ class ActionRanker:
 
     Combines:
     - Risk-adjusted Expected Utility
-    - UCB1 exploration bonus
+    - Pure exploration bonus (UCB minus mean)
     - Thompson sampling
-    - Entropy-aware softmax mixed strategy
+    - Entropy-aware softmax
 
-    IMPORTANT:
-    - No regret updates occur here.
-    - Regret must be updated AFTER real reward is observed.
+    No regret updates occur here.
     """
 
     MIN_TAU = 0.15
@@ -37,22 +37,35 @@ class ActionRanker:
             raise RuntimeError("No candidate actions")
 
         action_ids = [self._action_key(a) for a in actions]
-
         scores = []
 
         for action, key in zip(actions, action_ids):
 
-            # Exploitation
+            # ---------------- Exploitation ----------------
             eu = belief_state.expected_utility(key)
 
-            # Optimism under uncertainty
-            ucb = belief_state.ucb_score(key)
+            # ---------------- Exploration ----------------
+            # UCB = mean + exploration
+            ucb_full = belief_state.ucb_score(key)
 
-            # Posterior sampling
+            rewards = belief_state.action_rewards.get(key)
+            mean_reward = (
+                sum(rewards) / len(rewards)
+                if rewards else 0.0
+            )
+
+            exploration_bonus = ucb_full - mean_reward
+
+            # ---------------- Posterior Sampling ----------------
             thompson = belief_state.thompson_sample(key)
 
-            # Combined score
-            combined = 0.5 * eu + 0.3 * ucb + 0.2 * thompson
+            # ---------------- Balanced Combination ----------------
+            # Do NOT double-count mean reward.
+            combined = (
+                0.6 * eu
+                + 0.2 * exploration_bonus
+                + 0.2 * thompson
+            )
 
             scores.append(combined)
 
@@ -64,17 +77,17 @@ class ActionRanker:
         tau = self._entropy_temperature(entropy)
 
         # --------------------------------------------------
-        # Numerically stable softmax (log-sum-exp trick)
+        # Numerically stable softmax (overflow safe)
         # --------------------------------------------------
 
         max_score = max(scores)
         shifted = [(s - max_score) / tau for s in scores]
 
-        exp_scores = [math.exp(s) for s in shifted]
+        # Prevent overflow
+        exp_scores = [math.exp(min(50.0, s)) for s in shifted]
         total = sum(exp_scores)
 
         if total <= 0.0:
-            # fallback deterministic
             return actions[scores.index(max_score)]
 
         probabilities = [s / total for s in exp_scores]
@@ -93,26 +106,31 @@ class ActionRanker:
 
     def _entropy_temperature(self, entropy: float) -> float:
         """
-        High entropy → exploration (higher tau)
-        Low entropy → exploitation (lower tau)
+        Low entropy → exploitation (low tau)
+        High entropy → exploration (high tau)
         """
 
-        tau = entropy
-        tau = max(self.MIN_TAU, min(self.MAX_TAU, tau))
-        return tau
+        # Smooth mapping instead of direct identity
+        tau = math.tanh(entropy) * self.MAX_TAU
+
+        return max(self.MIN_TAU, min(self.MAX_TAU, tau))
 
     # ==================================================
-    # ACTION KEYING
+    # ACTION KEYING (COLLISION-SAFE)
     # ==================================================
 
     def _action_key(self, action: Dict[str, Any]) -> str:
         """
-        Deterministic action identity for reward tracking.
+        Canonical deterministic identity.
+        Prevents collisions caused by string concatenation.
         """
 
-        op = action.get("operation", "")
-        target = str(action.get("target", ""))
-        text = str(action.get("text", ""))
-        keys = str(action.get("keys", ""))
+        canonical = json.dumps(
+            action,
+            sort_keys=True,
+            default=str,
+        )
 
-        return f"{op}|{target}|{text}|{keys}"
+        return hashlib.sha256(
+            canonical.encode()
+        ).hexdigest()[:16]
