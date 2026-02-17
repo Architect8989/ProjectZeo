@@ -123,9 +123,7 @@ def _execute_plan(
             if not progress.is_completed(dep):
                 raise RuntimeError(f"Dependency {dep} not satisfied")
 
-        # -------------------------------------------------
-        # PERCEPTION SYNC
-        # -------------------------------------------------
+        # ---------------- PERCEPTION SYNC ----------------
 
         if observer and world_graph:
             try:
@@ -136,9 +134,7 @@ def _execute_plan(
             except Exception:
                 pass
 
-        # -------------------------------------------------
-        # CLOSED LOOP REPLAN CHECK
-        # -------------------------------------------------
+        # ---------------- REPLAN CHECK ----------------
 
         if planner and world_graph:
             current_world = world_graph.snapshot()
@@ -158,9 +154,7 @@ def _execute_plan(
             if decision.get("replan_required"):
                 raise RuntimeError("REPLAN_REQUIRED")
 
-        # -------------------------------------------------
-        # DIVERGENCE CHECK
-        # -------------------------------------------------
+        # ---------------- DIVERGENCE CHECK ----------------
 
         if world_graph:
             current_snapshot = world_graph.snapshot()
@@ -182,9 +176,7 @@ def _execute_plan(
 
             previous_snapshot = current_snapshot
 
-        # -------------------------------------------------
-        # AUTHORITY CHECK
-        # -------------------------------------------------
+        # ---------------- AUTHORITY CHECK ----------------
 
         decision = input_arbitrator.evaluate(
             input_event_ts=time.monotonic(),
@@ -205,10 +197,6 @@ def _execute_plan(
         })
 
         attempt_ctx = {"attempt": 0}
-
-        # -------------------------------------------------
-        # STEP LOOP
-        # -------------------------------------------------
 
         while True:
             try:
@@ -261,7 +249,6 @@ def _execute_plan(
 
             except ActionTimeout as e:
                 log_warn(f"[EXEC] timeout on step {step.id}")
-
                 if planner and world_graph:
                     action = recovery.handle_failure_with_perception(
                         step=step,
@@ -276,7 +263,6 @@ def _execute_plan(
             except Exception as e:
                 if str(e) == "REPLAN_REQUIRED":
                     raise
-
                 if planner and world_graph:
                     action = recovery.handle_failure_with_perception(
                         step=step,
@@ -304,3 +290,86 @@ def _execute_plan(
             raise RuntimeError("Execution aborted")
 
     journal.record({"event": "execution_complete"})
+
+
+# ==================================================
+# EXECUTION HELPERS (NEW – MINIMUM FIX)
+# ==================================================
+
+def _execute_step(
+    *,
+    step: ExecutionStep,
+    os_backend: OperatingSystem,
+    accessibility_backend: Optional[AccessibilityBackend],
+    installer: Optional[AutonomousInstaller],
+) -> Dict[str, Any]:
+
+    if step.type == StepType.UI_INTERACTION:
+        action = step.action
+        op = action.get("operation")
+
+        if op == "click":
+            target = action.get("target")
+            os_backend.click(target)
+            return {"status": "clicked", "target": target}
+
+        if op == "type":
+            os_backend.type_text(action.get("text", ""))
+            return {"status": "typed"}
+
+        if op == "hotkey":
+            os_backend.press_keys(action.get("keys", []))
+            return {"status": "hotkey"}
+
+        if op == "move":
+            os_backend.move_cursor(action.get("target"))
+            return {"status": "moved"}
+
+        if op == "scroll":
+            os_backend.scroll(
+                action.get("direction", "down"),
+                action.get("amount", 3),
+            )
+            return {"status": "scrolled"}
+
+        raise RuntimeError(f"Unknown UI operation: {op}")
+
+    elif step.type == StepType.COMMAND_EXECUTION:
+        action = step.action
+        command = action.get("command")
+        result = os_backend.execute_command(
+            command,
+            cwd=action.get("cwd"),
+            timeout=action.get("timeout", 30),
+            shell=action.get("shell", True),
+        )
+        return result
+
+    elif step.type == StepType.FILE_CREATION:
+        action = step.action
+        path = action.get("path")
+        content = action.get("content", "")
+        os_backend.write_file(path, content)
+        return {"status": "file_written", "path": path}
+
+    elif step.type == StepType.TOOL_INSTALLATION:
+        if installer is None:
+            raise RuntimeError("Installer not available")
+        tool = step.action.get("tool")
+        return installer.install(tool)
+
+    elif step.type == StepType.DONE:
+        return {"status": "complete"}
+
+    else:
+        raise RuntimeError(f"Unsupported step type: {step.type}")
+
+
+def _extract_screen(observer) -> Optional[Dict[str, Any]]:
+    if observer is None:
+        return None
+    try:
+        snap = observer.snapshot()
+        return snap.get("perception")
+    except Exception:
+        return None
