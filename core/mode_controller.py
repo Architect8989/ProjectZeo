@@ -32,7 +32,8 @@ class PlanningTimeoutError(ModeTransitionError):
 class ModeController:
 
     MAX_TRANSITION_HISTORY = 2000
-    MAX_PLANNING_SECONDS = 60.0  # HARD FAIL-CLOSED LIMIT
+    MAX_PLANNING_SECONDS = 60.0
+    MAX_PLAN_ID_LENGTH = 128
 
     def __init__(self):
         self._lock = threading.RLock()
@@ -42,6 +43,7 @@ class ModeController:
         self._last_transition_reason: Optional[str] = None
 
         self._planning_started_at: Optional[float] = None
+        self._replan_in_progress: bool = False
 
         self._snapshot_id: Optional[str] = None
         self._snapshot_consumed: bool = False
@@ -58,8 +60,7 @@ class ModeController:
         self._failure_reason: Optional[str] = None
 
         self._input_locked: bool = False
-
-        self._llm_callable: Optional[Callable[[str], str]] = None
+        self._llm_callable: Optional[Callable] = None
 
         self._transition_history: Deque[Dict[str, object]] = deque(
             maxlen=self.MAX_TRANSITION_HISTORY
@@ -89,25 +90,19 @@ class ModeController:
     def attach_snapshot(self, snapshot_id: str) -> None:
         with self._lock:
             if self._mode is not SystemMode.OBSERVER:
-                raise ModeTransitionError(
-                    "Snapshot can only attach in OBSERVER mode"
-                )
-            if not snapshot_id:
+                raise ModeTransitionError("Snapshot attach only in OBSERVER")
+            if not snapshot_id or not snapshot_id.strip():
                 raise ModeTransitionError("Invalid snapshot_id")
             if self._snapshot_id is not None:
-                raise ModeTransitionError(
-                    "Snapshot already attached for this cycle"
-                )
+                raise ModeTransitionError("Snapshot already attached")
 
-            self._snapshot_id = snapshot_id
+            self._snapshot_id = snapshot_id.strip()
             self._snapshot_consumed = False
 
     def consume_snapshot(self) -> str:
         with self._lock:
             if self._mode is not SystemMode.ARMED:
-                raise ModeTransitionError(
-                    "Snapshot can only be consumed in ARMED state"
-                )
+                raise ModeTransitionError("Snapshot consume only in ARMED")
             if not self._snapshot_id:
                 raise ModeTransitionError("No snapshot attached")
             if self._snapshot_consumed:
@@ -120,25 +115,21 @@ class ModeController:
     # LLM INJECTION
     # ==================================================
 
-    def inject_llm_callable(self, llm_call: Callable[[str], str]) -> None:
+    def inject_llm_callable(self, llm_call: Callable) -> None:
         if not callable(llm_call):
             raise TypeError("llm_call must be callable")
 
         with self._lock:
             if self._llm_callable is not None:
-                raise RuntimeError("LLM callable already injected")
+                raise RuntimeError("LLM already injected")
             self._llm_callable = llm_call
 
-    def get_llm_callable(self) -> Callable[[str], str]:
+    def get_llm_callable(self) -> Callable:
         with self._lock:
             if self._mode is not SystemMode.PLANNING:
-                raise RuntimeError(
-                    f"LLM callable only accessible during PLANNING (current: {self._mode.value})"
-                )
+                raise RuntimeError("LLM only accessible in PLANNING")
             if self._llm_callable is None:
-                raise RuntimeError(
-                    "No LLM callable injected into ModeController"
-                )
+                raise RuntimeError("No LLM injected")
             return self._llm_callable
 
     # ==================================================
@@ -163,12 +154,15 @@ class ModeController:
 
     def arm(self, intent: str) -> None:
         with self._lock:
+            if self._replan_in_progress:
+                raise ModeTransitionError("Replan in progress")
+
             if self._mode is not SystemMode.OBSERVER:
-                raise ModeTransitionError("Cannot arm unless in OBSERVER")
+                raise ModeTransitionError("Cannot arm unless OBSERVER")
+
             if not self._snapshot_id:
-                raise ModeTransitionError(
-                    "Cannot arm without snapshot boundary"
-                )
+                raise ModeTransitionError("Snapshot required before arm")
+
             if not intent or not intent.strip():
                 raise ModeTransitionError("Intent must be non-empty")
 
@@ -179,80 +173,69 @@ class ModeController:
             self._execution_plan_id = None
             self._failure_reason = None
 
-            self._commit_transition(
-                SystemMode.ARMED,
-                reason="intent armed",
-                forced=False,
-            )
+            self._commit_transition(SystemMode.ARMED, "intent armed", False)
 
     def begin_planning(self) -> None:
         with self._lock:
             if self._mode is not SystemMode.ARMED:
-                raise ModeTransitionError(
-                    "Planning requires ARMED state"
-                )
+                raise ModeTransitionError("Planning requires ARMED")
+
             if not self._intent:
-                raise ModeTransitionError("No intent available")
+                raise ModeTransitionError("Intent missing")
+
             if not self._observer_healthy:
-                raise ObserverUnavailableError(
-                    self._failure_reason
-                )
+                raise ObserverUnavailableError(self._failure_reason)
+
             if not self._vision_ok:
                 raise VisionUnavailableError("vision unavailable")
 
             self._intent_frozen = True
             self._planning_started_at = time.time()
 
-            self._commit_transition(
-                SystemMode.PLANNING,
-                reason="planning started",
-                forced=False,
-            )
+            self._commit_transition(SystemMode.PLANNING, "planning started", False)
 
     def check_planning_timeout(self) -> None:
         with self._lock:
             if self._mode is not SystemMode.PLANNING:
                 return
 
-            if self._planning_started_at is None:
-                raise PlanningTimeoutError("Planning start timestamp missing")
+            if not self._planning_started_at:
+                raise PlanningTimeoutError("Planning timestamp missing")
 
-            elapsed = time.time() - self._planning_started_at
-            if elapsed > self.MAX_PLANNING_SECONDS:
+            if time.time() - self._planning_started_at > self.MAX_PLANNING_SECONDS:
                 self._reset_internal_state()
                 self._commit_transition(
                     SystemMode.OBSERVER,
-                    reason="planning timeout",
-                    forced=True,
+                    "planning timeout",
+                    True,
                 )
-                raise PlanningTimeoutError(
-                    f"Planning exceeded {self.MAX_PLANNING_SECONDS}s"
-                )
+                raise PlanningTimeoutError("Planning timeout exceeded")
 
     def attach_execution_plan(self, plan_id: str) -> None:
         with self._lock:
             if self._mode is not SystemMode.PLANNING:
-                raise ModeTransitionError(
-                    "Execution plan can only attach during PLANNING"
-                )
+                raise ModeTransitionError("Plan attach only in PLANNING")
+
             if not plan_id or not plan_id.strip():
                 raise ModeTransitionError("Invalid plan_id")
+
+            plan_id = plan_id.strip()
+
+            if len(plan_id) > self.MAX_PLAN_ID_LENGTH:
+                raise ModeTransitionError("plan_id too long")
+
             if self._execution_plan_attached:
-                raise ModeTransitionError(
-                    "Execution plan already attached"
-                )
+                raise ModeTransitionError("Plan already attached")
 
             self._execution_plan_attached = True
-            self._execution_plan_id = plan_id.strip()
+            self._execution_plan_id = plan_id
 
     def mark_planning_complete(self) -> None:
         with self._lock:
             if self._mode is not SystemMode.PLANNING:
                 raise ModeTransitionError("Planning not active")
             if not self._execution_plan_attached:
-                raise ModeTransitionError(
-                    "Cannot complete planning without plan"
-                )
+                raise ModeTransitionError("Plan not attached")
 
             self._planning_completed = True
             self._planning_started_at = None
@@ -260,47 +243,31 @@ class ModeController:
     def execute(self) -> None:
         with self._lock:
             if self._mode is not SystemMode.PLANNING:
-                raise ModeTransitionError(
-                    "Execute requires PLANNING state"
-                )
+                raise ModeTransitionError("Execute requires PLANNING")
             if not self._planning_completed:
-                raise ModeTransitionError("Plan not completed")
+                raise ModeTransitionError("Planning incomplete")
             if not self._vision_ok:
                 raise VisionUnavailableError("vision unavailable")
             if not self._observer_healthy:
-                raise ObserverUnavailableError(
-                    self._failure_reason
-                )
+                raise ObserverUnavailableError(self._failure_reason)
 
             self._input_locked = True
 
             self._commit_transition(
                 SystemMode.EXECUTING,
-                reason=f"execution started (plan={self._execution_plan_id})",
-                forced=False,
+                f"execution started (plan={self._execution_plan_id})",
+                False,
             )
-
-    def consume_intent(self) -> str:
-        with self._lock:
-            if self._mode is not SystemMode.EXECUTING:
-                raise ModeTransitionError(
-                    "Intent consumed outside EXECUTING"
-                )
-            if not self._intent:
-                raise ModeTransitionError("No intent available")
-            return self._intent
 
     def begin_restoration(self) -> None:
         with self._lock:
             if self._mode is not SystemMode.EXECUTING:
-                raise ModeTransitionError(
-                    "Restoration requires EXECUTING state"
-                )
+                raise ModeTransitionError("Restoration requires EXECUTING")
 
             self._commit_transition(
                 SystemMode.RESTORING,
-                reason="restoration started",
-                forced=False,
+                "restoration started",
+                False,
             )
 
     # ==================================================
@@ -310,27 +277,24 @@ class ModeController:
     def complete_execution(self, reason: str = "execution complete") -> None:
         with self._lock:
             if self._mode is not SystemMode.RESTORING:
-                raise ModeTransitionError(
-                    "Completion requires RESTORING state"
-                )
+                raise ModeTransitionError("Completion requires RESTORING")
 
             self._reset_internal_state()
 
             self._commit_transition(
                 SystemMode.OBSERVER,
-                reason=reason,
-                forced=False,
+                reason,
+                False,
             )
 
     def force_observer(self) -> None:
         with self._lock:
             self._reset_internal_state()
             self._failure_reason = None
-
             self._commit_transition(
                 SystemMode.OBSERVER,
-                reason="forced reset",
-                forced=True,
+                "forced reset",
+                True,
             )
 
     def _reset_internal_state(self) -> None:
@@ -343,6 +307,7 @@ class ModeController:
         self._snapshot_id = None
         self._snapshot_consumed = False
         self._planning_started_at = None
+        self._replan_in_progress = False
 
     # ==================================================
     # TRANSITION COMMIT
