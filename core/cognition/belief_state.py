@@ -1,4 +1,5 @@
 from typing import Dict, Any, List
+from collections import deque
 import time
 import math
 import random
@@ -15,6 +16,9 @@ class BeliefState:
     RISK_LAMBDA = 0.3
     SOFTMAX_TAU = 0.5
 
+    # Sliding window cap for rewards (prevents O(n) growth)
+    REWARD_WINDOW = 100
+
     def __init__(self):
         self.created_at = time.time()
 
@@ -23,7 +27,7 @@ class BeliefState:
         }
 
         self.action_counts: Dict[str, int] = {}
-        self.action_rewards: Dict[str, List[float]] = {}
+        self.action_rewards: Dict[str, deque] = {}
         self.regret: Dict[str, float] = {}
 
         self.progress_score: float = 0.0
@@ -66,28 +70,32 @@ class BeliefState:
         )
 
     # ==================================================
-    # EXPECTED UTILITY
+    # EXPECTED UTILITY (RISK-AWARE)
     # ==================================================
 
     def expected_utility(self, action: str) -> float:
-        rewards = self.action_rewards.get(action, [])
+        rewards = self.action_rewards.get(action)
         if not rewards:
             return 0.0
 
-        mean_reward = sum(rewards) / len(rewards)
-        variance = sum((r - mean_reward) ** 2 for r in rewards) / len(rewards)
+        n = len(rewards)
+        mean_reward = sum(rewards) / n
+        variance = sum((r - mean_reward) ** 2 for r in rewards) / n
 
         return mean_reward - self.RISK_LAMBDA * variance
 
     # ==================================================
-    # UCB EXPLORATION BONUS
+    # UCB EXPLORATION BONUS (NO DOUBLE EU)
     # ==================================================
 
     def ucb_score(self, action: str) -> float:
         total_actions = sum(self.action_counts.values()) + 1
         count = self.action_counts.get(action, 0) + 1
 
-        mean_reward = self.expected_utility(action)
+        rewards = self.action_rewards.get(action)
+        mean_reward = (
+            sum(rewards) / len(rewards) if rewards else 0.0
+        )
 
         exploration = self.EXPLORATION_C * math.sqrt(
             math.log(total_actions) / count
@@ -96,39 +104,42 @@ class BeliefState:
         return mean_reward + exploration
 
     # ==================================================
-    # THOMPSON SAMPLING (BOUNDED)
+    # THOMPSON SAMPLING (GAUSSIAN, ±3σ BOUND)
     # ==================================================
 
     def thompson_sample(self, action: str) -> float:
-        rewards = self.action_rewards.get(action, [])
+        rewards = self.action_rewards.get(action)
         if not rewards:
             return random.random()
 
-        mean = sum(rewards) / len(rewards)
+        n = len(rewards)
+        mean = sum(rewards) / n
         variance = (
-            sum((r - mean) ** 2 for r in rewards) / len(rewards)
+            sum((r - mean) ** 2 for r in rewards) / n
         ) + 1e-6
 
-        sample = random.gauss(mean, math.sqrt(variance))
+        sigma = math.sqrt(variance)
+        sample = random.gauss(mean, sigma)
 
-        min_r = min(rewards)
-        max_r = max(rewards)
+        # Bound to ±3σ (statistically meaningful)
+        lower = mean - 3 * sigma
+        upper = mean + 3 * sigma
 
-        lower_bound = min_r - 1.0
-        upper_bound = max_r + 1.0
-
-        return max(lower_bound, min(upper_bound, sample))
+        return max(lower, min(upper, sample))
 
     # ==================================================
-    # COUNTERFACTUAL REGRET UPDATE
+    # REGRET UPDATE (POSITIVE REGRET ONLY)
     # ==================================================
 
     def update_regret(self, action: str, reward: float, best_reward: float):
         regret_value = best_reward - reward
-        self.regret[action] = self.regret.get(action, 0.0) + regret_value
+        if regret_value > 0:
+            self.regret[action] = (
+                self.regret.get(action, 0.0) + regret_value
+            )
 
     # ==================================================
-    # SOFTMAX EQUILIBRIUM SELECTION (STABLE)
+    # SOFTMAX EQUILIBRIUM SELECTION
     # ==================================================
 
     def softmax_select(self, actions: List[str]) -> str:
@@ -154,12 +165,16 @@ class BeliefState:
         return random.choices(actions, weights=probabilities, k=1)[0]
 
     # ==================================================
-    # RECORD ACTION OUTCOME
+    # RECORD ACTION OUTCOME (BOUNDED MEMORY)
     # ==================================================
 
     def record_action(self, action: str, reward: float):
         self.action_counts[action] = self.action_counts.get(action, 0) + 1
-        self.action_rewards.setdefault(action, []).append(reward)
+
+        if action not in self.action_rewards:
+            self.action_rewards[action] = deque(maxlen=self.REWARD_WINDOW)
+
+        self.action_rewards[action].append(reward)
 
     # ==================================================
     # ENVIRONMENT STABILITY
@@ -179,7 +194,7 @@ class BeliefState:
             )
 
     # ==================================================
-    # COMMITMENT HASH CHAIN (DETERMINISTIC)
+    # COMMITMENT HASH CHAIN
     # ==================================================
 
     def commit(self, action: str, observation: Dict[str, Any]) -> None:
@@ -195,7 +210,7 @@ class BeliefState:
         ).hexdigest()
 
     # ==================================================
-    # CONVERGENCE DETECTION (FIXED SIGNATURE)
+    # CONVERGENCE DETECTION (SHORT-TASK SAFE)
     # ==================================================
 
     def converged(
@@ -209,7 +224,14 @@ class BeliefState:
 
         low_entropy = self.entropy() < 0.1
         stable_env = self.environment_stability > 0.9
-        high_progress = self.progress_score > 0.5
+
+        # Adaptive progress requirement
+        dynamic_threshold = min(
+            0.5,
+            0.1 * max(1, current_iteration)
+        )
+
+        high_progress = self.progress_score > dynamic_threshold
 
         return low_entropy and stable_env and high_progress
 
