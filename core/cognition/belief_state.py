@@ -1,25 +1,14 @@
-# core/cognition/belief_state.py
-
 from typing import Dict, Any, List
 import time
 import math
 import random
 import hashlib
+import json
 
 
 class BeliefState:
     """
     Decision-theoretic cognitive belief engine.
-
-    Implements:
-    - Bayesian belief updates
-    - Entropy measurement
-    - Thompson Sampling
-    - UCB1 exploration
-    - Risk-adjusted expected utility
-    - Counterfactual regret minimization
-    - Softmax equilibrium selection
-    - Cryptographic commitment chain
     """
 
     EXPLORATION_C = 1.4
@@ -29,40 +18,31 @@ class BeliefState:
     def __init__(self):
         self.created_at = time.time()
 
-        # Probabilistic state hypothesis
         self.state_probabilities: Dict[str, float] = {
             "neutral": 1.0
         }
 
-        # Action statistics
         self.action_counts: Dict[str, int] = {}
         self.action_rewards: Dict[str, List[float]] = {}
         self.regret: Dict[str, float] = {}
 
-        # Progress
         self.progress_score: float = 0.0
-
-        # Stability metric
         self.environment_stability: float = 1.0
 
-        # Commitment chain
         self.commitment_hash: str = "GENESIS"
 
     # ==================================================
-    # BAYESIAN UPDATE
+    # BAYESIAN UPDATE (UNION-SAFE)
     # ==================================================
 
     def bayesian_update(self, likelihoods: Dict[str, float]) -> None:
-        """
-        Update belief using Bayes rule.
+        all_states = set(self.state_probabilities) | set(likelihoods)
 
-        likelihoods: P(O | S)
-        """
-
-        new_belief = {}
+        new_belief: Dict[str, float] = {}
         total = 0.0
 
-        for state, prior in self.state_probabilities.items():
+        for state in all_states:
+            prior = self.state_probabilities.get(state, 0.01)
             likelihood = likelihoods.get(state, 0.01)
             posterior = prior * likelihood
             new_belief[state] = posterior
@@ -71,10 +51,9 @@ class BeliefState:
         if total == 0:
             return
 
-        for state in new_belief:
-            new_belief[state] /= total
-
-        self.state_probabilities = new_belief
+        self.state_probabilities = {
+            s: v / total for s, v in new_belief.items()
+        }
 
     # ==================================================
     # ENTROPY
@@ -91,10 +70,6 @@ class BeliefState:
     # ==================================================
 
     def expected_utility(self, action: str) -> float:
-        """
-        Risk-adjusted expected utility.
-        """
-
         rewards = self.action_rewards.get(action, [])
         if not rewards:
             return 0.0
@@ -121,7 +96,7 @@ class BeliefState:
         return mean_reward + exploration
 
     # ==================================================
-    # THOMPSON SAMPLING
+    # THOMPSON SAMPLING (BOUNDED)
     # ==================================================
 
     def thompson_sample(self, action: str) -> float:
@@ -134,7 +109,15 @@ class BeliefState:
             sum((r - mean) ** 2 for r in rewards) / len(rewards)
         ) + 1e-6
 
-        return random.gauss(mean, math.sqrt(variance))
+        sample = random.gauss(mean, math.sqrt(variance))
+
+        min_r = min(rewards)
+        max_r = max(rewards)
+
+        lower_bound = min_r - 1.0
+        upper_bound = max_r + 1.0
+
+        return max(lower_bound, min(upper_bound, sample))
 
     # ==================================================
     # COUNTERFACTUAL REGRET UPDATE
@@ -145,22 +128,27 @@ class BeliefState:
         self.regret[action] = self.regret.get(action, 0.0) + regret_value
 
     # ==================================================
-    # SOFTMAX EQUILIBRIUM SELECTION
+    # SOFTMAX EQUILIBRIUM SELECTION (STABLE)
     # ==================================================
 
     def softmax_select(self, actions: List[str]) -> str:
-        scores = []
+        if not actions:
+            raise ValueError("No actions provided to softmax_select")
 
-        for action in actions:
-            score = self.ucb_score(action)
-            scores.append(score)
+        scores = [self.ucb_score(a) for a in actions]
 
-        exp_scores = [
-            math.exp(score / self.SOFTMAX_TAU)
-            for score in scores
+        max_score = max(scores)
+        shifted = [
+            (s - max_score) / self.SOFTMAX_TAU
+            for s in scores
         ]
 
+        exp_scores = [math.exp(s) for s in shifted]
         total = sum(exp_scores)
+
+        if total <= 0.0:
+            return actions[scores.index(max_score)]
+
         probabilities = [s / total for s in exp_scores]
 
         return random.choices(actions, weights=probabilities, k=1)[0]
@@ -191,15 +179,15 @@ class BeliefState:
             )
 
     # ==================================================
-    # COMMITMENT HASH CHAIN
+    # COMMITMENT HASH CHAIN (DETERMINISTIC)
     # ==================================================
 
     def commit(self, action: str, observation: Dict[str, Any]) -> None:
         payload = (
             self.commitment_hash
             + action
-            + str(observation)
-            + str(self.state_probabilities)
+            + json.dumps(observation, sort_keys=True, default=str)
+            + json.dumps(self.state_probabilities, sort_keys=True)
         )
 
         self.commitment_hash = hashlib.sha256(
@@ -207,13 +195,23 @@ class BeliefState:
         ).hexdigest()
 
     # ==================================================
-    # CONVERGENCE DETECTION
+    # CONVERGENCE DETECTION (FIXED SIGNATURE)
     # ==================================================
 
-    def converged(self) -> bool:
+    def converged(
+        self,
+        min_iterations: int = 0,
+        current_iteration: int = 0,
+    ) -> bool:
+
+        if current_iteration < min_iterations:
+            return False
+
         low_entropy = self.entropy() < 0.1
         stable_env = self.environment_stability > 0.9
-        return low_entropy and stable_env
+        high_progress = self.progress_score > 0.5
+
+        return low_entropy and stable_env and high_progress
 
     # ==================================================
     # SUMMARY
