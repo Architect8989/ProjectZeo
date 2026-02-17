@@ -141,14 +141,14 @@ class ExecutionPlanner:
             raise PlanningError("Invalid world snapshot")
 
         try:
-            frozen = json.loads(json.dumps(new_snapshot))
+            frozen = json.loads(json.dumps(new_snapshot, sort_keys=True))
         except Exception:
             raise PlanningError("Failed to freeze new snapshot")
 
         self._world_snapshot = frozen
 
     # ==================================================
-    # REPLAN DECISION (HARDENED)
+    # REPLAN DECISION
     # ==================================================
 
     def should_replan(
@@ -161,15 +161,11 @@ class ExecutionPlanner:
         if not isinstance(current_step_id, int):
             raise PlanningError("Invalid step id")
 
-        if not isinstance(execution_history, list):
-            execution_history = []
-
         if not self._world_snapshot:
             return self._no_replan("No snapshot available")
 
         snapshot_hash = self._hash_snapshot(self._world_snapshot)
 
-        # Prevent replan storm for identical snapshot
         if snapshot_hash == self._last_replan_snapshot_hash:
             return self._no_replan("Snapshot unchanged")
 
@@ -189,15 +185,15 @@ Return JSON only:
   "confidence": 0.0-1.0,
   "reason": "short explanation"
 }}
-
 Be conservative.
 """
 
+        raw = self._call_llm_with_timeout(prompt)
+
         try:
-            raw = self._call_llm_with_timeout(prompt)
-            decision = json.loads(raw.strip())
+            decision = json.loads(raw)
         except Exception:
-            return self._no_replan("LLM failure")
+            return self._no_replan("Invalid JSON")
 
         if not isinstance(decision, dict):
             return self._no_replan("Invalid schema")
@@ -210,7 +206,6 @@ Be conservative.
             confidence = 0.0
 
         confidence = max(0.0, min(confidence, 1.0))
-
         reason = str(decision.get("reason", ""))[:300]
 
         if replan_required:
@@ -226,32 +221,47 @@ Be conservative.
     # INTERNAL HELPERS
     # ==================================================
 
-    def _no_replan(self, reason: str) -> Dict[str, Any]:
-        return {
-            "replan_required": False,
-            "confidence": 0.0,
-            "reason": reason[:300],
-        }
-
-    def _hash_snapshot(self, snapshot: Dict[str, Any]) -> str:
-        try:
-            raw = json.dumps(snapshot, sort_keys=True)
-        except Exception:
-            raw = str(snapshot)
-        return hashlib.sha256(raw.encode()).hexdigest()
-
     def _call_llm_with_timeout(self, prompt: str) -> str:
+        """
+        FIXED:
+        - Wrap prompt in message structure
+        - Accept dict or string return
+        - Enforce timeout
+        """
+
+        message_payload = [
+            {"role": "system", "content": "You are a deterministic planner."},
+            {"role": "user", "content": prompt},
+        ]
+
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(self._llm_call, prompt)
+            future = executor.submit(
+                self._llm_call,
+                message_payload,
+                None,
+                "planning",
+            )
+
             try:
                 result = future.result(timeout=self.LLM_TIMEOUT_SECONDS)
             except concurrent.futures.TimeoutError:
                 raise PlanningError("LLM call timeout")
 
-        if not isinstance(result, str):
-            raise PlanningError("LLM must return string")
+        # Normalize output
+        if isinstance(result, dict):
+            content = result.get("content")
+            if not isinstance(content, str):
+                raise PlanningError("LLM returned invalid dict structure")
+            return content.strip()
 
-        return result
+        if not isinstance(result, str):
+            raise PlanningError("LLM must return string or dict")
+
+        return result.strip()
+
+    def _hash_snapshot(self, snapshot: Dict[str, Any]) -> str:
+        raw = json.dumps(snapshot, sort_keys=True)
+        return hashlib.sha256(raw.encode()).hexdigest()
 
     def _extract_required_tools(
         self, requirements: Dict[str, Any]
@@ -259,17 +269,17 @@ Be conservative.
         tools = requirements.get("tools", [])
         if not isinstance(tools, list):
             return []
-        return [t for t in tools if isinstance(t, str) and t.strip()]
+        return [t.strip() for t in tools if isinstance(t, str) and t.strip()]
 
     def _read_screen_context(self) -> str:
         if not self._world_snapshot:
             return ""
 
-        text_chunks: List[str] = []
         entities = self._world_snapshot.get("entities", [])
-
         if not isinstance(entities, list):
             return ""
+
+        text_chunks: List[str] = []
 
         for ent in entities:
             if not isinstance(ent, dict):
