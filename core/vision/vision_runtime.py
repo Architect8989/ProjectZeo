@@ -10,6 +10,7 @@ import copy
 
 from PIL import Image, ImageGrab
 import ollama
+import httpx
 
 
 class VisionUnavailableError(RuntimeError):
@@ -20,18 +21,32 @@ class VisionDegradedError(RuntimeError):
     pass
 
 
-QWEN_MODEL = "qwen2.5-vl:7b-instruct"
+# ==================================================
+# CONFIG
+# ==================================================
 
-MAX_LATENCY_SECONDS = 1.5
+MAX_ALLOWED_LATENCY_SECONDS = 3.0          # health threshold
+NETWORK_CONNECT_TIMEOUT = 5.0
+NETWORK_READ_TIMEOUT = 25.0
+
 MAX_FRAME_BYTES = 4 * 1024 * 1024
 MAX_ELEMENTS = 128
 MAX_CONSECUTIVE_FAILURES = 5
 CAPTURE_INTERVAL_SECONDS = 0.5
 
 
+# ==================================================
+# VISION RUNTIME
+# ==================================================
+
 class VisionRuntime:
 
-    def __init__(self):
+    def __init__(self, model_name: str):
+        if not isinstance(model_name, str) or not model_name.strip():
+            raise VisionUnavailableError("Vision model_name must be non-empty")
+
+        self._model_name = model_name.strip()
+
         self._lock = threading.Lock()
         self._last_output: Optional[Dict[str, Any]] = None
         self._last_frame_ts: Optional[float] = None
@@ -40,12 +55,19 @@ class VisionRuntime:
         self._running: bool = False
         self._thread: Optional[threading.Thread] = None
 
-        # Real network-level timeout enforcement
-        self._ollama_client = ollama.Client(timeout=MAX_LATENCY_SECONDS)
+        # Real granular network timeout
+        self._ollama_client = ollama.Client(
+            timeout=httpx.Timeout(
+                connect=NETWORK_CONNECT_TIMEOUT,
+                read=NETWORK_READ_TIMEOUT,
+                write=5.0,
+                pool=5.0,
+            )
+        )
 
-    # -------------------------------------------------
+    # ==================================================
     # LIFECYCLE
-    # -------------------------------------------------
+    # ==================================================
 
     def start(self) -> None:
         with self._lock:
@@ -67,6 +89,9 @@ class VisionRuntime:
         with self._lock:
             self._running = False
 
+        if self._thread:
+            self._thread.join(timeout=2.0)
+
     def is_healthy(self) -> bool:
         with self._lock:
             return self._healthy
@@ -75,9 +100,9 @@ class VisionRuntime:
         with self._lock:
             return copy.deepcopy(self._last_output)
 
-    # -------------------------------------------------
+    # ==================================================
     # MAIN LOOP
-    # -------------------------------------------------
+    # ==================================================
 
     def _loop(self) -> None:
         while True:
@@ -106,9 +131,9 @@ class VisionRuntime:
 
             time.sleep(CAPTURE_INTERVAL_SECONDS)
 
-    # -------------------------------------------------
+    # ==================================================
     # FRAME PROCESSING
-    # -------------------------------------------------
+    # ==================================================
 
     def _process_frame_internal(self) -> Dict[str, Any]:
         start = time.monotonic()
@@ -116,10 +141,12 @@ class VisionRuntime:
 
         image = self._capture_frame()
         encoded = self._encode_image(image)
-        perception = self._call_qwen(encoded)
+        perception = self._call_model(encoded)
 
         latency = time.monotonic() - start
-        if latency > MAX_LATENCY_SECONDS:
+
+        # Health threshold (NOT network timeout)
+        if latency > MAX_ALLOWED_LATENCY_SECONDS:
             raise VisionDegradedError(
                 f"Vision latency exceeded: {latency:.2f}s"
             )
@@ -129,9 +156,9 @@ class VisionRuntime:
             frame_ts=frame_ts,
         )
 
-    # -------------------------------------------------
+    # ==================================================
     # FRAME CAPTURE
-    # -------------------------------------------------
+    # ==================================================
 
     def _capture_frame(self) -> Image.Image:
         try:
@@ -156,11 +183,11 @@ class VisionRuntime:
 
         return base64.b64encode(data).decode("utf-8")
 
-    # -------------------------------------------------
-    # MODEL CALL (HARDENED)
-    # -------------------------------------------------
+    # ==================================================
+    # MODEL CALL (NO HARDCODE)
+    # ==================================================
 
-    def _call_qwen(self, image_b64: str) -> Dict[str, Any]:
+    def _call_model(self, image_b64: str) -> Dict[str, Any]:
 
         prompt = (
             "Return ONLY valid JSON in this schema:\n"
@@ -177,7 +204,7 @@ class VisionRuntime:
 
         try:
             response = self._ollama_client.chat(
-                model=QWEN_MODEL,
+                model=self._model_name,
                 messages=[
                     {
                         "role": "user",
@@ -199,18 +226,21 @@ class VisionRuntime:
         if not isinstance(response, dict):
             raise VisionDegradedError("Invalid vision response type")
 
-        try:
-            content = response["message"]["content"]
-        except Exception:
+        content = (
+            response.get("message", {})
+            .get("content")
+        )
+
+        if not isinstance(content, str):
             raise VisionDegradedError(
                 "Unexpected response structure"
             )
 
         return self._parse_json(content)
 
-    # -------------------------------------------------
+    # ==================================================
     # NORMALIZATION
-    # -------------------------------------------------
+    # ==================================================
 
     def _normalize_output(
         self,
@@ -256,7 +286,6 @@ class VisionRuntime:
         if focused_app is not None and not isinstance(focused_app, str):
             focused_app = None
 
-        # monotonic timestamp enforcement
         with self._lock:
             if self._last_frame_ts is not None:
                 if frame_ts <= self._last_frame_ts:
@@ -271,9 +300,9 @@ class VisionRuntime:
             "focused_app": focused_app,
         }
 
-    # -------------------------------------------------
-    # UTILS
-    # -------------------------------------------------
+    # ==================================================
+    # UTILITIES
+    # ==================================================
 
     def _is_interactable(self, element: Dict[str, Any]) -> bool:
         element_type = str(element.get("type", "")).lower()
@@ -296,12 +325,10 @@ class VisionRuntime:
     def _parse_json(self, raw: str) -> Dict[str, Any]:
         raw = raw.strip()
 
+        # Remove fenced blocks safely
         if raw.startswith("```"):
             parts = raw.split("```")
-            if len(parts) >= 3:
-                raw = parts[1]
-            else:
-                raw = parts[-1]
+            raw = parts[1] if len(parts) >= 3 else parts[-1]
 
         try:
             parsed = json.loads(raw)
