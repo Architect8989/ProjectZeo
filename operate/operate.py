@@ -20,7 +20,6 @@ from core.execution.failure_recovery import FailureRecoveryManager
 from core.tools.autonomous_installer import AutonomousInstaller
 
 from core.cognition.belief_state import BeliefState
-from core.cognition.reasoning_engine import ReasoningEngine
 from core.cognition.action_ranker import ActionRanker
 from core.vision.semantic_resolver import SemanticResolver
 
@@ -98,7 +97,7 @@ def operate_main(
 
 
 # ==================================================
-# AUTONOMOUS LOOP (FIXED)
+# AUTONOMOUS LOOP
 # ==================================================
 
 def _execute_autonomous_loop(
@@ -127,7 +126,6 @@ def _execute_autonomous_loop(
     })
 
     belief = BeliefState()
-    reasoning_engine = ReasoningEngine(planner._llm_call)
     action_ranker = ActionRanker()
     semantic_resolver = SemanticResolver(world_graph)
 
@@ -186,12 +184,32 @@ def _execute_autonomous_loop(
             except Exception:
                 bounded_snapshot = {}
 
-        # ---------------- BELIEF UPDATE ----------------
+        # ---------------- BELIEF UPDATE (RESTORED) ----------------
 
         delta = None
         if previous_snapshot and world_graph:
             delta = world_graph.compute_delta(previous_snapshot)
             belief.compute_environment_stability(delta)
+
+        if bounded_snapshot:
+            likelihoods: Dict[str, float] = {}
+
+            focused_app = bounded_snapshot.get("focused_app")
+            entity_count = len(bounded_snapshot.get("entities", []))
+
+            if focused_app:
+                likelihoods[f"app:{str(focused_app).lower()}"] = 0.9
+
+            if entity_count > 10:
+                likelihoods["ui_rich"] = 0.8
+            elif entity_count > 0:
+                likelihoods["ui_sparse"] = 0.7
+            else:
+                likelihoods["ui_empty"] = 0.5
+
+            likelihoods["neutral"] = 0.5 if delta else 0.9
+
+            belief.bayesian_update(likelihoods)
 
         previous_snapshot = world_snapshot
 
@@ -235,7 +253,7 @@ def _execute_autonomous_loop(
                 raise RuntimeError("Execution stagnation detected")
             continue
 
-        # ---------------- VERIFICATION (FIXED) ----------------
+        # ---------------- VERIFICATION ----------------
 
         verification = verifier.verify_step(
             step=current_step,
@@ -248,8 +266,13 @@ def _execute_autonomous_loop(
         reward = float(verification.confidence) - 0.5
         belief.record_action(action_key, reward=reward)
 
-        # Regret update (activates CRM)
-        best_reward = reward
+        # Correct regret update
+        all_rewards = [
+            belief.action_rewards[k][-1]
+            for k in belief.action_rewards
+            if belief.action_rewards[k]
+        ]
+        best_reward = max(all_rewards) if all_rewards else reward
         belief.update_regret(action_key, reward, best_reward)
 
         if not verification.success:
@@ -264,12 +287,10 @@ def _execute_autonomous_loop(
         previous_perception = perception_snapshot
         current_step_index += 1
 
-        # DONE step
         if current_step.type.name == "DONE":
             journal.record({"event": "execution_complete"})
             return
 
-        # Convergence now bound to plan completion
         if belief.converged(
             min_iterations=3,
             current_iteration=iteration,
