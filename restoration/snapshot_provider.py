@@ -31,41 +31,43 @@ class SnapshotProvider:
     - Vision must be available
     - OS state captured atomically
     - Deterministic serialization
-    - Bounded in-memory registry
+    - Bounded in-memory registry (LRU)
     - No PID validation violation
     """
 
-    SNAPSHOT_SCHEMA_VERSION = "2.0"
+    SNAPSHOT_SCHEMA_VERSION = "2.1"
 
-    # ---- BOUNDED SNAPSHOT REGISTRY (LRU discipline) ----
     _snapshots: "OrderedDict[str, RestorationSnapshot]" = OrderedDict()
     _lock = threading.Lock()
 
     MAX_SNAPSHOTS = 128
     MAX_SNAPSHOT_AGE_SECONDS = 3600
-
     ATOMIC_WINDOW_SECONDS = 0.02  # 20ms
 
     # =========================================================
-    # SNAPSHOT REGISTRY
+    # SNAPSHOT REGISTRY (LRU + TTL)
     # =========================================================
 
     @classmethod
     def store_snapshot(cls, snapshot: RestorationSnapshot) -> str:
+        if not isinstance(snapshot, RestorationSnapshot):
+            raise SnapshotProviderError("Invalid snapshot object")
+
         now = time.time()
 
         with cls._lock:
-            # Evict stale
-            stale_keys = [
-                k for k, v in cls._snapshots.items()
-                if (now - v.metadata.get("captured_at_wallclock", now))
-                > cls.MAX_SNAPSHOT_AGE_SECONDS
-            ]
+            # TTL eviction
+            stale_keys = []
+            for k, v in cls._snapshots.items():
+                captured = v.metadata.get("captured_at_wallclock", now)
+                if (now - float(captured)) > cls.MAX_SNAPSHOT_AGE_SECONDS:
+                    stale_keys.append(k)
+
             for k in stale_keys:
                 cls._snapshots.pop(k, None)
 
-            # Enforce LRU capacity
-            if len(cls._snapshots) >= cls.MAX_SNAPSHOTS:
+            # LRU capacity enforcement
+            while len(cls._snapshots) >= cls.MAX_SNAPSHOTS:
                 cls._snapshots.popitem(last=False)
 
             if snapshot.snapshot_id in cls._snapshots:
@@ -79,8 +81,13 @@ class SnapshotProvider:
 
     @classmethod
     def get_snapshot(
-        cls, snapshot_id: str
+        cls,
+        snapshot_id: str,
     ) -> Optional[RestorationSnapshot]:
+
+        if not isinstance(snapshot_id, str) or not snapshot_id:
+            return None
+
         with cls._lock:
             snap = cls._snapshots.get(snapshot_id)
             if snap:
@@ -169,7 +176,9 @@ class SnapshotProvider:
             cursor_x = int(cursor["x"])
             cursor_y = int(cursor["y"])
         except Exception:
-            raise SnapshotProviderError("Cursor coordinate coercion failed")
+            raise SnapshotProviderError(
+                "Cursor coordinate coercion failed"
+            )
 
         if (
             not isinstance(focused_window, dict)
@@ -190,14 +199,17 @@ class SnapshotProvider:
         app_title = active_app["title"].strip()
 
         # ---- State Objects ----
-        cursor_state = CursorState(x=cursor_x, y=cursor_y)
+        cursor_state = CursorState(
+            x=cursor_x,
+            y=cursor_y,
+        )
 
         focus_state = FocusState(
             window_id=window_title,
             title=window_title,
         )
 
-        # CRITICAL FIX: pid=None (no validation violation)
+        # CRITICAL: pid=None avoids validation violation
         application_state = ApplicationState(
             process_name=app_title,
             pid=None,
@@ -211,13 +223,14 @@ class SnapshotProvider:
             "execution_mode": self._mode.mode.value,
             "vision_frame_ts": frame_ts,
             "capture_duration_ms": round(
-                (t_end - t_start) * 1000.0, 6
+                (t_end - t_start) * 1000.0,
+                6,
             ),
         }
 
-        # Canonicalize metadata deterministically
+        # Canonical JSON normalization
         metadata = json.loads(
-            json.dumps(metadata, sort_keys=True)
+            json.dumps(metadata, sort_keys=True, separators=(",", ":"))
         )
 
         # ---- Create Snapshot ----
