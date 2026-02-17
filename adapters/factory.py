@@ -16,10 +16,11 @@ from operate.models.apis import (
 )
 
 from operate.exceptions import ModelNotRecognizedException
+from adapters.pure_llm_wrapper import PureLLMWrapper
 
 
 # ==================================================
-# MODEL REGISTRY (No branching sprawl)
+# MODEL REGISTRY
 # ==================================================
 
 _MODEL_REGISTRY = {
@@ -44,6 +45,10 @@ class AdapterFactory:
     Adapter Factory for dynamic model selection.
     """
 
+    # --------------------------------------------------
+    # RAW MODEL ACCESS (Legacy Support)
+    # --------------------------------------------------
+
     @staticmethod
     def create_llm_callable(model_name: str) -> Callable:
         """
@@ -56,45 +61,47 @@ class AdapterFactory:
             )
         return model_fn
 
+    # --------------------------------------------------
+    # NORMALIZED KERNEL-FACING BUILDER
+    # --------------------------------------------------
+
     @staticmethod
     def build_llm(model_name: str) -> Callable:
         """
-        Unified kernel-facing LLM builder.
+        Returns normalized LLM callable using PureLLMWrapper.
 
-        Returns a normalized callable with consistent signature:
-
+        Unified signature:
             llm_callable(messages, objective=None, session_id=None)
 
-        This prevents signature mismatch across models.
+        This isolates kernel from apis.py signature inconsistencies.
         """
-
-        model_fn = AdapterFactory.create_llm_callable(model_name)
-
-        def llm_callable(
-            messages: List[Dict[str, Any]],
-            objective: str = None,
-            session_id: str = None,
-        ):
-            """
-            Normalized wrapper around all model APIs.
-            """
-            return model_fn(
-                messages=messages,
-                objective=objective,
-                session_id=session_id,
+        if model_name not in _MODEL_REGISTRY:
+            raise ModelNotRecognizedException(
+                f"Model '{model_name}' not recognized!"
             )
 
-        return llm_callable
+        return PureLLMWrapper(model_name)
+
+    # --------------------------------------------------
+    # BACKWARD-COMPATIBLE ACTION FLOW
+    # --------------------------------------------------
 
     @staticmethod
-    def get_action(model_name: str, messages, objective, session_id):
+    def get_action(
+        model_name: str,
+        messages: List[Dict[str, Any]],
+        objective: str,
+        session_id: str,
+    ):
         """
         Backward-compatible action fetcher.
+
+        Uses original get_next_action() from apis.py
+        which expects model_name as string.
         """
         try:
-            llm_callable = AdapterFactory.build_llm(model_name)
             return get_next_action(
-                llm_callable,
+                model_name,
                 messages,
                 objective,
                 session_id,
