@@ -47,7 +47,6 @@ class StepVerifier:
         world_graph=None,
     ) -> VerificationResult:
 
-        # ---------------- FAIL-CLOSED ----------------
         if step is None:
             return VerificationResult(
                 success=False,
@@ -63,20 +62,12 @@ class StepVerifier:
 
             if step.type == StepType.DONE:
                 return VerificationResult(
-                    True,
-                    None,
-                    {},
-                    confidence=1.0,
-                    progress_score=1.0,
+                    True, None, {}, confidence=1.0, progress_score=1.0
                 )
 
             if step.type == StepType.VERIFICATION:
                 return VerificationResult(
-                    True,
-                    None,
-                    {},
-                    confidence=1.0,
-                    progress_score=0.05,
+                    True, None, {}, confidence=1.0, progress_score=0.05
                 )
 
             if step.type == StepType.COMMAND_EXECUTION:
@@ -175,7 +166,7 @@ class StepVerifier:
         return True, "", {"path": path}
 
     # =================================================
-    # TOOL VERIFICATION (STRICT)
+    # TOOL VERIFICATION
     # =================================================
 
     def _verify_tool(self, step: ExecutionStep) -> Tuple[bool, str, Dict[str, Any]]:
@@ -191,7 +182,7 @@ class StepVerifier:
         return True, "", {"tool_path": tool_path}
 
     # =================================================
-    # UI VERIFICATION (STRICT DELTA + SEMANTIC)
+    # UI VERIFICATION (STRICT + CAUSAL DELTA)
     # =================================================
 
     def _verify_ui_change(
@@ -206,11 +197,10 @@ class StepVerifier:
         if world_graph is None:
             return False, "world_graph required", {}
 
-        current = world_graph.snapshot()
-
         verification = step.verification or {}
+        current_snapshot = world_graph.snapshot()
 
-        # ---------------- STRICT TEXT CHECK ----------------
+        # ---------- STRICT TEXT CHECK ----------
         expected_text = verification.get("screen_contains")
         if expected_text:
             if not isinstance(expected_text, list):
@@ -224,16 +214,27 @@ class StepVerifier:
 
             return True, "", {"screen_contains_verified": True}
 
-        # ---------------- STRICT ENTITY TYPE CHECK ----------------
+        # ---------- STRICT ENTITY TYPE DELTA ----------
         expected_type = verification.get("entity_type_exists")
         if expected_type:
-            matches = world_graph.find_by_type(expected_type)
-            if not matches:
+
+            current_matches = world_graph.find_by_type(expected_type) or []
+
+            if not current_matches:
                 return False, f"entity type not found: {expected_type}", {}
 
-            return True, "", {"entity_type": expected_type}
+            if previous_screenshot:
+                previous_matches = world_graph.find_by_type(
+                    expected_type,
+                    snapshot=previous_screenshot,
+                ) or []
 
-        # ---------------- STRICT DELTA CHECK ----------------
+                if len(current_matches) <= len(previous_matches):
+                    return False, "entity pre-existed before action", {}
+
+            return True, "", {"entity_type_added": expected_type}
+
+        # ---------- STRICT DELTA CHECK ----------
         if previous_screenshot:
             delta = world_graph.compute_delta(previous_screenshot)
             if delta and delta.get("significant_change"):
