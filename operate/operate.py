@@ -4,7 +4,7 @@ from typing import Any, Dict, Optional, List
 from authority.authority_policy import AuthorityDecision
 from authority.input_arbitrator import InputArbitrator
 
-from core.safety.action_timeout import action_timeout, ActionTimeout
+from core.safety.action_timeout import action_timeout
 from core.telemetry.logger import log_warn
 
 from operate.utils.operating_system import OperatingSystem
@@ -18,7 +18,6 @@ from core.execution.progress_tracker import ProgressTracker
 from core.execution.failure_recovery import FailureRecoveryManager
 from core.tools.autonomous_installer import AutonomousInstaller
 
-# --- COGNITION STACK ---
 from core.cognition.belief_state import BeliefState
 from core.cognition.reasoning_engine import ReasoningEngine
 from core.cognition.action_ranker import ActionRanker
@@ -61,6 +60,8 @@ def operate_main(
     progress = ProgressTracker(execution_plan)
 
     llm_callable = getattr(planner, "_llm_call", None)
+    if llm_callable is None:
+        raise RuntimeError("Planner LLM callable unavailable")
 
     installer: Optional[AutonomousInstaller] = None
     if observer is not None:
@@ -91,7 +92,7 @@ def operate_main(
 
 
 # ==================================================
-# DECISION-THEORETIC AUTONOMOUS LOOP
+# AUTONOMOUS LOOP
 # ==================================================
 
 def _execute_autonomous_loop(
@@ -149,24 +150,16 @@ def _execute_autonomous_loop(
                 if world_graph and isinstance(perception_snapshot, dict):
                     world_graph.update(perception_snapshot)
             except Exception:
-                pass
+                log_warn("Observer snapshot failed")
 
         world_snapshot = world_graph.snapshot() if world_graph else {}
 
         # ---------------- BELIEF UPDATE ----------------
 
-        likelihoods = {"neutral": 1.0}
-
         if previous_snapshot and world_graph:
             delta = world_graph.compute_delta(previous_snapshot)
             belief.compute_environment_stability(delta)
 
-            if delta.get("significant_change"):
-                likelihoods["neutral"] = 0.7
-            else:
-                likelihoods["neutral"] = 0.95
-
-        belief.bayesian_update(likelihoods)
         previous_snapshot = world_snapshot
 
         # ---------------- ACTION PROPOSAL ----------------
@@ -181,34 +174,45 @@ def _execute_autonomous_loop(
         if not candidates:
             raise RuntimeError("No actions proposed")
 
-        # ---------------- ACTION SELECTION ----------------
-
-        selected_action = action_ranker.select(
-            candidates,
-            belief,
-        )
-
+        selected_action = action_ranker.select(candidates, belief)
         action_key = action_ranker._action_key(selected_action)
 
         # ---------------- SEMANTIC GROUNDING ----------------
 
         if selected_action.get("operation") == "click":
+
             resolution = semantic_resolver.resolve(
                 selected_action.get("target", "")
             )
 
-            if resolution.get("confidence", 0) < 0.5:
+            if resolution.get("confidence", 0.0) < 0.55:
                 belief.record_action(action_key, reward=-0.2)
                 continue
 
-            entity = resolution.get("entity", {})
-            selected_action["target"] = entity.get("coordinates")
+            entity = resolution.get("entity")
+            if not isinstance(entity, dict):
+                belief.record_action(action_key, reward=-0.2)
+                continue
+
+            x = entity.get("x")
+            y = entity.get("y")
+
+            if not isinstance(x, (int, float)) or not isinstance(y, (int, float)):
+                belief.record_action(action_key, reward=-0.2)
+                continue
+
+            selected_action["target"] = {"x": float(x), "y": float(y)}
 
         # ---------------- AUTHORITY CHECK ----------------
 
+        high_risk = selected_action.get("operation") in {
+            "command",
+            "install",
+        }
+
         authority = input_arbitrator.evaluate(
             input_event_ts=time.monotonic(),
-            high_risk=False,
+            high_risk=high_risk,
             soc_confident=True,
         )
 
@@ -230,7 +234,8 @@ def _execute_autonomous_loop(
                     installer=installer,
                 )
 
-        except Exception:
+        except Exception as e:
+            log_warn(f"Execution failure: {e}")
             belief.record_action(action_key, reward=-0.5)
             continue
 
@@ -244,7 +249,7 @@ def _execute_autonomous_loop(
             world_graph=world_graph,
         )
 
-        reward = verification.confidence - 0.5
+        reward = float(verification.confidence) - 0.5
         belief.record_action(action_key, reward=reward)
 
         belief.commit(action_key, perception_snapshot or {})
@@ -254,11 +259,7 @@ def _execute_autonomous_loop(
 
         belief.progress_score += verification.progress_score
 
-        # ---------------- CONVERGENCE ----------------
-
-        if belief.converged():
-            journal.record({"event": "execution_converged"})
-            return
+        # ---------------- DONE CHECK ----------------
 
         if selected_action.get("operation") == "done":
             journal.record({"event": "execution_complete"})
@@ -283,7 +284,10 @@ def _execute_decision(
     op = decision.get("operation")
 
     if op == "click":
-        os_backend.click(decision.get("target"))
+        target = decision.get("target")
+        if not isinstance(target, dict):
+            raise RuntimeError("Invalid click target")
+        os_backend.click(target)
         return {"status": "clicked"}
 
     if op == "type":
