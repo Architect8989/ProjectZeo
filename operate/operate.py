@@ -11,7 +11,7 @@ from operate.utils.operating_system import OperatingSystem
 from utils.accessibility import AccessibilityBackend
 from audit.journal import ActionJournal
 
-from core.schemas.execution_plan import ExecutionPlan, ExecutionStep, StepType
+from core.schemas.execution_plan import ExecutionPlan
 from core.verification.step_verifier import StepVerifier
 from core.verification.plan_verifier import PlanVerifier
 from core.execution.progress_tracker import ProgressTracker
@@ -237,6 +237,7 @@ def _execute_autonomous_loop(
         except Exception as e:
             log_warn(f"Execution failure: {e}")
             belief.record_action(action_key, reward=-0.5)
+            belief.update_regret(action_key, reward=-0.5, best_reward=0.0)
             continue
 
         # ---------------- VERIFICATION ----------------
@@ -251,6 +252,18 @@ def _execute_autonomous_loop(
 
         reward = float(verification.confidence) - 0.5
         belief.record_action(action_key, reward=reward)
+
+        # Compute best possible reward among candidate estimates
+        best_estimate = max(
+            belief.expected_utility(action_ranker._action_key(a))
+            for a in candidates
+        )
+
+        belief.update_regret(
+            action_key,
+            reward=reward,
+            best_reward=best_estimate,
+        )
 
         belief.commit(action_key, perception_snapshot or {})
 
