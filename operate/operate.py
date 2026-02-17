@@ -60,9 +60,9 @@ def operate_main(
     recovery = FailureRecoveryManager()
     progress = ProgressTracker(execution_plan)
 
-    installer: Optional[AutonomousInstaller] = None
     llm_callable = getattr(planner, "_llm_call", None)
 
+    installer: Optional[AutonomousInstaller] = None
     if observer is not None:
         installer = AutonomousInstaller(
             observer=observer,
@@ -91,7 +91,7 @@ def operate_main(
 
 
 # ==================================================
-# COGNITIVE AUTONOMOUS LOOP
+# DECISION-THEORETIC AUTONOMOUS LOOP
 # ==================================================
 
 def _execute_autonomous_loop(
@@ -127,7 +127,9 @@ def _execute_autonomous_loop(
     semantic_resolver = SemanticResolver(world_graph)
 
     iteration = 0
-    MAX_ITERATIONS = max(len(execution_plan.steps) * 5, 15)
+    MAX_ITERATIONS = max(len(execution_plan.steps) * 5, 25)
+
+    previous_snapshot = None
 
     while iteration < MAX_ITERATIONS:
 
@@ -150,73 +152,87 @@ def _execute_autonomous_loop(
                 pass
 
         world_snapshot = world_graph.snapshot() if world_graph else {}
-        belief.update_entities(world_snapshot)
 
-        # ---------------- REASONING ----------------
+        # ---------------- BELIEF UPDATE ----------------
+
+        likelihoods = {"neutral": 1.0}
+
+        if previous_snapshot and world_graph:
+            delta = world_graph.compute_delta(previous_snapshot)
+            belief.compute_environment_stability(delta)
+
+            if delta.get("significant_change"):
+                likelihoods["neutral"] = 0.7
+            else:
+                likelihoods["neutral"] = 0.95
+
+        belief.bayesian_update(likelihoods)
+        previous_snapshot = world_snapshot
+
+        # ---------------- ACTION PROPOSAL ----------------
 
         candidates: List[Dict[str, Any]] = reasoning_engine.propose_actions(
             objective=execution_plan.objective,
             belief_summary=belief.summary(),
             perception=world_snapshot,
-            k=3,
+            k=4,
         )
 
-        ranked_actions = action_ranker.rank(
+        if not candidates:
+            raise RuntimeError("No actions proposed")
+
+        # ---------------- ACTION SELECTION ----------------
+
+        selected_action = action_ranker.select(
             candidates,
-            belief.summary(),
+            belief,
         )
 
-        selected_action = None
-        result = None
+        action_key = action_ranker._action_key(selected_action)
 
-        for action in ranked_actions:
+        # ---------------- SEMANTIC GROUNDING ----------------
 
-            # semantic grounding
-            if action.get("operation") == "click":
-                resolution = semantic_resolver.resolve(
-                    action.get("target", "")
-                )
-
-                if resolution.get("confidence", 0) < 0.5:
-                    belief.record_failure(action, "low_confidence_target")
-                    continue
-
-                entity = resolution.get("entity", {})
-                action["target"] = entity.get("coordinates")
-
-            # authority check
-            authority = input_arbitrator.evaluate(
-                input_event_ts=time.monotonic(),
-                high_risk=False,
-                soc_confident=True,
+        if selected_action.get("operation") == "click":
+            resolution = semantic_resolver.resolve(
+                selected_action.get("target", "")
             )
 
-            if authority != AuthorityDecision.CONTINUE:
-                raise RuntimeError("Authority interrupted execution")
-
-            try:
-                input_arbitrator.soc_action_started()
-                os_backend.heartbeat()
-
-                with action_timeout(30):
-                    result = _execute_decision(
-                        decision=action,
-                        execution_plan=execution_plan,
-                        os_backend=os_backend,
-                        accessibility_backend=accessibility_backend,
-                        installer=installer,
-                    )
-
-                belief.record_action(action, result)
-                selected_action = action
-                break
-
-            except Exception as e:
-                belief.record_failure(action, str(e))
+            if resolution.get("confidence", 0) < 0.5:
+                belief.record_action(action_key, reward=-0.2)
                 continue
 
-        if selected_action is None:
-            raise RuntimeError("All candidate actions failed")
+            entity = resolution.get("entity", {})
+            selected_action["target"] = entity.get("coordinates")
+
+        # ---------------- AUTHORITY CHECK ----------------
+
+        authority = input_arbitrator.evaluate(
+            input_event_ts=time.monotonic(),
+            high_risk=False,
+            soc_confident=True,
+        )
+
+        if authority != AuthorityDecision.CONTINUE:
+            raise RuntimeError("Authority interrupted execution")
+
+        # ---------------- EXECUTION ----------------
+
+        try:
+            input_arbitrator.soc_action_started()
+            os_backend.heartbeat()
+
+            with action_timeout(30):
+                result = _execute_decision(
+                    decision=selected_action,
+                    execution_plan=execution_plan,
+                    os_backend=os_backend,
+                    accessibility_backend=accessibility_backend,
+                    installer=installer,
+                )
+
+        except Exception:
+            belief.record_action(action_key, reward=-0.5)
+            continue
 
         # ---------------- VERIFICATION ----------------
 
@@ -228,15 +244,65 @@ def _execute_autonomous_loop(
             world_graph=world_graph,
         )
 
+        reward = verification.confidence - 0.5
+        belief.record_action(action_key, reward=reward)
+
+        belief.commit(action_key, perception_snapshot or {})
+
         if not verification.success:
-            belief.record_failure(selected_action, verification.reason)
             continue
 
-        # success path
-        belief.progress_score += 0.1
+        belief.progress_score += verification.progress_score
+
+        # ---------------- CONVERGENCE ----------------
+
+        if belief.converged():
+            journal.record({"event": "execution_converged"})
+            return
 
         if selected_action.get("operation") == "done":
             journal.record({"event": "execution_complete"})
             return
 
     journal.record({"event": "execution_complete"})
+
+
+# ==================================================
+# DECISION EXECUTION
+# ==================================================
+
+def _execute_decision(
+    *,
+    decision: Dict[str, Any],
+    execution_plan: ExecutionPlan,
+    os_backend: OperatingSystem,
+    accessibility_backend: Optional[AccessibilityBackend],
+    installer: Optional[AutonomousInstaller],
+) -> Dict[str, Any]:
+
+    op = decision.get("operation")
+
+    if op == "click":
+        os_backend.click(decision.get("target"))
+        return {"status": "clicked"}
+
+    if op == "type":
+        os_backend.type_text(decision.get("text", ""))
+        return {"status": "typed"}
+
+    if op == "hotkey":
+        os_backend.press_keys(decision.get("keys", []))
+        return {"status": "hotkey"}
+
+    if op == "command":
+        return os_backend.execute_command(decision.get("command"))
+
+    if op == "install":
+        if installer is None:
+            raise RuntimeError("Installer unavailable")
+        return installer.install_tool(decision.get("tool"))
+
+    if op == "done":
+        return {"status": "complete"}
+
+    raise RuntimeError(f"Unknown operation: {op}")
