@@ -1,46 +1,40 @@
 from typing import Callable, List, Dict, Any
 
 from operate.exceptions import ModelNotRecognizedException
-from adapters.pure_llm_wrapper import PureLLMWrapper
 
 
 # ==================================================
-# MODEL REGISTRY (STRING → FUNCTION NAME)
+# MODEL REGISTRY
 # ==================================================
+# Maps model names → adapter class paths
+# Keeps apis.py isolated and optional
 
-_MODEL_REGISTRY: Dict[str, str] = {
-    "gpt-4o": "call_gpt_4o",
-    "qwen-vl": "call_qwen_vl_with_ocr",
-    "gpt-4o-with-ocr": "call_gpt_4o_with_ocr",
-    "o1-with-ocr": "call_o1_with_ocr",
-    "claude-3": "call_claude_3_with_ocr",
-    "gemini-pro-vision": "call_gemini_pro_vision",
-    "llava": "call_ollama_llava",
-    "gpt-4.1-with-ocr": "call_gpt_4_1_with_ocr",
-    "gpt-4o-labeled": "call_gpt_4o_labeled",
+_ADAPTER_REGISTRY: Dict[str, str] = {
+    # Pure local Qwen-VL adapter
+    "qwen2.5-vl:7b-instruct": "adapters.qwen_ollama_adapter.QwenOllamaAdapter",
+    "qwen2.5-vl:3b-instruct": "adapters.qwen_ollama_adapter.QwenOllamaAdapter",
 }
 
 
 # ==================================================
-# INTERNAL RESOLUTION
+# INTERNAL UTIL
 # ==================================================
 
-def _resolve_provider(model_name: str) -> Callable:
-    fn_name = _MODEL_REGISTRY.get(model_name)
-    if fn_name is None:
-        raise ModelNotRecognizedException(
-            f"Model '{model_name}' not recognized."
-        )
+def _import_from_path(path: str):
+    """
+    Lazy class importer.
+    Prevents heavy imports at module load time.
+    """
+    module_path, class_name = path.rsplit(".", 1)
 
-    # Lazy import — prevents heavy dependency loading at module import time
-    from operate.models import apis
+    module = __import__(module_path, fromlist=[class_name])
 
-    if not hasattr(apis, fn_name):
+    if not hasattr(module, class_name):
         raise RuntimeError(
-            f"Provider '{fn_name}' not found in operate.models.apis"
+            f"Adapter class '{class_name}' not found in '{module_path}'"
         )
 
-    return getattr(apis, fn_name)
+    return getattr(module, class_name)
 
 
 # ==================================================
@@ -49,69 +43,61 @@ def _resolve_provider(model_name: str) -> Callable:
 
 class AdapterFactory:
     """
-    Adapter Factory for dynamic model selection.
-    Responsible for:
-        - Registry validation
-        - Raw model access (legacy)
-        - Kernel-facing normalized builder
+    Clean adapter factory.
+    No apis.py usage.
+    No fallback logic.
+    One model → one adapter.
     """
 
     # --------------------------------------------------
-    # RAW MODEL ACCESS (Legacy Support)
+    # PURE ADAPTER BUILDER
     # --------------------------------------------------
 
     @staticmethod
-    def create_llm_callable(model_name: str) -> Callable:
-        return _resolve_provider(model_name)
+    def build_llm(model_name: str):
+        """
+        Returns adapter instance.
+        """
 
-    # --------------------------------------------------
-    # NORMALIZED KERNEL-FACING BUILDER
-    # --------------------------------------------------
+        adapter_path = _ADAPTER_REGISTRY.get(model_name)
 
-    @staticmethod
-    def build_llm(model_name: str) -> Callable:
-        if model_name not in _MODEL_REGISTRY:
+        if adapter_path is None:
             raise ModelNotRecognizedException(
-                f"Model '{model_name}' not recognized."
+                f"Model '{model_name}' not registered in AdapterFactory."
             )
 
-        # PureLLMWrapper internally resolves provider via apis
-        return PureLLMWrapper(model_name)
+        AdapterClass = _import_from_path(adapter_path)
+
+        return AdapterClass(model_name=model_name)
 
     # --------------------------------------------------
-    # BACKWARD-COMPATIBLE ACTION FLOW
+    # DIRECT ACTION FLOW
     # --------------------------------------------------
 
     @staticmethod
-    def get_action(
+    async def get_action(
         model_name: str,
         messages: List[Dict[str, Any]],
         objective: str,
         session_id: str,
-    ) -> Any:
+    ):
+        """
+        Direct execution entrypoint.
+        Returns (operation_list, error_object)
+        """
 
-        if model_name not in _MODEL_REGISTRY:
-            raise ModelNotRecognizedException(
-                f"Model '{model_name}' not recognized."
-            )
+        adapter = AdapterFactory.build_llm(model_name)
 
-        from operate.models import apis  # lazy import
-
-        if not hasattr(apis, "get_next_action"):
-            raise RuntimeError("get_next_action not available in apis")
-
-        return apis.get_next_action(
-            model_name,
-            messages,
-            objective,
-            session_id,
+        return await adapter.get_next_action(
+            messages=messages,
+            objective=objective,
+            session_id=session_id,
         )
 
 
 # ==================================================
-# MODULE-LEVEL EXPORTS
+# MODULE EXPORTS
 # ==================================================
 
 build_llm = AdapterFactory.build_llm
-create_llm_callable = AdapterFactory.create_llm_callable
 get_action = AdapterFactory.get_action
