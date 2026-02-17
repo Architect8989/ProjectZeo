@@ -3,6 +3,7 @@ import time
 import sys
 import select
 import os
+import stat
 from typing import Optional
 
 
@@ -17,10 +18,12 @@ class IntentListener:
     - No intent overwrite
     - Works in interactive + non-interactive environments
     - Clean shutdown
+    - Secure file-based ingestion
     """
 
     POLL_INTERVAL = 0.1  # seconds
     INTENT_FILE = "/tmp/projectzeo.intent"
+    INTENT_MAX_BYTES = 4096
 
     def __init__(self, mode_controller, snapshot_provider):
         self.mode = mode_controller
@@ -53,7 +56,6 @@ class IntentListener:
     def _listen_loop(self):
         while self._running:
             try:
-                # Accept intent ONLY in OBSERVER mode
                 if self.mode.mode.name != "OBSERVER":
                     time.sleep(self.POLL_INTERVAL)
                     continue
@@ -64,7 +66,7 @@ class IntentListener:
                     time.sleep(self.POLL_INTERVAL)
                     continue
 
-                # ---- SNAPSHOT FIRST (HARD GUARANTEE) ----
+                # ---- SNAPSHOT FIRST ----
                 try:
                     snapshot_id = self.snapshot_provider.take_snapshot()
                 except Exception as e:
@@ -77,7 +79,7 @@ class IntentListener:
                     time.sleep(self.POLL_INTERVAL)
                     continue
 
-                # ---- AUTHORITATIVE SNAPSHOT ATTACH ----
+                # ---- ATTACH SNAPSHOT ----
                 try:
                     self.mode.attach_snapshot(snapshot_id)
                 except Exception as e:
@@ -85,7 +87,7 @@ class IntentListener:
                     time.sleep(self.POLL_INTERVAL)
                     continue
 
-                # ---- THEN ARM ----
+                # ---- ARM ----
                 try:
                     self.mode.arm(intent=intent)
                 except Exception as e:
@@ -108,12 +110,7 @@ class IntentListener:
         # ---- interactive stdin ----
         if sys.stdin and sys.stdin.isatty():
             try:
-                ready, _, _ = select.select(
-                    [sys.stdin],
-                    [],
-                    [],
-                    0.0,
-                )
+                ready, _, _ = select.select([sys.stdin], [], [], 0.0)
             except Exception:
                 ready = []
 
@@ -125,17 +122,45 @@ class IntentListener:
                 line = line.strip()
                 return line if line else None
 
-        # ---- non-interactive intent file ----
-        if os.path.exists(self.INTENT_FILE):
-            try:
-                with open(self.INTENT_FILE, "r", encoding="utf-8") as f:
-                    data = f.read().strip()
+        # ---- secure file ingestion ----
+        path = self.INTENT_FILE
 
-                os.remove(self.INTENT_FILE)
+        if not os.path.exists(path):
+            return None
 
-                return data if data else None
+        try:
+            st = os.stat(path, follow_symlinks=False)
 
-            except Exception:
+            # Must be regular file
+            if not stat.S_ISREG(st.st_mode):
+                os.remove(path)
                 return None
 
-        return None
+            # Must be owned by current user
+            if st.st_uid != os.getuid():
+                os.remove(path)
+                return None
+
+            # Size bounds
+            if st.st_size <= 0 or st.st_size > self.INTENT_MAX_BYTES:
+                os.remove(path)
+                return None
+
+            with open(path, "r", encoding="utf-8") as f:
+                data = f.read(self.INTENT_MAX_BYTES)
+
+        except Exception:
+            try:
+                os.remove(path)
+            except Exception:
+                pass
+            return None
+
+        # Remove after successful read
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+
+        intent = data.strip()
+        return intent if intent else None
