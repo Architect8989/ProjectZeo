@@ -817,17 +817,9 @@ def call_ollama_llava(messages):
         )
 
     except Exception as e:
-        print(
-            f"{ANSI_GREEN}[Self-Operating Computer]{ANSI_BRIGHT_MAGENTA}[llava] That did not work. Trying again {ANSI_RESET}",
-            e,
-        )
-        print(
-            f"{ANSI_GREEN}[Self-Operating Computer]{ANSI_RED}[Error] AI response was {ANSI_RESET}",
-            content,
-        )
-        if config.verbose:
-            traceback.print_exc()
-        return call_ollama_llava(messages)
+    if config.verbose:
+        traceback.print_exc()
+    raise RuntimeError(f"Ollama llava failed: {e}") from e
 
 
 async def call_claude_3_with_ocr(messages, objective, model):
