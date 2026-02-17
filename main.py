@@ -70,14 +70,11 @@ def _ingest_latest_perception(observer, world_graph):
     snap = observer.snapshot()
     if not isinstance(snap, dict):
         return
-
     if not snap.get("perception_available"):
         return
-
     perception = snap.get("perception")
     if not isinstance(perception, dict):
         return
-
     world_graph.ingest(perception)
 
 
@@ -85,13 +82,13 @@ def _ingest_latest_perception(observer, world_graph):
 # MAIN LOOP
 # ==================================================
 
-def main(llm_callable: Callable[[str], str]):
+def main(llm_callable: Callable):
+
     global TASK_START
 
     if not callable(llm_callable):
         raise RuntimeError("LLM callable must be provided")
 
-    # Runtime-owned dependencies (moved from global scope)
     os_backend = OperatingSystem()
     state_path = os.path.join(os.getcwd(), ".authority_state.json")
     auth_state = AuthorityStateSerializer(state_path)
@@ -151,7 +148,9 @@ def main(llm_callable: Callable[[str], str]):
     intent_listener.start()
 
     while True:
+
         try:
+
             mode.update_observer_health(observer.is_healthy())
             mode.update_vision_status(vision_runtime.is_healthy())
 
@@ -168,6 +167,9 @@ def main(llm_callable: Callable[[str], str]):
                     raise RuntimeError("Missing snapshot")
 
                 _ingest_latest_perception(observer, world_graph)
+
+                # ---------------- PLANNING ----------------
+
                 mode.begin_planning()
 
                 intent = mode.get_intent()
@@ -203,9 +205,14 @@ def main(llm_callable: Callable[[str], str]):
                 mode.execute()
                 consumed_intent = mode.consume_intent()
 
+                # ---------------- EXECUTION LOOP ----------------
+
                 try:
+
                     while True:
+
                         try:
+
                             operate_main(
                                 terminal_prompt=consumed_intent,
                                 execution_plan=execution_plan,
@@ -216,6 +223,7 @@ def main(llm_callable: Callable[[str], str]):
                             break
 
                         except RuntimeError as e:
+
                             if str(e) != "REPLAN_REQUIRED":
                                 raise
 
@@ -223,8 +231,19 @@ def main(llm_callable: Callable[[str], str]):
                             if replan_count > MAX_REPLANS:
                                 raise RuntimeError("Max replans exceeded")
 
+                            # EXECUTING → OBSERVER
+                            mode.force_observer()
+
+                            # Re-arm with same intent + same snapshot
+                            mode.attach_snapshot(snapshot_id)
+                            mode.arm(consumed_intent)
+
+                            # Fresh perception
                             _ingest_latest_perception(observer, world_graph)
                             planner.update_world_snapshot(world_graph.snapshot())
+
+                            # PLANNING again
+                            mode.begin_planning()
 
                             execution_plan = planner.create_plan(
                                 objective=consumed_intent,
@@ -235,7 +254,6 @@ def main(llm_callable: Callable[[str], str]):
                                 high_level_steps=[{"goal": consumed_intent}],
                             )
 
-                            mode.begin_planning()
                             mode.attach_execution_plan(
                                 f"plan_replan_{replan_count}_{int(time.time())}"
                             )
@@ -243,6 +261,9 @@ def main(llm_callable: Callable[[str], str]):
                             mode.execute()
 
                 finally:
+
+                    # ---------------- RESTORATION ----------------
+
                     mode.begin_restoration()
 
                     restore_provider.restore_snapshot(snapshot_id)
