@@ -35,7 +35,6 @@ def apply_patches():
 
     _patch_all_providers()
     _disable_cloud_fallbacks()
-    _disable_cross_provider_fallbacks()
     _disable_screenshot_writes()
     _guard_dispatch()
 
@@ -68,16 +67,19 @@ def _wrap_provider(fn):
             )
 
     def _inject_determinism(kwargs):
-        # Force deterministic temperature if options supported
+        # Enforce deterministic temperature if options supported
         options = kwargs.get("options")
         if isinstance(options, dict):
+            options = dict(options)
             options["temperature"] = 0
+            kwargs["options"] = options
         return kwargs
 
     if is_async:
 
         @functools.wraps(fn)
         async def async_wrapper(messages, *args, **kwargs):
+
             if not isinstance(messages, list):
                 raise RuntimeError(
                     "[APIS-SAFETY] messages must be list"
@@ -106,6 +108,7 @@ def _wrap_provider(fn):
 
         @functools.wraps(fn)
         def sync_wrapper(messages, *args, **kwargs):
+
             if not isinstance(messages, list):
                 raise RuntimeError(
                     "[APIS-SAFETY] messages must be list"
@@ -138,12 +141,13 @@ def _wrap_provider(fn):
 def _patch_all_providers():
 
     for name in dir(apis):
+
         if not name.startswith("call_"):
             continue
 
         attr = getattr(apis, name)
 
-        if isinstance(attr, (types.FunctionType, types.CoroutineType)):
+        if isinstance(attr, types.FunctionType):
             wrapped = _wrap_provider(attr)
             setattr(apis, name, wrapped)
 
@@ -165,38 +169,39 @@ def _disable_cloud_fallbacks():
 
 
 # ============================================================
-# DISABLE CROSS-PROVIDER FALLBACK CHAINS
-# ============================================================
-
-def _disable_cross_provider_fallbacks():
-
-    for name in dir(apis):
-        if name.startswith("call_gpt_") and name != "call_gpt_4o":
-            continue
-
-        if name.startswith("call_") and name != "call_ollama_llava":
-            continue
-
-    # Intentionally no-op override for fallback chains
-    # If any provider internally calls another provider,
-    # the wrapper above ensures mutation and None failure detection.
-
-
-# ============================================================
 # DISABLE SCREENSHOT SIDE EFFECTS
 # ============================================================
 
 def _disable_screenshot_writes():
+    """
+    Neutralize filesystem screenshot writes
+    without corrupting the os module.
+    """
 
-    if hasattr(apis, "os"):
-        try:
-            apis.os.makedirs = lambda *a, **k: None
-        except Exception:
-            pass
+    # Block directory creation for screenshots only
+    if hasattr(apis, "os") and hasattr(apis.os, "makedirs"):
 
+        original_makedirs = apis.os.makedirs
+
+        def guarded_makedirs(path, *args, **kwargs):
+            if isinstance(path, str) and "screenshot" in path.lower():
+                return
+            return original_makedirs(path, *args, **kwargs)
+
+        apis.os.makedirs = guarded_makedirs
+
+    # Block PIL Image.save used for screenshots
     if hasattr(apis, "Image"):
+
         try:
-            apis.Image.save = lambda *a, **k: None
+            original_save = apis.Image.Image.save
+
+            def guarded_save(self, fp, *args, **kwargs):
+                if isinstance(fp, str) and "screenshot" in fp.lower():
+                    return
+                return original_save(self, fp, *args, **kwargs)
+
+            apis.Image.Image.save = guarded_save
         except Exception:
             pass
 
@@ -215,27 +220,53 @@ def _guard_dispatch():
     if getattr(original, "_apis_safety_wrapped", False):
         return
 
-    @functools.wraps(original)
-    async def guarded(model, messages, objective, session_id):
+    if inspect.iscoroutinefunction(original):
 
-        if not isinstance(messages, list):
-            raise RuntimeError(
-                "[APIS-SAFETY] Dispatcher messages must be list"
-            )
+        @functools.wraps(original)
+        async def guarded(model, messages, objective, session_id):
 
-        result = await original(model, messages, objective, session_id)
+            if not isinstance(messages, list):
+                raise RuntimeError(
+                    "[APIS-SAFETY] Dispatcher messages must be list"
+                )
 
-        if result is None:
-            raise RuntimeError(
-                "[APIS-SAFETY] get_next_action returned None"
-            )
+            result = await original(model, messages, objective, session_id)
 
-        if not isinstance(result, (dict, list)):
-            raise RuntimeError(
-                "[APIS-SAFETY] get_next_action invalid type"
-            )
+            if result is None:
+                raise RuntimeError(
+                    "[APIS-SAFETY] get_next_action returned None"
+                )
 
-        return result
+            if not isinstance(result, (dict, list)):
+                raise RuntimeError(
+                    "[APIS-SAFETY] get_next_action invalid type"
+                )
+
+            return result
+
+    else:
+
+        @functools.wraps(original)
+        def guarded(model, messages, objective, session_id):
+
+            if not isinstance(messages, list):
+                raise RuntimeError(
+                    "[APIS-SAFETY] Dispatcher messages must be list"
+                )
+
+            result = original(model, messages, objective, session_id)
+
+            if result is None:
+                raise RuntimeError(
+                    "[APIS-SAFETY] get_next_action returned None"
+                )
+
+            if not isinstance(result, (dict, list)):
+                raise RuntimeError(
+                    "[APIS-SAFETY] get_next_action invalid type"
+                )
+
+            return result
 
     guarded._apis_safety_wrapped = True
     apis.get_next_action = guarded
