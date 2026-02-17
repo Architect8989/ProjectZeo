@@ -11,15 +11,21 @@ class ActionRanker:
 
     Combines:
     - Risk-adjusted Expected Utility
-    - UCB1 exploration
+    - UCB1 exploration bonus
     - Thompson sampling
-    - Regret minimization
-    - Softmax mixed strategy equilibrium
-    - Entropy-aware temperature control
+    - Entropy-aware softmax mixed strategy
+
+    IMPORTANT:
+    - No regret updates occur here.
+    - Regret must be updated AFTER real reward is observed.
     """
 
     MIN_TAU = 0.15
     MAX_TAU = 1.5
+
+    # ==================================================
+    # ACTION SELECTION
+    # ==================================================
 
     def select(
         self,
@@ -32,43 +38,45 @@ class ActionRanker:
 
         action_ids = [self._action_key(a) for a in actions]
 
-        # Score each action
         scores = []
-        best_reward_estimate = float("-inf")
 
         for action, key in zip(actions, action_ids):
 
+            # Exploitation
             eu = belief_state.expected_utility(key)
+
+            # Optimism under uncertainty
             ucb = belief_state.ucb_score(key)
+
+            # Posterior sampling
             thompson = belief_state.thompson_sample(key)
 
-            # Combine exploitation + exploration
+            # Combined score
             combined = 0.5 * eu + 0.3 * ucb + 0.2 * thompson
-
-            # Regret penalty
-            regret_penalty = belief_state.regret.get(key, 0.0)
-            combined -= regret_penalty * 0.1
 
             scores.append(combined)
 
-            if combined > best_reward_estimate:
-                best_reward_estimate = combined
-
-        # Update regrets
-        for key, score in zip(action_ids, scores):
-            belief_state.update_regret(
-                key,
-                reward=score,
-                best_reward=best_reward_estimate,
-            )
-
+        # --------------------------------------------------
         # Entropy-aware temperature
+        # --------------------------------------------------
+
         entropy = belief_state.entropy()
         tau = self._entropy_temperature(entropy)
 
-        # Softmax mixed strategy equilibrium
-        exp_scores = [math.exp(s / tau) for s in scores]
+        # --------------------------------------------------
+        # Numerically stable softmax (log-sum-exp trick)
+        # --------------------------------------------------
+
+        max_score = max(scores)
+        shifted = [(s - max_score) / tau for s in scores]
+
+        exp_scores = [math.exp(s) for s in shifted]
         total = sum(exp_scores)
+
+        if total <= 0.0:
+            # fallback deterministic
+            return actions[scores.index(max_score)]
+
         probabilities = [s / total for s in exp_scores]
 
         selected_index = random.choices(
@@ -77,9 +85,7 @@ class ActionRanker:
             k=1,
         )[0]
 
-        selected_action = actions[selected_index]
-
-        return selected_action
+        return actions[selected_index]
 
     # ==================================================
     # ENTROPY-ADAPTIVE TEMPERATURE
@@ -87,15 +93,12 @@ class ActionRanker:
 
     def _entropy_temperature(self, entropy: float) -> float:
         """
-        High entropy → high exploration (higher tau)
+        High entropy → exploration (higher tau)
         Low entropy → exploitation (lower tau)
         """
 
-        # Normalize entropy roughly
         tau = entropy
-
         tau = max(self.MIN_TAU, min(self.MAX_TAU, tau))
-
         return tau
 
     # ==================================================
