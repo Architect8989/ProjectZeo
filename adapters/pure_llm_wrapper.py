@@ -2,7 +2,9 @@
 
 import asyncio
 import inspect
-from typing import Callable, List, Dict, Any
+import copy
+import json
+from typing import Callable, List, Dict, Any, Optional
 
 from operate.models import apis
 
@@ -10,11 +12,21 @@ from operate.models import apis
 class PureLLMWrapper:
     """
     Isolation layer between kernel and apis.py.
-    Normalizes all model functions to unified interface.
+
+    Guarantees:
+        - No input mutation
+        - Unified callable interface
+        - Safe coroutine handling
+        - Dict-only JSON output
+        - Deterministic failure behavior
     """
 
     def __init__(self, model_name: str):
         self.model_name = model_name
+
+    # ==================================================
+    # MODEL RESOLUTION
+    # ==================================================
 
     def _resolve_model_function(self) -> Callable:
         registry = {
@@ -35,37 +47,156 @@ class PureLLMWrapper:
 
         return fn
 
+    # ==================================================
+    # PUBLIC CALL INTERFACE
+    # ==================================================
+
     def __call__(
         self,
         messages: List[Dict[str, Any]],
-        objective: str = None,
-        session_id: str = None,
-    ) -> Any:
+        objective: Optional[str] = None,
+        session_id: Optional[str] = None,
+        screen_image: Optional[str] = None,
+    ) -> Dict[str, Any]:
 
         model_fn = self._resolve_model_function()
 
+        # ----------------------------
+        # 1. Freeze inputs
+        # ----------------------------
+
+        original_snapshot = copy.deepcopy(messages)
+        messages_copy = copy.deepcopy(messages)
+
+        # ----------------------------
+        # 2. Execute safely
+        # ----------------------------
+
         try:
-            if inspect.iscoroutinefunction(model_fn):
-                return asyncio.run(
-                    model_fn(messages, objective, self.model_name)
-                )
-
-            # Try full signature
-            try:
-                return model_fn(messages, objective, self.model_name)
-            except TypeError:
-                pass
-
-            # Try reduced signature
-            try:
-                return model_fn(messages, objective)
-            except TypeError:
-                pass
-
-            # Try minimal signature
-            return model_fn(messages)
-
+            result = self._execute_model(
+                model_fn,
+                messages_copy,
+                objective,
+                session_id,
+                screen_image,
+            )
         except Exception as e:
             raise RuntimeError(
                 f"Model execution failed for {self.model_name}: {e}"
-          )
+            )
+
+        # ----------------------------
+        # 3. Mutation detection
+        # ----------------------------
+
+        if messages != original_snapshot:
+            raise RuntimeError(
+                f"Model '{self.model_name}' mutated input messages."
+            )
+
+        # ----------------------------
+        # 4. Normalize output
+        # ----------------------------
+
+        return self._normalize_output(result)
+
+    # ==================================================
+    # INTERNAL EXECUTION LOGIC
+    # ==================================================
+
+    def _execute_model(
+        self,
+        model_fn: Callable,
+        messages: List[Dict[str, Any]],
+        objective: Optional[str],
+        session_id: Optional[str],
+        screen_image: Optional[str],
+    ) -> Any:
+
+        if inspect.iscoroutinefunction(model_fn):
+            return asyncio.run(
+                self._call_with_fallback(
+                    model_fn,
+                    messages,
+                    objective,
+                    session_id,
+                    screen_image,
+                )
+            )
+
+        return self._call_with_fallback(
+            model_fn,
+            messages,
+            objective,
+            session_id,
+            screen_image,
+        )
+
+    def _call_with_fallback(
+        self,
+        model_fn: Callable,
+        messages: List[Dict[str, Any]],
+        objective: Optional[str],
+        session_id: Optional[str],
+        screen_image: Optional[str],
+    ) -> Any:
+
+        # Try full modern signature
+        try:
+            return model_fn(
+                messages,
+                objective=objective,
+                session_id=session_id,
+                screen_image=screen_image,
+            )
+        except TypeError:
+            pass
+
+        # Try legacy signature with model_name
+        try:
+            return model_fn(messages, objective, self.model_name)
+        except TypeError:
+            pass
+
+        # Try reduced signature
+        try:
+            return model_fn(messages, objective)
+        except TypeError:
+            pass
+
+        # Minimal fallback
+        return model_fn(messages)
+
+    # ==================================================
+    # OUTPUT NORMALIZATION
+    # ==================================================
+
+    def _normalize_output(self, result: Any) -> Dict[str, Any]:
+
+        if result is None:
+            raise RuntimeError(
+                f"Model '{self.model_name}' returned None."
+            )
+
+        if isinstance(result, dict):
+            return result
+
+        if isinstance(result, str):
+            try:
+                parsed = json.loads(result)
+            except Exception:
+                raise RuntimeError(
+                    f"Model '{self.model_name}' returned non-JSON string."
+                )
+
+            if not isinstance(parsed, dict):
+                raise RuntimeError(
+                    f"Model '{self.model_name}' JSON output not dict."
+                )
+
+            return parsed
+
+        raise RuntimeError(
+            f"Model '{self.model_name}' returned unsupported type: "
+            f"{type(result)}"
+            )
