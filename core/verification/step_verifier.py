@@ -1,6 +1,5 @@
 import os
 import shutil
-import subprocess
 import re
 from dataclasses import dataclass
 from typing import Optional, Any, Dict, Tuple, List
@@ -29,13 +28,7 @@ class StepVerifier:
     - Evidence > vision
     - Absence of evidence == failure
     - Unknown step types == failure
-    - No substring version validation
     - Fail-closed always
-
-    Cognitive additions:
-    - Confidence modeling
-    - Progress scoring
-    - Delta-based UI verification
     """
 
     VERSION_REGEX = re.compile(r"\d+(?:\.\d+)+")
@@ -54,24 +47,37 @@ class StepVerifier:
         world_graph=None,
     ) -> VerificationResult:
 
+        # ---------------- FAIL-CLOSED ----------------
         if step is None:
-            # cognitive-only check (used in cognition loop)
             return VerificationResult(
-                success=True,
-                reason="cognitive-only",
-                confidence=0.8,
-                progress_score=0.05,
+                success=False,
+                reason="step required for verification",
+                confidence=0.0,
+                progress_score=0.0,
             )
 
         if not isinstance(step, ExecutionStep):
             raise VerificationError("Invalid step object")
 
         try:
+
             if step.type == StepType.DONE:
-                return VerificationResult(True, "done", confidence=1.0, progress_score=1.0)
+                return VerificationResult(
+                    True,
+                    None,
+                    {},
+                    confidence=1.0,
+                    progress_score=1.0,
+                )
 
             if step.type == StepType.VERIFICATION:
-                return VerificationResult(True, "verification-only", confidence=1.0)
+                return VerificationResult(
+                    True,
+                    None,
+                    {},
+                    confidence=1.0,
+                    progress_score=0.05,
+                )
 
             if step.type == StepType.COMMAND_EXECUTION:
                 ok, reason, details = self._verify_command(step, execution_result)
@@ -103,7 +109,12 @@ class StepVerifier:
                 progress_score=0.0,
             )
 
-        return VerificationResult(False, f"Unhandled step type: {step.type}")
+        return VerificationResult(
+            False,
+            f"Unhandled step type: {step.type}",
+            confidence=0.0,
+            progress_score=0.0,
+        )
 
     # =================================================
     # RESULT BUILDER
@@ -164,7 +175,7 @@ class StepVerifier:
         return True, "", {"path": path}
 
     # =================================================
-    # TOOL VERIFICATION
+    # TOOL VERIFICATION (STRICT)
     # =================================================
 
     def _verify_tool(self, step: ExecutionStep) -> Tuple[bool, str, Dict[str, Any]]:
@@ -180,7 +191,7 @@ class StepVerifier:
         return True, "", {"tool_path": tool_path}
 
     # =================================================
-    # UI VERIFICATION (DELTA-BASED)
+    # UI VERIFICATION (STRICT DELTA + SEMANTIC)
     # =================================================
 
     def _verify_ui_change(
@@ -197,30 +208,35 @@ class StepVerifier:
 
         current = world_graph.snapshot()
 
-        delta = None
-        if previous_screenshot:
-            delta = world_graph.compute_delta(previous_screenshot)
-
-        # semantic evidence
         verification = step.verification or {}
 
+        # ---------------- STRICT TEXT CHECK ----------------
         expected_text = verification.get("screen_contains")
         if expected_text:
+            if not isinstance(expected_text, list):
+                return False, "screen_contains must be list", {}
+
             for token in expected_text:
+                if not isinstance(token, str):
+                    return False, "invalid screen_contains token", {}
                 if not world_graph.find_by_text(contains=token):
                     return False, f"text not found: {token}", {}
 
-        # delta-based progress
-        if delta and delta.get("significant_change"):
-            return True, "", {
-                "delta_detected": True,
-                "delta": delta,
-            }
+            return True, "", {"screen_contains_verified": True}
 
-        # fallback: entity existence
+        # ---------------- STRICT ENTITY TYPE CHECK ----------------
         expected_type = verification.get("entity_type_exists")
         if expected_type:
-            if world_graph.find_by_type(expected_type):
-                return True, "", {"entity_type": expected_type}
+            matches = world_graph.find_by_type(expected_type)
+            if not matches:
+                return False, f"entity type not found: {expected_type}", {}
 
-        return False, "no meaningful UI change detected", {}
+            return True, "", {"entity_type": expected_type}
+
+        # ---------------- STRICT DELTA CHECK ----------------
+        if previous_screenshot:
+            delta = world_graph.compute_delta(previous_screenshot)
+            if delta and delta.get("significant_change"):
+                return True, "", {"delta_detected": True}
+
+        return False, "no verification evidence found", {}
