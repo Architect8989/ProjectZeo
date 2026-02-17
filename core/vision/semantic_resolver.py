@@ -1,5 +1,3 @@
-# core/vision/semantic_resolver.py
-
 from typing import Dict, Any, List, Tuple
 import math
 
@@ -11,12 +9,26 @@ class SemanticResolver:
     Converts natural-language target description
     into ranked world_graph entity candidates.
 
-    Scoring factors:
-        - Token overlap
-        - Partial string similarity
-        - Entity visibility
-        - Spatial prominence
-        - Recent change boost
+    Assumes world_graph.snapshot() returns:
+
+    {
+        "timestamp": ...,
+        "focused_app": ...,
+        "entities": [ {entity_dict}, ... ],
+        "entity_count": ...
+    }
+
+    Entity schema (expected):
+        {
+            "id": str,
+            "type": str,
+            "text": str,
+            "x": float (0-1),
+            "y": float (0-1),
+            "interactable": bool,
+            "confidence": float,
+            ...
+        }
     """
 
     MIN_CONFIDENCE = 0.55
@@ -30,20 +42,29 @@ class SemanticResolver:
 
     def resolve(self, description: str) -> Dict[str, Any]:
 
-        if not description or not isinstance(description, str):
+        if not isinstance(description, str) or not description.strip():
             return {"confidence": 0.0}
 
-        entities = self._world_graph.snapshot() or {}
+        snapshot = self._world_graph.snapshot() or {}
+        entity_list = snapshot.get("entities", [])
 
-        candidates = self._extract_interactive_entities(entities)
+        if not isinstance(entity_list, list) or not entity_list:
+            return {"confidence": 0.0}
+
+        candidates = self._extract_interactive_entities(entity_list)
 
         if not candidates:
             return {"confidence": 0.0}
 
-        scored = [
-            (self._score(description, entity), entity)
-            for entity in candidates
-        ]
+        scored: List[Tuple[float, Dict[str, Any]]] = []
+
+        for entity in candidates:
+            score = self._score(description, entity)
+            if score > 0.0:
+                scored.append((score, entity))
+
+        if not scored:
+            return {"confidence": 0.0}
 
         scored.sort(key=lambda x: x[0], reverse=True)
 
@@ -74,20 +95,20 @@ class SemanticResolver:
 
     def _extract_interactive_entities(
         self,
-        entities: Dict[str, Any],
+        entity_list: List[Dict[str, Any]],
     ) -> List[Dict[str, Any]]:
 
         interactive = []
 
-        for entity in entities.values():
+        for entity in entity_list:
 
             if not isinstance(entity, dict):
                 continue
 
-            if not entity.get("visible", True):
+            if not entity.get("interactable", True):
                 continue
 
-            entity_type = entity.get("type", "").lower()
+            entity_type = str(entity.get("type", "")).lower()
 
             if entity_type in {
                 "button",
@@ -108,28 +129,41 @@ class SemanticResolver:
 
     def _score(self, description: str, entity: Dict[str, Any]) -> float:
 
-        label = entity.get("label", "") or ""
+        label = entity.get("text", "") or ""
+        if not isinstance(label, str) or not label.strip():
+            return 0.0
+
         desc_tokens = self._tokenize(description)
         label_tokens = self._tokenize(label)
 
-        if not label_tokens:
+        if not desc_tokens or not label_tokens:
             return 0.0
 
-        token_overlap = len(set(desc_tokens) & set(label_tokens))
-        token_score = token_overlap / max(len(desc_tokens), 1)
+        # ---- Token Overlap ----
+        overlap = len(set(desc_tokens) & set(label_tokens))
+        token_score = overlap / max(len(desc_tokens), 1)
 
-        substring_score = 1.0 if description.lower() in label.lower() else 0.0
+        # ---- Substring Match ----
+        substring_score = (
+            1.0 if description.lower() in label.lower() else 0.0
+        )
 
+        # ---- Spatial Prominence ----
         spatial_score = self._spatial_prominence(entity)
 
-        recency_score = 1.0 if entity.get("recently_changed") else 0.0
+        # ---- Visual Confidence Boost ----
+        visual_conf = float(entity.get("confidence", 0.0))
+        visual_score = max(0.0, min(1.0, visual_conf))
 
-        return (
+        # Weighted combination (bounded 0–1)
+        score = (
             0.4 * token_score +
             0.2 * substring_score +
             0.2 * spatial_score +
-            0.2 * recency_score
+            0.2 * visual_score
         )
+
+        return max(0.0, min(1.0, score))
 
     # ==================================================
     # TOKENIZATION
@@ -148,18 +182,20 @@ class SemanticResolver:
 
     def _spatial_prominence(self, entity: Dict[str, Any]) -> float:
 
-        coords = entity.get("coordinates")
+        x = entity.get("x")
+        y = entity.get("y")
 
-        if not coords or not isinstance(coords, dict):
+        if not isinstance(x, (int, float)) or not isinstance(y, (int, float)):
             return 0.0
 
-        x = coords.get("x", 0.5)
-        y = coords.get("y", 0.5)
+        # Assume normalized coordinates [0,1]
+        dx = float(x) - 0.5
+        dy = float(y) - 0.5
 
-        # assume normalized coordinates 0-1
-        center_distance = math.sqrt((x - 0.5) ** 2 + (y - 0.5) ** 2)
+        distance = math.sqrt(dx * dx + dy * dy)
 
-        return max(0.0, 1.0 - center_distance)
+        # Normalize so center = 1.0, edges ≈ 0
+        return max(0.0, 1.0 - min(distance, 1.0))
 
     # ==================================================
     # CONFIDENCE CALIBRATION
@@ -175,13 +211,13 @@ class SemanticResolver:
             return 0.0
 
         if len(scored) == 1:
-            return min(1.0, best_score + 0.1)
+            return max(0.0, min(1.0, best_score))
 
         second_score = scored[1][0]
 
         margin = best_score - second_score
 
-        # strong margin increases confidence
+        # Stable margin-based confidence
         confidence = best_score * (1.0 + margin)
 
         return max(0.0, min(1.0, confidence))
