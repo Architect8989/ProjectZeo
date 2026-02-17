@@ -1,4 +1,5 @@
 import time
+import json
 from typing import Any, Dict, Optional, List
 
 from authority.authority_policy import AuthorityDecision
@@ -22,6 +23,11 @@ from core.cognition.belief_state import BeliefState
 from core.cognition.reasoning_engine import ReasoningEngine
 from core.cognition.action_ranker import ActionRanker
 from core.vision.semantic_resolver import SemanticResolver
+
+
+MAX_PERCEPTION_ENTITIES = 20
+MAX_PERCEPTION_JSON_BYTES = 10_000
+MAX_STAGNANT_ITERS = 12
 
 
 # ==================================================
@@ -60,12 +66,10 @@ def operate_main(
     progress = ProgressTracker(execution_plan)
 
     llm_callable = getattr(planner, "_llm_call", None)
-    if llm_callable is None or not callable(llm_callable):
-        raise RuntimeError(
-            "ExecutionPlanner has no valid _llm_call — cannot construct ReasoningEngine"
-        )
+    if not callable(llm_callable):
+        raise RuntimeError("Planner LLM callable unavailable")
 
-    installer: Optional[AutonomousInstaller] = None
+    installer = None
     if observer is not None:
         installer = AutonomousInstaller(
             observer=observer,
@@ -122,18 +126,14 @@ def _execute_autonomous_loop(
         "objective": execution_plan.objective,
     })
 
-    llm_callable = getattr(planner, "_llm_call", None)
-    if llm_callable is None:
-        raise RuntimeError("Planner LLM callable unavailable")
-
     belief = BeliefState()
-    reasoning_engine = ReasoningEngine(llm_callable)
+    reasoning_engine = ReasoningEngine(planner._llm_call)
     action_ranker = ActionRanker()
     semantic_resolver = SemanticResolver(world_graph)
 
     iteration = 0
+    stagnant_iterations = 0
     MAX_ITERATIONS = max(len(execution_plan.steps) * 5, 25)
-
     previous_snapshot = None
 
     while iteration < MAX_ITERATIONS:
@@ -158,7 +158,30 @@ def _execute_autonomous_loop(
 
         world_snapshot = world_graph.snapshot() if world_graph else {}
 
-        # ---------------- BELIEF UPDATE ----------------
+        # ---------------- BOUND SNAPSHOT (FIX HIGH-2) ----------------
+
+        bounded_snapshot = {}
+        if isinstance(world_snapshot, dict):
+
+            entities = world_snapshot.get("entities", [])
+            if isinstance(entities, list):
+                entities = entities[:MAX_PERCEPTION_ENTITIES]
+
+            bounded_snapshot = {
+                k: v
+                for k, v in world_snapshot.items()
+                if k != "entities"
+            }
+            bounded_snapshot["entities"] = entities
+
+            # Hard byte limit
+            try:
+                if len(json.dumps(bounded_snapshot)) > MAX_PERCEPTION_JSON_BYTES:
+                    bounded_snapshot = {}
+            except Exception:
+                bounded_snapshot = {}
+
+        # ---------------- BELIEF UPDATE (FIX MEDIUM-2) ----------------
 
         delta = None
         if previous_snapshot and world_graph:
@@ -167,17 +190,14 @@ def _execute_autonomous_loop(
 
         previous_snapshot = world_snapshot
 
-        # ---- Bayesian multi-hypothesis update (FIX-15) ----
-
         likelihoods: Dict[str, float] = {}
 
-        if world_snapshot:
-            focused_app = world_snapshot.get("focused_app")
-            entity_count = world_snapshot.get("entity_count", 0)
+        if bounded_snapshot:
+            focused_app = bounded_snapshot.get("focused_app")
+            entity_count = len(bounded_snapshot.get("entities", []))
 
             if focused_app:
-                key = f"app:{str(focused_app).lower().replace(' ', '_')}"
-                likelihoods[key] = 0.9
+                likelihoods[f"app:{str(focused_app).lower()}"] = 0.9
 
             if entity_count > 10:
                 likelihoods["ui_rich"] = 0.8
@@ -188,57 +208,29 @@ def _execute_autonomous_loop(
 
             likelihoods["neutral"] = 0.5 if delta else 0.9
 
-            for hyp in likelihoods:
-                if hyp not in belief.state_probabilities:
-                    belief.state_probabilities[hyp] = 0.1
-
             belief.bayesian_update(likelihoods)
 
         # ---------------- ACTION PROPOSAL ----------------
 
-        candidates: List[Dict[str, Any]] = reasoning_engine.propose_actions(
+        candidates = reasoning_engine.propose_actions(
             objective=execution_plan.objective,
             belief_summary=belief.summary(),
-            perception=world_snapshot,
+            perception=bounded_snapshot,
             k=4,
         )
 
-        if not candidates:
-            raise RuntimeError("No actions proposed")
+        if not isinstance(candidates, list) or not candidates:
+            raise RuntimeError("Invalid or empty action proposal")
 
         selected_action = action_ranker.select(candidates, belief)
+        if not isinstance(selected_action, dict):
+            raise RuntimeError("Invalid action selection")
+
         action_key = action_ranker._action_key(selected_action)
 
-        # ---------------- SEMANTIC GROUNDING ----------------
+        # ---------------- AUTHORITY ----------------
 
-        if selected_action.get("operation") == "click":
-
-            resolution = semantic_resolver.resolve(
-                selected_action.get("target", "")
-            )
-
-            if resolution.get("confidence", 0.0) < 0.55:
-                belief.record_action(action_key, reward=-0.2)
-                continue
-
-            entity = resolution.get("entity")
-            if not isinstance(entity, dict):
-                belief.record_action(action_key, reward=-0.2)
-                continue
-
-            x = entity.get("x")
-            y = entity.get("y")
-
-            if not isinstance(x, (int, float)) or not isinstance(y, (int, float)):
-                belief.record_action(action_key, reward=-0.2)
-                continue
-
-            selected_action["target"] = {"x": float(x), "y": float(y)}
-
-        # ---------------- AUTHORITY CHECK (FIX-25) ----------------
-
-        HIGH_RISK_OPERATIONS = {"command", "install"}
-        is_high_risk = selected_action.get("operation") in HIGH_RISK_OPERATIONS
+        is_high_risk = selected_action.get("operation") in {"command", "install"}
 
         authority = input_arbitrator.evaluate(
             input_event_ts=time.monotonic(),
@@ -265,19 +257,10 @@ def _execute_autonomous_loop(
                 )
 
         except Exception as e:
-            log_warn(
-                f"Action execution failed (iter={iteration}): "
-                f"{type(e).__name__}: {e}"
-            )
-            journal.record({
-                "event": "action_failed",
-                "iteration": iteration,
-                "action_key": action_key,
-                "error": str(e),
-                "error_type": type(e).__name__,
-            })
             belief.record_action(action_key, reward=-0.5)
-            recovery.record_failure(action_key, str(e))
+            stagnant_iterations += 1
+            if stagnant_iterations >= MAX_STAGNANT_ITERS:
+                raise RuntimeError("Execution stagnation detected")
             continue
 
         # ---------------- VERIFICATION ----------------
@@ -293,86 +276,21 @@ def _execute_autonomous_loop(
         reward = float(verification.confidence) - 0.5
         belief.record_action(action_key, reward=reward)
 
-        # ---- Regret update using actual reward (FIX-14) ----
-
-        candidate_keys = [
-            action_ranker._action_key(a) for a in candidates
-        ]
-
-        best_reward = max(
-            belief.expected_utility(k) for k in candidate_keys
-        )
-
-        belief.update_regret(
-            action_key,
-            reward=reward,
-            best_reward=best_reward,
-        )
-
-        belief.commit(action_key, perception_snapshot or {})
-
         if not verification.success:
+            stagnant_iterations += 1
+            if stagnant_iterations >= MAX_STAGNANT_ITERS:
+                raise RuntimeError("Execution stagnation detected")
             continue
 
+        stagnant_iterations = 0
         belief.progress_score += verification.progress_score
-
-        # ---------------- DONE CHECK ----------------
 
         if selected_action.get("operation") == "done":
             journal.record({"event": "execution_complete"})
             return
 
-        # ---- Convergence guard (FIX-16) ----
-
-        if belief.converged(
-            min_iterations=3,
-            current_iteration=iteration,
-        ):
+        if belief.converged(min_iterations=3, current_iteration=iteration):
             journal.record({"event": "execution_converged"})
             return
 
     journal.record({"event": "execution_complete"})
-
-
-# ==================================================
-# DECISION EXECUTION
-# ==================================================
-
-def _execute_decision(
-    *,
-    decision: Dict[str, Any],
-    execution_plan: ExecutionPlan,
-    os_backend: OperatingSystem,
-    accessibility_backend: Optional[AccessibilityBackend],
-    installer: Optional[AutonomousInstaller],
-) -> Dict[str, Any]:
-
-    op = decision.get("operation")
-
-    if op == "click":
-        target = decision.get("target")
-        if not isinstance(target, dict):
-            raise RuntimeError("Invalid click target")
-        os_backend.click(target)
-        return {"status": "clicked"}
-
-    if op == "type":
-        os_backend.type_text(decision.get("text", ""))
-        return {"status": "typed"}
-
-    if op == "hotkey":
-        os_backend.press_keys(decision.get("keys", []))
-        return {"status": "hotkey"}
-
-    if op == "command":
-        return os_backend.execute_command(decision.get("command"))
-
-    if op == "install":
-        if installer is None:
-            raise RuntimeError("Installer unavailable")
-        return installer.install_tool(decision.get("tool"))
-
-    if op == "done":
-        return {"status": "complete"}
-
-    raise RuntimeError(f"Unknown operation: {op}")
