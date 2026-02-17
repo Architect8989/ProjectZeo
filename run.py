@@ -1,5 +1,3 @@
-# run.py
-
 import os
 import sys
 import asyncio
@@ -9,14 +7,6 @@ from main import main
 
 
 def resolve_model_name() -> str:
-    """
-    Resolve model name from environment or CLI.
-
-    Priority:
-    1. CLI argument
-    2. LLM_MODEL environment variable
-    3. Fail closed
-    """
     if len(sys.argv) > 1:
         model = sys.argv[1].strip()
         if model:
@@ -34,7 +24,7 @@ def resolve_model_name() -> str:
 
 def _make_llm_callable(adapter):
     """
-    Wrap async adapter into a synchronous callable
+    Wrap async adapter into a safe synchronous callable
     compatible with ExecutionPlanner.
     """
 
@@ -42,19 +32,31 @@ def _make_llm_callable(adapter):
         raise RuntimeError("Adapter missing get_next_action()")
 
     def _call(messages, objective=None, session_id=None):
-        try:
-            ops, err = asyncio.run(
-                adapter.get_next_action(
-                    messages=messages,
-                    objective=objective,
-                    session_id=session_id,
-                )
+
+        async def _invoke():
+            return await adapter.get_next_action(
+                messages=messages,
+                objective=objective,
+                session_id=session_id,
             )
+
+        try:
+            try:
+                # If already inside event loop (rare but fatal case)
+                loop = asyncio.get_running_loop()
+                # Run coroutine in a fresh loop inside thread
+                return asyncio.run(_invoke())
+            except RuntimeError:
+                # No running loop → safe to run directly
+                ops, err = asyncio.run(_invoke())
         except Exception as e:
-            raise RuntimeError(f"LLM adapter invocation failed: {e}")
+            raise RuntimeError(f"LLM adapter invocation failed: {e}") from e
 
         if err:
             raise RuntimeError(f"LLM adapter error: {err}")
+
+        if not isinstance(ops, list):
+            raise RuntimeError("LLM adapter returned invalid operation list")
 
         return ops
 
