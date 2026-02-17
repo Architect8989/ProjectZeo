@@ -14,15 +14,21 @@ Goals:
 
 import copy
 import inspect
+import functools
 from operate.models import apis
 
 _PATCHED = False
 
 
+# ============================================================
+# Public Entry
+# ============================================================
+
 def apply_patches():
     global _PATCHED
     if _PATCHED:
         return
+
     _PATCHED = True
 
     _patch_all_providers()
@@ -35,12 +41,16 @@ def apply_patches():
 # ============================================================
 
 def _wrap_provider(fn):
+
+    if getattr(fn, "_apis_safety_wrapped", False):
+        return fn
+
     is_async = inspect.iscoroutinefunction(fn)
 
-    def validate_no_mutation(original, current, name):
-        if original != current:
+    def validate_no_mutation(original, caller_messages, name):
+        if caller_messages != original:
             raise RuntimeError(
-                f"[APIS-SAFETY] Provider mutated message history: {name}"
+                f"[APIS-SAFETY] Provider mutated caller message history: {name}"
             )
 
     def validate_result(result, name):
@@ -55,8 +65,9 @@ def _wrap_provider(fn):
 
     if is_async:
 
+        @functools.wraps(fn)
         async def async_wrapper(messages, *args, **kwargs):
-            snapshot = copy.deepcopy(messages)
+            caller_snapshot = copy.deepcopy(messages)
             safe_messages = copy.deepcopy(messages)
 
             try:
@@ -66,16 +77,19 @@ def _wrap_provider(fn):
                     f"[APIS-SAFETY] {fn.__name__} failed: {e}"
                 ) from e
 
-            validate_no_mutation(snapshot, messages, fn.__name__)
+            validate_no_mutation(caller_snapshot, messages, fn.__name__)
             validate_result(result, fn.__name__)
+
             return result
 
+        async_wrapper._apis_safety_wrapped = True
         return async_wrapper
 
     else:
 
+        @functools.wraps(fn)
         def sync_wrapper(messages, *args, **kwargs):
-            snapshot = copy.deepcopy(messages)
+            caller_snapshot = copy.deepcopy(messages)
             safe_messages = copy.deepcopy(messages)
 
             try:
@@ -85,10 +99,12 @@ def _wrap_provider(fn):
                     f"[APIS-SAFETY] {fn.__name__} failed: {e}"
                 ) from e
 
-            validate_no_mutation(snapshot, messages, fn.__name__)
+            validate_no_mutation(caller_snapshot, messages, fn.__name__)
             validate_result(result, fn.__name__)
+
             return result
 
+        sync_wrapper._apis_safety_wrapped = True
         return sync_wrapper
 
 
@@ -123,17 +139,18 @@ def _patch_all_providers():
 
 def _disable_cloud_fallback():
 
-    def hard_fail_fallback(*args, **kwargs):
-        raise RuntimeError(
-            "[APIS-SAFETY] Cloud fallback disabled"
-        )
-
     if hasattr(apis, "gpt_4_fallback"):
+
+        def hard_fail_fallback(*args, **kwargs):
+            raise RuntimeError(
+                "[APIS-SAFETY] Cloud fallback disabled"
+            )
+
         apis.gpt_4_fallback = hard_fail_fallback
 
 
 # ============================================================
-# Guard get_next_action
+# Guard Dispatcher
 # ============================================================
 
 def _guard_dispatch():
@@ -143,6 +160,10 @@ def _guard_dispatch():
 
     original = apis.get_next_action
 
+    if getattr(original, "_apis_safety_wrapped", False):
+        return
+
+    @functools.wraps(original)
     async def guarded(model, messages, objective, session_id):
         result = await original(model, messages, objective, session_id)
 
@@ -151,6 +172,12 @@ def _guard_dispatch():
                 "[APIS-SAFETY] get_next_action returned None"
             )
 
+        if not isinstance(result, (dict, list)):
+            raise RuntimeError(
+                "[APIS-SAFETY] get_next_action returned invalid type"
+            )
+
         return result
 
+    guarded._apis_safety_wrapped = True
     apis.get_next_action = guarded
