@@ -3,9 +3,11 @@ import json
 import os
 import re
 import uuid
+import threading
 from typing import List, Tuple, Optional
 
 import ollama
+import httpx
 from PIL import Image
 
 from operate.config import Config
@@ -20,22 +22,49 @@ from operate.utils.screenshot import capture_screen_with_cursor, compress_screen
 
 config = Config()
 
-# Persistent OCR reader (avoids reload overhead)
-_OCR_READER = None
+# ==========================================================
+# THREAD-SAFE OCR READER
+# ==========================================================
 
+_OCR_READER = None
+_OCR_LOCK = threading.Lock()
+
+
+def _get_ocr_reader():
+    global _OCR_READER
+    if _OCR_READER is None:
+        with _OCR_LOCK:
+            if _OCR_READER is None:
+                import easyocr
+                _OCR_READER = easyocr.Reader(["en"])
+    return _OCR_READER
+
+
+# ==========================================================
+# ADAPTER
+# ==========================================================
 
 class QwenOllamaAdapter:
     """
     Local-only Qwen-VL adapter.
-    Replaces multi-model apis.py usage.
+    Hardened version.
     """
 
     def __init__(self, model_name: str = "qwen2.5-vl:7b-instruct"):
         self.model_name = model_name
-        self._client = ollama.Client()
+
+        # Explicit network timeouts (prevents indefinite hangs)
+        self._client = ollama.Client(
+            timeout=httpx.Timeout(
+                connect=5.0,
+                read=25.0,
+                write=5.0,
+                pool=2.0,
+            )
+        )
 
     # ==========================================================
-    # PUBLIC ENTRY (matches apis.py contract)
+    # PUBLIC ENTRY
     # ==========================================================
 
     async def get_next_action(
@@ -44,9 +73,6 @@ class QwenOllamaAdapter:
         objective: str,
         session_id: Optional[str] = None,
     ) -> Tuple[Optional[List[dict]], Optional[Exception]]:
-        """
-        Returns: (operation_list, error_object)
-        """
 
         local_messages = list(messages)
 
@@ -69,13 +95,15 @@ class QwenOllamaAdapter:
         objective: str,
     ) -> List[dict]:
 
-        # Inject/confirm system prompt (pure copy)
         local_msgs = self._confirm_system_prompt(messages, objective)
 
-        raw_screenshot = self._prepare_unique_screenshot()
-        jpeg_screenshot = raw_screenshot.replace(".png", ".jpeg")
+        raw_screenshot = None
+        jpeg_screenshot = None
 
         try:
+            raw_screenshot = self._prepare_unique_screenshot()
+            jpeg_screenshot = raw_screenshot.replace(".png", ".jpeg")
+
             compress_screenshot(raw_screenshot, jpeg_screenshot)
 
             with open(jpeg_screenshot, "rb") as f:
@@ -107,11 +135,12 @@ class QwenOllamaAdapter:
                 options={"temperature": 0},
             )
 
-            operations = self._parse_and_normalize_json(
-                response["message"]["content"]
-            )
+            content = response.get("message", {}).get("content")
+            if not isinstance(content, str):
+                raise RuntimeError("Unexpected Ollama response shape")
 
-            # OCR coordinate resolution
+            operations = self._parse_and_normalize_json(content)
+
             self._resolve_click_coordinates(
                 operations,
                 jpeg_screenshot,
@@ -120,9 +149,13 @@ class QwenOllamaAdapter:
             return operations
 
         finally:
+            # Crash-safe cleanup
             for p in (raw_screenshot, jpeg_screenshot):
-                if os.path.exists(p):
-                    os.remove(p)
+                try:
+                    if p and os.path.exists(p):
+                        os.remove(p)
+                except OSError:
+                    pass
 
     # ==========================================================
     # OCR RESOLUTION
@@ -133,29 +166,29 @@ class QwenOllamaAdapter:
         operations: List[dict],
         screenshot_path: str,
     ):
-        global _OCR_READER
 
-        import easyocr
-
-        if _OCR_READER is None:
-            _OCR_READER = easyocr.Reader(["en"])
-
-        ocr_result = _OCR_READER.readtext(screenshot_path)
+        reader = _get_ocr_reader()
+        ocr_result = reader.readtext(screenshot_path)
 
         for op in operations:
             if op.get("operation") == "click" and "text" in op:
-                idx = get_text_element(
-                    ocr_result,
-                    op["text"],
-                    screenshot_path,
-                )
-                coords = get_text_coordinates(
-                    ocr_result,
-                    idx,
-                    screenshot_path,
-                )
-                op["x"] = coords["x"]
-                op["y"] = coords["y"]
+                try:
+                    idx = get_text_element(
+                        ocr_result,
+                        op["text"],
+                        screenshot_path,
+                    )
+                    coords = get_text_coordinates(
+                        ocr_result,
+                        idx,
+                        screenshot_path,
+                    )
+                    if isinstance(coords, dict):
+                        op["x"] = coords.get("x")
+                        op["y"] = coords.get("y")
+                except Exception:
+                    # Fail closed on coordinate resolution
+                    continue
 
     # ==========================================================
     # HELPERS
@@ -175,7 +208,7 @@ class QwenOllamaAdapter:
         }
 
         if local and local[0].get("role") == "system":
-            local[0] = system_message
+            local[0]["content"] = system_message["content"]
         else:
             local.insert(0, system_message)
 
@@ -194,7 +227,6 @@ class QwenOllamaAdapter:
     def _parse_and_normalize_json(self, text: str) -> List[dict]:
         text = text.strip()
 
-        # Strip markdown fences
         text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.MULTILINE)
         text = re.sub(r"\s*```$", "", text, flags=re.MULTILINE).strip()
 
@@ -217,4 +249,4 @@ class QwenOllamaAdapter:
 
         raise RuntimeError(
             f"No valid JSON structure found. Sample: {text[:80]}"
-)
+        )
