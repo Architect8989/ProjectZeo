@@ -1,4 +1,5 @@
 import time
+import json
 from typing import Dict, Any, Optional
 
 from observer.observer_core import ObserverCore
@@ -13,12 +14,12 @@ class InstallationError(RuntimeError):
 
 class AutonomousInstaller:
     """
-    Human-style installer.
+    Pure LLM-driven installer.
 
     HARD CONTRACT:
     - Browser-driven only
-    - No silent shell installs
-    - Deterministic wait logic
+    - No shell installs
+    - LLM decides actions dynamically
     - Verification is authoritative
     - Idempotent
     - Fail-closed
@@ -27,7 +28,7 @@ class AutonomousInstaller:
     MAX_INSTALL_TIME = 15 * 60
     UI_SETTLE_DELAY = 1.0
     PAGE_LOAD_TIMEOUT = 10.0
-    VERIFICATION_POLL_INTERVAL = 5.0
+    MAX_ITERATIONS = 120
 
     REQUIRED_FIELDS = {"name", "official_url"}
 
@@ -36,6 +37,7 @@ class AutonomousInstaller:
         *,
         observer: ObserverCore,
         os_backend: OperatingSystem,
+        llm_callable,
     ):
         if not isinstance(observer, ObserverCore):
             raise InstallationError("Observer required")
@@ -43,8 +45,12 @@ class AutonomousInstaller:
         if not isinstance(os_backend, OperatingSystem):
             raise InstallationError("OperatingSystem backend required")
 
+        if not callable(llm_callable):
+            raise InstallationError("LLM callable required")
+
         self._observer = observer
         self._os = os_backend
+        self._llm = llm_callable
         self._verifier = StepVerifier()
 
     # =================================================
@@ -52,100 +58,145 @@ class AutonomousInstaller:
     # =================================================
 
     def install_tool(self, tool: Dict[str, Any]) -> None:
-        """
-        Install tool via deterministic browser workflow.
-        """
 
         self._validate_tool_schema(tool)
 
         name = tool["name"]
         url = tool["official_url"]
 
-        # --------------------------------------------------
-        # IDENTITY CHECK (STRICT)
-        # --------------------------------------------------
-
         if self._is_already_installed(tool):
             return
-
-        start_ts = time.time()
-
-        # --------------------------------------------------
-        # ENVIRONMENT SAFETY CHECK
-        # --------------------------------------------------
 
         if not self._observer.is_healthy():
             raise InstallationError("Observer unhealthy — aborting install")
 
-        # --------------------------------------------------
-        # BROWSER WORKFLOW
-        # --------------------------------------------------
+        start_ts = time.time()
 
         self._open_browser()
         self._wait_ui()
 
         self._navigate(url)
-        self._wait_for_page_change()
+        time.sleep(self.PAGE_LOAD_TIMEOUT)
 
-        # --------------------------------------------------
-        # INSTALL WAIT LOOP
-        # --------------------------------------------------
+        iteration = 0
 
-        while time.time() - start_ts < self.MAX_INSTALL_TIME:
+        while iteration < self.MAX_ITERATIONS:
+
+            if time.time() - start_ts > self.MAX_INSTALL_TIME:
+                break
 
             if not self._observer.is_healthy():
                 raise InstallationError("Observer lost during install")
 
             if self._is_already_installed(tool):
-                return  # VERIFIED SUCCESS
+                return
 
-            time.sleep(self.VERIFICATION_POLL_INTERVAL)
+            screen = self._observer.snapshot()
+            perception = screen.get("perception")
 
-        raise InstallationError(
-            f"Installation timed out without verification: {name}"
+            action = self._decide_next_action(
+                tool_name=name,
+                url=url,
+                perception=perception,
+            )
+
+            if action.get("operation") == "done":
+                if self._is_already_installed(tool):
+                    return
+                raise InstallationError("LLM declared done but verification failed")
+
+            self._execute_action(action)
+
+            time.sleep(self.UI_SETTLE_DELAY)
+
+            iteration += 1
+
+        raise InstallationError(f"Installation timed out: {name}")
+
+    # =================================================
+    # LLM DECISION LOOP
+    # =================================================
+
+    def _decide_next_action(
+        self,
+        *,
+        tool_name: str,
+        url: str,
+        perception: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+
+        prompt = {
+            "role": "user",
+            "content": f"""
+Objective: Install {tool_name}
+
+Current URL: {url}
+
+Screen perception:
+{json.dumps(perception)}
+
+Return JSON ONLY:
+{{
+  "operation": "click|type|hotkey|wait|done",
+  "target": "element description (if click)",
+  "text": "text to type (if type)",
+  "keys": ["ctrl","c"] (if hotkey)
+}}
+"""
+        }
+
+        response = self._llm(
+            messages=[prompt],
+            objective=f"Install {tool_name}",
+            session_id="installer",
         )
 
+        if not isinstance(response, dict):
+            raise InstallationError("LLM returned invalid decision format")
+
+        return response
+
     # =================================================
-    # INTERNAL ACTIONS
+    # ACTION EXECUTION
     # =================================================
 
-    def _open_browser(self) -> None:
-        try:
-            self._os.open_browser()
-        except Exception as e:
-            raise InstallationError(
-                f"Failed to open browser: {e}"
-            ) from e
+    def _execute_action(self, action: Dict[str, Any]) -> None:
 
-    def _navigate(self, url: str) -> None:
-        try:
-            self._os.focus_address_bar()
-            self._os.press(["ctrl", "a"])
-            self._os.write(url)
-            self._os.press(["enter"])
-        except Exception as e:
-            raise InstallationError(
-                f"Navigation failed: {e}"
-            ) from e
+        op = action.get("operation")
 
-    def _wait_for_page_change(self) -> None:
-        time.sleep(self.PAGE_LOAD_TIMEOUT)
+        if op == "click":
+            target = action.get("target")
+            if not target:
+                raise InstallationError("Missing click target")
+            self._os.click(target)
+            return
+
+        if op == "type":
+            text = action.get("text", "")
+            self._os.type_text(text)
+            return
+
+        if op == "hotkey":
+            keys = action.get("keys", [])
+            self._os.press_keys(keys)
+            return
+
+        if op == "wait":
+            time.sleep(self.UI_SETTLE_DELAY)
+            return
+
+        raise InstallationError(f"Unsupported installer operation: {op}")
 
     # =================================================
     # VERIFICATION
     # =================================================
 
     def _is_already_installed(self, tool: Dict[str, Any]) -> bool:
-        """
-        Single authoritative existence check.
-        """
 
         version_cmd = tool.get("version_command")
         min_version = tool.get("min_version")
 
         if not isinstance(version_cmd, str) or not version_cmd.strip():
-            # If no deterministic verification command exists,
-            # installation cannot be trusted.
             return False
 
         step = ExecutionStep(
@@ -169,10 +220,33 @@ class AutonomousInstaller:
             return False
 
     # =================================================
+    # BROWSER UTILITIES
+    # =================================================
+
+    def _open_browser(self) -> None:
+        try:
+            self._os.open_browser()
+        except Exception as e:
+            raise InstallationError(f"Failed to open browser: {e}") from e
+
+    def _navigate(self, url: str) -> None:
+        try:
+            self._os.focus_address_bar()
+            self._os.press_keys(["ctrl", "a"])
+            self._os.type_text(url)
+            self._os.press_keys(["enter"])
+        except Exception as e:
+            raise InstallationError(f"Navigation failed: {e}") from e
+
+    def _wait_ui(self) -> None:
+        time.sleep(self.UI_SETTLE_DELAY)
+
+    # =================================================
     # VALIDATION
     # =================================================
 
     def _validate_tool_schema(self, tool: Dict[str, Any]) -> None:
+
         if not isinstance(tool, dict):
             raise InstallationError("Tool must be dictionary")
 
@@ -185,10 +259,3 @@ class AutonomousInstaller:
 
         if not isinstance(tool.get("official_url"), str) or not tool["official_url"].strip():
             raise InstallationError("Invalid official_url")
-
-    # =================================================
-    # UTIL
-    # =================================================
-
-    def _wait_ui(self) -> None:
-        time.sleep(self.UI_SETTLE_DELAY)
