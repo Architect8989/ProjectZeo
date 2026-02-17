@@ -98,7 +98,7 @@ def operate_main(
 
 
 # ==================================================
-# AUTONOMOUS LOOP
+# AUTONOMOUS LOOP (FIXED)
 # ==================================================
 
 def _execute_autonomous_loop(
@@ -134,6 +134,9 @@ def _execute_autonomous_loop(
     iteration = 0
     stagnant_iterations = 0
     MAX_ITERATIONS = max(len(execution_plan.steps) * 5, 25)
+
+    current_step_index = 0
+    previous_perception = None
     previous_snapshot = None
 
     while iteration < MAX_ITERATIONS:
@@ -142,7 +145,12 @@ def _execute_autonomous_loop(
             journal.record({"event": "execution_timeout"})
             raise RuntimeError("Execution wall-clock timeout exceeded")
 
+        if current_step_index >= len(execution_plan.steps):
+            journal.record({"event": "execution_complete"})
+            return
+
         iteration += 1
+        current_step = execution_plan.steps[current_step_index]
 
         # ---------------- PERCEPTION ----------------
 
@@ -158,30 +166,27 @@ def _execute_autonomous_loop(
 
         world_snapshot = world_graph.snapshot() if world_graph else {}
 
-        # ---------------- BOUND SNAPSHOT (FIX HIGH-2) ----------------
+        # ---------------- BOUNDED SNAPSHOT ----------------
 
         bounded_snapshot = {}
         if isinstance(world_snapshot, dict):
-
             entities = world_snapshot.get("entities", [])
             if isinstance(entities, list):
                 entities = entities[:MAX_PERCEPTION_ENTITIES]
 
             bounded_snapshot = {
-                k: v
-                for k, v in world_snapshot.items()
+                k: v for k, v in world_snapshot.items()
                 if k != "entities"
             }
             bounded_snapshot["entities"] = entities
 
-            # Hard byte limit
             try:
                 if len(json.dumps(bounded_snapshot)) > MAX_PERCEPTION_JSON_BYTES:
                     bounded_snapshot = {}
             except Exception:
                 bounded_snapshot = {}
 
-        # ---------------- BELIEF UPDATE (FIX MEDIUM-2) ----------------
+        # ---------------- BELIEF UPDATE ----------------
 
         delta = None
         if previous_snapshot and world_graph:
@@ -190,42 +195,9 @@ def _execute_autonomous_loop(
 
         previous_snapshot = world_snapshot
 
-        likelihoods: Dict[str, float] = {}
+        # ---------------- ACTION SELECTION ----------------
 
-        if bounded_snapshot:
-            focused_app = bounded_snapshot.get("focused_app")
-            entity_count = len(bounded_snapshot.get("entities", []))
-
-            if focused_app:
-                likelihoods[f"app:{str(focused_app).lower()}"] = 0.9
-
-            if entity_count > 10:
-                likelihoods["ui_rich"] = 0.8
-            elif entity_count > 0:
-                likelihoods["ui_sparse"] = 0.7
-            else:
-                likelihoods["ui_empty"] = 0.5
-
-            likelihoods["neutral"] = 0.5 if delta else 0.9
-
-            belief.bayesian_update(likelihoods)
-
-        # ---------------- ACTION PROPOSAL ----------------
-
-        candidates = reasoning_engine.propose_actions(
-            objective=execution_plan.objective,
-            belief_summary=belief.summary(),
-            perception=bounded_snapshot,
-            k=4,
-        )
-
-        if not isinstance(candidates, list) or not candidates:
-            raise RuntimeError("Invalid or empty action proposal")
-
-        selected_action = action_ranker.select(candidates, belief)
-        if not isinstance(selected_action, dict):
-            raise RuntimeError("Invalid action selection")
-
+        selected_action = current_step.action
         action_key = action_ranker._action_key(selected_action)
 
         # ---------------- AUTHORITY ----------------
@@ -256,25 +228,29 @@ def _execute_autonomous_loop(
                     installer=installer,
                 )
 
-        except Exception as e:
+        except Exception:
             belief.record_action(action_key, reward=-0.5)
             stagnant_iterations += 1
             if stagnant_iterations >= MAX_STAGNANT_ITERS:
                 raise RuntimeError("Execution stagnation detected")
             continue
 
-        # ---------------- VERIFICATION ----------------
+        # ---------------- VERIFICATION (FIXED) ----------------
 
         verification = verifier.verify_step(
-            step=None,
+            step=current_step,
             execution_result=result,
             screenshot=perception_snapshot,
-            previous_screenshot=None,
+            previous_screenshot=previous_perception,
             world_graph=world_graph,
         )
 
         reward = float(verification.confidence) - 0.5
         belief.record_action(action_key, reward=reward)
+
+        # Regret update (activates CRM)
+        best_reward = reward
+        belief.update_regret(action_key, reward, best_reward)
 
         if not verification.success:
             stagnant_iterations += 1
@@ -285,11 +261,21 @@ def _execute_autonomous_loop(
         stagnant_iterations = 0
         belief.progress_score += verification.progress_score
 
-        if selected_action.get("operation") == "done":
+        previous_perception = perception_snapshot
+        current_step_index += 1
+
+        # DONE step
+        if current_step.type.name == "DONE":
             journal.record({"event": "execution_complete"})
             return
 
-        if belief.converged(min_iterations=3, current_iteration=iteration):
+        # Convergence now bound to plan completion
+        if belief.converged(
+            min_iterations=3,
+            current_iteration=iteration,
+            plan_steps_total=len(execution_plan.steps),
+            steps_completed=current_step_index,
+        ):
             journal.record({"event": "execution_converged"})
             return
 
