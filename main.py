@@ -29,7 +29,7 @@ HEARTBEAT_INTERVAL = 2.0
 MAX_TASK_SECONDS = 90 * 60
 MAX_REPLANS = 3
 
-TASK_START = None
+TASK_START: Optional[float] = None
 
 
 # ==================================================
@@ -79,6 +79,21 @@ def _ingest_latest_perception(observer, world_graph):
 
 
 # ==================================================
+# TIMEOUT ENFORCEMENT
+# ==================================================
+
+def _enforce_task_timeout(os_backend, auth_state):
+    global TASK_START
+
+    if TASK_START is None:
+        return
+
+    if (time.time() - TASK_START) > MAX_TASK_SECONDS:
+        _force_safe_shutdown(os_backend, auth_state, "task_timeout")
+        os._exit(1)
+
+
+# ==================================================
 # MAIN LOOP
 # ==================================================
 
@@ -124,7 +139,6 @@ def main(llm_callable: Callable):
     vision_runtime.start()
     observer_loop.start()
 
-    # Warmup perception
     warmup_deadline = time.time() + 5.0
     while time.time() < warmup_deadline:
         if observer.is_healthy() and vision_runtime.is_healthy():
@@ -151,6 +165,8 @@ def main(llm_callable: Callable):
 
         try:
 
+            _enforce_task_timeout(os_backend, auth_state)
+
             mode.update_observer_health(observer.is_healthy())
             mode.update_vision_status(vision_runtime.is_healthy())
 
@@ -167,8 +183,6 @@ def main(llm_callable: Callable):
                     raise RuntimeError("Missing snapshot")
 
                 _ingest_latest_perception(observer, world_graph)
-
-                # ---------------- PLANNING ----------------
 
                 mode.begin_planning()
 
@@ -205,14 +219,13 @@ def main(llm_callable: Callable):
                 mode.execute()
                 consumed_intent = mode.consume_intent()
 
-                # ---------------- EXECUTION LOOP ----------------
-
                 try:
 
                     while True:
 
-                        try:
+                        _enforce_task_timeout(os_backend, auth_state)
 
+                        try:
                             operate_main(
                                 terminal_prompt=consumed_intent,
                                 execution_plan=execution_plan,
@@ -224,6 +237,8 @@ def main(llm_callable: Callable):
 
                         except RuntimeError as e:
 
+                            _enforce_task_timeout(os_backend, auth_state)
+
                             if str(e) != "REPLAN_REQUIRED":
                                 raise
 
@@ -231,18 +246,13 @@ def main(llm_callable: Callable):
                             if replan_count > MAX_REPLANS:
                                 raise RuntimeError("Max replans exceeded")
 
-                            # EXECUTING → OBSERVER
                             mode.force_observer()
-
-                            # Re-arm with same intent + same snapshot
                             mode.attach_snapshot(snapshot_id)
                             mode.arm(consumed_intent)
 
-                            # Fresh perception
                             _ingest_latest_perception(observer, world_graph)
                             planner.update_world_snapshot(world_graph.snapshot())
 
-                            # PLANNING again
                             mode.begin_planning()
 
                             execution_plan = planner.create_plan(
@@ -262,10 +272,7 @@ def main(llm_callable: Callable):
 
                 finally:
 
-                    # ---------------- RESTORATION ----------------
-
                     mode.begin_restoration()
-
                     restore_provider.restore_snapshot(snapshot_id)
 
                     auth_state.persist(
@@ -281,9 +288,6 @@ def main(llm_callable: Callable):
                     observer.reset_for_new_task()
                     world_graph.reset()
                     TASK_START = None
-
-            if TASK_START and (time.time() - TASK_START) > MAX_TASK_SECONDS:
-                raise RuntimeError("task_timeout")
 
         except ObserverBlindnessError:
             _force_safe_shutdown(os_backend, auth_state, "observer_blindness")
