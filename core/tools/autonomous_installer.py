@@ -6,6 +6,7 @@ from observer.observer_core import ObserverCore
 from operate.utils.operating_system import OperatingSystem
 from core.verification.step_verifier import StepVerifier, VerificationError
 from core.schemas.execution_plan import ExecutionStep, StepType
+from core.cognition.reasoning_engine import ReasoningEngine
 
 
 class InstallationError(RuntimeError):
@@ -29,6 +30,7 @@ class AutonomousInstaller:
     UI_SETTLE_DELAY = 1.0
     PAGE_LOAD_TIMEOUT = 10.0
     MAX_ITERATIONS = 120
+    MAX_PERCEPTION_BYTES = 10_000
 
     REQUIRED_FIELDS = {"name", "official_url"}
 
@@ -52,6 +54,9 @@ class AutonomousInstaller:
         self._os = os_backend
         self._llm = llm_callable
         self._verifier = StepVerifier()
+
+        # Sanitizer without full engine construction
+        self._sanitizer = ReasoningEngine.__new__(ReasoningEngine)
 
     # =================================================
     # PUBLIC API
@@ -114,7 +119,7 @@ class AutonomousInstaller:
         raise InstallationError(f"Installation timed out: {name}")
 
     # =================================================
-    # LLM DECISION LOOP
+    # LLM DECISION LOOP (SANITIZED + FAIL-CLOSED)
     # =================================================
 
     def _decide_next_action(
@@ -125,24 +130,23 @@ class AutonomousInstaller:
         perception: Optional[Dict[str, Any]],
     ) -> Dict[str, Any]:
 
+        safe_perception = self._sanitize_perception(perception)
+
         prompt = {
             "role": "user",
-            "content": f"""
-Objective: Install {tool_name}
-
-Current URL: {url}
-
-Screen perception:
-{json.dumps(perception)}
-
-Return JSON ONLY:
-{{
-  "operation": "click|type|hotkey|wait|done",
-  "target": "element description (if click)",
-  "text": "text to type (if type)",
-  "keys": ["ctrl","c"] (if hotkey)
-}}
-"""
+            "content": (
+                f"Objective: Install {tool_name}\n\n"
+                f"Current URL: {url}\n\n"
+                f"Screen perception:\n"
+                f"{json.dumps(safe_perception)}\n\n"
+                "Return JSON ONLY:\n"
+                "{\n"
+                '  "operation": "click|type|hotkey|wait|done",\n'
+                '  "target": "element description (if click)",\n'
+                '  "text": "text to type (if type)",\n'
+                '  "keys": ["ctrl","c"] (if hotkey)\n'
+                "}"
+            ),
         }
 
         response = self._llm(
@@ -151,10 +155,64 @@ Return JSON ONLY:
             session_id="installer",
         )
 
+        decision = self._normalize_llm_response(response)
+
+        self._validate_action_schema(decision)
+
+        return decision
+
+    # =================================================
+    # PERCEPTION SANITIZATION
+    # =================================================
+
+    def _sanitize_perception(
+        self,
+        perception: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+
+        if not isinstance(perception, dict):
+            return {}
+
+        try:
+            safe = self._sanitizer._sanitize_perception(perception)
+        except Exception:
+            return {}
+
+        try:
+            serialized = json.dumps(safe)
+            if len(serialized) > self.MAX_PERCEPTION_BYTES:
+                return {}
+        except Exception:
+            return {}
+
+        return safe
+
+    # =================================================
+    # RESPONSE NORMALIZATION
+    # =================================================
+
+    def _normalize_llm_response(self, response: Any) -> Dict[str, Any]:
+
+        if isinstance(response, list):
+            if not response:
+                raise InstallationError("LLM returned empty list")
+            response = response[0]
+
         if not isinstance(response, dict):
             raise InstallationError("LLM returned invalid decision format")
 
         return response
+
+    def _validate_action_schema(self, action: Dict[str, Any]) -> None:
+
+        if "operation" not in action:
+            raise InstallationError("Installer decision missing operation")
+
+        allowed = {"click", "type", "hotkey", "wait", "done"}
+        if action["operation"] not in allowed:
+            raise InstallationError(
+                f"Unsupported installer operation: {action['operation']}"
+            )
 
     # =================================================
     # ACTION EXECUTION
@@ -166,18 +224,22 @@ Return JSON ONLY:
 
         if op == "click":
             target = action.get("target")
-            if not target:
+            if not isinstance(target, str) or not target.strip():
                 raise InstallationError("Missing click target")
             self._os.click(target)
             return
 
         if op == "type":
             text = action.get("text", "")
+            if not isinstance(text, str):
+                raise InstallationError("Invalid type text")
             self._os.type_text(text)
             return
 
         if op == "hotkey":
             keys = action.get("keys", [])
+            if not isinstance(keys, list):
+                raise InstallationError("Invalid hotkey format")
             self._os.press_keys(keys)
             return
 
