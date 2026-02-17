@@ -1,37 +1,18 @@
 from typing import Dict, Any, List, Tuple
 import math
+import re
 
 
 class SemanticResolver:
     """
     Grounded semantic resolver.
 
-    Converts natural-language target description
-    into ranked world_graph entity candidates.
-
-    Assumes world_graph.snapshot() returns:
-
-    {
-        "timestamp": ...,
-        "focused_app": ...,
-        "entities": [ {entity_dict}, ... ],
-        "entity_count": ...
-    }
-
-    Entity schema (expected):
-        {
-            "id": str,
-            "type": str,
-            "text": str,
-            "x": float (0-1),
-            "y": float (0-1),
-            "interactable": bool,
-            "confidence": float,
-            ...
-        }
+    Deterministic, bounded, schema-safe resolution of
+    natural-language description to world_graph entities.
     """
 
     MIN_CONFIDENCE = 0.55
+    MAX_ALTERNATIVES = 2
 
     def __init__(self, world_graph):
         self._world_graph = world_graph
@@ -45,14 +26,15 @@ class SemanticResolver:
         if not isinstance(description, str) or not description.strip():
             return {"confidence": 0.0}
 
-        snapshot = self._world_graph.snapshot() or {}
-        entity_list = snapshot.get("entities", [])
+        snapshot = self._world_graph.snapshot()
+        if not isinstance(snapshot, dict):
+            return {"confidence": 0.0}
 
+        entity_list = snapshot.get("entities", [])
         if not isinstance(entity_list, list) or not entity_list:
             return {"confidence": 0.0}
 
         candidates = self._extract_interactive_entities(entity_list)
-
         if not candidates:
             return {"confidence": 0.0}
 
@@ -70,9 +52,13 @@ class SemanticResolver:
 
         best_score, best_entity = scored[0]
 
+        # Ensure resolved entity has usable coordinates
+        if not self._has_valid_coordinates(best_entity):
+            return {"confidence": 0.0}
+
         alternatives = [
             {"entity": e, "score": s}
-            for s, e in scored[1:3]
+            for s, e in scored[1:self.MAX_ALTERNATIVES + 1]
         ]
 
         confidence = self._calibrate_confidence(best_score, scored)
@@ -98,7 +84,7 @@ class SemanticResolver:
         entity_list: List[Dict[str, Any]],
     ) -> List[Dict[str, Any]]:
 
-        interactive = []
+        interactive: List[Dict[str, Any]] = []
 
         for entity in entity_list:
 
@@ -129,7 +115,7 @@ class SemanticResolver:
 
     def _score(self, description: str, entity: Dict[str, Any]) -> float:
 
-        label = entity.get("text", "") or ""
+        label = entity.get("text", "")
         if not isinstance(label, str) or not label.strip():
             return 0.0
 
@@ -155,7 +141,6 @@ class SemanticResolver:
         visual_conf = float(entity.get("confidence", 0.0))
         visual_score = max(0.0, min(1.0, visual_conf))
 
-        # Weighted combination (bounded 0–1)
         score = (
             0.4 * token_score +
             0.2 * substring_score +
@@ -170,11 +155,10 @@ class SemanticResolver:
     # ==================================================
 
     def _tokenize(self, text: str) -> List[str]:
-        return [
-            t.strip().lower()
-            for t in text.split()
-            if t.strip()
-        ]
+        # Lowercase + strip punctuation deterministically
+        text = text.lower()
+        text = re.sub(r"[^\w\s]", " ", text)
+        return [t for t in text.split() if t]
 
     # ==================================================
     # SPATIAL PROMINENCE
@@ -188,14 +172,17 @@ class SemanticResolver:
         if not isinstance(x, (int, float)) or not isinstance(y, (int, float)):
             return 0.0
 
-        # Assume normalized coordinates [0,1]
-        dx = float(x) - 0.5
-        dy = float(y) - 0.5
+        # Clamp coordinates to [0,1]
+        x = max(0.0, min(1.0, float(x)))
+        y = max(0.0, min(1.0, float(y)))
+
+        dx = x - 0.5
+        dy = y - 0.5
 
         distance = math.sqrt(dx * dx + dy * dy)
 
-        # Normalize so center = 1.0, edges ≈ 0
-        return max(0.0, 1.0 - min(distance, 1.0))
+        # Center = 1.0, edge ≈ 0.0
+        return max(0.0, 1.0 - min(distance * 2.0, 1.0))
 
     # ==================================================
     # CONFIDENCE CALIBRATION
@@ -215,9 +202,18 @@ class SemanticResolver:
 
         second_score = scored[1][0]
 
-        margin = best_score - second_score
+        margin = max(0.0, best_score - second_score)
 
-        # Stable margin-based confidence
-        confidence = best_score * (1.0 + margin)
+        # Stable margin scaling without explosive amplification
+        confidence = best_score * (1.0 + min(margin, 0.5))
 
         return max(0.0, min(1.0, confidence))
+
+    # ==================================================
+    # VALIDATION
+    # ==================================================
+
+    def _has_valid_coordinates(self, entity: Dict[str, Any]) -> bool:
+        x = entity.get("x")
+        y = entity.get("y")
+        return isinstance(x, (int, float)) and isinstance(y, (int, float))
