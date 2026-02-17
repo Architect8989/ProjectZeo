@@ -1,5 +1,3 @@
-# adapters/pure_llm_wrapper.py
-
 import asyncio
 import inspect
 import copy
@@ -17,7 +15,6 @@ class PureLLMWrapper:
         - No input mutation
         - Unified callable interface
         - Safe coroutine handling
-        - Dict-only JSON output
         - Deterministic failure behavior
     """
 
@@ -37,7 +34,7 @@ class PureLLMWrapper:
             "claude-3": apis.call_claude_3_with_ocr,
             "gemini-pro-vision": apis.call_gemini_pro_vision,
             "llava": apis.call_ollama_llava,
-            "gpt-4_1-with-ocr": apis.call_gpt_4_1_with_ocr,
+            "gpt-4.1-with-ocr": apis.call_gpt_4_1_with_ocr,
             "gpt-4o-labeled": apis.call_gpt_4o_labeled,
         }
 
@@ -57,7 +54,7 @@ class PureLLMWrapper:
         objective: Optional[str] = None,
         session_id: Optional[str] = None,
         screen_image: Optional[str] = None,
-    ) -> Dict[str, Any]:
+    ) -> Any:
 
         model_fn = self._resolve_model_function()
 
@@ -83,13 +80,13 @@ class PureLLMWrapper:
         except Exception as e:
             raise RuntimeError(
                 f"Model execution failed for {self.model_name}: {e}"
-            )
+            ) from e
 
         # ----------------------------
         # 3. Mutation detection
         # ----------------------------
 
-        if messages != original_snapshot:
+        if messages_copy != original_snapshot:
             raise RuntimeError(
                 f"Model '{self.model_name}' mutated input messages."
             )
@@ -114,8 +111,24 @@ class PureLLMWrapper:
     ) -> Any:
 
         if inspect.iscoroutinefunction(model_fn):
+            try:
+                loop = asyncio.get_running_loop()
+                if loop.is_running():
+                    # Running inside existing loop (e.g. notebook)
+                    return asyncio.create_task(
+                        self._call_with_signature(
+                            model_fn,
+                            messages,
+                            objective,
+                            session_id,
+                            screen_image,
+                        )
+                    )
+            except RuntimeError:
+                pass
+
             return asyncio.run(
-                self._call_with_fallback(
+                self._call_with_signature(
                     model_fn,
                     messages,
                     objective,
@@ -124,7 +137,7 @@ class PureLLMWrapper:
                 )
             )
 
-        return self._call_with_fallback(
+        return self._call_with_signature(
             model_fn,
             messages,
             objective,
@@ -132,7 +145,7 @@ class PureLLMWrapper:
             screen_image,
         )
 
-    def _call_with_fallback(
+    def _call_with_signature(
         self,
         model_fn: Callable,
         messages: List[Dict[str, Any]],
@@ -141,37 +154,34 @@ class PureLLMWrapper:
         screen_image: Optional[str],
     ) -> Any:
 
-        # Try full modern signature
-        try:
+        sig = inspect.signature(model_fn)
+        params = sig.parameters
+
+        if "screen_image" in params:
             return model_fn(
                 messages,
                 objective=objective,
                 session_id=session_id,
                 screen_image=screen_image,
             )
-        except TypeError:
-            pass
 
-        # Try legacy signature with model_name
-        try:
-            return model_fn(messages, objective, self.model_name)
-        except TypeError:
-            pass
+        if "session_id" in params:
+            return model_fn(
+                messages,
+                objective=objective,
+                session_id=session_id,
+            )
 
-        # Try reduced signature
-        try:
+        if "objective" in params:
             return model_fn(messages, objective)
-        except TypeError:
-            pass
 
-        # Minimal fallback
         return model_fn(messages)
 
     # ==================================================
     # OUTPUT NORMALIZATION
     # ==================================================
 
-    def _normalize_output(self, result: Any) -> Dict[str, Any]:
+    def _normalize_output(self, result: Any) -> Any:
 
         if result is None:
             raise RuntimeError(
@@ -181,17 +191,15 @@ class PureLLMWrapper:
         if isinstance(result, dict):
             return result
 
+        if isinstance(result, list):
+            return result  # allow action arrays (llava, etc.)
+
         if isinstance(result, str):
             try:
                 parsed = json.loads(result)
             except Exception:
                 raise RuntimeError(
                     f"Model '{self.model_name}' returned non-JSON string."
-                )
-
-            if not isinstance(parsed, dict):
-                raise RuntimeError(
-                    f"Model '{self.model_name}' JSON output not dict."
                 )
 
             return parsed
