@@ -14,9 +14,6 @@ _ADAPTER_REGISTRY: Dict[str, str] = {
 _PATCHES_APPLIED = False
 _PATCH_LOCK = threading.Lock()
 
-_ADAPTER_CACHE: Dict[str, Any] = {}
-_CACHE_LOCK = threading.Lock()
-
 _MODEL_PATTERN = re.compile(r"^[a-zA-Z0-9.\-_:]+$")
 
 
@@ -65,8 +62,7 @@ def _validate_model_name(model_name: str) -> str:
 
 def _resolve_base_model(model_name: str) -> str:
     # Accept format like: qwen2.5-vl:7b-instruct
-    base = model_name.split(":", 1)[0]
-    return base
+    return model_name.split(":", 1)[0]
 
 
 class AdapterFactory:
@@ -86,14 +82,12 @@ class AdapterFactory:
                 f"Model '{model_name}' not registered in AdapterFactory."
             )
 
-        with _CACHE_LOCK:
-            if model_name in _ADAPTER_CACHE:
-                return _ADAPTER_CACHE[model_name]
+        AdapterClass = _import_from_path(adapter_path)
 
-            AdapterClass = _import_from_path(adapter_path)
-            instance = AdapterClass(model_name=model_name)
-            _ADAPTER_CACHE[model_name] = instance
-            return instance
+        # IMPORTANT:
+        # No shared instance caching.
+        # Each caller receives a fresh adapter instance.
+        return AdapterClass(model_name=model_name)
 
     @staticmethod
     async def get_action(
