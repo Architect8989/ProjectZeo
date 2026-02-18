@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import time
 import threading
-from typing import Optional
+import json
+import os
+from typing import Optional, Set
 
 from restoration.snapshot_types import RestorationSnapshot
 from restoration.snapshot_provider import SnapshotProvider
@@ -18,7 +20,7 @@ class RestoreProvider:
     Restoration provider.
 
     Guarantees:
-    - Idempotent per snapshot
+    - Idempotent per snapshot (persisted across restarts)
     - Concurrency-safe
     - Fail-closed
     - Strict mode enforcement
@@ -30,6 +32,8 @@ class RestoreProvider:
     POST_ACTION_DELAY = 0.08
     MAX_VERIFY_ATTEMPTS = 5
 
+    _RESTORE_LEDGER_PATH = os.path.join("memory", "restore_ledger.json")
+
     def __init__(
         self,
         *,
@@ -40,11 +44,47 @@ class RestoreProvider:
         self._os = os_backend
         self._mode = mode_controller
         self._snapshot_provider = snapshot_provider
-        self._completed_snapshot_id: Optional[str] = None
         self._lock = threading.Lock()
 
+        os.makedirs("memory", exist_ok=True)
+        self._completed_snapshots: Set[str] = self._load_ledger()
+
     # =========================================================
-    # PUBLIC ENTRYPOINT (REQUIRED BY main.py)
+    # LEDGER (PERSISTED IDEMPOTENCY)
+    # =========================================================
+
+    def _load_ledger(self) -> Set[str]:
+        if not os.path.exists(self._RESTORE_LEDGER_PATH):
+            return set()
+
+        try:
+            with open(self._RESTORE_LEDGER_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+
+            if not isinstance(data, list):
+                raise RestorationError("Restore ledger corrupted")
+
+            return set(str(x) for x in data)
+
+        except Exception as e:
+            raise RestorationError(f"Restore ledger load failed: {e}") from e
+
+    def _persist_ledger(self) -> None:
+        tmp_path = self._RESTORE_LEDGER_PATH + ".tmp"
+
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(sorted(self._completed_snapshots), f)
+                f.flush()
+                os.fsync(f.fileno())
+
+            os.replace(tmp_path, self._RESTORE_LEDGER_PATH)
+
+        except Exception as e:
+            raise RestorationError(f"Restore ledger persist failed: {e}") from e
+
+    # =========================================================
+    # PUBLIC ENTRYPOINT
     # =========================================================
 
     def restore_snapshot(self, snapshot_id: str) -> None:
@@ -70,15 +110,14 @@ class RestoreProvider:
 
         with self._lock:
 
-            if self._completed_snapshot_id == snapshot_id:
-                return  # idempotent
+            if snapshot_id in self._completed_snapshots:
+                return  # persisted idempotency
 
             if self._mode.mode is not SystemMode.RESTORING:
                 raise RestorationError(
                     f"Restore attempted in invalid mode: {self._mode.mode}"
                 )
 
-            # HARD STOP AUTOMATION
             try:
                 self._os.stop_automated_input()
                 self._os.force_release_all(reason="restoration")
@@ -88,15 +127,14 @@ class RestoreProvider:
                     f"Automation shutdown failed: {e}"
                 ) from e
 
-            # Deterministic restore order
             self._restore_application(snapshot)
             self._restore_window(snapshot)
             self._restore_cursor(snapshot)
 
-            # Strict verification
             self._verify(snapshot)
 
-            self._completed_snapshot_id = snapshot_id
+            self._completed_snapshots.add(snapshot_id)
+            self._persist_ledger()
 
     # =========================================================
     # RESTORE STEPS
@@ -178,7 +216,6 @@ class RestoreProvider:
     # =========================================================
 
     def _validate_cursor(self, cursor, snapshot) -> bool:
-
         if not isinstance(cursor, dict):
             return False
 
@@ -201,19 +238,15 @@ class RestoreProvider:
     def _fuzzy_match(self, expected: str, actual: str) -> bool:
         if not expected or not actual:
             return False
-
         if expected == actual:
             return True
-
         if expected in actual:
             return True
         if actual in expected:
             return True
-
         return False
 
     def _validate_window(self, current_window, snapshot) -> bool:
-
         if (
             not isinstance(current_window, dict)
             or not isinstance(current_window.get("title"), str)
@@ -226,7 +259,6 @@ class RestoreProvider:
         return self._fuzzy_match(expected, actual)
 
     def _validate_application(self, current_app, snapshot) -> bool:
-
         if (
             not isinstance(current_app, dict)
             or not isinstance(current_app.get("title"), str)
