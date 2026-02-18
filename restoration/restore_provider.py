@@ -27,7 +27,7 @@ class RestoreProvider:
 
     CURSOR_TOLERANCE_PX = 5
     POST_ACTION_DELAY = 0.08
-    MAX_VERIFY_ATTEMPTS = 3
+    MAX_VERIFY_ATTEMPTS = 5  # increased reliability
 
     def __init__(self, *, os_backend, mode_controller: ModeController):
         self._os = os_backend
@@ -39,36 +39,24 @@ class RestoreProvider:
     # PUBLIC
     # =========================================================
 
-    def restore_snapshot(self, snapshot_id: str) -> None:
-        from restoration.snapshot_provider import SnapshotProvider
-
-        snapshot = SnapshotProvider.get_snapshot(snapshot_id)
-        if snapshot is None:
-            raise RestorationError(f"Snapshot not found: {snapshot_id}")
-
-        self.restore(snapshot)
-
-    # =========================================================
-    # CORE RESTORE
-    # =========================================================
-
     def restore(self, snapshot: RestorationSnapshot) -> None:
+
+        if not isinstance(snapshot, RestorationSnapshot):
+            raise RestorationError("Invalid snapshot object")
 
         snapshot_id = snapshot.snapshot_id
 
         with self._lock:
 
-            # Idempotency guard
             if self._completed_snapshot_id == snapshot_id:
-                return
+                return  # idempotent
 
-            # Strict mode enforcement — must already be RESTORING
             if self._mode.mode is not SystemMode.RESTORING:
                 raise RestorationError(
                     f"Restore attempted in invalid mode: {self._mode.mode}"
                 )
 
-            # HARD STOP AUTOMATION (fail-closed)
+            # HARD STOP AUTOMATION
             try:
                 self._os.stop_automated_input()
                 self._os.force_release_all(reason="restoration")
@@ -83,11 +71,9 @@ class RestoreProvider:
             self._restore_window(snapshot)
             self._restore_cursor(snapshot)
 
-            # Strict verification (still in RESTORING state)
+            # Strict verification
             self._verify(snapshot)
 
-            # DO NOT mutate mode here.
-            # Caller (main.py) must call mode.complete_execution()
             self._completed_snapshot_id = snapshot_id
 
     # =========================================================
@@ -128,15 +114,14 @@ class RestoreProvider:
             ) from e
 
     # =========================================================
-    # VERIFICATION (STRICT + DETERMINISTIC)
+    # VERIFICATION
     # =========================================================
 
     def _verify(self, snapshot: RestorationSnapshot) -> None:
 
-        # Mode must still be RESTORING during verification
         if self._mode.mode is not SystemMode.RESTORING:
             raise RestorationError(
-                f"Verification attempted outside RESTORING mode: {self._mode.mode}"
+                f"Verification outside RESTORING mode: {self._mode.mode}"
             )
 
         for _ in range(self.MAX_VERIFY_ATTEMPTS):
@@ -162,12 +147,12 @@ class RestoreProvider:
                 time.sleep(self.POST_ACTION_DELAY)
                 continue
 
-            return  # success
+            return
 
         raise RestorationError("Post-restore verification failed")
 
     # =========================================================
-    # STRICT VALIDATION HELPERS
+    # VALIDATION HELPERS
     # =========================================================
 
     def _validate_cursor(self, cursor, snapshot) -> bool:
@@ -189,7 +174,22 @@ class RestoreProvider:
         )
 
     def _normalize(self, text: str) -> str:
-        return text.strip().lower()
+        return " ".join(text.strip().lower().split())
+
+    def _fuzzy_match(self, expected: str, actual: str) -> bool:
+        if not expected or not actual:
+            return False
+
+        if expected == actual:
+            return True
+
+        # Bidirectional containment (handles dynamic titles)
+        if expected in actual:
+            return True
+        if actual in expected:
+            return True
+
+        return False
 
     def _validate_window(self, current_window, snapshot) -> bool:
 
@@ -202,7 +202,7 @@ class RestoreProvider:
         expected = self._normalize(snapshot.focus.window_id)
         actual = self._normalize(current_window["title"])
 
-        return expected == actual
+        return self._fuzzy_match(expected, actual)
 
     def _validate_application(self, current_app, snapshot) -> bool:
 
@@ -215,4 +215,4 @@ class RestoreProvider:
         expected = self._normalize(snapshot.application.process_name)
         actual = self._normalize(current_app["title"])
 
-        return expected == actual
+        return self._fuzzy_match(expected, actual)
