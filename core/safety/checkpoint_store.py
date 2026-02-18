@@ -4,86 +4,143 @@ import json
 import os
 import tempfile
 import hashlib
-from typing import Optional, Dict
+from typing import Optional, Dict, Any
 
 CHECKPOINT_DIR = "memory"
 CHECKPOINT_FILE = os.path.join(CHECKPOINT_DIR, "kernel_checkpoint.json")
-CHECKPOINT_TMP = os.path.join(CHECKPOINT_DIR, "kernel_checkpoint.tmp")
 
 
 # -------------------------------------------------
 # INTERNAL
 # -------------------------------------------------
 
-def _ensure_dir():
+def _ensure_dir() -> None:
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+
+
+def _stable_json_bytes(obj: Any) -> bytes:
+    """
+    Deterministic JSON serialization.
+    """
+    return json.dumps(
+        obj,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
 
 
 def _checksum(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def _fsync_dir(path: str) -> None:
+    """
+    Ensure directory metadata is flushed (POSIX durability).
+    """
+    try:
+        dir_fd = os.open(path, os.O_DIRECTORY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except Exception:
+        # Non-POSIX systems may not support O_DIRECTORY
+        pass
+
+
 # -------------------------------------------------
 # PUBLIC API
 # -------------------------------------------------
 
-def save_checkpoint(state: Dict):
+def save_checkpoint(state: Dict) -> None:
     """
-    Atomic, crash-safe checkpoint write.
+    Crash-safe, cross-filesystem-safe atomic checkpoint.
 
-    - Write temp
-    - fsync
-    - Rename over target
+    - Deterministic state serialization
+    - Write temp file inside target directory
+    - fsync file
+    - atomic replace
+    - fsync directory
     """
+
+    if not isinstance(state, dict):
+        raise TypeError("Checkpoint state must be dict")
 
     _ensure_dir()
 
+    state_bytes = _stable_json_bytes(state)
+
     payload = {
-        "checksum": None,
+        "checksum": _checksum(state_bytes),
         "state": state,
     }
 
-    raw = json.dumps(payload["state"]).encode("utf-8")
-    payload["checksum"] = _checksum(raw)
+    serialized_bytes = _stable_json_bytes(payload)
 
-    serialized = json.dumps(payload)
+    # Create temp file in same directory (avoids cross-device rename)
+    with tempfile.NamedTemporaryFile(
+        mode="wb",
+        dir=CHECKPOINT_DIR,
+        delete=False,
+    ) as tmp_file:
 
-    with open(CHECKPOINT_TMP, "w") as f:
-        f.write(serialized)
-        f.flush()
-        os.fsync(f.fileno())
+        tmp_file.write(serialized_bytes)
+        tmp_file.flush()
+        os.fsync(tmp_file.fileno())
+        tmp_path = tmp_file.name
 
-    os.replace(CHECKPOINT_TMP, CHECKPOINT_FILE)
+    # Atomic replace
+    os.replace(tmp_path, CHECKPOINT_FILE)
+
+    # Ensure directory entry durability
+    _fsync_dir(CHECKPOINT_DIR)
 
 
 def load_checkpoint() -> Optional[Dict]:
     """
-    Loads checkpoint only if checksum valid.
+    Loads checkpoint only if checksum matches.
+    Fail-closed on corruption.
     """
 
     if not os.path.exists(CHECKPOINT_FILE):
         return None
 
     try:
-        with open(CHECKPOINT_FILE) as f:
-            payload = json.load(f)
+        with open(CHECKPOINT_FILE, "rb") as f:
+            raw_bytes = f.read()
 
-        raw = json.dumps(payload["state"]).encode("utf-8")
-        if payload.get("checksum") != _checksum(raw):
-            raise RuntimeError("Checksum mismatch")
+        payload = json.loads(raw_bytes.decode("utf-8"))
 
-        return payload["state"]
+        if not isinstance(payload, dict):
+            return None
+
+        state = payload.get("state")
+        checksum = payload.get("checksum")
+
+        if not isinstance(state, dict) or not isinstance(checksum, str):
+            return None
+
+        recalculated = _checksum(_stable_json_bytes(state))
+
+        if recalculated != checksum:
+            return None
+
+        return state
 
     except Exception:
+        # Corrupt, partial, or invalid JSON
         return None
 
 
-def clear_checkpoint():
+def clear_checkpoint() -> None:
     """
-    Best-effort deletion.
+    Best-effort deletion with directory sync.
     """
+
     try:
         if os.path.exists(CHECKPOINT_FILE):
             os.remove(CHECKPOINT_FILE)
+            _fsync_dir(CHECKPOINT_DIR)
     except Exception:
         pass
