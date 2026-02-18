@@ -27,17 +27,9 @@ MAX_PERCEPTION_JSON_BYTES = 10_000
 MAX_STAGNANT_ITERS = 12
 
 
-# ==================================================
-# CUSTOM TERMINAL AUTHORITY ERROR
-# ==================================================
-
 class AuthorityAbortError(RuntimeError):
     pass
 
-
-# ==================================================
-# PUBLIC ENTRYPOINT
-# ==================================================
 
 def operate_main(
     *,
@@ -100,10 +92,6 @@ def operate_main(
         input_arbitrator.shutdown()
 
 
-# ==================================================
-# AUTONOMOUS LOOP
-# ==================================================
-
 def _execute_autonomous_loop(
     *,
     execution_plan: ExecutionPlan,
@@ -144,7 +132,6 @@ def _execute_autonomous_loop(
 
     while iteration < max_iterations:
 
-        # ---- TERMINAL WALL-CLOCK TIMEOUT ----
         if time.time() - start_ts > max_wallclock_seconds:
             journal.record({"event": "execution_timeout"})
             raise RuntimeError("TASK_FAILED:timeout")
@@ -227,7 +214,6 @@ def _execute_autonomous_loop(
             soc_confident=belief.environment_stability > 0.7,
         )
 
-        # ---- AUTHORITY SPLIT ----
         if authority == AuthorityDecision.ABORT:
             raise AuthorityAbortError("Human authority abort — task terminated")
 
@@ -295,6 +281,65 @@ def _execute_autonomous_loop(
             journal.record({"event": "execution_converged"})
             return
 
-    # ---- TERMINAL ITERATION BUDGET EXHAUSTION ----
     journal.record({"event": "iteration_budget_exhausted"})
     raise RuntimeError("TASK_FAILED:iteration_budget_exhausted")
+
+
+def _execute_decision(
+    *,
+    decision: Dict[str, Any],
+    os_backend: OperatingSystem,
+    accessibility_backend: Optional[AccessibilityBackend],
+    installer: Optional[AutonomousInstaller],
+):
+
+    if not isinstance(decision, dict):
+        raise RuntimeError("Invalid decision payload")
+
+    operation = decision.get("operation")
+    if not isinstance(operation, str):
+        raise RuntimeError("Missing operation")
+
+    operation = operation.lower().strip()
+
+    if operation == "click":
+        x = decision.get("x")
+        y = decision.get("y")
+        if x is None or y is None:
+            raise RuntimeError("Click missing coordinates")
+        os_backend.click(float(x), float(y))
+        return None
+
+    if operation == "type":
+        text = decision.get("text")
+        if not isinstance(text, str):
+            raise RuntimeError("Invalid text payload")
+        os_backend.type_text(text)
+        return None
+
+    if operation == "hotkey":
+        keys = decision.get("keys")
+        if not isinstance(keys, list) or not keys:
+            raise RuntimeError("Invalid hotkey format")
+        os_backend.press_keys(keys)
+        return None
+
+    if operation == "command":
+        command = decision.get("command")
+        if not isinstance(command, str) or not command.strip():
+            raise RuntimeError("Invalid command")
+        return os_backend.run_command(command)
+
+    if operation == "install":
+        if installer is None:
+            raise RuntimeError("Installer unavailable")
+        tool = decision.get("tool")
+        if not isinstance(tool, dict):
+            raise RuntimeError("Invalid tool specification")
+        installer.install_tool(tool)
+        return None
+
+    if operation == "done":
+        return None
+
+    raise RuntimeError(f"Unsupported operation: {operation}")
