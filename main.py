@@ -32,21 +32,15 @@ MAX_REPLANS = 3
 TASK_START: Optional[float] = None
 
 
-# ==================================================
-# SAFE SHUTDOWN
-# ==================================================
-
 def _force_safe_shutdown(os_backend, auth_state, reason: str):
     try:
         os_backend.force_release_all(reason=reason)
     except Exception:
         pass
-
     try:
         auth_state.force_safe_state()
     except Exception:
         pass
-
     print(f"[SAFE-SHUTDOWN] {reason}", file=sys.stderr)
 
 
@@ -62,10 +56,6 @@ def _install_signal_handlers(os_backend, auth_state):
         signal.signal(signal.SIGQUIT, _signal_handler)
 
 
-# ==================================================
-# PERCEPTION INGESTION
-# ==================================================
-
 def _ingest_latest_perception(observer, world_graph):
     snap = observer.snapshot()
     if not isinstance(snap, dict):
@@ -78,24 +68,14 @@ def _ingest_latest_perception(observer, world_graph):
     world_graph.ingest(perception)
 
 
-# ==================================================
-# TIMEOUT ENFORCEMENT
-# ==================================================
-
 def _enforce_task_timeout(os_backend, auth_state):
     global TASK_START
-
     if TASK_START is None:
         return
-
     if (time.time() - TASK_START) > MAX_TASK_SECONDS:
         _force_safe_shutdown(os_backend, auth_state, "task_timeout")
         os._exit(1)
 
-
-# ==================================================
-# MAIN LOOP
-# ==================================================
 
 def main(llm_callable: Callable, model_name: str):
 
@@ -188,7 +168,6 @@ def main(llm_callable: Callable, model_name: str):
 
                 _ingest_latest_perception(observer, world_graph)
 
-                # ---------------- PLANNING ----------------
                 mode.begin_planning()
 
                 intent = mode.get_intent()
@@ -223,7 +202,6 @@ def main(llm_callable: Callable, model_name: str):
 
                 mode.execute()
 
-                # ---------------- EXECUTION + REPLAN LOOP ----------------
                 while True:
 
                     _enforce_task_timeout(os_backend, auth_state)
@@ -237,8 +215,7 @@ def main(llm_callable: Callable, model_name: str):
                             world_graph=world_graph,
                             os_backend=os_backend,
                         )
-
-                        break  # success
+                        break
 
                     except RuntimeError as e:
 
@@ -257,6 +234,8 @@ def main(llm_callable: Callable, model_name: str):
 
                                 new_snapshot_id = snapshot_provider.take_snapshot()
                                 mode.attach_snapshot(new_snapshot_id)
+
+                                mode.arm(intent)
 
                                 _ingest_latest_perception(observer, world_graph)
                                 planner.update_world_snapshot(world_graph.snapshot())
@@ -290,7 +269,6 @@ def main(llm_callable: Callable, model_name: str):
 
                         raise
 
-                # ---------------- RESTORATION ----------------
                 mode.begin_restoration()
 
                 restore_provider.restore_snapshot(snapshot_id)
