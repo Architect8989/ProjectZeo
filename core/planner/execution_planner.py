@@ -2,7 +2,6 @@ from typing import List, Dict, Any, Optional
 import json
 import time
 import concurrent.futures
-import hashlib
 import re
 
 from core.schemas.execution_plan import (
@@ -19,6 +18,7 @@ class PlanningError(RuntimeError):
 class ExecutionPlanner:
     """
     Deterministic execution planner.
+    Hardened against malformed LLM output and thread leakage.
     """
 
     LLM_TIMEOUT_SECONDS = 30.0
@@ -151,7 +151,7 @@ class ExecutionPlanner:
         self._world_snapshot = frozen
 
     # ==================================================
-    # LLM CALL
+    # LLM CALL (SAFE + BOUNDED)
     # ==================================================
 
     def _call_llm_with_timeout(self, prompt: str) -> str:
@@ -172,13 +172,16 @@ class ExecutionPlanner:
 
             return result
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(_invoke)
-            try:
-                result = future.result(timeout=self.LLM_TIMEOUT_SECONDS)
-            except concurrent.futures.TimeoutError:
-                future.cancel()
-                raise PlanningError("LLM call timeout")
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        future = executor.submit(_invoke)
+
+        try:
+            result = future.result(timeout=self.LLM_TIMEOUT_SECONDS)
+        except concurrent.futures.TimeoutError:
+            future.cancel()
+            raise PlanningError("LLM call timeout")
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
 
         if isinstance(result, str):
             return result.strip()
@@ -225,18 +228,26 @@ class ExecutionPlanner:
         return "\n".join(text_chunks)[: self.MAX_SCREEN_CHARS]
 
     # ==================================================
-    # STRICT JSON EXTRACTION
+    # ROBUST JSON EXTRACTION
     # ==================================================
 
     def _extract_json(self, raw: str) -> Any:
         raw = raw.strip()
-        raw = re.sub(r"^```(?:json)?", "", raw)
-        raw = re.sub(r"```$", "", raw).strip()
+        raw = re.sub(r"^```(?:json)?\s*", "", raw)
+        raw = re.sub(r"\s*```$", "", raw).strip()
 
         try:
             return json.loads(raw)
         except json.JSONDecodeError:
-            raise PlanningError("Invalid JSON from LLM")
+            # non-greedy fallback
+            match = re.search(r"(\{.*?\}|\[.*?\])", raw, re.DOTALL)
+            if match:
+                try:
+                    return json.loads(match.group(1))
+                except Exception:
+                    pass
+
+        raise PlanningError("Invalid JSON from LLM")
 
     # ==================================================
     # GOAL EXPANSION
@@ -265,13 +276,13 @@ Goal:
 
 Return STRICT JSON list of steps.
 
-Each step MUST have:
-- type (UI_INTERACTION | COMMAND_EXECUTION | FILE_CREATION | VERIFICATION | TOOL_INSTALLATION)
-- description (string)
-- action (object)
-- verification (object)
-- estimated_duration (float seconds)
-- retryable (boolean)
+Each step MUST contain:
+- type
+- description
+- action
+- verification
+- estimated_duration
+- retryable
 
 Return JSON only.
 """
@@ -321,6 +332,15 @@ Return JSON only.
 
             if duration < 0 or duration > self.MAX_ESTIMATED_DURATION:
                 raise PlanningError("Duration out of bounds")
+
+            # Minimal semantic validation
+            if step_type == StepType.COMMAND_EXECUTION.value:
+                if "command" not in action:
+                    raise PlanningError("COMMAND_EXECUTION missing 'command'")
+
+            if step_type == StepType.UI_INTERACTION.value:
+                if "operation" not in action:
+                    raise PlanningError("UI_INTERACTION missing 'operation'")
 
             validated.append(
                 {
