@@ -84,6 +84,29 @@ class ModeController:
             return self._intent
 
     # ==================================================
+    # REPLAN CONTROL  (FIXED)
+    # ==================================================
+
+    def begin_replan_sequence(self) -> None:
+        with self._lock:
+            if self._replan_in_progress:
+                raise ModeTransitionError("Replan already in progress")
+
+            if self._mode not in (
+                SystemMode.EXECUTING,
+                SystemMode.PLANNING,
+            ):
+                raise ModeTransitionError(
+                    f"Replan not allowed in mode: {self._mode.value}"
+                )
+
+            self._replan_in_progress = True
+
+    def end_replan_sequence(self) -> None:
+        with self._lock:
+            self._replan_in_progress = False
+
+    # ==================================================
     # SNAPSHOT CONTRACT
     # ==================================================
 
@@ -126,8 +149,8 @@ class ModeController:
 
     def get_llm_callable(self) -> Callable:
         with self._lock:
-            if self._mode is not SystemMode.PLANNING:
-                raise RuntimeError("LLM only accessible in PLANNING")
+            if self._mode not in (SystemMode.PLANNING, SystemMode.ARMED):
+                raise RuntimeError("LLM only accessible in PLANNING or ARMED")
             if self._llm_callable is None:
                 raise RuntimeError("No LLM injected")
             return self._llm_callable
@@ -297,6 +320,10 @@ class ModeController:
                 True,
             )
 
+    # ==================================================
+    # INTERNAL RESET
+    # ==================================================
+
     def _reset_internal_state(self) -> None:
         self._intent = None
         self._intent_frozen = False
@@ -357,4 +384,4 @@ class ModeController:
                 "execution_plan_attached": self._execution_plan_attached,
                 "execution_plan_id": self._execution_plan_id,
                 "transition_history_depth": len(self._transition_history),
-        }
+    }
