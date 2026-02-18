@@ -34,7 +34,7 @@ class ExecutionPlanner:
         "ci_environment",
     }
 
-    # Hardened destructive patterns
+    # Strict destructive patterns
     DANGEROUS_PATTERNS = [
         r"\brm\s+-rf\b",
         r"\bsudo\b",
@@ -160,6 +160,8 @@ class ExecutionPlanner:
         return plan
 
     # ==================================================
+    # SAFE ASYNC LLM CALL (NO asyncio.run INSIDE LOOP)
+    # ==================================================
 
     async def _call_llm_async(self, prompt: str) -> str:
 
@@ -194,6 +196,19 @@ class ExecutionPlanner:
 
         raise PlanningError("Unsupported LLM return type")
 
+    def _call_llm_sync(self, prompt: str) -> str:
+        try:
+            loop = asyncio.get_running_loop()
+            # already inside loop → schedule properly
+            future = asyncio.run_coroutine_threadsafe(
+                self._call_llm_async(prompt),
+                loop,
+            )
+            return future.result(timeout=LLM_CALL_TIMEOUT_SECONDS)
+        except RuntimeError:
+            # no running loop → safe to create one
+            return asyncio.run(self._call_llm_async(prompt))
+
     # ==================================================
 
     def _extract_required_tools(self, requirements: Dict[str, Any]) -> List[str]:
@@ -209,7 +224,7 @@ class ExecutionPlanner:
         if not isinstance(entities, list):
             return ""
 
-        text_chunks: List[str] = []
+        chunks: List[str] = []
 
         for ent in entities:
             if not isinstance(ent, dict):
@@ -217,9 +232,9 @@ class ExecutionPlanner:
             label = ent.get("text")
             etype = ent.get("type")
             if isinstance(label, str) and label.strip():
-                text_chunks.append(f"{etype}: {label}")
+                chunks.append(f"{etype}: {label}")
 
-        return "\n".join(text_chunks)[: self.MAX_SCREEN_CHARS]
+        return "\n".join(chunks)[: self.MAX_SCREEN_CHARS]
 
     # ==================================================
 
@@ -236,6 +251,11 @@ class ExecutionPlanner:
     # ==================================================
 
     def _validate_command(self, cmd: str) -> None:
+
+        cmd = cmd.strip()
+
+        if not cmd:
+            raise PlanningError("Empty command")
 
         if len(cmd) > self.MAX_COMMAND_LENGTH:
             raise PlanningError("Command too long")
@@ -268,7 +288,7 @@ Goal:
 Return STRICT JSON list of steps.
 """
 
-        raw = asyncio.run(self._call_llm_async(prompt))
+        raw = self._call_llm_sync(prompt)
         data = self._extract_json(raw)
 
         if not isinstance(data, list) or not data:
@@ -299,9 +319,9 @@ Return STRICT JSON list of steps.
 
             if step_type == StepType.COMMAND_EXECUTION.value:
                 cmd = action.get("command")
-                if not isinstance(cmd, str) or not cmd.strip():
+                if not isinstance(cmd, str):
                     raise PlanningError("Missing command")
-                self._validate_command(cmd.strip())
+                self._validate_command(cmd)
 
             try:
                 duration = float(step.get("estimated_duration", 0.0))
@@ -311,10 +331,14 @@ Return STRICT JSON list of steps.
             if duration < 0 or duration > self.MAX_ESTIMATED_DURATION:
                 raise PlanningError("Duration out of bounds")
 
+            description = step.get("description", "")
+            if not isinstance(description, str) or not description.strip():
+                raise PlanningError("Invalid description")
+
             validated.append(
                 {
                     "type": StepType(step_type),
-                    "description": step.get("description", "").strip(),
+                    "description": description.strip(),
                     "action": action,
                     "verification": step.get("verification", {}),
                     "estimated_duration": duration,
