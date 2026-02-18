@@ -8,20 +8,8 @@ from typing import Optional
 
 
 class IntentListener:
-    """
-    Deterministic intent ingestion.
 
-    Guarantees:
-    - NEVER blocks main thread
-    - Accepts intent ONLY in OBSERVER mode
-    - Snapshot taken BEFORE arming
-    - No intent overwrite
-    - Works in interactive + non-interactive environments
-    - Clean shutdown
-    - Secure file-based ingestion
-    """
-
-    POLL_INTERVAL = 0.1  # seconds
+    POLL_INTERVAL = 0.1
     INTENT_FILE = "/tmp/projectzeo.intent"
     INTENT_MAX_BYTES = 4096
 
@@ -48,6 +36,9 @@ class IntentListener:
 
     def stop(self):
         self._running = False
+        if self._thread:
+            self._thread.join(timeout=1.0)
+            self._thread = None
 
     # ==================================================
     # Core loop
@@ -66,39 +57,29 @@ class IntentListener:
                     time.sleep(self.POLL_INTERVAL)
                     continue
 
-                # ---- SNAPSHOT FIRST ----
                 try:
                     snapshot_id = self.snapshot_provider.take_snapshot()
-                except Exception as e:
-                    print(f"[INTENT] Snapshot failed, rejecting: {e}")
+                except Exception:
                     time.sleep(self.POLL_INTERVAL)
                     continue
 
                 if not snapshot_id:
-                    print("[INTENT] Snapshot returned invalid ID, rejecting")
                     time.sleep(self.POLL_INTERVAL)
                     continue
 
-                # ---- ATTACH SNAPSHOT ----
                 try:
                     self.mode.attach_snapshot(snapshot_id)
-                except Exception as e:
-                    print(f"[INTENT] Snapshot attach failed: {e}")
+                except Exception:
                     time.sleep(self.POLL_INTERVAL)
                     continue
 
-                # ---- ARM ----
                 try:
                     self.mode.arm(intent=intent)
-                except Exception as e:
-                    print(f"[INTENT] Arm rejected: {e}")
+                except Exception:
                     time.sleep(self.POLL_INTERVAL)
                     continue
 
-                print(f"[INTENT] Armed: {intent}")
-
-            except Exception as e:
-                print(f"[INTENT] Rejected: {e}")
+            except Exception:
                 time.sleep(self.POLL_INTERVAL)
 
     # ==================================================
@@ -107,7 +88,7 @@ class IntentListener:
 
     def _read_intent(self) -> Optional[str]:
 
-        # ---- interactive stdin ----
+        # ---- Non-blocking interactive stdin ----
         if sys.stdin and sys.stdin.isatty():
             try:
                 ready, _, _ = select.select([sys.stdin], [], [], 0.0)
@@ -115,52 +96,62 @@ class IntentListener:
                 ready = []
 
             if ready:
-                line = sys.stdin.readline()
-                if not line:
+                try:
+                    data = sys.stdin.readline()
+                except Exception:
                     return None
 
-                line = line.strip()
-                return line if line else None
+                if not data:
+                    return None
 
-        # ---- secure file ingestion ----
+                intent = data.strip()
+                return intent if intent else None
+
+        # ---- Secure file ingestion ----
         path = self.INTENT_FILE
 
         if not os.path.exists(path):
             return None
 
+        fd = None
         try:
-            st = os.stat(path, follow_symlinks=False)
+            # O_NOFOLLOW prevents symlink attacks
+            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+            fd = os.open(path, flags)
+
+            st = os.fstat(fd)
 
             # Must be regular file
             if not stat.S_ISREG(st.st_mode):
-                os.remove(path)
                 return None
 
             # Must be owned by current user
             if st.st_uid != os.getuid():
-                os.remove(path)
+                return None
+
+            # Enforce strict permissions 0600
+            if (st.st_mode & 0o077) != 0:
                 return None
 
             # Size bounds
             if st.st_size <= 0 or st.st_size > self.INTENT_MAX_BYTES:
-                os.remove(path)
                 return None
 
-            with open(path, "r", encoding="utf-8") as f:
-                data = f.read(self.INTENT_MAX_BYTES)
+            data = os.read(fd, self.INTENT_MAX_BYTES).decode("utf-8")
 
         except Exception:
+            return None
+
+        finally:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except Exception:
+                    pass
             try:
                 os.remove(path)
             except Exception:
                 pass
-            return None
-
-        # Remove after successful read
-        try:
-            os.remove(path)
-        except Exception:
-            pass
 
         intent = data.strip()
         return intent if intent else None
