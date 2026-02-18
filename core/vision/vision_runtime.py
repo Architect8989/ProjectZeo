@@ -25,7 +25,7 @@ class VisionDegradedError(RuntimeError):
 # CONFIG
 # ==================================================
 
-MAX_ALLOWED_LATENCY_SECONDS = 3.0          # health threshold
+MAX_ALLOWED_LATENCY_SECONDS = 3.0
 NETWORK_CONNECT_TIMEOUT = 5.0
 NETWORK_READ_TIMEOUT = 25.0
 
@@ -55,7 +55,6 @@ class VisionRuntime:
         self._running: bool = False
         self._thread: Optional[threading.Thread] = None
 
-        # Real granular network timeout
         self._ollama_client = ollama.Client(
             timeout=httpx.Timeout(
                 connect=NETWORK_CONNECT_TIMEOUT,
@@ -137,7 +136,9 @@ class VisionRuntime:
 
     def _process_frame_internal(self) -> Dict[str, Any]:
         start = time.monotonic()
-        frame_ts = time.monotonic()
+
+        # Wall-clock timestamp (restart-safe)
+        frame_ts = time.time()
 
         image = self._capture_frame()
         encoded = self._encode_image(image)
@@ -145,7 +146,6 @@ class VisionRuntime:
 
         latency = time.monotonic() - start
 
-        # Health threshold (NOT network timeout)
         if latency > MAX_ALLOWED_LATENCY_SECONDS:
             raise VisionDegradedError(
                 f"Vision latency exceeded: {latency:.2f}s"
@@ -184,7 +184,7 @@ class VisionRuntime:
         return base64.b64encode(data).decode("utf-8")
 
     # ==================================================
-    # MODEL CALL (NO HARDCODE)
+    # MODEL CALL
     # ==================================================
 
     def _call_model(self, image_b64: str) -> Dict[str, Any]:
@@ -214,9 +214,7 @@ class VisionRuntime:
                         ],
                     }
                 ],
-                options={
-                    "temperature": 0,
-                },
+                options={"temperature": 0},
             )
         except Exception as e:
             raise VisionUnavailableError(
@@ -226,15 +224,10 @@ class VisionRuntime:
         if not isinstance(response, dict):
             raise VisionDegradedError("Invalid vision response type")
 
-        content = (
-            response.get("message", {})
-            .get("content")
-        )
+        content = response.get("message", {}).get("content")
 
         if not isinstance(content, str):
-            raise VisionDegradedError(
-                "Unexpected response structure"
-            )
+            raise VisionDegradedError("Unexpected response structure")
 
         return self._parse_json(content)
 
@@ -288,7 +281,7 @@ class VisionRuntime:
 
         with self._lock:
             if self._last_frame_ts is not None:
-                if frame_ts <= self._last_frame_ts:
+                if frame_ts < self._last_frame_ts:
                     frame_ts = self._last_frame_ts + 1e-6
 
         return {
@@ -325,7 +318,6 @@ class VisionRuntime:
     def _parse_json(self, raw: str) -> Dict[str, Any]:
         raw = raw.strip()
 
-        # Remove fenced blocks safely
         if raw.startswith("```"):
             parts = raw.split("```")
             raw = parts[1] if len(parts) >= 3 else parts[-1]
