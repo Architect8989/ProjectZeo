@@ -33,7 +33,7 @@ class ObserverLoop:
     ):
         self._observer = observer
         self._vision = vision_runtime
-        self._world_graph = world_graph  # Now actively used
+        self._world_graph = world_graph
 
         self._tick_interval = max(0.05, float(tick_interval))
 
@@ -79,65 +79,81 @@ class ObserverLoop:
     # ==================================================
 
     def _run(self) -> None:
-        while not self._stop_event.is_set():
-            start_ts = time.monotonic()
+        try:
+            while not self._stop_event.is_set():
+                start_ts = time.monotonic()
 
-            try:
-                perception: Optional[Dict[str, Any]] = self._vision.get_latest()
-
-                if (
-                    isinstance(perception, dict)
-                    and perception.get("available") is True
-                ):
-                    # Feed observer
-                    self._observer.attach_perception_state(
-                        {
-                            "available": True,
-                            "frame_ts": perception.get("frame_ts"),
-                            "perception": perception,
-                        }
-                    )
-
-                    # Continuous world graph ingestion (non-blocking)
-                    if self._world_graph is not None:
-                        try:
-                            self._world_graph.ingest(perception)
-                        except Exception:
-                            # World graph failure must NEVER break observer loop
-                            pass
-                else:
-                    self._observer.attach_perception_state(
-                        {
-                            "available": False,
-                            "frame_ts": None,
-                            "perception": None,
-                        }
-                    )
-
-                # Authoritative tick
-                self._observer.tick()
-
-            except ObserverBlindnessError:
-                # Blindness handled internally by ObserverCore
-                pass
-
-            except Exception:
-                traceback.print_exc()
                 try:
-                    self._observer.attach_perception_state(
-                        {
-                            "available": False,
-                            "frame_ts": None,
-                            "perception": None,
-                        }
-                    )
-                except Exception:
-                    pass
+                    perception: Optional[Dict[str, Any]] = self._vision.get_latest()
 
-            elapsed = time.monotonic() - start_ts
-            sleep_for = self._tick_interval - elapsed
-            if sleep_for > 0:
-                time.sleep(sleep_for)
+                    if (
+                        isinstance(perception, dict)
+                        and perception.get("available") is True
+                    ):
+                        self._observer.attach_perception_state(
+                            {
+                                "available": True,
+                                "frame_ts": perception.get("frame_ts"),
+                                "perception": perception,
+                            }
+                        )
+
+                        if self._world_graph is not None:
+                            try:
+                                self._world_graph.ingest(perception)
+                            except Exception:
+                                # World graph failure must NEVER break observer loop
+                                pass
+                    else:
+                        self._observer.attach_perception_state(
+                            {
+                                "available": False,
+                                "frame_ts": None,
+                                "perception": None,
+                            }
+                        )
+
+                    # Authoritative tick
+                    self._observer.tick()
+
+                except ObserverBlindnessError:
+                    # Blindness is a critical structural failure.
+                    # Propagate by stopping loop and forcing unavailable state.
+                    try:
+                        self._observer.attach_perception_state(
+                            {
+                                "available": False,
+                                "frame_ts": None,
+                                "perception": None,
+                            }
+                        )
+                    except Exception:
+                        pass
+
+                    self._stop_event.set()
+                    raise
+
+                except Exception:
+                    traceback.print_exc()
+                    try:
+                        self._observer.attach_perception_state(
+                            {
+                                "available": False,
+                                "frame_ts": None,
+                                "perception": None,
+                            }
+                        )
+                    except Exception:
+                        pass
+
+                elapsed = time.monotonic() - start_ts
+                sleep_for = self._tick_interval - elapsed
+                if sleep_for > 0:
+                    time.sleep(sleep_for)
+
+        finally:
+            with self._lock:
+                self._running = False
 
     # ==================================================
     # INTROSPECTION
