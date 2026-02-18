@@ -10,8 +10,8 @@ import struct
 
 class BeliefState:
     """
-    Decision-theoretic cognitive belief engine.
-    Hardened against state explosion and regret drift.
+    Deterministic + bounded cognitive state.
+    Execution correctness dominates learning signals.
     """
 
     EXPLORATION_C = 1.4
@@ -30,8 +30,6 @@ class BeliefState:
 
         self.action_counts: Dict[str, int] = {}
         self.action_rewards: Dict[str, deque] = {}
-
-        # regret[action] = (raw_value, last_update_iteration)
         self.regret: Dict[str, Tuple[float, int]] = {}
 
         self.progress_score: float = 0.0
@@ -41,7 +39,7 @@ class BeliefState:
         self._iteration_counter: int = 0
 
     # ==================================================
-    # BAYESIAN UPDATE (STATE-BOUNDED)
+    # BAYESIAN UPDATE (BOUNDED)
     # ==================================================
 
     def bayesian_update(self, likelihoods: Dict[str, float]) -> None:
@@ -66,13 +64,13 @@ class BeliefState:
 
         normalized = {s: v / total for s, v in new_belief.items()}
 
-        # prune very small states
+        # prune low-prob states
         pruned = {
             s: p for s, p in normalized.items()
             if p >= self.PRIOR_ALPHA * 0.1
         }
 
-        # enforce MAX_STATES bound
+        # enforce hard cap
         if len(pruned) > self.MAX_STATES:
             sorted_states = sorted(
                 pruned.items(),
@@ -81,7 +79,6 @@ class BeliefState:
             )[: self.MAX_STATES]
             pruned = dict(sorted_states)
 
-        # renormalize after pruning
         total = sum(pruned.values())
         if total > 0:
             self.state_probabilities = {
@@ -89,7 +86,7 @@ class BeliefState:
             }
 
     # ==================================================
-    # ENTROPY
+    # ENTROPY (DIAGNOSTIC ONLY)
     # ==================================================
 
     def entropy(self) -> float:
@@ -132,21 +129,6 @@ class BeliefState:
         return mean_reward + exploration
 
     # ==================================================
-    # THOMPSON SAMPLING (NEUTRAL SAFE)
-    # ==================================================
-
-    def thompson_sample(self, action: str) -> float:
-        rewards = self.action_rewards.get(action)
-        if not rewards:
-            return random.random()
-
-        successes = sum(1 for r in rewards if r > 0)
-        failures = sum(1 for r in rewards if r < 0)
-
-        # neutral rewards (r == 0) do not bias posterior
-        return random.betavariate(successes + 1, failures + 1)
-
-    # ==================================================
     # REGRET (LAZY DECAY)
     # ==================================================
 
@@ -157,8 +139,7 @@ class BeliefState:
 
         raw_value, last_iter = entry
         delta_iter = self._iteration_counter - last_iter
-        decayed = raw_value * (self.REGRET_DECAY ** delta_iter)
-        return decayed
+        return raw_value * (self.REGRET_DECAY ** delta_iter)
 
     def update_regret(self, action: str, reward: float, best_reward: float):
         self._iteration_counter += 1
@@ -173,10 +154,14 @@ class BeliefState:
         self.regret[action] = (updated, self._iteration_counter)
 
     # ==================================================
-    # SOFTMAX SELECTION
+    # SOFTMAX (OPTIONAL, NON-AUTHORITATIVE)
     # ==================================================
 
     def softmax_select(self, actions: List[str]) -> str:
+        """
+        Available for experimentation.
+        Not used by execution kernel.
+        """
         if not actions:
             raise ValueError("No actions provided")
 
@@ -184,12 +169,10 @@ class BeliefState:
 
         for a in actions:
             base = self.ucb_score(a)
-
             regret_penalty = min(
                 self._get_effective_regret(a) * self.REGRET_SCALE,
                 0.5,
             )
-
             scores.append(base - regret_penalty)
 
         max_score = max(scores)
@@ -275,7 +258,7 @@ class BeliefState:
         ).hexdigest()
 
     # ==================================================
-    # CONVERGENCE (PLAN-BOUND SAFE)
+    # CONVERGENCE (STRICT PLAN-BOUND)
     # ==================================================
 
     def converged(
@@ -290,14 +273,14 @@ class BeliefState:
         if current_iteration < min_iterations:
             return False
 
-        if plan_steps_total > 0 and steps_completed < plan_steps_total:
+        if plan_steps_total <= 0:
             return False
 
-        # entropy is advisory only; plan completion dominates
-        low_entropy = self.entropy() < 0.1
-        stable_env = self.environment_stability > 0.9
+        if steps_completed < plan_steps_total:
+            return False
 
-        return low_entropy and stable_env
+        # Plan completion is the only authoritative convergence signal.
+        return True
 
     # ==================================================
     # SUMMARY
