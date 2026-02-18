@@ -4,6 +4,8 @@ import time
 import concurrent.futures
 import re
 
+from config.timeouts import LLM_CALL_TIMEOUT_SECONDS
+
 from core.schemas.execution_plan import (
     ExecutionPlan,
     ExecutionStep,
@@ -18,10 +20,10 @@ class PlanningError(RuntimeError):
 class ExecutionPlanner:
     """
     Deterministic execution planner.
-    Hardened against malformed LLM output and thread leakage.
+    Hardened against malformed LLM output,
+    thread leakage, and destructive command injection.
     """
 
-    LLM_TIMEOUT_SECONDS = 30.0
     MAX_SCREEN_CHARS = 500
     MAX_ESTIMATED_DURATION = 600.0
     MAX_STEPS_PER_GOAL = 25
@@ -35,6 +37,18 @@ class ExecutionPlanner:
         "running_in_wsl",
         "ci_environment",
     }
+
+    # ---- Destructive Command Denylist (EP-1 FIX) ----
+    DANGEROUS_PATTERNS = [
+        r"\brm\s+-rf\b",
+        r"\bsudo\b",
+        r"\bdd\b",
+        r"\bmkfs\b",
+        r"\bformat\b",
+        r"curl\s+.*\|\s*bash",
+        r"wget\s+.*\|\s*bash",
+        r"\bchmod\s+777\b",
+    ]
 
     def __init__(
         self,
@@ -176,7 +190,7 @@ class ExecutionPlanner:
         future = executor.submit(_invoke)
 
         try:
-            result = future.result(timeout=self.LLM_TIMEOUT_SECONDS)
+            result = future.result(timeout=LLM_CALL_TIMEOUT_SECONDS)
         except concurrent.futures.TimeoutError:
             future.cancel()
             raise PlanningError("LLM call timeout")
@@ -239,7 +253,6 @@ class ExecutionPlanner:
         try:
             return json.loads(raw)
         except json.JSONDecodeError:
-            # non-greedy fallback
             match = re.search(r"(\{.*?\}|\[.*?\])", raw, re.DOTALL)
             if match:
                 try:
@@ -333,10 +346,15 @@ Return JSON only.
             if duration < 0 or duration > self.MAX_ESTIMATED_DURATION:
                 raise PlanningError("Duration out of bounds")
 
-            # Minimal semantic validation
+            # ---- Destructive Command Protection ----
             if step_type == StepType.COMMAND_EXECUTION.value:
-                if "command" not in action:
+                cmd = action.get("command")
+                if not isinstance(cmd, str) or not cmd.strip():
                     raise PlanningError("COMMAND_EXECUTION missing 'command'")
+
+                for pattern in self.DANGEROUS_PATTERNS:
+                    if re.search(pattern, cmd, re.IGNORECASE):
+                        raise PlanningError("Dangerous command detected")
 
             if step_type == StepType.UI_INTERACTION.value:
                 if "operation" not in action:
