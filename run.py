@@ -1,6 +1,8 @@
 import os
 import sys
 import asyncio
+import threading
+from typing import Any, Tuple
 
 from adapters.factory import build_llm
 from main import main
@@ -20,6 +22,30 @@ def resolve_model_name() -> str:
         "No model specified. "
         "Pass model as CLI argument or set LLM_MODEL environment variable."
     )
+
+
+def _run_coroutine_threadsafe(coro) -> Any:
+    """
+    Execute coroutine in a fresh event loop inside a dedicated thread.
+    Used when already inside a running event loop.
+    """
+    result_container: dict = {}
+    error_container: dict = {}
+
+    def _thread_target():
+        try:
+            result_container["result"] = asyncio.run(coro)
+        except Exception as e:
+            error_container["error"] = e
+
+    t = threading.Thread(target=_thread_target, daemon=True)
+    t.start()
+    t.join()
+
+    if "error" in error_container:
+        raise error_container["error"]
+
+    return result_container.get("result")
 
 
 def _make_llm_callable(adapter):
@@ -42,15 +68,22 @@ def _make_llm_callable(adapter):
 
         try:
             try:
-                # If already inside event loop (rare but fatal case)
-                loop = asyncio.get_running_loop()
-                # Run coroutine in a fresh loop inside thread
-                return asyncio.run(_invoke())
+                # Detect running loop
+                asyncio.get_running_loop()
+                # If we reach here, we are inside an event loop
+                result = _run_coroutine_threadsafe(_invoke())
             except RuntimeError:
-                # No running loop → safe to run directly
-                ops, err = asyncio.run(_invoke())
+                # No running loop
+                result = asyncio.run(_invoke())
         except Exception as e:
             raise RuntimeError(f"LLM adapter invocation failed: {e}") from e
+
+        # Support adapter returning (ops, err)
+        if isinstance(result, tuple) and len(result) == 2:
+            ops, err = result
+        else:
+            ops = result
+            err = None
 
         if err:
             raise RuntimeError(f"LLM adapter error: {err}")
@@ -65,9 +98,6 @@ def _make_llm_callable(adapter):
 
 if __name__ == "__main__":
     model_name = resolve_model_name()
-
     adapter = build_llm(model_name)
-
     llm_callable = _make_llm_callable(adapter)
-
     main(llm_callable, model_name=model_name)
