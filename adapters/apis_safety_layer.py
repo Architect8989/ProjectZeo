@@ -8,7 +8,7 @@ Hard guarantees:
 - No silent None
 - No cloud fallback chains
 - Deterministic LLM temperature enforcement
-- Screenshot side-effects disabled
+- Screenshot side-effects disabled (ALL write vectors)
 - Strict return validation
 - Idempotent wrapping
 """
@@ -18,18 +18,17 @@ import inspect
 import functools
 import types
 import importlib
+import builtins
+import pathlib
 
 _PATCHED = False
 
 
 # ============================================================
-# RESOLVE APIS MODULE (ROBUST IMPORT)
+# RESOLVE APIS MODULE
 # ============================================================
 
 def _resolve_apis_module():
-    """
-    Resolve apis module without relying on fragile __init__ exports.
-    """
 
     candidates = [
         "operate.models.apis",
@@ -95,11 +94,9 @@ def _wrap_provider(fn):
             )
 
     def _inject_determinism(kwargs):
-        options = kwargs.get("options")
-        if isinstance(options, dict):
-            options = dict(options)
-            options["temperature"] = 0
-            kwargs["options"] = options
+        options = dict(kwargs.get("options") or {})
+        options["temperature"] = 0
+        kwargs["options"] = options
         return kwargs
 
     if is_async:
@@ -108,9 +105,7 @@ def _wrap_provider(fn):
         async def async_wrapper(messages, *args, **kwargs):
 
             if not isinstance(messages, list):
-                raise RuntimeError(
-                    "[APIS-SAFETY] messages must be list"
-                )
+                raise RuntimeError("[APIS-SAFETY] messages must be list")
 
             caller_snapshot = copy.deepcopy(messages)
             safe_messages = copy.deepcopy(messages)
@@ -137,9 +132,7 @@ def _wrap_provider(fn):
         def sync_wrapper(messages, *args, **kwargs):
 
             if not isinstance(messages, list):
-                raise RuntimeError(
-                    "[APIS-SAFETY] messages must be list"
-                )
+                raise RuntimeError("[APIS-SAFETY] messages must be list")
 
             caller_snapshot = copy.deepcopy(messages)
             safe_messages = copy.deepcopy(messages)
@@ -162,7 +155,7 @@ def _wrap_provider(fn):
 
 
 # ============================================================
-# PATCH ALL PROVIDERS
+# PATCH PROVIDERS
 # ============================================================
 
 def _patch_all_providers():
@@ -175,8 +168,7 @@ def _patch_all_providers():
         attr = getattr(apis, name)
 
         if isinstance(attr, types.FunctionType):
-            wrapped = _wrap_provider(attr)
-            setattr(apis, name, wrapped)
+            setattr(apis, name, _wrap_provider(attr))
 
 
 # ============================================================
@@ -188,47 +180,87 @@ def _disable_cloud_fallbacks():
     if hasattr(apis, "gpt_4_fallback"):
 
         def hard_fail_fallback(*args, **kwargs):
-            raise RuntimeError(
-                "[APIS-SAFETY] Cloud fallback disabled"
-            )
+            raise RuntimeError("[APIS-SAFETY] Cloud fallback disabled")
 
         apis.gpt_4_fallback = hard_fail_fallback
 
 
 # ============================================================
-# DISABLE SCREENSHOT SIDE EFFECTS
+# DISABLE SCREENSHOT SIDE EFFECTS (FULL HARDENING)
 # ============================================================
 
 def _disable_screenshot_writes():
 
+    def _is_screenshot_path(path):
+        if not isinstance(path, (str, pathlib.Path)):
+            return False
+        return "screenshot" in str(path).lower()
+
+    # ---- Guard os.makedirs ----
     if hasattr(apis, "os") and hasattr(apis.os, "makedirs"):
 
         original_makedirs = apis.os.makedirs
 
         def guarded_makedirs(path, *args, **kwargs):
-            if isinstance(path, str) and "screenshot" in path.lower():
+            if _is_screenshot_path(path):
                 return
             return original_makedirs(path, *args, **kwargs)
 
         apis.os.makedirs = guarded_makedirs
 
+    # ---- Guard PIL Image.save ----
     if hasattr(apis, "Image"):
-
         try:
             original_save = apis.Image.Image.save
 
             def guarded_save(self, fp, *args, **kwargs):
-                if isinstance(fp, str) and "screenshot" in fp.lower():
+                if _is_screenshot_path(fp):
                     return
                 return original_save(self, fp, *args, **kwargs)
 
             apis.Image.Image.save = guarded_save
-        except Exception:
-            pass
+        except Exception as e:
+            raise RuntimeError(
+                f"[APIS-SAFETY] Failed to patch PIL save: {e}"
+            )
+
+    # ---- Guard builtins.open ----
+    original_open = builtins.open
+
+    def guarded_open(file, mode="r", *args, **kwargs):
+        if "w" in mode or "a" in mode or "x" in mode:
+            if _is_screenshot_path(file):
+                raise RuntimeError(
+                    "[APIS-SAFETY] Screenshot file write blocked"
+                )
+        return original_open(file, mode, *args, **kwargs)
+
+    builtins.open = guarded_open
+
+    # ---- Guard pathlib writes ----
+    original_write_bytes = pathlib.Path.write_bytes
+    original_write_text = pathlib.Path.write_text
+
+    def guarded_write_bytes(self, data, *args, **kwargs):
+        if _is_screenshot_path(self):
+            raise RuntimeError(
+                "[APIS-SAFETY] Screenshot file write blocked"
+            )
+        return original_write_bytes(self, data, *args, **kwargs)
+
+    def guarded_write_text(self, data, *args, **kwargs):
+        if _is_screenshot_path(self):
+            raise RuntimeError(
+                "[APIS-SAFETY] Screenshot file write blocked"
+            )
+        return original_write_text(self, data, *args, **kwargs)
+
+    pathlib.Path.write_bytes = guarded_write_bytes
+    pathlib.Path.write_text = guarded_write_text
 
 
 # ============================================================
-# GUARD DISPATCHER
+# GUARD DISPATCH
 # ============================================================
 
 def _guard_dispatch():
