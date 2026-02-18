@@ -1,5 +1,7 @@
 import time
 import threading
+import json
+import os
 from enum import Enum
 from typing import Optional, Deque, Dict, Callable
 from collections import deque
@@ -34,6 +36,7 @@ class ModeController:
     MAX_TRANSITION_HISTORY = 2000
     MAX_PLANNING_SECONDS = 60.0
     MAX_PLAN_ID_LENGTH = 128
+    TRANSITION_LOG_PATH = "logs/mode_transitions.jsonl"
 
     def __init__(self):
         self._lock = threading.RLock()
@@ -66,9 +69,7 @@ class ModeController:
             maxlen=self.MAX_TRANSITION_HISTORY
         )
 
-    # ==================================================
-    # READS
-    # ==================================================
+        os.makedirs("logs", exist_ok=True)
 
     @property
     def mode(self) -> SystemMode:
@@ -82,10 +83,6 @@ class ModeController:
     def get_intent(self) -> Optional[str]:
         with self._lock:
             return self._intent
-
-    # ==================================================
-    # REPLAN CONTROL  (FIXED)
-    # ==================================================
 
     def begin_replan_sequence(self) -> None:
         with self._lock:
@@ -105,10 +102,6 @@ class ModeController:
     def end_replan_sequence(self) -> None:
         with self._lock:
             self._replan_in_progress = False
-
-    # ==================================================
-    # SNAPSHOT CONTRACT
-    # ==================================================
 
     def attach_snapshot(self, snapshot_id: str) -> None:
         with self._lock:
@@ -134,10 +127,6 @@ class ModeController:
             self._snapshot_consumed = True
             return self._snapshot_id
 
-    # ==================================================
-    # LLM INJECTION
-    # ==================================================
-
     def inject_llm_callable(self, llm_call: Callable) -> None:
         if not callable(llm_call):
             raise TypeError("llm_call must be callable")
@@ -155,10 +144,6 @@ class ModeController:
                 raise RuntimeError("No LLM injected")
             return self._llm_callable
 
-    # ==================================================
-    # HEALTH SIGNALS
-    # ==================================================
-
     def update_observer_health(
         self, healthy: bool, *, reason: Optional[str] = None
     ) -> None:
@@ -170,10 +155,6 @@ class ModeController:
     def update_vision_status(self, ok: bool) -> None:
         with self._lock:
             self._vision_ok = bool(ok)
-
-    # ==================================================
-    # TRANSITIONS
-    # ==================================================
 
     def arm(self, intent: str) -> None:
         with self._lock:
@@ -217,52 +198,6 @@ class ModeController:
 
             self._commit_transition(SystemMode.PLANNING, "planning started", False)
 
-    def check_planning_timeout(self) -> None:
-        with self._lock:
-            if self._mode is not SystemMode.PLANNING:
-                return
-
-            if not self._planning_started_at:
-                raise PlanningTimeoutError("Planning timestamp missing")
-
-            if time.time() - self._planning_started_at > self.MAX_PLANNING_SECONDS:
-                self._reset_internal_state()
-                self._commit_transition(
-                    SystemMode.OBSERVER,
-                    "planning timeout",
-                    True,
-                )
-                raise PlanningTimeoutError("Planning timeout exceeded")
-
-    def attach_execution_plan(self, plan_id: str) -> None:
-        with self._lock:
-            if self._mode is not SystemMode.PLANNING:
-                raise ModeTransitionError("Plan attach only in PLANNING")
-
-            if not plan_id or not plan_id.strip():
-                raise ModeTransitionError("Invalid plan_id")
-
-            plan_id = plan_id.strip()
-
-            if len(plan_id) > self.MAX_PLAN_ID_LENGTH:
-                raise ModeTransitionError("plan_id too long")
-
-            if self._execution_plan_attached:
-                raise ModeTransitionError("Plan already attached")
-
-            self._execution_plan_attached = True
-            self._execution_plan_id = plan_id
-
-    def mark_planning_complete(self) -> None:
-        with self._lock:
-            if self._mode is not SystemMode.PLANNING:
-                raise ModeTransitionError("Planning not active")
-            if not self._execution_plan_attached:
-                raise ModeTransitionError("Plan not attached")
-
-            self._planning_completed = True
-            self._planning_started_at = None
-
     def execute(self) -> None:
         with self._lock:
             if self._mode is not SystemMode.PLANNING:
@@ -282,64 +217,6 @@ class ModeController:
                 False,
             )
 
-    def begin_restoration(self) -> None:
-        with self._lock:
-            if self._mode is not SystemMode.EXECUTING:
-                raise ModeTransitionError("Restoration requires EXECUTING")
-
-            self._commit_transition(
-                SystemMode.RESTORING,
-                "restoration started",
-                False,
-            )
-
-    # ==================================================
-    # COMPLETION
-    # ==================================================
-
-    def complete_execution(self, reason: str = "execution complete") -> None:
-        with self._lock:
-            if self._mode is not SystemMode.RESTORING:
-                raise ModeTransitionError("Completion requires RESTORING")
-
-            self._reset_internal_state()
-
-            self._commit_transition(
-                SystemMode.OBSERVER,
-                reason,
-                False,
-            )
-
-    def force_observer(self) -> None:
-        with self._lock:
-            self._reset_internal_state()
-            self._failure_reason = None
-            self._commit_transition(
-                SystemMode.OBSERVER,
-                "forced reset",
-                True,
-            )
-
-    # ==================================================
-    # INTERNAL RESET
-    # ==================================================
-
-    def _reset_internal_state(self) -> None:
-        self._intent = None
-        self._intent_frozen = False
-        self._planning_completed = False
-        self._execution_plan_attached = False
-        self._execution_plan_id = None
-        self._input_locked = False
-        self._snapshot_id = None
-        self._snapshot_consumed = False
-        self._planning_started_at = None
-        self._replan_in_progress = False
-
-    # ==================================================
-    # TRANSITION COMMIT
-    # ==================================================
-
     def _commit_transition(
         self,
         target: SystemMode,
@@ -353,23 +230,25 @@ class ModeController:
         self._mode_entered_at = now
         self._last_transition_reason = reason
 
-        self._transition_history.append(
-            {
-                "ts": now,
-                "from": prev.value,
-                "to": target.value,
-                "reason": reason,
-                "forced": forced,
-                "vision_ok": self._vision_ok,
-                "observer_healthy": self._observer_healthy,
-                "plan_attached": self._execution_plan_attached,
-                "plan_id": self._execution_plan_id,
-            }
-        )
+        entry = {
+            "ts": now,
+            "from": prev.value,
+            "to": target.value,
+            "reason": reason,
+            "forced": forced,
+            "vision_ok": self._vision_ok,
+            "observer_healthy": self._observer_healthy,
+            "plan_attached": self._execution_plan_attached,
+            "plan_id": self._execution_plan_id,
+        }
 
-    # ==================================================
-    # FORENSICS
-    # ==================================================
+        self._transition_history.append(entry)
+
+        try:
+            with open(self.TRANSITION_LOG_PATH, "a", encoding="utf-8") as f:
+                f.write(json.dumps(entry, sort_keys=True) + "\n")
+        except Exception:
+            pass
 
     def get_authority_snapshot(self) -> Dict[str, object]:
         with self._lock:
@@ -384,4 +263,4 @@ class ModeController:
                 "execution_plan_attached": self._execution_plan_attached,
                 "execution_plan_id": self._execution_plan_id,
                 "transition_history_depth": len(self._transition_history),
-    }
+                }
