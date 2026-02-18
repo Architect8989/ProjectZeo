@@ -2,6 +2,7 @@ import time
 import threading
 import json
 import os
+import pathlib
 from enum import Enum
 from typing import Optional, Deque, Dict, Callable
 from collections import deque
@@ -36,7 +37,11 @@ class ModeController:
     MAX_TRANSITION_HISTORY = 2000
     MAX_PLANNING_SECONDS = 60.0
     MAX_PLAN_ID_LENGTH = 128
-    TRANSITION_LOG_PATH = "logs/mode_transitions.jsonl"
+
+    _MODULE_ROOT = pathlib.Path(__file__).resolve().parents[1]
+    TRANSITION_LOG_PATH = str(
+        _MODULE_ROOT / "logs" / "mode_transitions.jsonl"
+    )
 
     def __init__(self):
         self._lock = threading.RLock()
@@ -69,7 +74,14 @@ class ModeController:
             maxlen=self.MAX_TRANSITION_HISTORY
         )
 
-        os.makedirs("logs", exist_ok=True)
+        pathlib.Path(self.TRANSITION_LOG_PATH).parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+    # ==================================================
+    # READS
+    # ==================================================
 
     @property
     def mode(self) -> SystemMode:
@@ -83,6 +95,10 @@ class ModeController:
     def get_intent(self) -> Optional[str]:
         with self._lock:
             return self._intent
+
+    # ==================================================
+    # REPLAN CONTROL
+    # ==================================================
 
     def begin_replan_sequence(self) -> None:
         with self._lock:
@@ -102,6 +118,10 @@ class ModeController:
     def end_replan_sequence(self) -> None:
         with self._lock:
             self._replan_in_progress = False
+
+    # ==================================================
+    # SNAPSHOT CONTRACT
+    # ==================================================
 
     def attach_snapshot(self, snapshot_id: str) -> None:
         with self._lock:
@@ -127,6 +147,10 @@ class ModeController:
             self._snapshot_consumed = True
             return self._snapshot_id
 
+    # ==================================================
+    # LLM
+    # ==================================================
+
     def inject_llm_callable(self, llm_call: Callable) -> None:
         if not callable(llm_call):
             raise TypeError("llm_call must be callable")
@@ -144,6 +168,10 @@ class ModeController:
                 raise RuntimeError("No LLM injected")
             return self._llm_callable
 
+    # ==================================================
+    # HEALTH
+    # ==================================================
+
     def update_observer_health(
         self, healthy: bool, *, reason: Optional[str] = None
     ) -> None:
@@ -155,6 +183,10 @@ class ModeController:
     def update_vision_status(self, ok: bool) -> None:
         with self._lock:
             self._vision_ok = bool(ok)
+
+    # ==================================================
+    # TRANSITIONS
+    # ==================================================
 
     def arm(self, intent: str) -> None:
         with self._lock:
@@ -196,7 +228,11 @@ class ModeController:
             self._intent_frozen = True
             self._planning_started_at = time.time()
 
-            self._commit_transition(SystemMode.PLANNING, "planning started", False)
+            self._commit_transition(
+                SystemMode.PLANNING,
+                "planning started",
+                False,
+            )
 
     def execute(self) -> None:
         with self._lock:
@@ -216,6 +252,10 @@ class ModeController:
                 f"execution started (plan={self._execution_plan_id})",
                 False,
             )
+
+    # ==================================================
+    # COMMIT TRANSITION
+    # ==================================================
 
     def _commit_transition(
         self,
@@ -250,6 +290,10 @@ class ModeController:
         except Exception:
             pass
 
+    # ==================================================
+    # FORENSICS
+    # ==================================================
+
     def get_authority_snapshot(self) -> Dict[str, object]:
         with self._lock:
             return {
@@ -263,4 +307,4 @@ class ModeController:
                 "execution_plan_attached": self._execution_plan_attached,
                 "execution_plan_id": self._execution_plan_id,
                 "transition_history_depth": len(self._transition_history),
-                }
+        }
