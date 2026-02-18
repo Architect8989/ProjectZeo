@@ -1,8 +1,8 @@
-from typing import Callable, List, Dict, Any
+from typing import List, Dict, Any
 from operate.exceptions import ModelNotRecognizedException
 
-# Containment hardening
-from apis_safety_layer import apply_patches
+# Correct package import (prevents ModuleNotFoundError at startup)
+from .apis_safety_layer import apply_patches
 
 
 # ==================================================
@@ -23,7 +23,7 @@ _ADAPTER_REGISTRY: Dict[str, str] = {
 _PATCHES_APPLIED = False
 
 
-def _ensure_patches():
+def _ensure_patches() -> None:
     global _PATCHES_APPLIED
     if not _PATCHES_APPLIED:
         apply_patches()
@@ -66,10 +66,6 @@ class AdapterFactory:
     - Strict contract: returns (operation_list, error_object)
     """
 
-    # --------------------------------------------------
-    # BUILDER
-    # --------------------------------------------------
-
     @staticmethod
     def build_llm(model_name: str):
         """
@@ -77,7 +73,9 @@ class AdapterFactory:
         """
 
         if not isinstance(model_name, str) or not model_name.strip():
-            raise ModelNotRecognizedException("Model name must be non-empty string.")
+            raise ModelNotRecognizedException(
+                "Model name must be non-empty string."
+            )
 
         model_name = model_name.strip()
 
@@ -100,10 +98,6 @@ class AdapterFactory:
         AdapterClass = _import_from_path(adapter_path)
 
         return AdapterClass(model_name=model_name)
-
-    # --------------------------------------------------
-    # EXECUTION ENTRYPOINT
-    # --------------------------------------------------
 
     @staticmethod
     async def get_action(
