@@ -142,7 +142,6 @@ def main(llm_callable: Callable, model_name: str):
     vision_runtime.start()
     observer_loop.start()
 
-    # Warmup
     warmup_deadline = time.time() + 5.0
     while time.time() < warmup_deadline:
         if observer.is_healthy() and vision_runtime.is_healthy():
@@ -160,6 +159,7 @@ def main(llm_callable: Callable, model_name: str):
     restore_provider = RestoreProvider(
         os_backend=os_backend,
         mode_controller=mode,
+        snapshot_provider=snapshot_provider,   # FIXED
     )
 
     intent_listener = IntentListener(mode, snapshot_provider)
@@ -225,68 +225,21 @@ def main(llm_callable: Callable, model_name: str):
 
                 # ---- EXECUTION ----
                 try:
-
-                    while True:
-
-                        _enforce_task_timeout(os_backend, auth_state)
-
-                        try:
-                            operate_main(
-                                terminal_prompt=intent,
-                                execution_plan=execution_plan,
-                                planner=planner,
-                                observer=observer,
-                                world_graph=world_graph,
-                            )
-                            break
-
-                        except RuntimeError as e:
-
-                            if str(e) != "REPLAN_REQUIRED":
-                                raise
-
-                            replan_count += 1
-                            if replan_count > MAX_REPLANS:
-                                raise RuntimeError("Max replans exceeded")
-
-                            # ---- REPLAN ----
-                            mode.begin_replan_sequence()
-
-                            try:
-                                mode.force_observer()
-
-                                new_snapshot_id = snapshot_provider.take_snapshot()
-                                mode.attach_snapshot(new_snapshot_id)
-                                mode.arm(intent)
-
-                                _ingest_latest_perception(observer, world_graph)
-                                planner.update_world_snapshot(world_graph.snapshot())
-
-                                mode.begin_planning()
-
-                                execution_plan = planner.create_plan(
-                                    objective=intent,
-                                    requirements={
-                                        "environment": env_fingerprint,
-                                        "tools": env_fingerprint.get("tools", []),
-                                    },
-                                    high_level_steps=[{"goal": intent}],
-                                )
-
-                                mode.attach_execution_plan(
-                                    f"plan_replan_{replan_count}_{int(time.time())}"
-                                )
-                                mode.mark_planning_complete()
-                                mode.execute()
-
-                            finally:
-                                mode.end_replan_sequence()
+                    operate_main(
+                        terminal_prompt=intent,
+                        execution_plan=execution_plan,
+                        planner=planner,
+                        observer=observer,
+                        world_graph=world_graph,
+                        os_backend=os_backend,   # FIXED
+                    )
 
                 finally:
 
                     # ---- RESTORATION ----
                     mode.begin_restoration()
-                    restore_provider.restore_snapshot(snapshot_id)
+
+                    restore_provider.restore_snapshot(snapshot_id)  # FIXED
 
                     auth_state.persist(
                         execution_mode="OBSERVER",
