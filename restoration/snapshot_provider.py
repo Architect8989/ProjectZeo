@@ -29,70 +29,16 @@ class SnapshotProvider:
     - Snapshot only in OBSERVER mode
     - Observer must be healthy
     - Vision must be available
-    - OS state captured atomically
+    - OS state captured within bounded window
     - Deterministic serialization
-    - Bounded in-memory registry (LRU)
-    - No PID validation violation
+    - Instance-isolated LRU registry
     """
 
-    SNAPSHOT_SCHEMA_VERSION = "2.1"
-
-    _snapshots: "OrderedDict[str, RestorationSnapshot]" = OrderedDict()
-    _lock = threading.Lock()
+    SNAPSHOT_SCHEMA_VERSION = "2.2"
 
     MAX_SNAPSHOTS = 128
     MAX_SNAPSHOT_AGE_SECONDS = 3600
-    ATOMIC_WINDOW_SECONDS = 0.02  # 20ms
-
-    # =========================================================
-    # SNAPSHOT REGISTRY (LRU + TTL)
-    # =========================================================
-
-    @classmethod
-    def store_snapshot(cls, snapshot: RestorationSnapshot) -> str:
-        if not isinstance(snapshot, RestorationSnapshot):
-            raise SnapshotProviderError("Invalid snapshot object")
-
-        now = time.time()
-
-        with cls._lock:
-            # TTL eviction
-            stale_keys = []
-            for k, v in cls._snapshots.items():
-                captured = v.metadata.get("captured_at_wallclock", now)
-                if (now - float(captured)) > cls.MAX_SNAPSHOT_AGE_SECONDS:
-                    stale_keys.append(k)
-
-            for k in stale_keys:
-                cls._snapshots.pop(k, None)
-
-            # LRU capacity enforcement
-            while len(cls._snapshots) >= cls.MAX_SNAPSHOTS:
-                cls._snapshots.popitem(last=False)
-
-            if snapshot.snapshot_id in cls._snapshots:
-                raise SnapshotProviderError(
-                    f"Snapshot id collision: {snapshot.snapshot_id}"
-                )
-
-            cls._snapshots[snapshot.snapshot_id] = snapshot
-
-        return snapshot.snapshot_id
-
-    @classmethod
-    def get_snapshot(
-        cls,
-        snapshot_id: str,
-    ) -> Optional[RestorationSnapshot]:
-
-        if not isinstance(snapshot_id, str) or not snapshot_id:
-            return None
-
-        with cls._lock:
-            snap = cls._snapshots.get(snapshot_id)
-            if snap:
-                cls._snapshots.move_to_end(snapshot_id)
-            return snap
+    ATOMIC_WINDOW_SECONDS = 0.25  # realistic under load (250ms)
 
     # =========================================================
     # INIT
@@ -109,6 +55,64 @@ class SnapshotProvider:
         self._os = os_backend
         self._mode = mode_controller
 
+        # instance-local registry
+        self._snapshots: "OrderedDict[str, RestorationSnapshot]" = OrderedDict()
+        self._lock = threading.Lock()
+
+    # =========================================================
+    # SNAPSHOT REGISTRY (LRU + TTL)
+    # =========================================================
+
+    def _evict_stale(self, now: float) -> None:
+        stale_keys = []
+
+        for k, v in self._snapshots.items():
+            captured = v.metadata.get("captured_at_wallclock", now)
+            try:
+                captured = float(captured)
+            except Exception:
+                captured = now
+
+            if (now - captured) > self.MAX_SNAPSHOT_AGE_SECONDS:
+                stale_keys.append(k)
+
+        for k in stale_keys:
+            self._snapshots.pop(k, None)
+
+    def _enforce_capacity(self) -> None:
+        while len(self._snapshots) > self.MAX_SNAPSHOTS:
+            self._snapshots.popitem(last=False)
+
+    def store_snapshot(self, snapshot: RestorationSnapshot) -> str:
+        if not isinstance(snapshot, RestorationSnapshot):
+            raise SnapshotProviderError("Invalid snapshot object")
+
+        now = time.time()
+
+        with self._lock:
+            self._evict_stale(now)
+
+            if snapshot.snapshot_id in self._snapshots:
+                raise SnapshotProviderError(
+                    f"Snapshot id collision: {snapshot.snapshot_id}"
+                )
+
+            self._snapshots[snapshot.snapshot_id] = snapshot
+            self._enforce_capacity()
+
+        return snapshot.snapshot_id
+
+    def get_snapshot(self, snapshot_id: str) -> Optional[RestorationSnapshot]:
+
+        if not isinstance(snapshot_id, str) or not snapshot_id:
+            return None
+
+        with self._lock:
+            snap = self._snapshots.get(snapshot_id)
+            if snap:
+                self._snapshots.move_to_end(snapshot_id)
+            return snap
+
     # =========================================================
     # PUBLIC
     # =========================================================
@@ -123,17 +127,14 @@ class SnapshotProvider:
 
     def _capture_snapshot(self) -> RestorationSnapshot:
 
-        # ---- Observer wiring ----
         if self._observer is None:
             raise SnapshotProviderError("Observer missing")
 
-        # ---- Mode enforcement ----
         if self._mode.mode is not SystemMode.OBSERVER:
             raise SnapshotProviderError(
                 f"Snapshot attempted in {self._mode.mode.value}"
             )
 
-        # ---- Observer health ----
         if not self._observer.is_healthy():
             raise SnapshotProviderError("Observer unhealthy")
 
@@ -146,7 +147,8 @@ class SnapshotProvider:
 
         frame_ts = observer_state.get("perception_frame_ts")
 
-        # ---- Atomic OS capture ----
+        # ---------------- BOUNDED ATOMIC CAPTURE ----------------
+
         t_start = time.monotonic()
 
         try:
@@ -160,12 +162,15 @@ class SnapshotProvider:
 
         t_end = time.monotonic()
 
-        if (t_end - t_start) > self.ATOMIC_WINDOW_SECONDS:
+        capture_duration = t_end - t_start
+
+        if capture_duration > self.ATOMIC_WINDOW_SECONDS:
             raise SnapshotProviderError(
-                "Atomic capture window exceeded"
+                f"Atomic capture window exceeded ({round(capture_duration,4)}s)"
             )
 
-        # ---- Strict validation ----
+        # ---------------- VALIDATION ----------------
+
         if not isinstance(cursor, dict):
             raise SnapshotProviderError("Cursor invalid")
 
@@ -198,7 +203,8 @@ class SnapshotProvider:
 
         app_title = active_app["title"].strip()
 
-        # ---- State Objects ----
+        # ---------------- STATE OBJECTS ----------------
+
         cursor_state = CursorState(
             x=cursor_x,
             y=cursor_y,
@@ -209,13 +215,13 @@ class SnapshotProvider:
             title=window_title,
         )
 
-        # CRITICAL: pid=None avoids validation violation
         application_state = ApplicationState(
             process_name=app_title,
-            pid=None,
+            pid=None,  # deterministic & portable
         )
 
-        # ---- Deterministic Metadata ----
+        # ---------------- METADATA (CANONICALIZED) ----------------
+
         metadata = {
             "schema_version": self.SNAPSHOT_SCHEMA_VERSION,
             "captured_at_monotonic": float(t_end),
@@ -223,17 +229,21 @@ class SnapshotProvider:
             "execution_mode": self._mode.mode.value,
             "vision_frame_ts": frame_ts,
             "capture_duration_ms": round(
-                (t_end - t_start) * 1000.0,
+                capture_duration * 1000.0,
                 6,
             ),
         }
 
-        # Canonical JSON normalization
         metadata = json.loads(
-            json.dumps(metadata, sort_keys=True, separators=(",", ":"))
+            json.dumps(
+                metadata,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
         )
 
-        # ---- Create Snapshot ----
+        # ---------------- SNAPSHOT CREATION ----------------
+
         snapshot = RestorationSnapshot.create(
             cursor=cursor_state,
             focus=focus_state,
