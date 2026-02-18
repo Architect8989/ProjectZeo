@@ -8,24 +8,8 @@ import json
 
 
 class ActionRanker:
-    """
-    Decision-theoretic action selector.
-
-    Combines:
-    - Risk-adjusted Expected Utility
-    - Pure exploration bonus (UCB minus mean)
-    - Thompson sampling
-    - Entropy-aware softmax
-
-    No regret updates occur here.
-    """
-
     MIN_TAU = 0.15
     MAX_TAU = 1.5
-
-    # ==================================================
-    # ACTION SELECTION
-    # ==================================================
 
     def select(
         self,
@@ -36,16 +20,13 @@ class ActionRanker:
         if not actions:
             raise RuntimeError("No candidate actions")
 
-        action_ids = [self._action_key(a) for a in actions]
+        action_ids = [self.action_key(a) for a in actions]
         scores = []
 
         for action, key in zip(actions, action_ids):
 
-            # ---------------- Exploitation ----------------
             eu = belief_state.expected_utility(key)
 
-            # ---------------- Exploration ----------------
-            # UCB = mean + exploration
             ucb_full = belief_state.ucb_score(key)
 
             rewards = belief_state.action_rewards.get(key)
@@ -56,11 +37,10 @@ class ActionRanker:
 
             exploration_bonus = ucb_full - mean_reward
 
-            # ---------------- Posterior Sampling ----------------
-            thompson = belief_state.thompson_sample(key)
+            thompson = self._local_thompson_sample(
+                rewards if rewards else []
+            )
 
-            # ---------------- Balanced Combination ----------------
-            # Do NOT double-count mean reward.
             combined = (
                 0.6 * eu
                 + 0.2 * exploration_bonus
@@ -69,21 +49,12 @@ class ActionRanker:
 
             scores.append(combined)
 
-        # --------------------------------------------------
-        # Entropy-aware temperature
-        # --------------------------------------------------
-
         entropy = belief_state.entropy()
         tau = self._entropy_temperature(entropy)
-
-        # --------------------------------------------------
-        # Numerically stable softmax (overflow safe)
-        # --------------------------------------------------
 
         max_score = max(scores)
         shifted = [(s - max_score) / tau for s in scores]
 
-        # Prevent overflow
         exp_scores = [math.exp(min(50.0, s)) for s in shifted]
         total = sum(exp_scores)
 
@@ -100,37 +71,21 @@ class ActionRanker:
 
         return actions[selected_index]
 
-    # ==================================================
-    # ENTROPY-ADAPTIVE TEMPERATURE
-    # ==================================================
+    def _local_thompson_sample(self, rewards) -> float:
+        successes = sum(1 for r in rewards if r > 0)
+        failures = sum(1 for r in rewards if r < 0)
+        return random.betavariate(successes + 1, failures + 1)
 
     def _entropy_temperature(self, entropy: float) -> float:
-        """
-        Low entropy → exploitation (low tau)
-        High entropy → exploration (high tau)
-        """
-
-        # Smooth mapping instead of direct identity
         tau = math.tanh(entropy) * self.MAX_TAU
-
         return max(self.MIN_TAU, min(self.MAX_TAU, tau))
 
-    # ==================================================
-    # ACTION KEYING (COLLISION-SAFE)
-    # ==================================================
-
-    def _action_key(self, action: Dict[str, Any]) -> str:
-        """
-        Canonical deterministic identity.
-        Prevents collisions caused by string concatenation.
-        """
-
+    def action_key(self, action: Dict[str, Any]) -> str:
         canonical = json.dumps(
             action,
             sort_keys=True,
             default=str,
         )
-
         return hashlib.sha256(
             canonical.encode()
         ).hexdigest()[:16]
