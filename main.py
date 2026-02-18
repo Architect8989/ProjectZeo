@@ -142,6 +142,7 @@ def main(llm_callable: Callable, model_name: str):
     vision_runtime.start()
     observer_loop.start()
 
+    # Warmup
     warmup_deadline = time.time() + 5.0
     while time.time() < warmup_deadline:
         if observer.is_healthy() and vision_runtime.is_healthy():
@@ -181,12 +182,13 @@ def main(llm_callable: Callable, model_name: str):
                 TASK_START = time.time()
                 replan_count = 0
 
-                snapshot_id: Optional[str] = mode.consume_snapshot()
+                snapshot_id = mode.consume_snapshot()
                 if not snapshot_id:
                     raise RuntimeError("Missing snapshot")
 
                 _ingest_latest_perception(observer, world_graph)
 
+                # ---- PLANNING ----
                 mode.begin_planning()
 
                 intent = mode.get_intent()
@@ -219,9 +221,9 @@ def main(llm_callable: Callable, model_name: str):
                     dirty=True,
                 )
 
-                consumed_intent = intent
                 mode.execute()
 
+                # ---- EXECUTION ----
                 try:
 
                     while True:
@@ -230,7 +232,7 @@ def main(llm_callable: Callable, model_name: str):
 
                         try:
                             operate_main(
-                                terminal_prompt=consumed_intent,
+                                terminal_prompt=intent,
                                 execution_plan=execution_plan,
                                 planner=planner,
                                 observer=observer,
@@ -247,38 +249,42 @@ def main(llm_callable: Callable, model_name: str):
                             if replan_count > MAX_REPLANS:
                                 raise RuntimeError("Max replans exceeded")
 
-                            # ---- replan guard begin ----
+                            # ---- REPLAN ----
                             mode.begin_replan_sequence()
 
-                            mode.force_observer()
-                            mode.attach_snapshot(snapshot_id)
-                            mode.arm(consumed_intent)
+                            try:
+                                mode.force_observer()
 
-                            _ingest_latest_perception(observer, world_graph)
-                            planner.update_world_snapshot(world_graph.snapshot())
+                                new_snapshot_id = snapshot_provider.take_snapshot()
+                                mode.attach_snapshot(new_snapshot_id)
+                                mode.arm(intent)
 
-                            mode.begin_planning()
+                                _ingest_latest_perception(observer, world_graph)
+                                planner.update_world_snapshot(world_graph.snapshot())
 
-                            execution_plan = planner.create_plan(
-                                objective=consumed_intent,
-                                requirements={
-                                    "environment": env_fingerprint,
-                                    "tools": env_fingerprint.get("tools", []),
-                                },
-                                high_level_steps=[{"goal": consumed_intent}],
-                            )
+                                mode.begin_planning()
 
-                            mode.attach_execution_plan(
-                                f"plan_replan_{replan_count}_{int(time.time())}"
-                            )
-                            mode.mark_planning_complete()
-                            mode.execute()
+                                execution_plan = planner.create_plan(
+                                    objective=intent,
+                                    requirements={
+                                        "environment": env_fingerprint,
+                                        "tools": env_fingerprint.get("tools", []),
+                                    },
+                                    high_level_steps=[{"goal": intent}],
+                                )
 
-                            mode.end_replan_sequence()
-                            # ---- replan guard end ----
+                                mode.attach_execution_plan(
+                                    f"plan_replan_{replan_count}_{int(time.time())}"
+                                )
+                                mode.mark_planning_complete()
+                                mode.execute()
+
+                            finally:
+                                mode.end_replan_sequence()
 
                 finally:
 
+                    # ---- RESTORATION ----
                     mode.begin_restoration()
                     restore_provider.restore_snapshot(snapshot_id)
 
