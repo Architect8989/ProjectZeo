@@ -6,6 +6,7 @@ import hashlib
 from typing import Dict, Any, List, Optional
 import copy
 from collections import deque
+import math
 
 
 class WorldGraphError(RuntimeError):
@@ -20,16 +21,6 @@ SPATIAL_MATCH_THRESHOLD = 0.01
 
 
 class WorldGraph:
-    """
-    Incremental semantic world model.
-
-    HARDENED:
-    - O(1) history
-    - True stale pruning
-    - Safe spatial merge
-    - No entity ID duplication
-    - Strict bounded growth
-    """
 
     def __init__(self):
         self._lock = threading.RLock()
@@ -69,18 +60,16 @@ class WorldGraph:
 
         with self._lock:
 
-            # Reject non-monotonic frames
             if self._last_frame_ts is not None and frame_ts <= self._last_frame_ts:
                 return
 
             self._last_frame_ts = frame_ts
+
             focused = perception.get("focused_app")
             self._focused_app = focused if isinstance(focused, str) else None
 
             cutoff = now - ENTITY_STALE_SECONDS
-
-            # Start from existing entities (allow temporal persistence)
-            updated_entities = {}
+            updated_entities: Dict[str, Dict[str, Any]] = {}
 
             for el in elements:
                 if not isinstance(el, dict):
@@ -117,14 +106,11 @@ class WorldGraph:
                     "confidence": 1.0,
                 }
 
-            # Merge previous entities that are still within staleness window
             for eid, ent in self._entities.items():
                 if eid not in updated_entities and ent["last_seen"] >= cutoff:
                     updated_entities[eid] = ent
 
-            # Enforce global cap
             if len(updated_entities) > MAX_ENTITIES:
-                # Keep most recent entities
                 sorted_items = sorted(
                     updated_entities.values(),
                     key=lambda e: e["last_seen"],
@@ -276,6 +262,8 @@ class WorldGraph:
     def _clamped_float(self, value: Any) -> float:
         try:
             v = float(value)
+            if math.isnan(v) or math.isinf(v):
+                return 0.0
             return max(0.0, min(1.0, v))
         except Exception:
             return 0.0
@@ -285,14 +273,21 @@ class WorldGraph:
             return "unknown"
         return value.strip().lower()
 
-    def _stable_entity_id(self, *, etype: str, text: str, x: float, y: float) -> str:
-        qx = int(x / COORD_QUANT)
-        qy = int(y / COORD_QUANT)
+    def _quantize(self, value: float) -> int:
+        return int(round(value / COORD_QUANT))
 
-        if len(text) < 2:
-            raw = f"{etype}|{qx}|{qy}"
+    def _stable_entity_id(self, *, etype: str, text: str, x: float, y: float) -> str:
+        qx = self._quantize(x)
+        qy = self._quantize(y)
+
+        text_norm = text.strip().lower()
+
+        if text_norm:
+            text_hash = hashlib.sha256(text_norm.encode()).hexdigest()[:8]
         else:
-            raw = f"{etype}|{text}|{qx}|{qy}"
+            text_hash = "∅"
+
+        raw = f"{etype}|{text_hash}|{qx}|{qy}"
 
         return hashlib.sha256(raw.encode()).hexdigest()
 
