@@ -202,89 +202,96 @@ def main(llm_callable: Callable, model_name: str):
 
             mode.execute()
 
-            while True:
+            try:
+                while True:
 
-                _enforce_task_timeout(os_backend, auth_state)
+                    _enforce_task_timeout(os_backend, auth_state)
 
-                try:
-                    operate_main(
-                        terminal_prompt=intent,
-                        execution_plan=execution_plan,
-                        planner=planner,
-                        observer=observer,
-                        world_graph=world_graph,
-                        os_backend=os_backend,
-                    )
-                    break
+                    try:
+                        operate_main(
+                            terminal_prompt=intent,
+                            execution_plan=execution_plan,
+                            planner=planner,
+                            observer=observer,
+                            world_graph=world_graph,
+                            os_backend=os_backend,
+                        )
+                        break
 
-                except RuntimeError as e:
+                    except RuntimeError as e:
 
-                    msg = str(e)
+                        msg = str(e)
 
-                    if msg == "REPLAN_REQUIRED":
+                        if msg == "REPLAN_REQUIRED":
 
-                        replan_count += 1
-                        if replan_count > MAX_REPLANS:
-                            raise RuntimeError("TASK_FAILED:max_replans_exceeded")
+                            replan_count += 1
+                            if replan_count > MAX_REPLANS:
+                                raise RuntimeError("TASK_FAILED:max_replans_exceeded")
 
-                        mode.begin_replan_sequence()
+                            mode.begin_replan_sequence()
 
-                        try:
-                            mode.force_observer()
+                            try:
+                                mode.force_observer()
 
-                            new_snapshot_id = snapshot_provider.take_snapshot()
-                            mode.attach_snapshot(new_snapshot_id)
+                                new_snapshot_id = snapshot_provider.take_snapshot()
+                                mode.attach_snapshot(new_snapshot_id)
+                                mode.arm(intent)
 
-                            mode.arm(intent)
+                                _ingest_latest_perception(observer, world_graph)
+                                planner.update_world_snapshot(world_graph.snapshot())
 
-                            _ingest_latest_perception(observer, world_graph)
-                            planner.update_world_snapshot(world_graph.snapshot())
+                                mode.begin_planning()
 
-                            mode.begin_planning()
+                                execution_plan = planner.create_plan(
+                                    objective=intent,
+                                    requirements={
+                                        "environment": env_fingerprint,
+                                        "tools": env_fingerprint.get("tools", []),
+                                    },
+                                    high_level_steps=[{"goal": intent}],
+                                )
 
-                            execution_plan = planner.create_plan(
-                                objective=intent,
-                                requirements={
-                                    "environment": env_fingerprint,
-                                    "tools": env_fingerprint.get("tools", []),
-                                },
-                                high_level_steps=[{"goal": intent}],
-                            )
+                                mode.attach_execution_plan(
+                                    f"plan_replan_{replan_count}_{int(time.time())}"
+                                )
+                                mode.mark_planning_complete()
+                                mode.execute()
 
-                            mode.attach_execution_plan(
-                                f"plan_replan_{replan_count}_{int(time.time())}"
-                            )
-                            mode.mark_planning_complete()
-                            mode.execute()
+                                snapshot_id = new_snapshot_id
 
-                            snapshot_id = new_snapshot_id
+                            finally:
+                                mode.end_replan_sequence()
 
-                        finally:
-                            mode.end_replan_sequence()
+                            continue
 
-                        continue
-
-                    if msg.startswith("TASK_FAILED"):
                         raise
 
-                    raise
+            finally:
+                if mode.mode in (SystemMode.EXECUTING, SystemMode.RESTORING):
+                    try:
+                        mode.begin_restoration()
+                        restore_provider.restore_snapshot(snapshot_id)
 
-            mode.begin_restoration()
-            restore_provider.restore_snapshot(snapshot_id)
+                        auth_state.persist(
+                            execution_mode="OBSERVER",
+                            automation_active=False,
+                            restore_required=False,
+                            last_snapshot_id=None,
+                            dirty=False,
+                        )
 
-            auth_state.persist(
-                execution_mode="OBSERVER",
-                automation_active=False,
-                restore_required=False,
-                last_snapshot_id=None,
-                dirty=False,
-            )
+                        mode.complete_execution()
+                        observer.reset_for_new_task()
+                        world_graph.reset()
+                        TASK_START = None
 
-            mode.complete_execution()
-
-            observer.reset_for_new_task()
-            world_graph.reset()
-            TASK_START = None
+                    except Exception as cleanup_err:
+                        _force_safe_shutdown(
+                            os_backend,
+                            auth_state,
+                            f"restoration_failure:{cleanup_err}",
+                        )
+                        os._exit(1)
 
         except ObserverBlindnessError:
             _force_safe_shutdown(os_backend, auth_state, "observer_blindness")
