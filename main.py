@@ -74,19 +74,11 @@ def _force_safe_shutdown(os_backend, auth_state, reason: str):
     print(f"[SAFE-SHUTDOWN] {reason}", file=sys.stderr)
 
 
-def _graceful_exit(code: int = 1):
+def _signal_handler(signum, frame):
     _SHUTDOWN_EVENT.set()
-    raise SystemExit(code)
 
 
-def _install_signal_handlers(os_backend, auth_state):
-
-    def _signal_handler(signum, frame):
-        _force_safe_shutdown(os_backend, auth_state, f"signal-{signum}")
-        _graceful_exit(1)
-
-    atexit.register(_force_safe_shutdown, os_backend, auth_state, "atexit")
-
+def _install_signal_handlers():
     signal.signal(signal.SIGINT, _signal_handler)
     signal.signal(signal.SIGTERM, _signal_handler)
     if hasattr(signal, "SIGQUIT"):
@@ -147,7 +139,8 @@ def main(llm_callable: Callable, model_name: str):
     mode = ModeController()
     mode.inject_llm_callable(llm_callable)
 
-    _install_signal_handlers(os_backend, auth_state)
+    _install_signal_handlers()
+    atexit.register(lambda: _force_safe_shutdown(os_backend, auth_state, "atexit"))
 
     env_fingerprint = collect_environment_fingerprint()
 
@@ -253,8 +246,7 @@ def main(llm_callable: Callable, model_name: str):
                 mode.execute()
 
                 try:
-                    while True:
-
+                    while not _SHUTDOWN_EVENT.is_set():
                         _enforce_task_timeout()
 
                         try:
@@ -275,9 +267,7 @@ def main(llm_callable: Callable, model_name: str):
 
                             replan_count += 1
                             if replan_count > MAX_REPLANS:
-                                raise RuntimeError(
-                                    "TASK_FAILED:max_replans_exceeded"
-                                )
+                                raise RuntimeError("TASK_FAILED:max_replans_exceeded")
 
                             mode.begin_replan_sequence()
 
@@ -288,9 +278,7 @@ def main(llm_callable: Callable, model_name: str):
                                 mode.arm(intent)
 
                                 _ingest_latest_perception(observer, world_graph)
-                                planner.update_world_snapshot(
-                                    world_graph.snapshot()
-                                )
+                                planner.update_world_snapshot(world_graph.snapshot())
 
                                 mode.begin_planning()
 
@@ -344,7 +332,6 @@ def main(llm_callable: Callable, model_name: str):
                     _clear_task_start()
 
             except ObserverBlindnessError:
-                _force_safe_shutdown(os_backend, auth_state, "observer_blindness")
                 break
 
             except Exception as e:
