@@ -9,10 +9,6 @@ import struct
 
 
 class BeliefState:
-    """
-    Deterministic + bounded cognitive state.
-    Execution correctness dominates learning signals.
-    """
 
     EXPLORATION_C = 1.4
     RISK_LAMBDA = 0.3
@@ -25,36 +21,26 @@ class BeliefState:
 
     def __init__(self):
         self.created_at = time.time()
-
         self.state_probabilities: Dict[str, float] = {"neutral": 1.0}
-
         self.action_counts: Dict[str, int] = {}
         self.action_rewards: Dict[str, deque] = {}
         self.regret: Dict[str, Tuple[float, int]] = {}
-
         self.progress_score: float = 0.0
         self.environment_stability: float = 1.0
         self.commitment_hash: str = "GENESIS"
-
         self._iteration_counter: int = 0
-
-    # ==================================================
-    # BAYESIAN UPDATE (BOUNDED)
-    # ==================================================
 
     def bayesian_update(self, likelihoods: Dict[str, float]) -> None:
         if not likelihoods:
             return
 
         all_states = set(self.state_probabilities) | set(likelihoods)
-
         new_belief: Dict[str, float] = {}
         total = 0.0
 
         for state in all_states:
             prior = self.state_probabilities.get(state, self.PRIOR_ALPHA)
             likelihood = likelihoods.get(state, self.PRIOR_ALPHA)
-
             posterior = prior * max(likelihood, self.PRIOR_ALPHA)
             new_belief[state] = posterior
             total += posterior
@@ -64,13 +50,11 @@ class BeliefState:
 
         normalized = {s: v / total for s, v in new_belief.items()}
 
-        # prune low-prob states
         pruned = {
             s: p for s, p in normalized.items()
             if p >= self.PRIOR_ALPHA * 0.1
         }
 
-        # enforce hard cap
         if len(pruned) > self.MAX_STATES:
             sorted_states = sorted(
                 pruned.items(),
@@ -85,20 +69,12 @@ class BeliefState:
                 s: v / total for s, v in pruned.items()
             }
 
-    # ==================================================
-    # ENTROPY (DIAGNOSTIC ONLY)
-    # ==================================================
-
     def entropy(self) -> float:
         total = 0.0
         for p in self.state_probabilities.values():
             if p > 0:
                 total -= p * math.log(p)
         return total
-
-    # ==================================================
-    # EXPECTED UTILITY
-    # ==================================================
 
     def expected_utility(self, action: str) -> float:
         rewards = self.action_rewards.get(action)
@@ -108,17 +84,11 @@ class BeliefState:
         n = len(rewards)
         mean = sum(rewards) / n
         variance = sum((r - mean) ** 2 for r in rewards) / n
-
         return mean - self.RISK_LAMBDA * variance
-
-    # ==================================================
-    # UCB
-    # ==================================================
 
     def ucb_score(self, action: str) -> float:
         total_actions = sum(self.action_counts.values()) + 1
         count = self.action_counts.get(action, 0) + 1
-
         rewards = self.action_rewards.get(action)
         mean_reward = sum(rewards) / len(rewards) if rewards else 0.0
 
@@ -128,9 +98,15 @@ class BeliefState:
 
         return mean_reward + exploration
 
-    # ==================================================
-    # REGRET (LAZY DECAY)
-    # ==================================================
+    def thompson_sample(self, action: str) -> float:
+        rewards = self.action_rewards.get(action)
+        if not rewards:
+            return random.random()
+
+        successes = sum(1 for r in rewards if r > 0)
+        failures = sum(1 for r in rewards if r < 0)
+
+        return random.betavariate(successes + 1, failures + 1)
 
     def _get_effective_regret(self, action: str) -> float:
         entry = self.regret.get(action)
@@ -150,18 +126,9 @@ class BeliefState:
 
         current = self._get_effective_regret(action)
         updated = current + regret_value
-
         self.regret[action] = (updated, self._iteration_counter)
 
-    # ==================================================
-    # SOFTMAX (OPTIONAL, NON-AUTHORITATIVE)
-    # ==================================================
-
     def softmax_select(self, actions: List[str]) -> str:
-        """
-        Available for experimentation.
-        Not used by execution kernel.
-        """
         if not actions:
             raise ValueError("No actions provided")
 
@@ -186,12 +153,7 @@ class BeliefState:
             return actions[scores.index(max_score)]
 
         probabilities = [s / total for s in exp_scores]
-
         return random.choices(actions, weights=probabilities, k=1)[0]
-
-    # ==================================================
-    # RECORD ACTION
-    # ==================================================
 
     def record_action(self, action: str, reward: float):
         self.action_counts[action] = self.action_counts.get(action, 0) + 1
@@ -200,10 +162,6 @@ class BeliefState:
             self.action_rewards[action] = deque(maxlen=self.REWARD_WINDOW)
 
         self.action_rewards[action].append(reward)
-
-    # ==================================================
-    # ENVIRONMENT STABILITY
-    # ==================================================
 
     def compute_environment_stability(self, delta: Dict[str, Any]) -> None:
         if not delta:
@@ -223,10 +181,6 @@ class BeliefState:
             0.0,
             min(1.0, self.environment_stability),
         )
-
-    # ==================================================
-    # COMMITMENT HASH (DETERMINISTIC)
-    # ==================================================
 
     def _stable_float_bytes(self, d: Dict[str, float]) -> bytes:
         parts = []
@@ -253,13 +207,7 @@ class BeliefState:
             + prob_bytes
         )
 
-        self.commitment_hash = hashlib.sha256(
-            payload
-        ).hexdigest()
-
-    # ==================================================
-    # CONVERGENCE (STRICT PLAN-BOUND)
-    # ==================================================
+        self.commitment_hash = hashlib.sha256(payload).hexdigest()
 
     def converged(
         self,
@@ -279,12 +227,7 @@ class BeliefState:
         if steps_completed < plan_steps_total:
             return False
 
-        # Plan completion is the only authoritative convergence signal.
         return True
-
-    # ==================================================
-    # SUMMARY
-    # ==================================================
 
     def summary(self) -> Dict[str, Any]:
         return {
