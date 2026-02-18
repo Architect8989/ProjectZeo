@@ -39,9 +39,7 @@ class ModeController:
     MAX_PLAN_ID_LENGTH = 128
 
     _MODULE_ROOT = pathlib.Path(__file__).resolve().parents[1]
-    TRANSITION_LOG_PATH = str(
-        _MODULE_ROOT / "logs" / "mode_transitions.jsonl"
-    )
+    TRANSITION_LOG_PATH = _MODULE_ROOT / "logs" / "mode_transitions.jsonl"
 
     def __init__(self):
         self._lock = threading.RLock()
@@ -74,10 +72,7 @@ class ModeController:
             maxlen=self.MAX_TRANSITION_HISTORY
         )
 
-        pathlib.Path(self.TRANSITION_LOG_PATH).parent.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
+        self.TRANSITION_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
 
     # ==================================================
     # READS
@@ -234,6 +229,39 @@ class ModeController:
                 False,
             )
 
+    def check_planning_timeout(self) -> None:
+        with self._lock:
+            if self._mode is not SystemMode.PLANNING:
+                return
+
+            if (
+                self._planning_started_at
+                and (time.time() - self._planning_started_at)
+                > self.MAX_PLANNING_SECONDS
+            ):
+                raise PlanningTimeoutError("Planning timeout exceeded")
+
+    def attach_execution_plan(self, plan_id: str) -> None:
+        with self._lock:
+            if self._mode is not SystemMode.PLANNING:
+                raise ModeTransitionError("Plan attach requires PLANNING")
+
+            if not plan_id or not plan_id.strip():
+                raise ModeTransitionError("Invalid plan_id")
+
+            pid = plan_id.strip()
+            if len(pid) > self.MAX_PLAN_ID_LENGTH:
+                raise ModeTransitionError("Plan ID too long")
+
+            self._execution_plan_id = pid
+            self._execution_plan_attached = True
+
+    def mark_planning_complete(self) -> None:
+        with self._lock:
+            if not self._execution_plan_attached:
+                raise ModeTransitionError("No execution plan attached")
+            self._planning_completed = True
+
     def execute(self) -> None:
         with self._lock:
             if self._mode is not SystemMode.PLANNING:
@@ -250,6 +278,36 @@ class ModeController:
             self._commit_transition(
                 SystemMode.EXECUTING,
                 f"execution started (plan={self._execution_plan_id})",
+                False,
+            )
+
+    def begin_restoration(self) -> None:
+        with self._lock:
+            if self._mode is not SystemMode.EXECUTING:
+                raise ModeTransitionError("Restoration requires EXECUTING")
+
+            self._commit_transition(
+                SystemMode.RESTORING,
+                "restoration started",
+                False,
+            )
+
+    def complete_execution(self) -> None:
+        with self._lock:
+            self._input_locked = False
+            self._snapshot_id = None
+            self._snapshot_consumed = False
+            self._intent = None
+            self._intent_frozen = False
+            self._planning_completed = False
+            self._execution_plan_attached = False
+            self._execution_plan_id = None
+            self._planning_started_at = None
+            self._replan_in_progress = False
+
+            self._commit_transition(
+                SystemMode.OBSERVER,
+                "execution completed",
                 False,
             )
 
@@ -285,8 +343,22 @@ class ModeController:
         self._transition_history.append(entry)
 
         try:
-            with open(self.TRANSITION_LOG_PATH, "a", encoding="utf-8") as f:
-                f.write(json.dumps(entry, sort_keys=True) + "\n")
+            fd = os.open(
+                self.TRANSITION_LOG_PATH,
+                os.O_APPEND | os.O_CREAT | os.O_WRONLY,
+                0o644,
+            )
+            os.write(fd, (json.dumps(entry, sort_keys=True) + "\n").encode())
+            os.fsync(fd)
+            os.close(fd)
+
+            dir_fd = os.open(
+                str(self.TRANSITION_LOG_PATH.parent),
+                os.O_RDONLY,
+            )
+            os.fsync(dir_fd)
+            os.close(dir_fd)
+
         except Exception:
             pass
 
