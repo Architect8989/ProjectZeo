@@ -10,6 +10,7 @@ import ollama
 import pkg_resources
 from PIL import Image
 from ultralytics import YOLO
+from importlib import resources
 
 from operate.config import Config
 from operate.exceptions import ModelNotRecognizedException
@@ -29,6 +30,13 @@ from operate.utils.style import ANSI_BRIGHT_MAGENTA, ANSI_GREEN, ANSI_RED, ANSI_
 
 # Load configuration
 config = Config()
+_OCR_READER = None
+
+def _get_ocr_reader():
+    global _OCR_READER
+    if _OCR_READER is None:
+        _OCR_READER = easyocr.Reader(["en"])
+    return _OCR_READER
 
 async def get_next_action(model, messages, objective, session_id):
     if config.verbose:
@@ -52,7 +60,7 @@ async def get_next_action(model, messages, objective, session_id):
         operation = await call_o1_with_ocr(messages, objective, model)
         return operation, None
     if model == "agent-1":
-        return "coming soon"
+        raise ModelNotRecognizedException("agent-1")
     if model == "gemini-pro-vision":
         return call_gemini_pro_vision(messages, objective), None
     if model == "llava":
@@ -138,7 +146,7 @@ async def call_qwen_vl_with_ocr(messages, objective, model):
 
     try:
         time.sleep(1)
-
+        reader = _get_ocr_reader()
         confirm_system_prompt(messages, objective, model)
 
         screenshots_dir = "screenshots"
@@ -320,7 +328,7 @@ async def call_gpt_4o_with_ocr(messages, objective, model):
         )
 
         content = response.choices[0].message.content
-
+        reader = _get_ocr_reader()
         content = clean_json(content)
 
         # used later for the messages
@@ -378,7 +386,7 @@ async def call_gpt_4o_with_ocr(messages, objective, model):
         messages.append(assistant_message)
 
         return processed_content
-
+        reader = _get_ocr_reader()
     except Exception as e:
         print(
             f"{ANSI_GREEN}[Self-Operating Computer]{ANSI_BRIGHT_MAGENTA}[{model}] That did not work. Trying another method {ANSI_RESET}"
@@ -448,7 +456,7 @@ async def call_gpt_4_1_with_ocr(messages, objective, model):
                         "[call_gpt_4_1_with_ocr][click] text_to_click",
                         text_to_click,
                     )
-                reader = easyocr.Reader(["en"])
+                reader = _get_ocr_reader()
 
                 result = reader.readtext(screenshot_filename)
 
@@ -512,7 +520,7 @@ async def call_o1_with_ocr(messages, objective, model):
         screenshot_filename = os.path.join(screenshots_dir, "screenshot.png")
         # Call the function to capture the screen with the cursor
         capture_screen_with_cursor(screenshot_filename)
-
+        reader = _get_ocr_reader()
         with open(screenshot_filename, "rb") as img_file:
             img_base64 = base64.b64encode(img_file.read()).decode("utf-8")
 
@@ -615,7 +623,7 @@ async def call_gpt_4o_labeled(messages, objective, model):
         client = config.initialize_openai()
 
         confirm_system_prompt(messages, objective, model)
-        file_path = pkg_resources.resource_filename("operate.models.weights", "best.pt")
+        file_path = str(resources.files("operate.models.weights").joinpath("best.pt"))
         yolo_model = YOLO(file_path)  # Load your trained model
         screenshots_dir = "screenshots"
         if not os.path.exists(screenshots_dir):
@@ -734,6 +742,7 @@ async def call_gpt_4o_labeled(messages, objective, model):
                     )
 
                 processed_content.append(operation)
+                reader = _get_ocr_reader()
 
             if config.verbose:
                 print(
@@ -815,11 +824,10 @@ def call_ollama_llava(messages):
             f"{ANSI_GREEN}[Self-Operating Computer]{ANSI_RED}[Operate] Couldn't connect to Ollama. With Ollama installed, run `ollama pull llava` then `ollama serve`{ANSI_RESET}",
             e,
         )
-
     except Exception as e:
-    if config.verbose:
-        traceback.print_exc()
-    raise RuntimeError(f"Ollama llava failed: {e}") from e
+        if config.verbose:
+            traceback.print_exc()
+        raise RuntimeError(f"Ollama llava failed: {e}") from e
 
 
 async def call_claude_3_with_ocr(messages, objective, model):
@@ -1032,10 +1040,7 @@ def get_last_assistant_message(messages):
 
 
 def gpt_4_fallback(messages, objective, model):
-    if config.verbose:
-        print("[gpt_4_fallback]")
-    system_prompt = get_system_prompt("gpt-4o", objective)
-    new_system_message = {"role": "system", "content": system_prompt}
+    raise RuntimeError("Cloud fallback disabled")
     # remove and replace the first message in `messages` with `new_system_message`
 
     messages[0] = new_system_message
