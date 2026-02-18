@@ -1,6 +1,6 @@
 import time
 import json
-from typing import Any, Dict, Optional, List
+from typing import Any, Dict, Optional
 
 from authority.authority_policy import AuthorityDecision
 from authority.input_arbitrator import InputArbitrator
@@ -21,7 +21,6 @@ from core.tools.autonomous_installer import AutonomousInstaller
 
 from core.cognition.belief_state import BeliefState
 from core.cognition.action_ranker import ActionRanker
-from core.vision.semantic_resolver import SemanticResolver
 
 
 MAX_PERCEPTION_ENTITIES = 20
@@ -127,15 +126,14 @@ def _execute_autonomous_loop(
 
     belief = BeliefState()
     action_ranker = ActionRanker()
-    semantic_resolver = SemanticResolver(world_graph)
 
     iteration = 0
     stagnant_iterations = 0
     MAX_ITERATIONS = max(len(execution_plan.steps) * 5, 25)
 
     current_step_index = 0
-    previous_perception = None
     previous_snapshot = None
+    previous_perception = None
 
     while iteration < MAX_ITERATIONS:
 
@@ -184,7 +182,7 @@ def _execute_autonomous_loop(
             except Exception:
                 bounded_snapshot = {}
 
-        # ---------------- BELIEF UPDATE (RESTORED) ----------------
+        # ---------------- BELIEF UPDATE ----------------
 
         delta = None
         if previous_snapshot and world_graph:
@@ -197,8 +195,8 @@ def _execute_autonomous_loop(
             focused_app = bounded_snapshot.get("focused_app")
             entity_count = len(bounded_snapshot.get("entities", []))
 
-            if focused_app:
-                likelihoods[f"app:{str(focused_app).lower()}"] = 0.9
+            if isinstance(focused_app, str) and focused_app.strip():
+                likelihoods[f"app:{focused_app.lower()}"] = 0.9
 
             if entity_count > 10:
                 likelihoods["ui_rich"] = 0.8
@@ -213,7 +211,7 @@ def _execute_autonomous_loop(
 
         previous_snapshot = world_snapshot
 
-        # ---------------- ACTION SELECTION ----------------
+        # ---------------- ACTION (DETERMINISTIC PLAN STEP) ----------------
 
         selected_action = current_step.action
         action_key = action_ranker._action_key(selected_action)
@@ -266,13 +264,9 @@ def _execute_autonomous_loop(
         reward = float(verification.confidence) - 0.5
         belief.record_action(action_key, reward=reward)
 
-        # Correct regret update
-        all_rewards = [
-            belief.action_rewards[k][-1]
-            for k in belief.action_rewards
-            if belief.action_rewards[k]
-        ]
-        best_reward = max(all_rewards) if all_rewards else reward
+        # Regret update (per-action only)
+        action_rewards = belief.action_rewards.get(action_key, [])
+        best_reward = max(action_rewards) if action_rewards else reward
         belief.update_regret(action_key, reward, best_reward)
 
         if not verification.success:
