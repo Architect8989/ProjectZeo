@@ -7,6 +7,8 @@ import base64
 import io
 import json
 import copy
+import os
+import concurrent.futures
 
 from PIL import Image, ImageGrab
 import ollama
@@ -25,9 +27,10 @@ class VisionDegradedError(RuntimeError):
 # CONFIG
 # ==================================================
 
-MAX_ALLOWED_LATENCY_SECONDS = 3.0
+MAX_ALLOWED_LATENCY_SECONDS = 8.0          # aligned with network timeout
 NETWORK_CONNECT_TIMEOUT = 5.0
-NETWORK_READ_TIMEOUT = 25.0
+NETWORK_READ_TIMEOUT = 20.0               # must be >= latency threshold
+MODEL_CALL_TIMEOUT_SECONDS = 22.0         # hard cap
 
 MAX_FRAME_BYTES = 4 * 1024 * 1024
 MAX_ELEMENTS = 128
@@ -55,6 +58,8 @@ class VisionRuntime:
         self._running: bool = False
         self._thread: Optional[threading.Thread] = None
 
+        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+
         self._ollama_client = ollama.Client(
             timeout=httpx.Timeout(
                 connect=NETWORK_CONNECT_TIMEOUT,
@@ -63,6 +68,19 @@ class VisionRuntime:
                 pool=5.0,
             )
         )
+
+        self._validate_display_environment()
+
+    # ==================================================
+    # DISPLAY VALIDATION
+    # ==================================================
+
+    def _validate_display_environment(self) -> None:
+        if os.name != "nt":
+            if not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY"):
+                raise VisionUnavailableError(
+                    "No display environment detected (headless mode unsupported)"
+                )
 
     # ==================================================
     # LIFECYCLE
@@ -89,7 +107,9 @@ class VisionRuntime:
             self._running = False
 
         if self._thread:
-            self._thread.join(timeout=2.0)
+            self._thread.join(timeout=3.0)
+
+        self._executor.shutdown(wait=False, cancel_futures=True)
 
     def is_healthy(self) -> bool:
         with self._lock:
@@ -135,16 +155,15 @@ class VisionRuntime:
     # ==================================================
 
     def _process_frame_internal(self) -> Dict[str, Any]:
-        start = time.monotonic()
+        start = time.time()   # wall clock only
 
-        # Wall-clock timestamp (restart-safe)
         frame_ts = time.time()
 
         image = self._capture_frame()
         encoded = self._encode_image(image)
-        perception = self._call_model(encoded)
+        perception = self._call_model_with_timeout(encoded)
 
-        latency = time.monotonic() - start
+        latency = time.time() - start
 
         if latency > MAX_ALLOWED_LATENCY_SECONDS:
             raise VisionDegradedError(
@@ -184,8 +203,21 @@ class VisionRuntime:
         return base64.b64encode(data).decode("utf-8")
 
     # ==================================================
-    # MODEL CALL
+    # MODEL CALL (BOUNDED)
     # ==================================================
+
+    def _call_model_with_timeout(self, image_b64: str) -> Dict[str, Any]:
+
+        def _invoke():
+            return self._call_model(image_b64)
+
+        future = self._executor.submit(_invoke)
+
+        try:
+            return future.result(timeout=MODEL_CALL_TIMEOUT_SECONDS)
+        except concurrent.futures.TimeoutError:
+            future.cancel()
+            raise VisionUnavailableError("Vision model call timeout")
 
     def _call_model(self, image_b64: str) -> Dict[str, Any]:
 
@@ -280,9 +312,8 @@ class VisionRuntime:
             focused_app = None
 
         with self._lock:
-            if self._last_frame_ts is not None:
-                if frame_ts < self._last_frame_ts:
-                    frame_ts = self._last_frame_ts + 1e-6
+            if self._last_frame_ts is not None and frame_ts <= self._last_frame_ts:
+                frame_ts = self._last_frame_ts + 1e-6
 
         return {
             "available": True,
