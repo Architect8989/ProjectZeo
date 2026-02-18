@@ -1,11 +1,11 @@
 import base64
 import json
-import os
 import re
-import uuid
 import threading
 import asyncio
+import tempfile
 from typing import List, Tuple, Optional
+from concurrent.futures import ThreadPoolExecutor
 
 import ollama
 import httpx
@@ -47,13 +47,14 @@ def _get_ocr_reader():
 class QwenOllamaAdapter:
     """
     Local-only Qwen-VL adapter.
-    Non-blocking + fail-closed hardened version.
+    Fully in-memory, deterministic, bounded execution.
     """
 
-    MAX_SCREENSHOT_FILES = 200
-
     def __init__(self, model_name: str = "qwen2.5-vl:7b-instruct"):
-        self.model_name = model_name
+        if not isinstance(model_name, str) or not model_name.strip():
+            raise ValueError("Invalid model_name")
+
+        self.model_name = model_name.strip()
 
         self._client = ollama.Client(
             timeout=httpx.Timeout(
@@ -63,6 +64,9 @@ class QwenOllamaAdapter:
                 pool=2.0,
             )
         )
+
+        # Bounded executor (fixes unbounded thread spawn)
+        self._executor = ThreadPoolExecutor(max_workers=1)
 
     # ==========================================================
     # PUBLIC ENTRY
@@ -82,7 +86,7 @@ class QwenOllamaAdapter:
             return None, e
 
     # ==========================================================
-    # CORE EXECUTION
+    # CORE EXECUTION (NO PERSISTENT FILES)
     # ==========================================================
 
     async def _call_qwen_with_ocr(
@@ -93,16 +97,14 @@ class QwenOllamaAdapter:
 
         local_msgs = self._confirm_system_prompt(messages, objective)
 
-        raw_screenshot = None
-        jpeg_screenshot = None
+        # Use secure temporary files auto-deleted
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=True) as raw_tmp, \
+             tempfile.NamedTemporaryFile(suffix=".jpeg", delete=True) as jpeg_tmp:
 
-        try:
-            raw_screenshot = self._prepare_unique_screenshot()
-            jpeg_screenshot = raw_screenshot.replace(".png", ".jpeg")
+            capture_screen_with_cursor(raw_tmp.name)
+            compress_screenshot(raw_tmp.name, jpeg_tmp.name)
 
-            compress_screenshot(raw_screenshot, jpeg_screenshot)
-
-            with open(jpeg_screenshot, "rb") as f:
+            with open(jpeg_tmp.name, "rb") as f:
                 img_base64 = base64.b64encode(f.read()).decode("utf-8")
 
             user_prompt = (
@@ -134,7 +136,10 @@ class QwenOllamaAdapter:
                     options={"temperature": 0},
                 )
 
-            response = await loop.run_in_executor(None, _blocking_call)
+            response = await loop.run_in_executor(
+                self._executor,
+                _blocking_call,
+            )
 
             content = response.get("message", {}).get("content")
             if not isinstance(content, str):
@@ -152,18 +157,10 @@ class QwenOllamaAdapter:
 
             self._resolve_click_coordinates(
                 operations,
-                jpeg_screenshot,
+                jpeg_tmp.name,
             )
 
             return operations
-
-        finally:
-            for p in (raw_screenshot, jpeg_screenshot):
-                try:
-                    if p and os.path.exists(p):
-                        os.remove(p)
-                except OSError:
-                    pass
 
     # ==========================================================
     # OCR RESOLUTION (FAIL-CLOSED)
@@ -205,8 +202,8 @@ class QwenOllamaAdapter:
                     x = coords.get("x")
                     y = coords.get("y")
                     if isinstance(x, (int, float)) and isinstance(y, (int, float)):
-                        op["x"] = x
-                        op["y"] = y
+                        op["x"] = float(x)
+                        op["y"] = float(y)
                         filtered_ops.append(op)
 
             except Exception:
@@ -238,46 +235,6 @@ class QwenOllamaAdapter:
             local.insert(0, system_message)
 
         return local
-
-    def _prepare_unique_screenshot(self) -> str:
-
-        screenshots_dir = os.path.abspath("screenshots")
-        os.makedirs(screenshots_dir, exist_ok=True)
-
-        try:
-            existing = [
-                f for f in os.listdir(screenshots_dir)
-                if os.path.isfile(os.path.join(screenshots_dir, f))
-            ]
-
-            if len(existing) > self.MAX_SCREENSHOT_FILES:
-                # Deterministic oldest-first eviction
-                existing_sorted = sorted(
-                    existing,
-                    key=lambda f: os.path.getmtime(
-                        os.path.join(screenshots_dir, f)
-                    )
-                )
-
-                to_delete = existing_sorted[
-                    : len(existing_sorted) - self.MAX_SCREENSHOT_FILES
-                ]
-
-                for f in to_delete:
-                    try:
-                        os.remove(os.path.join(screenshots_dir, f))
-                    except Exception:
-                        pass
-
-        except Exception:
-            # Fail-closed: never block screenshot capture
-            pass
-
-        filename = f"screenshot_{uuid.uuid4().hex}.png"
-        path = os.path.join(screenshots_dir, filename)
-
-        capture_screen_with_cursor(path)
-        return path
 
     def _parse_and_normalize_json(self, text: str) -> List[dict]:
 
