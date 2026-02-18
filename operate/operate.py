@@ -16,7 +16,6 @@ from core.schemas.execution_plan import ExecutionPlan
 from core.verification.step_verifier import StepVerifier
 from core.verification.plan_verifier import PlanVerifier
 from core.execution.progress_tracker import ProgressTracker
-from core.execution.failure_recovery import FailureRecoveryManager
 from core.tools.autonomous_installer import AutonomousInstaller
 
 from core.cognition.belief_state import BeliefState
@@ -60,7 +59,6 @@ def operate_main(
     journal = ActionJournal()
     input_arbitrator = InputArbitrator()
     verifier = StepVerifier()
-    recovery = FailureRecoveryManager()
     progress = ProgressTracker(execution_plan)
 
     llm_callable = getattr(planner, "_llm_call", None)
@@ -78,7 +76,6 @@ def operate_main(
     try:
         _execute_autonomous_loop(
             execution_plan=execution_plan,
-            planner=planner,
             observer=observer,
             world_graph=world_graph,
             os_backend=os_backend,
@@ -86,7 +83,6 @@ def operate_main(
             journal=journal,
             input_arbitrator=input_arbitrator,
             verifier=verifier,
-            recovery=recovery,
             progress=progress,
             installer=installer,
             max_wallclock_seconds=max_wallclock_seconds,
@@ -102,7 +98,6 @@ def operate_main(
 def _execute_autonomous_loop(
     *,
     execution_plan: ExecutionPlan,
-    planner,
     observer,
     world_graph,
     os_backend: OperatingSystem,
@@ -110,7 +105,6 @@ def _execute_autonomous_loop(
     journal: ActionJournal,
     input_arbitrator: InputArbitrator,
     verifier: StepVerifier,
-    recovery: FailureRecoveryManager,
     progress: ProgressTracker,
     installer: Optional[AutonomousInstaller],
     max_wallclock_seconds: int,
@@ -129,13 +123,13 @@ def _execute_autonomous_loop(
 
     iteration = 0
     stagnant_iterations = 0
-    MAX_ITERATIONS = max(len(execution_plan.steps) * 5, 25)
+    max_iterations = max(len(execution_plan.steps) * (MAX_STAGNANT_ITERS + 1), 25)
 
     current_step_index = 0
     previous_snapshot = None
     previous_perception = None
 
-    while iteration < MAX_ITERATIONS:
+    while iteration < max_iterations:
 
         if time.time() - start_ts > max_wallclock_seconds:
             journal.record({"event": "execution_timeout"})
@@ -162,26 +156,6 @@ def _execute_autonomous_loop(
 
         world_snapshot = world_graph.snapshot() if world_graph else {}
 
-        # ---------------- BOUNDED SNAPSHOT ----------------
-
-        bounded_snapshot = {}
-        if isinstance(world_snapshot, dict):
-            entities = world_snapshot.get("entities", [])
-            if isinstance(entities, list):
-                entities = entities[:MAX_PERCEPTION_ENTITIES]
-
-            bounded_snapshot = {
-                k: v for k, v in world_snapshot.items()
-                if k != "entities"
-            }
-            bounded_snapshot["entities"] = entities
-
-            try:
-                if len(json.dumps(bounded_snapshot)) > MAX_PERCEPTION_JSON_BYTES:
-                    bounded_snapshot = {}
-            except Exception:
-                bounded_snapshot = {}
-
         # ---------------- BELIEF UPDATE ----------------
 
         delta = None
@@ -189,31 +163,14 @@ def _execute_autonomous_loop(
             delta = world_graph.compute_delta(previous_snapshot)
             belief.compute_environment_stability(delta)
 
-        if bounded_snapshot:
-            likelihoods: Dict[str, float] = {}
-
-            focused_app = bounded_snapshot.get("focused_app")
-            entity_count = len(bounded_snapshot.get("entities", []))
-
-            if isinstance(focused_app, str) and focused_app.strip():
-                likelihoods[f"app:{focused_app.lower()}"] = 0.9
-
-            if entity_count > 10:
-                likelihoods["ui_rich"] = 0.8
-            elif entity_count > 0:
-                likelihoods["ui_sparse"] = 0.7
-            else:
-                likelihoods["ui_empty"] = 0.5
-
-            likelihoods["neutral"] = 0.5 if delta else 0.9
-
-            belief.bayesian_update(likelihoods)
-
         previous_snapshot = world_snapshot
 
-        # ---------------- ACTION (DETERMINISTIC PLAN STEP) ----------------
+        # ---------------- ACTION ----------------
 
-        selected_action = current_step.action
+        selected_action = current_step.action or {}
+        if not isinstance(selected_action, dict):
+            raise RuntimeError("Invalid action format")
+
         action_key = action_ranker._action_key(selected_action)
 
         # ---------------- AUTHORITY ----------------
@@ -238,7 +195,6 @@ def _execute_autonomous_loop(
             with action_timeout(30):
                 result = _execute_decision(
                     decision=selected_action,
-                    execution_plan=execution_plan,
                     os_backend=os_backend,
                     accessibility_backend=accessibility_backend,
                     installer=installer,
@@ -264,7 +220,6 @@ def _execute_autonomous_loop(
         reward = float(verification.confidence) - 0.5
         belief.record_action(action_key, reward=reward)
 
-        # Regret update (per-action only)
         action_rewards = belief.action_rewards.get(action_key, [])
         best_reward = max(action_rewards) if action_rewards else reward
         belief.update_regret(action_key, reward, best_reward)
@@ -295,3 +250,55 @@ def _execute_autonomous_loop(
             return
 
     journal.record({"event": "execution_complete"})
+
+
+# ==================================================
+# EXECUTION DISPATCH
+# ==================================================
+
+def _execute_decision(
+    *,
+    decision: Dict[str, Any],
+    os_backend: OperatingSystem,
+    accessibility_backend: Optional[AccessibilityBackend],
+    installer: Optional[AutonomousInstaller],
+):
+
+    operation = decision.get("operation")
+
+    if operation == "click":
+        x = decision.get("x")
+        y = decision.get("y")
+        if x is None or y is None:
+            raise RuntimeError("Click missing coordinates")
+        os_backend.click(x, y)
+        return None
+
+    if operation == "type":
+        text = decision.get("text", "")
+        os_backend.type_text(text)
+        return None
+
+    if operation == "hotkey":
+        keys = decision.get("keys", [])
+        if not isinstance(keys, list):
+            raise RuntimeError("Invalid hotkey format")
+        os_backend.press_keys(keys)
+        return None
+
+    if operation == "command":
+        cmd = decision.get("command")
+        if not cmd:
+            raise RuntimeError("Missing command")
+        return os_backend.run_command(cmd)
+
+    if operation == "install":
+        if installer is None:
+            raise RuntimeError("Installer unavailable")
+        tool = decision.get("tool")
+        if not isinstance(tool, dict):
+            raise RuntimeError("Invalid tool specification")
+        installer.install_tool(tool)
+        return None
+
+    raise RuntimeError(f"Unsupported operation: {operation}")
