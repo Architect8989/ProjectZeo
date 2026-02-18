@@ -16,21 +16,13 @@ class RestorationError(RuntimeError):
 
 
 class RestoreProvider:
-    """
-    Restoration provider.
-
-    Guarantees:
-    - Idempotent per snapshot (persisted across restarts)
-    - Concurrency-safe
-    - Fail-closed
-    - Strict mode enforcement
-    - Deterministic restore order
-    - No internal mode transitions
-    """
 
     CURSOR_TOLERANCE_PX = 5
     POST_ACTION_DELAY = 0.08
     MAX_VERIFY_ATTEMPTS = 5
+
+    MAX_LEDGER_ENTRIES = 10_000
+    MAX_TITLE_DISTANCE = 2
 
     _RESTORE_LEDGER_PATH = os.path.join("memory", "restore_ledger.json")
 
@@ -50,7 +42,7 @@ class RestoreProvider:
         self._completed_snapshots: Set[str] = self._load_ledger()
 
     # =========================================================
-    # LEDGER (PERSISTED IDEMPOTENCY)
+    # LEDGER
     # =========================================================
 
     def _load_ledger(self) -> Set[str]:
@@ -64,7 +56,8 @@ class RestoreProvider:
             if not isinstance(data, list):
                 raise RestorationError("Restore ledger corrupted")
 
-            return set(str(x) for x in data)
+            # Enforce deterministic ordering
+            return set(str(x) for x in data[: self.MAX_LEDGER_ENTRIES])
 
         except Exception as e:
             raise RestorationError(f"Restore ledger load failed: {e}") from e
@@ -73,18 +66,31 @@ class RestoreProvider:
         tmp_path = self._RESTORE_LEDGER_PATH + ".tmp"
 
         try:
+            # Enforce bounded size
+            if len(self._completed_snapshots) > self.MAX_LEDGER_ENTRIES:
+                trimmed = sorted(self._completed_snapshots)[
+                    -self.MAX_LEDGER_ENTRIES :
+                ]
+                self._completed_snapshots = set(trimmed)
+
             with open(tmp_path, "w", encoding="utf-8") as f:
-                json.dump(sorted(self._completed_snapshots), f)
+                json.dump(
+                    sorted(self._completed_snapshots),
+                    f,
+                    separators=(",", ":"),
+                )
                 f.flush()
                 os.fsync(f.fileno())
 
             os.replace(tmp_path, self._RESTORE_LEDGER_PATH)
 
         except Exception as e:
-            raise RestorationError(f"Restore ledger persist failed: {e}") from e
+            raise RestorationError(
+                f"Restore ledger persist failed: {e}"
+            ) from e
 
     # =========================================================
-    # PUBLIC ENTRYPOINT
+    # PUBLIC ENTRY
     # =========================================================
 
     def restore_snapshot(self, snapshot_id: str) -> None:
@@ -111,7 +117,7 @@ class RestoreProvider:
         with self._lock:
 
             if snapshot_id in self._completed_snapshots:
-                return  # persisted idempotency
+                return
 
             if self._mode.mode is not SystemMode.RESTORING:
                 raise RestorationError(
@@ -141,37 +147,22 @@ class RestoreProvider:
     # =========================================================
 
     def _restore_application(self, snapshot: RestorationSnapshot) -> None:
-        try:
-            self._os.activate_application(
-                {"title": snapshot.application.process_name}
-            )
-            time.sleep(self.POST_ACTION_DELAY)
-        except Exception as e:
-            raise RestorationError(
-                f"Application activation failed: {e}"
-            ) from e
+        self._os.activate_application(
+            {"title": snapshot.application.process_name}
+        )
+        time.sleep(self.POST_ACTION_DELAY)
 
     def _restore_window(self, snapshot: RestorationSnapshot) -> None:
-        try:
-            self._os.focus_window(
-                {"title": snapshot.focus.window_id}
-            )
-            time.sleep(self.POST_ACTION_DELAY)
-        except Exception as e:
-            raise RestorationError(
-                f"Window focus restore failed: {e}"
-            ) from e
+        self._os.focus_window(
+            {"title": snapshot.focus.window_id}
+        )
+        time.sleep(self.POST_ACTION_DELAY)
 
     def _restore_cursor(self, snapshot: RestorationSnapshot) -> None:
-        try:
-            self._os.set_cursor_position(
-                {"x": snapshot.cursor.x, "y": snapshot.cursor.y}
-            )
-            time.sleep(self.POST_ACTION_DELAY)
-        except Exception as e:
-            raise RestorationError(
-                f"Cursor restore failed: {e}"
-            ) from e
+        self._os.set_cursor_position(
+            {"x": snapshot.cursor.x, "y": snapshot.cursor.y}
+        )
+        time.sleep(self.POST_ACTION_DELAY)
 
     # =========================================================
     # VERIFICATION
@@ -180,20 +171,13 @@ class RestoreProvider:
     def _verify(self, snapshot: RestorationSnapshot) -> None:
 
         if self._mode.mode is not SystemMode.RESTORING:
-            raise RestorationError(
-                f"Verification outside RESTORING mode: {self._mode.mode}"
-            )
+            raise RestorationError("Verification outside RESTORING mode")
 
         for _ in range(self.MAX_VERIFY_ATTEMPTS):
 
-            try:
-                cursor = self._os.get_cursor_position()
-                current_window = self._os.get_focused_window()
-                current_app = self._os.get_active_application()
-            except Exception as e:
-                raise RestorationError(
-                    f"Verification read failed: {e}"
-                ) from e
+            cursor = self._os.get_cursor_position()
+            current_window = self._os.get_focused_window()
+            current_app = self._os.get_active_application()
 
             if not self._validate_cursor(cursor, snapshot):
                 time.sleep(self.POST_ACTION_DELAY)
@@ -212,7 +196,7 @@ class RestoreProvider:
         raise RestorationError("Post-restore verification failed")
 
     # =========================================================
-    # VALIDATION HELPERS
+    # VALIDATION
     # =========================================================
 
     def _validate_cursor(self, cursor, snapshot) -> bool:
@@ -220,31 +204,46 @@ class RestoreProvider:
             return False
 
         try:
-            current_x = int(cursor["x"])
-            current_y = int(cursor["y"])
+            cx = int(cursor["x"])
+            cy = int(cursor["y"])
         except Exception:
             return False
 
         return (
-            abs(current_x - snapshot.cursor.x)
-            <= self.CURSOR_TOLERANCE_PX
-            and abs(current_y - snapshot.cursor.y)
-            <= self.CURSOR_TOLERANCE_PX
+            abs(cx - snapshot.cursor.x) <= self.CURSOR_TOLERANCE_PX
+            and abs(cy - snapshot.cursor.y) <= self.CURSOR_TOLERANCE_PX
         )
 
     def _normalize(self, text: str) -> str:
-        return " ".join(text.strip().lower().split())
+        return " ".join(text.lower().strip().split())
 
-    def _fuzzy_match(self, expected: str, actual: str) -> bool:
+    def _levenshtein(self, a: str, b: str) -> int:
+        if a == b:
+            return 0
+        if not a:
+            return len(b)
+        if not b:
+            return len(a)
+
+        prev = list(range(len(b) + 1))
+        for i, ca in enumerate(a, 1):
+            curr = [i]
+            for j, cb in enumerate(b, 1):
+                insert = curr[j - 1] + 1
+                delete = prev[j] + 1
+                replace = prev[j - 1] + (ca != cb)
+                curr.append(min(insert, delete, replace))
+            prev = curr
+        return prev[-1]
+
+    def _strict_match(self, expected: str, actual: str) -> bool:
         if not expected or not actual:
             return False
+
         if expected == actual:
             return True
-        if expected in actual:
-            return True
-        if actual in expected:
-            return True
-        return False
+
+        return self._levenshtein(expected, actual) <= self.MAX_TITLE_DISTANCE
 
     def _validate_window(self, current_window, snapshot) -> bool:
         if (
@@ -256,7 +255,7 @@ class RestoreProvider:
         expected = self._normalize(snapshot.focus.window_id)
         actual = self._normalize(current_window["title"])
 
-        return self._fuzzy_match(expected, actual)
+        return self._strict_match(expected, actual)
 
     def _validate_application(self, current_app, snapshot) -> bool:
         if (
@@ -268,4 +267,4 @@ class RestoreProvider:
         expected = self._normalize(snapshot.application.process_name)
         actual = self._normalize(current_app["title"])
 
-        return self._fuzzy_match(expected, actual)
+        return self._strict_match(expected, actual)
