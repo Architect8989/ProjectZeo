@@ -3,6 +3,7 @@ import inspect
 import copy
 import json
 from typing import Callable, List, Dict, Any, Optional
+from concurrent.futures import ThreadPoolExecutor
 
 from operate.models import apis
 
@@ -10,6 +11,7 @@ from operate.models import apis
 class PureLLMWrapper:
 
     _patch_applied = False
+    _executor = ThreadPoolExecutor(max_workers=4)
 
     def __init__(self, model_name: str):
         if not PureLLMWrapper._patch_applied:
@@ -118,20 +120,22 @@ class PureLLMWrapper:
     def _run_coroutine_safely(self, coro):
 
         try:
-            loop = asyncio.get_running_loop()
-            running = loop.is_running()
+            asyncio.get_running_loop()
+            inside_running_loop = True
         except RuntimeError:
-            loop = None
-            running = False
+            inside_running_loop = False
 
-        if not running:
+        # No loop running → safe to use asyncio.run
+        if not inside_running_loop:
             return asyncio.run(coro)
 
-        new_loop = asyncio.new_event_loop()
-        try:
-            return new_loop.run_until_complete(coro)
-        finally:
-            new_loop.close()
+        # Already inside running loop → execute coroutine in worker thread
+        future = PureLLMWrapper._executor.submit(asyncio.run, coro)
+        return future.result()
+
+    # ==================================================
+    # SIGNATURE HANDLING
+    # ==================================================
 
     def _call_with_signature(
         self,
@@ -190,4 +194,4 @@ class PureLLMWrapper:
         raise RuntimeError(
             f"Model '{self.model_name}' returned unsupported type: "
             f"{type(result)}"
-        )
+    )
