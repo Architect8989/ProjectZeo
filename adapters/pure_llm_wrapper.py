@@ -8,16 +8,6 @@ from operate.models import apis
 
 
 class PureLLMWrapper:
-    """
-    Isolation layer between kernel and apis.py.
-
-    Guarantees:
-        - No input mutation
-        - Unified callable interface
-        - Safe coroutine handling
-        - Deterministic failure behavior
-        - Idempotent patch activation
-    """
 
     _patch_applied = False
 
@@ -82,7 +72,6 @@ class PureLLMWrapper:
                 f"Model execution failed for {self.model_name}: {e}"
             ) from e
 
-        # Strict mutation detection
         if messages_copy != original_snapshot:
             raise RuntimeError(
                 f"Model '{self.model_name}' mutated input messages."
@@ -104,15 +93,14 @@ class PureLLMWrapper:
     ) -> Any:
 
         if inspect.iscoroutinefunction(model_fn):
-            return asyncio.run(
-                self._call_with_signature(
-                    model_fn,
-                    messages,
-                    objective,
-                    session_id,
-                    screen_image,
-                )
+            coro = self._call_with_signature(
+                model_fn,
+                messages,
+                objective,
+                session_id,
+                screen_image,
             )
+            return self._run_coroutine_safely(coro)
 
         result = self._call_with_signature(
             model_fn,
@@ -122,11 +110,28 @@ class PureLLMWrapper:
             screen_image,
         )
 
-        # If sync function accidentally returns coroutine, resolve it
         if inspect.iscoroutine(result):
-            return asyncio.run(result)
+            return self._run_coroutine_safely(result)
 
         return result
+
+    def _run_coroutine_safely(self, coro):
+
+        try:
+            loop = asyncio.get_running_loop()
+            running = loop.is_running()
+        except RuntimeError:
+            loop = None
+            running = False
+
+        if not running:
+            return asyncio.run(coro)
+
+        new_loop = asyncio.new_event_loop()
+        try:
+            return new_loop.run_until_complete(coro)
+        finally:
+            new_loop.close()
 
     def _call_with_signature(
         self,
