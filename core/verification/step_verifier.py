@@ -22,13 +22,8 @@ class VerificationResult:
 
 class StepVerifier:
     """
-    Deterministic + cognitive verifier.
-
-    HARD RULES:
-    - Evidence > vision
-    - Absence of evidence == failure
-    - Unknown step types == failure
-    - Fail-closed always
+    Deterministic + evidence-first verifier.
+    Fail-closed always.
     """
 
     VERSION_REGEX = re.compile(r"\d+(?:\.\d+)+")
@@ -66,8 +61,16 @@ class StepVerifier:
                 )
 
             if step.type == StepType.VERIFICATION:
+                # Must contain explicit verification condition
+                if not step.verification:
+                    return VerificationResult(
+                        False,
+                        "verification step missing conditions",
+                        confidence=0.0,
+                        progress_score=0.0,
+                    )
                 return VerificationResult(
-                    True, None, {}, confidence=1.0, progress_score=0.05
+                    True, None, {}, confidence=0.95, progress_score=0.05
                 )
 
             if step.type == StepType.COMMAND_EXECUTION:
@@ -85,7 +88,6 @@ class StepVerifier:
             if step.type == StepType.UI_INTERACTION:
                 ok, reason, details = self._verify_ui_change(
                     step=step,
-                    screenshot=screenshot,
                     previous_screenshot=previous_screenshot,
                     world_graph=world_graph,
                 )
@@ -111,7 +113,13 @@ class StepVerifier:
     # RESULT BUILDER
     # =================================================
 
-    def _result(self, ok: bool, reason: str, details: Dict[str, Any]) -> VerificationResult:
+    def _result(
+        self,
+        ok: bool,
+        reason: str,
+        details: Dict[str, Any],
+    ) -> VerificationResult:
+
         if ok:
             return VerificationResult(
                 True,
@@ -120,6 +128,7 @@ class StepVerifier:
                 confidence=0.95,
                 progress_score=0.1,
             )
+
         return VerificationResult(
             False,
             reason,
@@ -182,14 +191,13 @@ class StepVerifier:
         return True, "", {"tool_path": tool_path}
 
     # =================================================
-    # UI VERIFICATION (STRICT + CAUSAL DELTA)
+    # UI VERIFICATION (STRICT + CAUSAL)
     # =================================================
 
     def _verify_ui_change(
         self,
         *,
         step: ExecutionStep,
-        screenshot: Optional[Dict[str, Any]],
         previous_screenshot: Optional[Dict[str, Any]],
         world_graph=None,
     ) -> Tuple[bool, str, Dict[str, Any]]:
@@ -198,46 +206,54 @@ class StepVerifier:
             return False, "world_graph required", {}
 
         verification = step.verification or {}
-        current_snapshot = world_graph.snapshot()
 
         # ---------- STRICT TEXT CHECK ----------
+
         expected_text = verification.get("screen_contains")
         if expected_text:
+
             if not isinstance(expected_text, list):
                 return False, "screen_contains must be list", {}
 
             for token in expected_text:
                 if not isinstance(token, str):
                     return False, "invalid screen_contains token", {}
-                if not world_graph.find_by_text(contains=token):
+
+                matches = world_graph.find_by_text(contains=token)
+                if not matches:
                     return False, f"text not found: {token}", {}
 
             return True, "", {"screen_contains_verified": True}
 
-        # ---------- STRICT ENTITY TYPE DELTA ----------
+        # ---------- ENTITY TYPE DELTA CHECK ----------
+
         expected_type = verification.get("entity_type_exists")
         if expected_type:
 
             current_matches = world_graph.find_by_type(expected_type) or []
-
             if not current_matches:
                 return False, f"entity type not found: {expected_type}", {}
 
+            # Strict causal check using world delta if available
             if previous_screenshot:
-                previous_matches = world_graph.find_by_type(
-                    expected_type,
-                    snapshot=previous_screenshot,
-                ) or []
+                try:
+                    delta = world_graph.compute_delta(previous_screenshot)
+                except Exception:
+                    delta = None
 
-                if len(current_matches) <= len(previous_matches):
-                    return False, "entity pre-existed before action", {}
+                if not delta or not delta.get("significant_change"):
+                    return False, "no causal delta detected", {}
 
-            return True, "", {"entity_type_added": expected_type}
+            return True, "", {"entity_type_detected": expected_type}
 
-        # ---------- STRICT DELTA CHECK ----------
+        # ---------- GENERIC SIGNIFICANT DELTA ----------
+
         if previous_screenshot:
-            delta = world_graph.compute_delta(previous_screenshot)
-            if delta and delta.get("significant_change"):
-                return True, "", {"delta_detected": True}
+            try:
+                delta = world_graph.compute_delta(previous_screenshot)
+                if delta and delta.get("significant_change"):
+                    return True, "", {"delta_detected": True}
+            except Exception:
+                pass
 
         return False, "no verification evidence found", {}
