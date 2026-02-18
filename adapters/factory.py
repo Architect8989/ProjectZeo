@@ -52,7 +52,7 @@ def _validate_model_name(model_name: str) -> str:
 
     model_name = model_name.strip()
 
-    if not _MODEL_PATTERN.match(model_name):
+    if not _MODEL_PATTERN.fullmatch(model_name):
         raise ModelNotRecognizedException(
             f"Invalid model name format: '{model_name}'"
         )
@@ -61,7 +61,6 @@ def _validate_model_name(model_name: str) -> str:
 
 
 def _resolve_base_model(model_name: str) -> str:
-    # Accept format like: qwen2.5-vl:7b-instruct
     return model_name.split(":", 1)[0]
 
 
@@ -84,9 +83,6 @@ class AdapterFactory:
 
         AdapterClass = _import_from_path(adapter_path)
 
-        # IMPORTANT:
-        # No shared instance caching.
-        # Each caller receives a fresh adapter instance.
         return AdapterClass(model_name=model_name)
 
     @staticmethod
