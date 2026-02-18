@@ -2,10 +2,13 @@ import os
 import sys
 import asyncio
 import threading
-from typing import Any, Tuple
+from typing import Any
 
 from adapters.factory import build_llm
 from main import main
+
+
+LLM_THREAD_TIMEOUT_SECONDS = 120.0
 
 
 def resolve_model_name() -> str:
@@ -27,7 +30,7 @@ def resolve_model_name() -> str:
 def _run_coroutine_threadsafe(coro) -> Any:
     """
     Execute coroutine in a fresh event loop inside a dedicated thread.
-    Used when already inside a running event loop.
+    Enforces hard timeout to prevent permanent kernel freeze.
     """
     result_container: dict = {}
     error_container: dict = {}
@@ -40,7 +43,12 @@ def _run_coroutine_threadsafe(coro) -> Any:
 
     t = threading.Thread(target=_thread_target, daemon=True)
     t.start()
-    t.join()
+    t.join(timeout=LLM_THREAD_TIMEOUT_SECONDS)
+
+    if t.is_alive():
+        raise RuntimeError(
+            f"LLM thread timed out after {LLM_THREAD_TIMEOUT_SECONDS} seconds"
+        )
 
     if "error" in error_container:
         raise error_container["error"]
@@ -68,17 +76,13 @@ def _make_llm_callable(adapter):
 
         try:
             try:
-                # Detect running loop
                 asyncio.get_running_loop()
-                # If we reach here, we are inside an event loop
                 result = _run_coroutine_threadsafe(_invoke())
             except RuntimeError:
-                # No running loop
                 result = asyncio.run(_invoke())
         except Exception as e:
             raise RuntimeError(f"LLM adapter invocation failed: {e}") from e
 
-        # Support adapter returning (ops, err)
         if isinstance(result, tuple) and len(result) == 2:
             ops, err = result
         else:
