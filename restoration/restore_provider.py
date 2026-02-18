@@ -5,6 +5,7 @@ import threading
 from typing import Optional
 
 from restoration.snapshot_types import RestorationSnapshot
+from restoration.snapshot_provider import SnapshotProvider
 from core.mode_controller import ModeController, SystemMode
 
 
@@ -27,16 +28,37 @@ class RestoreProvider:
 
     CURSOR_TOLERANCE_PX = 5
     POST_ACTION_DELAY = 0.08
-    MAX_VERIFY_ATTEMPTS = 5  # increased reliability
+    MAX_VERIFY_ATTEMPTS = 5
 
-    def __init__(self, *, os_backend, mode_controller: ModeController):
+    def __init__(
+        self,
+        *,
+        os_backend,
+        mode_controller: ModeController,
+        snapshot_provider: SnapshotProvider,
+    ):
         self._os = os_backend
         self._mode = mode_controller
+        self._snapshot_provider = snapshot_provider
         self._completed_snapshot_id: Optional[str] = None
         self._lock = threading.Lock()
 
     # =========================================================
-    # PUBLIC
+    # PUBLIC ENTRYPOINT (REQUIRED BY main.py)
+    # =========================================================
+
+    def restore_snapshot(self, snapshot_id: str) -> None:
+        if not isinstance(snapshot_id, str) or not snapshot_id.strip():
+            raise RestorationError("Invalid snapshot_id")
+
+        snapshot = self._snapshot_provider.get_snapshot(snapshot_id)
+        if snapshot is None:
+            raise RestorationError(f"Snapshot not found: {snapshot_id}")
+
+        self.restore(snapshot)
+
+    # =========================================================
+    # CORE RESTORE
     # =========================================================
 
     def restore(self, snapshot: RestorationSnapshot) -> None:
@@ -183,7 +205,6 @@ class RestoreProvider:
         if expected == actual:
             return True
 
-        # Bidirectional containment (handles dynamic titles)
         if expected in actual:
             return True
         if actual in expected:
