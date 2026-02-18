@@ -76,7 +76,7 @@ def _force_safe_shutdown(os_backend, auth_state, reason: str):
 
 def _graceful_exit(code: int = 1):
     _SHUTDOWN_EVENT.set()
-    sys.exit(code)
+    raise SystemExit(code)
 
 
 def _install_signal_handlers(os_backend, auth_state):
@@ -86,6 +86,7 @@ def _install_signal_handlers(os_backend, auth_state):
         _graceful_exit(1)
 
     atexit.register(_force_safe_shutdown, os_backend, auth_state, "atexit")
+
     signal.signal(signal.SIGINT, _signal_handler)
     signal.signal(signal.SIGTERM, _signal_handler)
     if hasattr(signal, "SIGQUIT"):
@@ -162,10 +163,6 @@ def main(llm_callable: Callable, model_name: str):
     vision_runtime.start()
     observer_loop.start()
 
-    # --------------------------------------------------------
-    # STRONGER WARMUP: require consecutive stable frames
-    # --------------------------------------------------------
-
     stable_frames = 0
     warmup_deadline = time.time() + 8.0
 
@@ -200,7 +197,6 @@ def main(llm_callable: Callable, model_name: str):
         while not _SHUTDOWN_EVENT.is_set():
 
             try:
-
                 _enforce_task_timeout()
 
                 mode.update_observer_health(observer.is_healthy())
@@ -257,7 +253,6 @@ def main(llm_callable: Callable, model_name: str):
                 mode.execute()
 
                 try:
-
                     while True:
 
                         _enforce_task_timeout()
