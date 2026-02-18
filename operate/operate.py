@@ -38,6 +38,7 @@ def operate_main(
     planner=None,
     observer=None,
     world_graph=None,
+    os_backend: Optional[OperatingSystem] = None,
     max_wallclock_seconds: int = 90 * 60,
 ):
 
@@ -47,7 +48,8 @@ def operate_main(
     execution_plan.validate()
     PlanVerifier().verify(execution_plan)
 
-    os_backend = OperatingSystem()
+    # Use injected OS backend if provided (prevents dual instances)
+    os_backend = os_backend or OperatingSystem()
 
     try:
         accessibility_backend = AccessibilityBackend()
@@ -123,7 +125,11 @@ def _execute_autonomous_loop(
 
     iteration = 0
     stagnant_iterations = 0
-    max_iterations = max(len(execution_plan.steps) * (MAX_STAGNANT_ITERS + 1), 25)
+
+    max_iterations = max(
+        len(execution_plan.steps) * (MAX_STAGNANT_ITERS + 1),
+        25,
+    )
 
     current_step_index = 0
     previous_snapshot = None
@@ -145,12 +151,15 @@ def _execute_autonomous_loop(
         # ---------------- PERCEPTION ----------------
 
         perception_snapshot = None
+
         if observer:
             try:
                 snap = observer.snapshot()
                 perception_snapshot = snap.get("perception")
+
                 if world_graph and isinstance(perception_snapshot, dict):
                     world_graph.update(perception_snapshot)
+
             except Exception:
                 log_warn("Observer snapshot failed")
 
@@ -160,14 +169,55 @@ def _execute_autonomous_loop(
 
         delta = None
         if previous_snapshot and world_graph:
-            delta = world_graph.compute_delta(previous_snapshot)
-            belief.compute_environment_stability(delta)
+            try:
+                delta = world_graph.compute_delta(previous_snapshot)
+                belief.compute_environment_stability(delta)
+            except Exception:
+                delta = None
+
+        # bounded world context for belief likelihood
+        if isinstance(world_snapshot, dict):
+
+            entities = world_snapshot.get("entities", [])
+            if isinstance(entities, list):
+                entities = entities[:MAX_PERCEPTION_ENTITIES]
+
+            bounded = {
+                k: v for k, v in world_snapshot.items()
+                if k != "entities"
+            }
+            bounded["entities"] = entities
+
+            try:
+                if len(json.dumps(bounded)) <= MAX_PERCEPTION_JSON_BYTES:
+                    likelihoods: Dict[str, float] = {}
+
+                    focused_app = bounded.get("focused_app")
+                    entity_count = len(bounded.get("entities", []))
+
+                    if isinstance(focused_app, str) and focused_app.strip():
+                        likelihoods[f"app:{focused_app.lower()}"] = 0.9
+
+                    if entity_count > 10:
+                        likelihoods["ui_rich"] = 0.8
+                    elif entity_count > 0:
+                        likelihoods["ui_sparse"] = 0.7
+                    else:
+                        likelihoods["ui_empty"] = 0.5
+
+                    likelihoods["neutral"] = 0.5 if delta else 0.9
+
+                    belief.bayesian_update(likelihoods)
+
+            except Exception:
+                pass
 
         previous_snapshot = world_snapshot
 
         # ---------------- ACTION ----------------
 
-        selected_action = current_step.action or {}
+        selected_action = current_step.action
+
         if not isinstance(selected_action, dict):
             raise RuntimeError("Invalid action format")
 
@@ -220,8 +270,8 @@ def _execute_autonomous_loop(
         reward = float(verification.confidence) - 0.5
         belief.record_action(action_key, reward=reward)
 
-        action_rewards = belief.action_rewards.get(action_key, [])
-        best_reward = max(action_rewards) if action_rewards else reward
+        rewards = belief.action_rewards.get(action_key, [])
+        best_reward = max(rewards) if rewards else reward
         belief.update_regret(action_key, reward, best_reward)
 
         if not verification.success:
@@ -266,21 +316,26 @@ def _execute_decision(
 
     operation = decision.get("operation")
 
+    if not isinstance(operation, str):
+        raise RuntimeError("Missing operation")
+
     if operation == "click":
         x = decision.get("x")
         y = decision.get("y")
         if x is None or y is None:
             raise RuntimeError("Click missing coordinates")
-        os_backend.click(x, y)
+        os_backend.click(float(x), float(y))
         return None
 
     if operation == "type":
-        text = decision.get("text", "")
+        text = decision.get("text")
+        if not isinstance(text, str):
+            raise RuntimeError("Invalid text payload")
         os_backend.type_text(text)
         return None
 
     if operation == "hotkey":
-        keys = decision.get("keys", [])
+        keys = decision.get("keys")
         if not isinstance(keys, list):
             raise RuntimeError("Invalid hotkey format")
         os_backend.press_keys(keys)
@@ -288,8 +343,8 @@ def _execute_decision(
 
     if operation == "command":
         cmd = decision.get("command")
-        if not cmd:
-            raise RuntimeError("Missing command")
+        if not isinstance(cmd, str) or not cmd.strip():
+            raise RuntimeError("Invalid command")
         return os_backend.run_command(cmd)
 
     if operation == "install":
@@ -299,6 +354,9 @@ def _execute_decision(
         if not isinstance(tool, dict):
             raise RuntimeError("Invalid tool specification")
         installer.install_tool(tool)
+        return None
+
+    if operation == "done":
         return None
 
     raise RuntimeError(f"Unsupported operation: {operation}")
