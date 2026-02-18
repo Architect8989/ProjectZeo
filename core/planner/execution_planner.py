@@ -1,8 +1,8 @@
 from typing import List, Dict, Any, Optional
 import json
 import time
-import concurrent.futures
 import re
+import asyncio
 
 from config.timeouts import LLM_CALL_TIMEOUT_SECONDS
 
@@ -18,15 +18,11 @@ class PlanningError(RuntimeError):
 
 
 class ExecutionPlanner:
-    """
-    Deterministic execution planner.
-    Hardened against malformed LLM output,
-    thread leakage, and destructive command injection.
-    """
 
     MAX_SCREEN_CHARS = 500
     MAX_ESTIMATED_DURATION = 600.0
     MAX_STEPS_PER_GOAL = 25
+    MAX_COMMAND_LENGTH = 512
 
     SAFE_ENV_FIELDS = {
         "os",
@@ -38,16 +34,32 @@ class ExecutionPlanner:
         "ci_environment",
     }
 
-    # ---- Destructive Command Denylist (EP-1 FIX) ----
+    # Hardened destructive patterns
     DANGEROUS_PATTERNS = [
         r"\brm\s+-rf\b",
         r"\bsudo\b",
         r"\bdd\b",
         r"\bmkfs\b",
         r"\bformat\b",
-        r"curl\s+.*\|\s*bash",
-        r"wget\s+.*\|\s*bash",
         r"\bchmod\s+777\b",
+        r"\bpython\s*-c\b",
+        r"\bpython3\s*-c\b",
+        r"\bbash\s*-c\b",
+        r"\bsh\s*-c\b",
+        r"\beval\b",
+        r"\bexec\b",
+        r"\bnc\b",
+        r"\bnetcat\b",
+        r"\bcrontab\b",
+        r"\bat\b",
+        r"\bbase64\b.*-d",
+        r"\$\(",
+        r";",
+        r"&&",
+        r"\|\|",
+        r"\|",
+        r">",
+        r"<",
     ]
 
     def __init__(
@@ -74,8 +86,6 @@ class ExecutionPlanner:
                 "timestamp": None,
             }
 
-    # ==================================================
-    # PLAN CREATION
     # ==================================================
 
     def create_plan(
@@ -150,52 +160,26 @@ class ExecutionPlanner:
         return plan
 
     # ==================================================
-    # SNAPSHOT UPDATE
-    # ==================================================
 
-    def update_world_snapshot(self, new_snapshot: Dict[str, Any]) -> None:
-        if not isinstance(new_snapshot, dict):
-            raise PlanningError("Invalid world snapshot")
-
-        try:
-            frozen = json.loads(json.dumps(new_snapshot, sort_keys=True))
-        except Exception:
-            raise PlanningError("Failed to freeze snapshot")
-
-        self._world_snapshot = frozen
-
-    # ==================================================
-    # LLM CALL (SAFE + BOUNDED)
-    # ==================================================
-
-    def _call_llm_with_timeout(self, prompt: str) -> str:
+    async def _call_llm_async(self, prompt: str) -> str:
 
         payload = [
             {"role": "system", "content": "You are a deterministic planner."},
             {"role": "user", "content": prompt},
         ]
 
+        loop = asyncio.get_running_loop()
+
         def _invoke():
-            result = self._llm_call(payload, None, "planning")
-
-            if isinstance(result, tuple) and len(result) == 2:
-                ops, err = result
-                if err:
-                    raise PlanningError(f"LLM adapter error: {err}")
-                return ops
-
-            return result
-
-        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-        future = executor.submit(_invoke)
+            return self._llm_call(payload, None, "planning")
 
         try:
-            result = future.result(timeout=LLM_CALL_TIMEOUT_SECONDS)
-        except concurrent.futures.TimeoutError:
-            future.cancel()
+            result = await asyncio.wait_for(
+                loop.run_in_executor(None, _invoke),
+                timeout=LLM_CALL_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
             raise PlanningError("LLM call timeout")
-        finally:
-            executor.shutdown(wait=False, cancel_futures=True)
 
         if isinstance(result, str):
             return result.strip()
@@ -211,8 +195,6 @@ class ExecutionPlanner:
         raise PlanningError("Unsupported LLM return type")
 
     # ==================================================
-    # TOOL EXTRACTION
-    # ==================================================
 
     def _extract_required_tools(self, requirements: Dict[str, Any]) -> List[str]:
         tools = requirements.get("tools", [])
@@ -220,8 +202,6 @@ class ExecutionPlanner:
             return []
         return [t.strip() for t in tools if isinstance(t, str) and t.strip()]
 
-    # ==================================================
-    # SCREEN CONTEXT
     # ==================================================
 
     def _read_screen_context(self) -> str:
@@ -242,8 +222,6 @@ class ExecutionPlanner:
         return "\n".join(text_chunks)[: self.MAX_SCREEN_CHARS]
 
     # ==================================================
-    # ROBUST JSON EXTRACTION
-    # ==================================================
 
     def _extract_json(self, raw: str) -> Any:
         raw = raw.strip()
@@ -253,17 +231,19 @@ class ExecutionPlanner:
         try:
             return json.loads(raw)
         except json.JSONDecodeError:
-            match = re.search(r"(\{.*?\}|\[.*?\])", raw, re.DOTALL)
-            if match:
-                try:
-                    return json.loads(match.group(1))
-                except Exception:
-                    pass
-
-        raise PlanningError("Invalid JSON from LLM")
+            raise PlanningError("Invalid JSON from LLM")
 
     # ==================================================
-    # GOAL EXPANSION
+
+    def _validate_command(self, cmd: str) -> None:
+
+        if len(cmd) > self.MAX_COMMAND_LENGTH:
+            raise PlanningError("Command too long")
+
+        for pattern in self.DANGEROUS_PATTERNS:
+            if re.search(pattern, cmd, re.IGNORECASE):
+                raise PlanningError("Dangerous command detected")
+
     # ==================================================
 
     def _expand_goal(self, goal: str) -> List[Dict[str, Any]]:
@@ -276,35 +256,23 @@ class ExecutionPlanner:
         }
 
         prompt = f"""
-You are a deterministic execution planner.
-
 Environment:
 {json.dumps(safe_env)}
 
-Frozen screen:
+Screen:
 {screen_context}
 
 Goal:
 "{goal}"
 
 Return STRICT JSON list of steps.
-
-Each step MUST contain:
-- type
-- description
-- action
-- verification
-- estimated_duration
-- retryable
-
-Return JSON only.
 """
 
-        raw = self._call_llm_with_timeout(prompt)
+        raw = asyncio.run(self._call_llm_async(prompt))
         data = self._extract_json(raw)
 
         if not isinstance(data, list) or not data:
-            raise PlanningError("LLM produced invalid step list")
+            raise PlanningError("Invalid step list")
 
         allowed_types = {
             StepType.UI_INTERACTION.value,
@@ -325,18 +293,15 @@ Return JSON only.
             if step_type not in allowed_types:
                 raise PlanningError("Invalid step type")
 
-            description = step.get("description")
             action = step.get("action")
-            verification = step.get("verification")
-
-            if not isinstance(description, str) or not description.strip():
-                raise PlanningError("Invalid description")
-
             if not isinstance(action, dict):
                 raise PlanningError("Invalid action")
 
-            if not isinstance(verification, dict):
-                raise PlanningError("Invalid verification")
+            if step_type == StepType.COMMAND_EXECUTION.value:
+                cmd = action.get("command")
+                if not isinstance(cmd, str) or not cmd.strip():
+                    raise PlanningError("Missing command")
+                self._validate_command(cmd.strip())
 
             try:
                 duration = float(step.get("estimated_duration", 0.0))
@@ -346,26 +311,12 @@ Return JSON only.
             if duration < 0 or duration > self.MAX_ESTIMATED_DURATION:
                 raise PlanningError("Duration out of bounds")
 
-            # ---- Destructive Command Protection ----
-            if step_type == StepType.COMMAND_EXECUTION.value:
-                cmd = action.get("command")
-                if not isinstance(cmd, str) or not cmd.strip():
-                    raise PlanningError("COMMAND_EXECUTION missing 'command'")
-
-                for pattern in self.DANGEROUS_PATTERNS:
-                    if re.search(pattern, cmd, re.IGNORECASE):
-                        raise PlanningError("Dangerous command detected")
-
-            if step_type == StepType.UI_INTERACTION.value:
-                if "operation" not in action:
-                    raise PlanningError("UI_INTERACTION missing 'operation'")
-
             validated.append(
                 {
                     "type": StepType(step_type),
-                    "description": description.strip(),
+                    "description": step.get("description", "").strip(),
                     "action": action,
-                    "verification": verification,
+                    "verification": step.get("verification", {}),
                     "estimated_duration": duration,
                     "retryable": bool(step.get("retryable", True)),
                 }
