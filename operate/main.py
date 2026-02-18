@@ -10,17 +10,15 @@ from operate.operate import operate_main
 from core.telemetry.logger import log_info, log_error
 
 from operate.utils.operating_system import OperatingSystem
-from utils.accessibility import AccessibilityBackend
-from audit.journal import ActionJournal
-from authority.input_arbitrator import InputArbitrator
+from core.planner.execution_planner import ExecutionPlanner
+from core.environment_fingerprint import collect_environment_fingerprint
+from core.vision.world_graph import WorldGraph
 
 
 def main_entry(
     *,
     model: str = None,
     terminal_prompt: str = None,
-    voice_mode: bool = False,
-    verbose_mode: bool = False,
     observer=None,
 ):
     """
@@ -28,13 +26,9 @@ def main_entry(
 
     Responsibilities:
     - Parse CLI or accept programmatic input
-    - Construct execution dependencies
+    - Construct minimal execution dependencies
+    - Build ExecutionPlan
     - Call operate_main()
-
-    Does NOT:
-    - manage lifecycle
-    - manage snapshots
-    - manage authority state
     """
 
     try:
@@ -48,7 +42,7 @@ def main_entry(
 
             parser.add_argument(
                 "-m", "--model",
-                default=None,
+                required=True,
             )
 
             parser.add_argument(
@@ -62,34 +56,53 @@ def main_entry(
             model = args.model
             objective = args.prompt
         else:
+            if not model:
+                raise RuntimeError("model must be provided")
             objective = terminal_prompt
 
         if observer is None:
-            raise RuntimeError(
-                "observer is required for execution"
-            )
+            raise RuntimeError("observer is required for execution")
 
         # --------------------------------------------------
-        # DEPENDENCY CONSTRUCTION (EXPLICIT)
+        # DEPENDENCY CONSTRUCTION
         # --------------------------------------------------
         os_backend = OperatingSystem()
+        world_graph = WorldGraph()
+        env_fingerprint = collect_environment_fingerprint()
 
-        accessibility_backend = AccessibilityBackend()
-        accessibility_backend.wire(observer=observer)
+        planner = ExecutionPlanner(
+            llm_call=None,  # expected injected via higher-level orchestrator
+            environment_fingerprint=env_fingerprint,
+            world_graph=world_graph,
+        )
 
-        journal = ActionJournal()
-        input_arbitrator = InputArbitrator()
+        if not callable(planner._llm_call):
+            raise RuntimeError("ExecutionPlanner LLM callable not configured")
 
         log_info("[SYSTEM] Starting SOC execution")
+
+        # --------------------------------------------------
+        # PLAN GENERATION
+        # --------------------------------------------------
+        execution_plan = planner.create_plan(
+            objective=objective,
+            requirements={
+                "environment": env_fingerprint,
+                "tools": env_fingerprint.get("tools", []),
+            },
+            high_level_steps=[{"goal": objective}],
+        )
 
         # --------------------------------------------------
         # EXECUTION
         # --------------------------------------------------
         operate_main(
-            model=model,
             terminal_prompt=objective,
-            execution_plan=None,  # expected to be provided by caller in SOC flow
+            execution_plan=execution_plan,
+            planner=planner,
             observer=observer,
+            world_graph=world_graph,
+            os_backend=os_backend,
         )
 
     except KeyboardInterrupt:
