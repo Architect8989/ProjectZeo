@@ -1,4 +1,4 @@
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Tuple
 from collections import deque
 import time
 import math
@@ -11,7 +11,7 @@ import struct
 class BeliefState:
     """
     Decision-theoretic cognitive belief engine.
-    Production-hardened and convergence-safe.
+    Hardened against state explosion and regret drift.
     """
 
     EXPLORATION_C = 1.4
@@ -19,29 +19,35 @@ class BeliefState:
     SOFTMAX_TAU = 0.5
     REWARD_WINDOW = 100
     REGRET_SCALE = 0.05
-    PRIOR_ALPHA = 0.001  # Dirichlet prior floor
-    REGRET_DECAY = 0.995  # prevents unbounded regret growth
+    PRIOR_ALPHA = 0.001
+    REGRET_DECAY = 0.995
+    MAX_STATES = 64
 
     def __init__(self):
         self.created_at = time.time()
 
-        self.state_probabilities: Dict[str, float] = {
-            "neutral": 1.0
-        }
+        self.state_probabilities: Dict[str, float] = {"neutral": 1.0}
 
         self.action_counts: Dict[str, int] = {}
         self.action_rewards: Dict[str, deque] = {}
-        self.regret: Dict[str, float] = {}
+
+        # regret[action] = (raw_value, last_update_iteration)
+        self.regret: Dict[str, Tuple[float, int]] = {}
 
         self.progress_score: float = 0.0
         self.environment_stability: float = 1.0
         self.commitment_hash: str = "GENESIS"
 
+        self._iteration_counter: int = 0
+
     # ==================================================
-    # BAYESIAN UPDATE (DIRICHLET SAFE)
+    # BAYESIAN UPDATE (STATE-BOUNDED)
     # ==================================================
 
     def bayesian_update(self, likelihoods: Dict[str, float]) -> None:
+        if not likelihoods:
+            return
+
         all_states = set(self.state_probabilities) | set(likelihoods)
 
         new_belief: Dict[str, float] = {}
@@ -58,9 +64,29 @@ class BeliefState:
         if total <= 0:
             return
 
-        self.state_probabilities = {
-            s: v / total for s, v in new_belief.items()
+        normalized = {s: v / total for s, v in new_belief.items()}
+
+        # prune very small states
+        pruned = {
+            s: p for s, p in normalized.items()
+            if p >= self.PRIOR_ALPHA * 0.1
         }
+
+        # enforce MAX_STATES bound
+        if len(pruned) > self.MAX_STATES:
+            sorted_states = sorted(
+                pruned.items(),
+                key=lambda x: x[1],
+                reverse=True,
+            )[: self.MAX_STATES]
+            pruned = dict(sorted_states)
+
+        # renormalize after pruning
+        total = sum(pruned.values())
+        if total > 0:
+            self.state_probabilities = {
+                s: v / total for s, v in pruned.items()
+            }
 
     # ==================================================
     # ENTROPY
@@ -106,7 +132,7 @@ class BeliefState:
         return mean_reward + exploration
 
     # ==================================================
-    # THOMPSON SAMPLING (BETA STABLE)
+    # THOMPSON SAMPLING (NEUTRAL SAFE)
     # ==================================================
 
     def thompson_sample(self, action: str) -> float:
@@ -114,29 +140,40 @@ class BeliefState:
         if not rewards:
             return random.random()
 
-        # Map rewards to success/failure
-        successes = sum(1 for r in rewards if r > 0) + 1
-        failures = sum(1 for r in rewards if r <= 0) + 1
+        successes = sum(1 for r in rewards if r > 0)
+        failures = sum(1 for r in rewards if r < 0)
 
-        return random.betavariate(successes, failures)
+        # neutral rewards (r == 0) do not bias posterior
+        return random.betavariate(successes + 1, failures + 1)
 
     # ==================================================
-    # REGRET UPDATE (DECAYED)
+    # REGRET (LAZY DECAY)
     # ==================================================
+
+    def _get_effective_regret(self, action: str) -> float:
+        entry = self.regret.get(action)
+        if not entry:
+            return 0.0
+
+        raw_value, last_iter = entry
+        delta_iter = self._iteration_counter - last_iter
+        decayed = raw_value * (self.REGRET_DECAY ** delta_iter)
+        return decayed
 
     def update_regret(self, action: str, reward: float, best_reward: float):
-        # Apply decay to all regret values
-        for k in list(self.regret.keys()):
-            self.regret[k] *= self.REGRET_DECAY
+        self._iteration_counter += 1
 
         regret_value = best_reward - reward
-        if regret_value > 0:
-            self.regret[action] = (
-                self.regret.get(action, 0.0) + regret_value
-            )
+        if regret_value <= 0:
+            return
+
+        current = self._get_effective_regret(action)
+        updated = current + regret_value
+
+        self.regret[action] = (updated, self._iteration_counter)
 
     # ==================================================
-    # SOFTMAX SELECTION (NUMERICALLY SAFE)
+    # SOFTMAX SELECTION
     # ==================================================
 
     def softmax_select(self, actions: List[str]) -> str:
@@ -144,20 +181,21 @@ class BeliefState:
             raise ValueError("No actions provided")
 
         scores = []
+
         for a in actions:
-            base_score = self.ucb_score(a)
+            base = self.ucb_score(a)
+
             regret_penalty = min(
-                self.regret.get(a, 0.0) * self.REGRET_SCALE,
+                self._get_effective_regret(a) * self.REGRET_SCALE,
                 0.5,
             )
-            scores.append(base_score - regret_penalty)
+
+            scores.append(base - regret_penalty)
 
         max_score = max(scores)
         tau = max(0.15, self.SOFTMAX_TAU)
 
         shifted = [(s - max_score) / tau for s in scores]
-
-        # Overflow protection
         exp_scores = [math.exp(min(50, s)) for s in shifted]
         total = sum(exp_scores)
 
@@ -198,7 +236,6 @@ class BeliefState:
                 self.environment_stability + 0.05,
             )
 
-        # Clamp to [0,1]
         self.environment_stability = max(
             0.0,
             min(1.0, self.environment_stability),
@@ -238,7 +275,7 @@ class BeliefState:
         ).hexdigest()
 
     # ==================================================
-    # CONVERGENCE (PLAN-BOUND)
+    # CONVERGENCE (PLAN-BOUND SAFE)
     # ==================================================
 
     def converged(
@@ -253,11 +290,10 @@ class BeliefState:
         if current_iteration < min_iterations:
             return False
 
-        # Require full plan completion if plan provided
-        if plan_steps_total > 0:
-            if steps_completed < plan_steps_total:
-                return False
+        if plan_steps_total > 0 and steps_completed < plan_steps_total:
+            return False
 
+        # entropy is advisory only; plan completion dominates
         low_entropy = self.entropy() < 0.1
         stable_env = self.environment_stability > 0.9
 
@@ -272,7 +308,10 @@ class BeliefState:
             "entropy": self.entropy(),
             "state_distribution": self.state_probabilities,
             "action_counts": self.action_counts,
-            "regret": self.regret,
+            "regret": {
+                k: self._get_effective_regret(k)
+                for k in self.regret
+            },
             "progress_score": self.progress_score,
             "environment_stability": self.environment_stability,
             "commitment_hash": self.commitment_hash,
