@@ -17,9 +17,37 @@ import copy
 import inspect
 import functools
 import types
-from operate.models import apis
+import importlib
 
 _PATCHED = False
+
+
+# ============================================================
+# RESOLVE APIS MODULE (ROBUST IMPORT)
+# ============================================================
+
+def _resolve_apis_module():
+    """
+    Resolve apis module without relying on fragile __init__ exports.
+    """
+
+    candidates = [
+        "operate.models.apis",
+        "operate.legacy.apis",
+    ]
+
+    for path in candidates:
+        try:
+            return importlib.import_module(path)
+        except Exception:
+            continue
+
+    raise RuntimeError(
+        "[APIS-SAFETY] Unable to resolve operate apis module"
+    )
+
+
+apis = _resolve_apis_module()
 
 
 # ============================================================
@@ -67,7 +95,6 @@ def _wrap_provider(fn):
             )
 
     def _inject_determinism(kwargs):
-        # Enforce deterministic temperature if options supported
         options = kwargs.get("options")
         if isinstance(options, dict):
             options = dict(options)
@@ -173,12 +200,7 @@ def _disable_cloud_fallbacks():
 # ============================================================
 
 def _disable_screenshot_writes():
-    """
-    Neutralize filesystem screenshot writes
-    without corrupting the os module.
-    """
 
-    # Block directory creation for screenshots only
     if hasattr(apis, "os") and hasattr(apis.os, "makedirs"):
 
         original_makedirs = apis.os.makedirs
@@ -190,7 +212,6 @@ def _disable_screenshot_writes():
 
         apis.os.makedirs = guarded_makedirs
 
-    # Block PIL Image.save used for screenshots
     if hasattr(apis, "Image"):
 
         try:
