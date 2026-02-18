@@ -4,11 +4,11 @@ import os
 import re
 import uuid
 import threading
+import asyncio
 from typing import List, Tuple, Optional
 
 import ollama
 import httpx
-from PIL import Image
 
 from operate.config import Config
 from operate.models.prompts import (
@@ -47,13 +47,14 @@ def _get_ocr_reader():
 class QwenOllamaAdapter:
     """
     Local-only Qwen-VL adapter.
-    Hardened version.
+    Non-blocking + fail-closed hardened version.
     """
+
+    MAX_SCREENSHOT_FILES = 200
 
     def __init__(self, model_name: str = "qwen2.5-vl:7b-instruct"):
         self.model_name = model_name
 
-        # Explicit network timeouts (prevents indefinite hangs)
         self._client = ollama.Client(
             timeout=httpx.Timeout(
                 connect=5.0,
@@ -74,14 +75,9 @@ class QwenOllamaAdapter:
         session_id: Optional[str] = None,
     ) -> Tuple[Optional[List[dict]], Optional[Exception]]:
 
-        local_messages = list(messages)
-
         try:
-            operations = await self._call_qwen_with_ocr(
-                local_messages,
-                objective,
-            )
-            return operations, None
+            ops = await self._call_qwen_with_ocr(messages, objective)
+            return ops, None
         except Exception as e:
             return None, e
 
@@ -115,31 +111,47 @@ class QwenOllamaAdapter:
                 else get_user_prompt()
             )
 
-            response = self._client.chat(
-                model=self.model_name,
-                messages=[
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": f"{user_prompt}\nReturn JSON list of operations.",
-                            },
-                            {
-                                "type": "image",
-                                "image": img_base64,
-                            },
-                        ],
-                    }
-                ],
-                options={"temperature": 0},
-            )
+            # -------- NON-BLOCKING LLM CALL --------
+
+            loop = asyncio.get_running_loop()
+
+            def _blocking_call():
+                return self._client.chat(
+                    model=self.model_name,
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": f"{user_prompt}\nReturn JSON list of operations.",
+                                },
+                                {
+                                    "type": "image",
+                                    "image": img_base64,
+                                },
+                            ],
+                        }
+                    ],
+                    options={"temperature": 0},
+                )
+
+            response = await loop.run_in_executor(None, _blocking_call)
 
             content = response.get("message", {}).get("content")
             if not isinstance(content, str):
                 raise RuntimeError("Unexpected Ollama response shape")
 
             operations = self._parse_and_normalize_json(content)
+
+            # Validate list of dicts
+            if not isinstance(operations, list):
+                raise RuntimeError("LLM output must be list")
+
+            operations = [
+                op for op in operations
+                if isinstance(op, dict) and "operation" in op
+            ]
 
             self._resolve_click_coordinates(
                 operations,
@@ -149,7 +161,6 @@ class QwenOllamaAdapter:
             return operations
 
         finally:
-            # Crash-safe cleanup
             for p in (raw_screenshot, jpeg_screenshot):
                 try:
                     if p and os.path.exists(p):
@@ -158,7 +169,7 @@ class QwenOllamaAdapter:
                     pass
 
     # ==========================================================
-    # OCR RESOLUTION
+    # OCR RESOLUTION (FAIL-CLOSED)
     # ==========================================================
 
     def _resolve_click_coordinates(
@@ -170,25 +181,42 @@ class QwenOllamaAdapter:
         reader = _get_ocr_reader()
         ocr_result = reader.readtext(screenshot_path)
 
+        filtered_ops = []
+
         for op in operations:
-            if op.get("operation") == "click" and "text" in op:
-                try:
-                    idx = get_text_element(
-                        ocr_result,
-                        op["text"],
-                        screenshot_path,
-                    )
-                    coords = get_text_coordinates(
-                        ocr_result,
-                        idx,
-                        screenshot_path,
-                    )
-                    if isinstance(coords, dict):
-                        op["x"] = coords.get("x")
-                        op["y"] = coords.get("y")
-                except Exception:
-                    # Fail closed on coordinate resolution
-                    continue
+
+            if op.get("operation") != "click":
+                filtered_ops.append(op)
+                continue
+
+            if "text" not in op:
+                continue  # invalid click → drop
+
+            try:
+                idx = get_text_element(
+                    ocr_result,
+                    op["text"],
+                    screenshot_path,
+                )
+                coords = get_text_coordinates(
+                    ocr_result,
+                    idx,
+                    screenshot_path,
+                )
+
+                if isinstance(coords, dict):
+                    x = coords.get("x")
+                    y = coords.get("y")
+                    if isinstance(x, (int, float)) and isinstance(y, (int, float)):
+                        op["x"] = x
+                        op["y"] = y
+                        filtered_ops.append(op)
+
+            except Exception:
+                continue  # drop malformed click
+
+        operations.clear()
+        operations.extend(filtered_ops)
 
     # ==========================================================
     # HELPERS
@@ -215,8 +243,18 @@ class QwenOllamaAdapter:
         return local
 
     def _prepare_unique_screenshot(self) -> str:
-        screenshots_dir = "screenshots"
+
+        screenshots_dir = os.path.abspath("screenshots")
         os.makedirs(screenshots_dir, exist_ok=True)
+
+        # Hard limit to prevent unbounded growth
+        existing = os.listdir(screenshots_dir)
+        if len(existing) > self.MAX_SCREENSHOT_FILES:
+            for f in existing[: len(existing) - self.MAX_SCREENSHOT_FILES]:
+                try:
+                    os.remove(os.path.join(screenshots_dir, f))
+                except Exception:
+                    pass
 
         filename = f"screenshot_{uuid.uuid4().hex}.png"
         path = os.path.join(screenshots_dir, filename)
@@ -225,28 +263,31 @@ class QwenOllamaAdapter:
         return path
 
     def _parse_and_normalize_json(self, text: str) -> List[dict]:
-        text = text.strip()
 
+        text = text.strip()
         text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.MULTILINE)
         text = re.sub(r"\s*```$", "", text, flags=re.MULTILINE).strip()
 
-        decoder = json.JSONDecoder()
+        # First attempt: direct parse
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, dict):
+                return [parsed]
+            if isinstance(parsed, list):
+                return parsed
+        except Exception:
+            pass
 
-        for start_char in ("{", "["):
-            idx = text.find(start_char)
-            if idx != -1:
-                try:
-                    data, _ = decoder.raw_decode(text[idx:])
-                    if isinstance(data, dict):
-                        return [data]
-                    if isinstance(data, list):
-                        return data
-                    raise RuntimeError(
-                        f"Unexpected JSON structure: {type(data)}"
-                    )
-                except json.JSONDecodeError:
-                    continue
+        # Robust fallback: minimal non-greedy match
+        match = re.search(r"(\{.*?\}|\[.*?\])", text, re.DOTALL)
+        if match:
+            try:
+                parsed = json.loads(match.group(1))
+                if isinstance(parsed, dict):
+                    return [parsed]
+                if isinstance(parsed, list):
+                    return parsed
+            except Exception:
+                pass
 
-        raise RuntimeError(
-            f"No valid JSON structure found. Sample: {text[:80]}"
-        )
+        raise RuntimeError("No valid JSON structure found")
