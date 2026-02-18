@@ -251,6 +251,12 @@ def _execute_autonomous_loop(
 
         except Exception:
             belief.record_action(action_key, reward=-0.5)
+
+            normalized_history = belief.action_rewards.get(action_key, [])
+            normalized_reward = normalized_history[-1] if normalized_history else -0.5
+            best_reward = max(normalized_history) if normalized_history else normalized_reward
+            belief.update_regret(action_key, normalized_reward, best_reward)
+
             stagnant_iterations += 1
             if stagnant_iterations >= MAX_STAGNANT_ITERS:
                 journal.record({"event": "stagnation_detected"})
@@ -265,12 +271,14 @@ def _execute_autonomous_loop(
             world_graph=world_graph,
         )
 
-        reward = float(verification.confidence) - 0.5
-        belief.record_action(action_key, reward=reward)
+        raw_reward = float(verification.confidence) - 0.5
+        belief.record_action(action_key, reward=raw_reward)
 
-        rewards = belief.action_rewards.get(action_key, [])
-        best_reward = max(rewards) if rewards else reward
-        belief.update_regret(action_key, reward, best_reward)
+        normalized_history = belief.action_rewards.get(action_key, [])
+        normalized_reward = normalized_history[-1] if normalized_history else raw_reward
+        best_reward = max(normalized_history) if normalized_history else normalized_reward
+
+        belief.update_regret(action_key, normalized_reward, best_reward)
 
         if not verification.success:
             stagnant_iterations += 1
