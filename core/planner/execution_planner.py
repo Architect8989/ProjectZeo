@@ -19,13 +19,6 @@ class PlanningError(RuntimeError):
 class ExecutionPlanner:
     """
     Deterministic execution planner.
-
-    HARD CONTRACT:
-    - Only intelligence boundary
-    - No side effects
-    - Strict validation
-    - Snapshot always frozen
-    - Replan bounded
     """
 
     LLM_TIMEOUT_SECONDS = 30.0
@@ -43,10 +36,6 @@ class ExecutionPlanner:
         "ci_environment",
     }
 
-    # ==================================================
-    # INIT
-    # ==================================================
-
     def __init__(
         self,
         *,
@@ -59,8 +48,7 @@ class ExecutionPlanner:
 
         self._llm_call = llm_call
         self._environment = environment_fingerprint or {}
-        self._world_snapshot: Optional[Dict[str, Any]] = None
-        self._last_replan_snapshot_hash: Optional[str] = None
+        self._world_snapshot: Dict[str, Any] = {}
 
         if world_graph is not None:
             self.update_world_snapshot(world_graph.snapshot())
@@ -158,28 +146,24 @@ class ExecutionPlanner:
         try:
             frozen = json.loads(json.dumps(new_snapshot, sort_keys=True))
         except Exception:
-            raise PlanningError("Failed to freeze new snapshot")
+            raise PlanningError("Failed to freeze snapshot")
 
         self._world_snapshot = frozen
 
     # ==================================================
-    # LLM CALL (FIXED CONTRACT)
+    # LLM CALL
     # ==================================================
 
     def _call_llm_with_timeout(self, prompt: str) -> str:
-        message_payload = [
+
+        payload = [
             {"role": "system", "content": "You are a deterministic planner."},
             {"role": "user", "content": prompt},
         ]
 
         def _invoke():
-            result = self._llm_call(
-                message_payload,
-                None,
-                "planning",
-            )
+            result = self._llm_call(payload, None, "planning")
 
-            # Support adapter returning (ops, err)
             if isinstance(result, tuple) and len(result) == 2:
                 ops, err = result
                 if err:
@@ -188,18 +172,13 @@ class ExecutionPlanner:
 
             return result
 
-        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-        future = executor.submit(_invoke)
-
-        try:
-            result = future.result(timeout=self.LLM_TIMEOUT_SECONDS)
-        except concurrent.futures.TimeoutError:
-            executor.shutdown(cancel_futures=True)
-            raise PlanningError("LLM call timeout")
-        finally:
-            executor.shutdown(wait=False)
-
-        # Normalize return
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(_invoke)
+            try:
+                result = future.result(timeout=self.LLM_TIMEOUT_SECONDS)
+            except concurrent.futures.TimeoutError:
+                future.cancel()
+                raise PlanningError("LLM call timeout")
 
         if isinstance(result, str):
             return result.strip()
@@ -209,19 +188,10 @@ class ExecutionPlanner:
 
         if isinstance(result, dict):
             content = result.get("content")
-            if not isinstance(content, str):
-                raise PlanningError("LLM returned invalid dict structure")
-            return content.strip()
+            if isinstance(content, str):
+                return content.strip()
 
-        raise PlanningError(f"Unsupported LLM return type: {type(result)}")
-
-    # ==================================================
-    # HASHING
-    # ==================================================
-
-    def _hash_snapshot(self, snapshot: Dict[str, Any]) -> str:
-        raw = json.dumps(snapshot, sort_keys=True)
-        return hashlib.sha256(raw.encode()).hexdigest()
+        raise PlanningError("Unsupported LLM return type")
 
     # ==================================================
     # TOOL EXTRACTION
@@ -238,9 +208,6 @@ class ExecutionPlanner:
     # ==================================================
 
     def _read_screen_context(self) -> str:
-        if not self._world_snapshot:
-            return ""
-
         entities = self._world_snapshot.get("entities", [])
         if not isinstance(entities, list):
             return ""
@@ -258,7 +225,7 @@ class ExecutionPlanner:
         return "\n".join(text_chunks)[: self.MAX_SCREEN_CHARS]
 
     # ==================================================
-    # JSON EXTRACTION (ROBUST)
+    # STRICT JSON EXTRACTION
     # ==================================================
 
     def _extract_json(self, raw: str) -> Any:
@@ -268,11 +235,7 @@ class ExecutionPlanner:
 
         try:
             return json.loads(raw)
-        except Exception:
-            # fallback: attempt first JSON block
-            match = re.search(r"\{.*\}|\[.*\]", raw, re.DOTALL)
-            if match:
-                return json.loads(match.group())
+        except json.JSONDecodeError:
             raise PlanningError("Invalid JSON from LLM")
 
     # ==================================================
@@ -280,6 +243,7 @@ class ExecutionPlanner:
     # ==================================================
 
     def _expand_goal(self, goal: str) -> List[Dict[str, Any]]:
+
         screen_context = self._read_screen_context()
 
         safe_env = {
@@ -288,7 +252,7 @@ class ExecutionPlanner:
         }
 
         prompt = f"""
-You are the deterministic planning brain.
+You are a deterministic execution planner.
 
 Environment:
 {json.dumps(safe_env)}
@@ -299,7 +263,17 @@ Frozen screen:
 Goal:
 "{goal}"
 
-Return JSON list only.
+Return STRICT JSON list of steps.
+
+Each step MUST have:
+- type (UI_INTERACTION | COMMAND_EXECUTION | FILE_CREATION | VERIFICATION | TOOL_INSTALLATION)
+- description (string)
+- action (object)
+- verification (object)
+- estimated_duration (float seconds)
+- retryable (boolean)
+
+Return JSON only.
 """
 
         raw = self._call_llm_with_timeout(prompt)
@@ -313,11 +287,13 @@ Return JSON list only.
             StepType.COMMAND_EXECUTION.value,
             StepType.FILE_CREATION.value,
             StepType.VERIFICATION.value,
+            StepType.TOOL_INSTALLATION.value,
         }
 
         validated: List[Dict[str, Any]] = []
 
         for step in data:
+
             if not isinstance(step, dict):
                 raise PlanningError("Invalid step format")
 
