@@ -1,6 +1,6 @@
 import time
 import json
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List
 
 from authority.authority_policy import AuthorityDecision
 from authority.input_arbitrator import InputArbitrator
@@ -200,11 +200,28 @@ def _execute_autonomous_loop(
 
         previous_snapshot = world_snapshot
 
-        selected_action = current_step.action
-        if not isinstance(selected_action, dict):
+        raw_actions = current_step.action
+
+        candidate_actions: List[Dict[str, Any]] = []
+
+        if isinstance(raw_actions, dict):
+            candidate_actions.append(raw_actions)
+        elif isinstance(raw_actions, list):
+            candidate_actions.extend(
+                a for a in raw_actions if isinstance(a, dict)
+            )
+        else:
             raise RuntimeError("TASK_FAILED:invalid_action_format")
 
-        action_key = action_ranker._action_key(selected_action)
+        if not candidate_actions:
+            raise RuntimeError("TASK_FAILED:no_candidate_actions")
+
+        selected_action = action_ranker.select(
+            actions=candidate_actions,
+            belief_state=belief,
+        )
+
+        action_key = action_ranker.action_key(selected_action)
 
         is_high_risk = selected_action.get("operation") in {"command", "install"}
 
