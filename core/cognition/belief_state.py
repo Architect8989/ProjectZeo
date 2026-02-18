@@ -2,7 +2,6 @@ from typing import Dict, Any, List, Tuple
 from collections import deque
 import time
 import math
-import random
 import hashlib
 import json
 import struct
@@ -14,9 +13,13 @@ class BeliefState:
     RISK_LAMBDA = 0.3
     REWARD_WINDOW = 100
     REGRET_SCALE = 0.05
-    PRIOR_ALPHA = 0.001
+    PRIOR_ALPHA = 0.01
     REGRET_DECAY = 0.995
     MAX_STATES = 64
+    MAX_REGRET = 100.0
+    MIN_ENTROPY_FLOOR = 0.1
+    NORMALIZE_EPS = 1e-8
+    REWARD_CLAMP = 3.0
 
     def __init__(self):
         self.created_at = time.time()
@@ -72,6 +75,15 @@ class BeliefState:
                 s: v / total for s, v in pruned.items()
             }
 
+        # entropy floor injection
+        if self.entropy() < self.MIN_ENTROPY_FLOOR:
+            uniform = 1.0 / len(self.state_probabilities)
+            for k in self.state_probabilities:
+                self.state_probabilities[k] = (
+                    0.95 * self.state_probabilities[k]
+                    + 0.05 * uniform
+                )
+
     def entropy(self) -> float:
         total = 0.0
         for p in self.state_probabilities.values():
@@ -106,29 +118,32 @@ class BeliefState:
         return mean_reward + exploration
 
     # =========================================================
-    # CANONICAL THOMPSON SAMPLING
+    # DETERMINISTIC THOMPSON
     # =========================================================
 
     def thompson_sample(self, action: str) -> float:
-        """
-        Canonical Thompson sampling.
-        Strictly excludes neutral rewards (r == 0).
-        """
-
         rewards = self.action_rewards.get(action)
         if not rewards:
-            return random.random()
+            return 0.5
 
-        successes = 0
-        failures = 0
+        successes = sum(1 for r in rewards if r > 0)
+        failures = sum(1 for r in rewards if r < 0)
 
-        for r in rewards:
-            if r > 0:
-                successes += 1
-            elif r < 0:
-                failures += 1
+        # deterministic pseudo-random from commitment hash
+        seed_material = (
+            self.commitment_hash + action
+        ).encode()
 
-        return random.betavariate(successes + 1, failures + 1)
+        digest = hashlib.sha256(seed_material).digest()
+        deterministic_uniform = struct.unpack("!Q", digest[:8])[0] / 2**64
+
+        alpha = successes + 1
+        beta = failures + 1
+
+        # Beta mean blended with deterministic uniform
+        beta_mean = alpha / (alpha + beta)
+
+        return 0.7 * beta_mean + 0.3 * deterministic_uniform
 
     # =========================================================
     # REGRET TRACKING
@@ -141,30 +156,49 @@ class BeliefState:
 
         raw_value, last_iter = entry
         delta_iter = self._iteration_counter - last_iter
-        return raw_value * (self.REGRET_DECAY ** delta_iter)
+        value = raw_value * (self.REGRET_DECAY ** delta_iter)
+        return min(value, self.MAX_REGRET)
 
     def update_regret(self, action: str, reward: float, best_reward: float):
         self._iteration_counter += 1
 
         regret_value = best_reward - reward
-        if regret_value <= 0:
-            return
 
         current = self._get_effective_regret(action)
         updated = current + regret_value
+        updated = max(0.0, min(updated, self.MAX_REGRET))
+
         self.regret[action] = (updated, self._iteration_counter)
 
     # =========================================================
-    # RECORDING
+    # RECORDING WITH NORMALIZATION
     # =========================================================
 
     def record_action(self, action: str, reward: float):
-        self.action_counts[action] = self.action_counts.get(action, 0) + 1
 
         if action not in self.action_rewards:
             self.action_rewards[action] = deque(maxlen=self.REWARD_WINDOW)
 
-        self.action_rewards[action].append(reward)
+        history = self.action_rewards[action]
+
+        # running mean/std normalization
+        if history:
+            mean = sum(history) / len(history)
+            variance = sum((r - mean) ** 2 for r in history) / len(history)
+            std = math.sqrt(max(variance, self.NORMALIZE_EPS))
+            normalized = (reward - mean) / std
+            normalized = max(
+                -self.REWARD_CLAMP,
+                min(self.REWARD_CLAMP, normalized),
+            )
+        else:
+            normalized = reward
+
+        history.append(normalized)
+
+        self.action_counts[action] = (
+            self.action_counts.get(action, 0) + 1
+        )
 
     # =========================================================
     # ENVIRONMENT MODEL
@@ -190,7 +224,7 @@ class BeliefState:
         )
 
     # =========================================================
-    # COMMITMENT HASH
+    # STABLE COMMITMENT HASH
     # =========================================================
 
     def _stable_float_bytes(self, d: Dict[str, float]) -> bytes:
@@ -200,13 +234,20 @@ class BeliefState:
             parts.append(struct.pack("!d", float(d[k])))
         return b"".join(parts)
 
-    def commit(self, action: str, observation: Dict[str, Any]) -> None:
-        obs_bytes = json.dumps(
-            observation,
-            sort_keys=True,
-            default=str,
-        ).encode()
+    def _stable_observation_bytes(self, obs: Dict[str, Any]) -> bytes:
+        parts = []
+        for k in sorted(obs):
+            v = obs[k]
+            parts.append(k.encode())
+            if isinstance(v, float):
+                parts.append(struct.pack("!d", v))
+            else:
+                parts.append(str(v).encode())
+        return b"".join(parts)
 
+    def commit(self, action: str, observation: Dict[str, Any]) -> None:
+
+        obs_bytes = self._stable_observation_bytes(observation)
         prob_bytes = self._stable_float_bytes(
             self.state_probabilities
         )
