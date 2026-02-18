@@ -123,11 +123,13 @@ class BeliefState:
         if not rewards:
             return 0.5
 
-        successes = sum(1 for r in rewards if r > 0)
-        failures = sum(1 for r in rewards if r < 0)
+        # Convert normalized reward signal into pseudo success probability
+        # Clamp to [-CLAMP, +CLAMP], map to [0,1]
+        scaled = [(r + self.REWARD_CLAMP) / (2 * self.REWARD_CLAMP) for r in rewards]
+        scaled = [min(1.0, max(0.0, v)) for v in scaled]
 
-        alpha = successes + 1.0
-        beta = failures + 1.0
+        alpha = 1.0 + sum(scaled)
+        beta = 1.0 + sum(1.0 - v for v in scaled)
 
         seed_material = (
             f"{self.commitment_hash}:{action}:{self._iteration_counter}"
