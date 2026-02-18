@@ -106,8 +106,6 @@ def main(llm_callable: Callable, model_name: str):
 
     _install_signal_handlers(os_backend, auth_state)
 
-    print("[BOOT] ProjectZeo kernel starting")
-
     env_fingerprint = collect_environment_fingerprint()
 
     persisted = auth_state.load()
@@ -157,135 +155,136 @@ def main(llm_callable: Callable, model_name: str):
             if mode.mode == SystemMode.PLANNING:
                 mode.check_planning_timeout()
 
-            if mode.is_armed():
+            if not mode.is_armed():
+                time.sleep(HEARTBEAT_INTERVAL)
+                continue
 
-                TASK_START = time.time()
-                replan_count = 0
+            TASK_START = time.time()
+            replan_count = 0
 
-                snapshot_id = mode.consume_snapshot()
-                if not snapshot_id:
-                    raise RuntimeError("Missing snapshot")
+            snapshot_id = mode.consume_snapshot()
+            if not snapshot_id:
+                raise RuntimeError("Missing snapshot")
 
-                _ingest_latest_perception(observer, world_graph)
+            _ingest_latest_perception(observer, world_graph)
 
-                mode.begin_planning()
+            intent = mode.get_intent()
+            if not intent or not intent.strip():
+                raise RuntimeError("Invalid intent")
 
-                intent = mode.get_intent()
-                if not intent or not intent.strip():
-                    raise RuntimeError("Invalid intent")
+            planner = ExecutionPlanner(
+                llm_call=mode.get_llm_callable(),
+                environment_fingerprint=env_fingerprint,
+                world_graph=world_graph,
+            )
 
-                planner = ExecutionPlanner(
-                    llm_call=mode.get_llm_callable(),
-                    environment_fingerprint=env_fingerprint,
-                    world_graph=world_graph,
-                )
+            mode.begin_planning()
 
-                execution_plan = planner.create_plan(
-                    objective=intent,
-                    requirements={
-                        "environment": env_fingerprint,
-                        "tools": env_fingerprint.get("tools", []),
-                    },
-                    high_level_steps=[{"goal": intent}],
-                )
+            execution_plan = planner.create_plan(
+                objective=intent,
+                requirements={
+                    "environment": env_fingerprint,
+                    "tools": env_fingerprint.get("tools", []),
+                },
+                high_level_steps=[{"goal": intent}],
+            )
 
-                mode.attach_execution_plan(f"plan_{int(time.time())}")
-                mode.mark_planning_complete()
+            mode.attach_execution_plan(f"plan_{int(time.time())}")
+            mode.mark_planning_complete()
 
-                auth_state.persist(
-                    execution_mode="EXECUTING",
-                    automation_active=True,
-                    restore_required=True,
-                    last_snapshot_id=snapshot_id,
-                    dirty=True,
-                )
+            auth_state.persist(
+                execution_mode="EXECUTING",
+                automation_active=True,
+                restore_required=True,
+                last_snapshot_id=snapshot_id,
+                dirty=True,
+            )
 
-                mode.execute()
+            mode.execute()
 
-                while True:
+            while True:
 
-                    _enforce_task_timeout(os_backend, auth_state)
+                _enforce_task_timeout(os_backend, auth_state)
 
-                    try:
-                        operate_main(
-                            terminal_prompt=intent,
-                            execution_plan=execution_plan,
-                            planner=planner,
-                            observer=observer,
-                            world_graph=world_graph,
-                            os_backend=os_backend,
-                        )
-                        break
+                try:
+                    operate_main(
+                        terminal_prompt=intent,
+                        execution_plan=execution_plan,
+                        planner=planner,
+                        observer=observer,
+                        world_graph=world_graph,
+                        os_backend=os_backend,
+                    )
+                    break
 
-                    except RuntimeError as e:
+                except RuntimeError as e:
 
-                        msg = str(e)
+                    msg = str(e)
 
-                        if msg == "REPLAN_REQUIRED":
+                    if msg == "REPLAN_REQUIRED":
 
-                            replan_count += 1
-                            if replan_count > MAX_REPLANS:
-                                raise RuntimeError("TASK_FAILED:max_replans_exceeded")
+                        replan_count += 1
+                        if replan_count > MAX_REPLANS:
+                            raise RuntimeError("TASK_FAILED:max_replans_exceeded")
 
-                            mode.begin_replan_sequence()
+                        mode.begin_replan_sequence()
 
-                            try:
-                                mode.force_observer()
+                        try:
+                            mode.force_observer()
 
-                                new_snapshot_id = snapshot_provider.take_snapshot()
-                                mode.attach_snapshot(new_snapshot_id)
+                            new_snapshot_id = snapshot_provider.take_snapshot()
+                            mode.attach_snapshot(new_snapshot_id)
 
-                                mode.arm(intent)
+                            mode.arm(intent)
 
-                                _ingest_latest_perception(observer, world_graph)
-                                planner.update_world_snapshot(world_graph.snapshot())
+                            _ingest_latest_perception(observer, world_graph)
+                            planner.update_world_snapshot(world_graph.snapshot())
 
-                                mode.begin_planning()
+                            mode.begin_planning()
 
-                                execution_plan = planner.create_plan(
-                                    objective=intent,
-                                    requirements={
-                                        "environment": env_fingerprint,
-                                        "tools": env_fingerprint.get("tools", []),
-                                    },
-                                    high_level_steps=[{"goal": intent}],
-                                )
+                            execution_plan = planner.create_plan(
+                                objective=intent,
+                                requirements={
+                                    "environment": env_fingerprint,
+                                    "tools": env_fingerprint.get("tools", []),
+                                },
+                                high_level_steps=[{"goal": intent}],
+                            )
 
-                                mode.attach_execution_plan(
-                                    f"plan_replan_{replan_count}_{int(time.time())}"
-                                )
-                                mode.mark_planning_complete()
-                                mode.execute()
+                            mode.attach_execution_plan(
+                                f"plan_replan_{replan_count}_{int(time.time())}"
+                            )
+                            mode.mark_planning_complete()
+                            mode.execute()
 
-                                snapshot_id = new_snapshot_id
+                            snapshot_id = new_snapshot_id
 
-                            finally:
-                                mode.end_replan_sequence()
+                        finally:
+                            mode.end_replan_sequence()
 
-                            continue
+                        continue
 
-                        if msg.startswith("TASK_FAILED"):
-                            raise
-
+                    if msg.startswith("TASK_FAILED"):
                         raise
 
-                mode.begin_restoration()
+                    raise
 
-                restore_provider.restore_snapshot(snapshot_id)
+            mode.begin_restoration()
+            restore_provider.restore_snapshot(snapshot_id)
 
-                auth_state.persist(
-                    execution_mode="OBSERVER",
-                    automation_active=False,
-                    restore_required=False,
-                    last_snapshot_id=None,
-                    dirty=False,
-                )
+            auth_state.persist(
+                execution_mode="OBSERVER",
+                automation_active=False,
+                restore_required=False,
+                last_snapshot_id=None,
+                dirty=False,
+            )
 
-                mode.complete_execution()
+            mode.complete_execution()
 
-                observer.reset_for_new_task()
-                world_graph.reset()
-                TASK_START = None
+            observer.reset_for_new_task()
+            world_graph.reset()
+            TASK_START = None
 
         except ObserverBlindnessError:
             _force_safe_shutdown(os_backend, auth_state, "observer_blindness")
