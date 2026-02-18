@@ -3,6 +3,7 @@ import json
 import time
 import re
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 
 from config.timeouts import LLM_CALL_TIMEOUT_SECONDS
 
@@ -19,7 +20,7 @@ class PlanningError(RuntimeError):
 
 class ExecutionPlanner:
 
-    MAX_SCREEN_CHARS = 500
+    MAX_SCREEN_CHARS = 2000
     MAX_ESTIMATED_DURATION = 600.0
     MAX_STEPS_PER_GOAL = 25
     MAX_COMMAND_LENGTH = 512
@@ -34,7 +35,7 @@ class ExecutionPlanner:
         "ci_environment",
     }
 
-    # Strict destructive patterns
+    # Anchored + hardened destructive patterns
     DANGEROUS_PATTERNS = [
         r"\brm\s+-rf\b",
         r"\bsudo\b",
@@ -51,7 +52,7 @@ class ExecutionPlanner:
         r"\bnc\b",
         r"\bnetcat\b",
         r"\bcrontab\b",
-        r"\bat\b",
+        r"^\s*at\s",  # fixed false-positive
         r"\bbase64\b.*-d",
         r"\$\(",
         r";",
@@ -75,6 +76,11 @@ class ExecutionPlanner:
         self._llm_call = llm_call
         self._environment = environment_fingerprint or {}
         self._world_snapshot: Dict[str, Any] = {}
+        self._executor = ThreadPoolExecutor(max_workers=1)
+
+        self._compiled_patterns = [
+            re.compile(p, re.IGNORECASE) for p in self.DANGEROUS_PATTERNS
+        ]
 
         if world_graph is not None:
             self.update_world_snapshot(world_graph.snapshot())
@@ -85,6 +91,12 @@ class ExecutionPlanner:
                 "entity_count": 0,
                 "timestamp": None,
             }
+
+    # ==================================================
+
+    def update_world_snapshot(self, snapshot: Dict[str, Any]):
+        if isinstance(snapshot, dict):
+            self._world_snapshot = snapshot
 
     # ==================================================
 
@@ -160,7 +172,7 @@ class ExecutionPlanner:
         return plan
 
     # ==================================================
-    # SAFE ASYNC LLM CALL (NO asyncio.run INSIDE LOOP)
+    # LOOP-SAFE LLM CALL
     # ==================================================
 
     async def _call_llm_async(self, prompt: str) -> str:
@@ -177,7 +189,7 @@ class ExecutionPlanner:
 
         try:
             result = await asyncio.wait_for(
-                loop.run_in_executor(None, _invoke),
+                loop.run_in_executor(self._executor, _invoke),
                 timeout=LLM_CALL_TIMEOUT_SECONDS,
             )
         except asyncio.TimeoutError:
@@ -198,15 +210,9 @@ class ExecutionPlanner:
 
     def _call_llm_sync(self, prompt: str) -> str:
         try:
-            loop = asyncio.get_running_loop()
-            # already inside loop → schedule properly
-            future = asyncio.run_coroutine_threadsafe(
-                self._call_llm_async(prompt),
-                loop,
-            )
-            return future.result(timeout=LLM_CALL_TIMEOUT_SECONDS)
+            asyncio.get_running_loop()
+            raise PlanningError("ExecutionPlanner must not be called inside running event loop")
         except RuntimeError:
-            # no running loop → safe to create one
             return asyncio.run(self._call_llm_async(prompt))
 
     # ==================================================
@@ -218,21 +224,35 @@ class ExecutionPlanner:
         return [t.strip() for t in tools if isinstance(t, str) and t.strip()]
 
     # ==================================================
+    # Deterministic prioritised context
+    # ==================================================
 
     def _read_screen_context(self) -> str:
         entities = self._world_snapshot.get("entities", [])
         if not isinstance(entities, list):
             return ""
 
+        def score(ent):
+            text = ent.get("text", "")
+            etype = ent.get("type", "")
+            return (
+                1 if etype in ("button", "input", "link") else 0,
+                len(text),
+            )
+
+        ordered = sorted(
+            [e for e in entities if isinstance(e, dict)],
+            key=score,
+            reverse=True,
+        )
+
         chunks: List[str] = []
 
-        for ent in entities:
-            if not isinstance(ent, dict):
-                continue
+        for ent in ordered:
             label = ent.get("text")
             etype = ent.get("type")
             if isinstance(label, str) and label.strip():
-                chunks.append(f"{etype}: {label}")
+                chunks.append(f"{etype}: {label.strip()}")
 
         return "\n".join(chunks)[: self.MAX_SCREEN_CHARS]
 
@@ -243,6 +263,9 @@ class ExecutionPlanner:
         raw = re.sub(r"^```(?:json)?\s*", "", raw)
         raw = re.sub(r"\s*```$", "", raw).strip()
 
+        if len(raw) > 50_000:
+            raise PlanningError("LLM response too large")
+
         try:
             return json.loads(raw)
         except json.JSONDecodeError:
@@ -251,7 +274,6 @@ class ExecutionPlanner:
     # ==================================================
 
     def _validate_command(self, cmd: str) -> None:
-
         cmd = cmd.strip()
 
         if not cmd:
@@ -260,8 +282,8 @@ class ExecutionPlanner:
         if len(cmd) > self.MAX_COMMAND_LENGTH:
             raise PlanningError("Command too long")
 
-        for pattern in self.DANGEROUS_PATTERNS:
-            if re.search(pattern, cmd, re.IGNORECASE):
+        for pattern in self._compiled_patterns:
+            if pattern.search(cmd):
                 raise PlanningError("Dangerous command detected")
 
     # ==================================================
