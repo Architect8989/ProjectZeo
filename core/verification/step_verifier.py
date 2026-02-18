@@ -22,8 +22,8 @@ class VerificationResult:
 
 class StepVerifier:
     """
-    Deterministic + evidence-first verifier.
-    Fail-closed always.
+    Evidence-first verifier.
+    Strict. Deterministic. Fail-closed.
     """
 
     VERSION_REGEX = re.compile(r"\d+(?:\.\d+)+")
@@ -43,12 +43,7 @@ class StepVerifier:
     ) -> VerificationResult:
 
         if step is None:
-            return VerificationResult(
-                success=False,
-                reason="step required for verification",
-                confidence=0.0,
-                progress_score=0.0,
-            )
+            return self._fail("step required")
 
         if not isinstance(step, ExecutionStep):
             raise VerificationError("Invalid step object")
@@ -57,33 +52,33 @@ class StepVerifier:
 
             if step.type == StepType.DONE:
                 return VerificationResult(
-                    True, None, {}, confidence=1.0, progress_score=1.0
+                    True,
+                    None,
+                    {"done": True},
+                    confidence=1.0,
+                    progress_score=1.0,
                 )
 
             if step.type == StepType.VERIFICATION:
-                # Must contain explicit verification condition
-                if not step.verification:
-                    return VerificationResult(
-                        False,
-                        "verification step missing conditions",
-                        confidence=0.0,
-                        progress_score=0.0,
-                    )
-                return VerificationResult(
-                    True, None, {}, confidence=0.95, progress_score=0.05
+                return self._verify_explicit_conditions(
+                    step=step,
+                    execution_result=execution_result,
+                    screenshot=screenshot,
+                    previous_screenshot=previous_screenshot,
+                    world_graph=world_graph,
                 )
 
             if step.type == StepType.COMMAND_EXECUTION:
                 ok, reason, details = self._verify_command(step, execution_result)
-                return self._result(ok, reason, details)
+                return self._build(ok, reason, details)
 
             if step.type == StepType.FILE_CREATION:
                 ok, reason, details = self._verify_file(step)
-                return self._result(ok, reason, details)
+                return self._build(ok, reason, details)
 
             if step.type == StepType.TOOL_INSTALLATION:
                 ok, reason, details = self._verify_tool(step)
-                return self._result(ok, reason, details)
+                return self._build(ok, reason, details)
 
             if step.type == StepType.UI_INTERACTION:
                 ok, reason, details = self._verify_ui_change(
@@ -91,7 +86,7 @@ class StepVerifier:
                     previous_screenshot=previous_screenshot,
                     world_graph=world_graph,
                 )
-                return self._result(ok, reason, details)
+                return self._build(ok, reason, details)
 
         except Exception as e:
             return VerificationResult(
@@ -102,18 +97,13 @@ class StepVerifier:
                 progress_score=0.0,
             )
 
-        return VerificationResult(
-            False,
-            f"Unhandled step type: {step.type}",
-            confidence=0.0,
-            progress_score=0.0,
-        )
+        return self._fail(f"Unhandled step type: {step.type}")
 
     # =================================================
-    # RESULT BUILDER
+    # RESULT HELPERS
     # =================================================
 
-    def _result(
+    def _build(
         self,
         ok: bool,
         reason: str,
@@ -125,17 +115,107 @@ class StepVerifier:
                 True,
                 None,
                 details,
+                confidence=0.9,
+                progress_score=0.1,
+            )
+
+        return self._fail(reason, details)
+
+    def _fail(
+        self,
+        reason: str,
+        details: Optional[Dict[str, Any]] = None,
+    ) -> VerificationResult:
+        return VerificationResult(
+            False,
+            reason,
+            details or {},
+            confidence=0.0,
+            progress_score=0.0,
+        )
+
+    # =================================================
+    # EXPLICIT VERIFICATION STEP (NO AUTO-SUCCESS)
+    # =================================================
+
+    def _verify_explicit_conditions(
+        self,
+        *,
+        step: ExecutionStep,
+        execution_result: Optional[Any],
+        screenshot: Optional[Dict[str, Any]],
+        previous_screenshot: Optional[Dict[str, Any]],
+        world_graph,
+    ) -> VerificationResult:
+
+        verification = step.verification or {}
+
+        if not isinstance(verification, dict) or not verification:
+            return self._fail("verification conditions required")
+
+        evidence_hits = 0
+        total_checks = 0
+
+        # ----- COMMAND RETURN CODE -----
+        if "expected_return_codes" in verification:
+            total_checks += 1
+            ok, _, _ = self._verify_command(step, execution_result)
+            if ok:
+                evidence_hits += 1
+
+        # ----- FILE EXISTS -----
+        if "file_exists" in verification:
+            total_checks += 1
+            path = verification["file_exists"]
+            if isinstance(path, str) and os.path.exists(path):
+                evidence_hits += 1
+
+        # ----- SCREEN TEXT -----
+        if "screen_contains" in verification:
+            total_checks += 1
+            if not world_graph:
+                return self._fail("world_graph required")
+
+            tokens = verification["screen_contains"]
+            if not isinstance(tokens, list):
+                return self._fail("screen_contains must be list")
+
+            found_all = True
+            for token in tokens:
+                if not isinstance(token, str):
+                    return self._fail("invalid screen_contains token")
+                matches = world_graph.find_by_text(contains=token)
+                if not matches:
+                    found_all = False
+                    break
+
+            if found_all:
+                evidence_hits += 1
+
+        # ----- ENTITY TYPE EXISTS -----
+        if "entity_type_exists" in verification:
+            total_checks += 1
+            if not world_graph:
+                return self._fail("world_graph required")
+
+            etype = verification["entity_type_exists"]
+            matches = world_graph.find_by_type(etype) or []
+            if matches:
+                evidence_hits += 1
+
+        if total_checks == 0:
+            return self._fail("no supported verification conditions")
+
+        if evidence_hits == total_checks:
+            return VerificationResult(
+                True,
+                None,
+                {"checks_passed": evidence_hits},
                 confidence=0.95,
                 progress_score=0.1,
             )
 
-        return VerificationResult(
-            False,
-            reason,
-            details,
-            confidence=0.0,
-            progress_score=0.0,
-        )
+        return self._fail("verification conditions not satisfied")
 
     # =================================================
     # COMMAND VERIFICATION
@@ -148,7 +228,7 @@ class StepVerifier:
     ) -> Tuple[bool, str, Dict[str, Any]]:
 
         if result is None or not hasattr(result, "returncode"):
-            return False, "missing command execution result", {}
+            return False, "missing command result", {}
 
         verification = step.verification or {}
         expected_codes = verification.get("expected_return_codes", [0])
@@ -166,8 +246,7 @@ class StepVerifier:
 
     def _verify_file(self, step: ExecutionStep) -> Tuple[bool, str, Dict[str, Any]]:
 
-        action = step.action or {}
-        path = action.get("path")
+        path = (step.action or {}).get("path")
 
         if not isinstance(path, str) or not os.path.exists(path):
             return False, "file missing", {}
@@ -181,17 +260,19 @@ class StepVerifier:
     def _verify_tool(self, step: ExecutionStep) -> Tuple[bool, str, Dict[str, Any]]:
 
         tool = (step.action or {}).get("tool")
+
         if not tool:
             return False, "tool missing", {}
 
         tool_path = shutil.which(tool)
+
         if not tool_path:
             return False, "tool not found", {}
 
         return True, "", {"tool_path": tool_path}
 
     # =================================================
-    # UI VERIFICATION (STRICT + CAUSAL)
+    # UI VERIFICATION (CAUSAL + STRICT)
     # =================================================
 
     def _verify_ui_change(
@@ -207,47 +288,18 @@ class StepVerifier:
 
         verification = step.verification or {}
 
-        # ---------- STRICT TEXT CHECK ----------
+        if verification:
+            # Delegate to explicit verification
+            result = self._verify_explicit_conditions(
+                step=step,
+                execution_result=None,
+                screenshot=None,
+                previous_screenshot=previous_screenshot,
+                world_graph=world_graph,
+            )
+            return result.success, result.reason or "", result.details or {}
 
-        expected_text = verification.get("screen_contains")
-        if expected_text:
-
-            if not isinstance(expected_text, list):
-                return False, "screen_contains must be list", {}
-
-            for token in expected_text:
-                if not isinstance(token, str):
-                    return False, "invalid screen_contains token", {}
-
-                matches = world_graph.find_by_text(contains=token)
-                if not matches:
-                    return False, f"text not found: {token}", {}
-
-            return True, "", {"screen_contains_verified": True}
-
-        # ---------- ENTITY TYPE DELTA CHECK ----------
-
-        expected_type = verification.get("entity_type_exists")
-        if expected_type:
-
-            current_matches = world_graph.find_by_type(expected_type) or []
-            if not current_matches:
-                return False, f"entity type not found: {expected_type}", {}
-
-            # Strict causal check using world delta if available
-            if previous_screenshot:
-                try:
-                    delta = world_graph.compute_delta(previous_screenshot)
-                except Exception:
-                    delta = None
-
-                if not delta or not delta.get("significant_change"):
-                    return False, "no causal delta detected", {}
-
-            return True, "", {"entity_type_detected": expected_type}
-
-        # ---------- GENERIC SIGNIFICANT DELTA ----------
-
+        # If no explicit condition → require delta evidence
         if previous_screenshot:
             try:
                 delta = world_graph.compute_delta(previous_screenshot)
@@ -256,4 +308,4 @@ class StepVerifier:
             except Exception:
                 pass
 
-        return False, "no verification evidence found", {}
+        return False, "no UI evidence detected", {}
