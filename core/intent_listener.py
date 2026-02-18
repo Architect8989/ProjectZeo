@@ -114,30 +114,30 @@ class IntentListener:
             return None
 
         fd = None
+        data = None
+        should_delete = False
+
         try:
-            # O_NOFOLLOW prevents symlink attacks
             flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
             fd = os.open(path, flags)
 
             st = os.fstat(fd)
 
-            # Must be regular file
             if not stat.S_ISREG(st.st_mode):
                 return None
 
-            # Must be owned by current user
             if st.st_uid != os.getuid():
                 return None
 
-            # Enforce strict permissions 0600
             if (st.st_mode & 0o077) != 0:
                 return None
 
-            # Size bounds
             if st.st_size <= 0 or st.st_size > self.INTENT_MAX_BYTES:
                 return None
 
-            data = os.read(fd, self.INTENT_MAX_BYTES).decode("utf-8")
+            raw = os.read(fd, self.INTENT_MAX_BYTES)
+            data = raw.decode("utf-8", errors="strict")
+            should_delete = True
 
         except Exception:
             return None
@@ -148,10 +148,15 @@ class IntentListener:
                     os.close(fd)
                 except Exception:
                     pass
+
+        if should_delete:
             try:
                 os.remove(path)
             except Exception:
                 pass
+
+        if not data:
+            return None
 
         intent = data.strip()
         return intent if intent else None
