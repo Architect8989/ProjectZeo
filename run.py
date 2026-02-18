@@ -6,9 +6,7 @@ from typing import Any
 
 from adapters.factory import build_llm
 from main import main
-
-
-LLM_THREAD_TIMEOUT_SECONDS = 120.0
+from config.timeouts import LLM_THREAD_TIMEOUT_SECONDS
 
 
 def resolve_model_name() -> str:
@@ -30,7 +28,7 @@ def resolve_model_name() -> str:
 def _run_coroutine_threadsafe(coro) -> Any:
     """
     Execute coroutine in a fresh event loop inside a dedicated thread.
-    Enforces hard timeout to prevent permanent kernel freeze.
+    Enforces hard timeout derived from shared config.
     """
     result_container: dict = {}
     error_container: dict = {}
