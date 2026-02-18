@@ -48,7 +48,6 @@ def operate_main(
     execution_plan.validate()
     PlanVerifier().verify(execution_plan)
 
-    # Use injected OS backend if provided (prevents dual instances)
     os_backend = os_backend or OperatingSystem()
 
     try:
@@ -139,7 +138,7 @@ def _execute_autonomous_loop(
 
         if time.time() - start_ts > max_wallclock_seconds:
             journal.record({"event": "execution_timeout"})
-            raise RuntimeError("Execution wall-clock timeout exceeded")
+            raise RuntimeError("REPLAN_REQUIRED")
 
         if current_step_index >= len(execution_plan.steps):
             journal.record({"event": "execution_complete"})
@@ -175,7 +174,6 @@ def _execute_autonomous_loop(
             except Exception:
                 delta = None
 
-        # bounded world context for belief likelihood
         if isinstance(world_snapshot, dict):
 
             entities = world_snapshot.get("entities", [])
@@ -206,7 +204,6 @@ def _execute_autonomous_loop(
                         likelihoods["ui_empty"] = 0.5
 
                     likelihoods["neutral"] = 0.5 if delta else 0.9
-
                     belief.bayesian_update(likelihoods)
 
             except Exception:
@@ -217,7 +214,6 @@ def _execute_autonomous_loop(
         # ---------------- ACTION ----------------
 
         selected_action = current_step.action
-
         if not isinstance(selected_action, dict):
             raise RuntimeError("Invalid action format")
 
@@ -234,7 +230,7 @@ def _execute_autonomous_loop(
         )
 
         if authority != AuthorityDecision.CONTINUE:
-            raise RuntimeError("Authority interrupted execution")
+            raise RuntimeError("REPLAN_REQUIRED")
 
         # ---------------- EXECUTION ----------------
 
@@ -254,7 +250,8 @@ def _execute_autonomous_loop(
             belief.record_action(action_key, reward=-0.5)
             stagnant_iterations += 1
             if stagnant_iterations >= MAX_STAGNANT_ITERS:
-                raise RuntimeError("Execution stagnation detected")
+                journal.record({"event": "stagnation_detected"})
+                raise RuntimeError("REPLAN_REQUIRED")
             continue
 
         # ---------------- VERIFICATION ----------------
@@ -277,7 +274,8 @@ def _execute_autonomous_loop(
         if not verification.success:
             stagnant_iterations += 1
             if stagnant_iterations >= MAX_STAGNANT_ITERS:
-                raise RuntimeError("Execution stagnation detected")
+                journal.record({"event": "verification_stagnation"})
+                raise RuntimeError("REPLAN_REQUIRED")
             continue
 
         stagnant_iterations = 0
@@ -299,7 +297,8 @@ def _execute_autonomous_loop(
             journal.record({"event": "execution_converged"})
             return
 
-    journal.record({"event": "execution_complete"})
+    journal.record({"event": "iteration_budget_exhausted"})
+    raise RuntimeError("REPLAN_REQUIRED")
 
 
 # ==================================================
