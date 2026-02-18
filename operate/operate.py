@@ -309,3 +309,63 @@ def _execute_autonomous_loop(
 
     journal.record({"event": "iteration_budget_exhausted"})
     raise RuntimeError("TASK_FAILED:iteration_budget_exhausted")
+
+
+def _execute_decision(
+    *,
+    decision: Dict[str, Any],
+    os_backend: OperatingSystem,
+    accessibility_backend: Optional[AccessibilityBackend],
+    installer: Optional[AutonomousInstaller],
+):
+
+    if not isinstance(decision, dict):
+        raise RuntimeError("TASK_FAILED:invalid_decision_payload")
+
+    operation = decision.get("operation")
+    if not isinstance(operation, str):
+        raise RuntimeError("TASK_FAILED:missing_operation")
+
+    operation = operation.lower().strip()
+
+    if operation == "click":
+        x = decision.get("x")
+        y = decision.get("y")
+        if x is None or y is None:
+            raise RuntimeError("TASK_FAILED:click_missing_coordinates")
+        os_backend.click(float(x), float(y))
+        return None
+
+    if operation in ("type", "write"):
+        text = decision.get("text")
+        if not isinstance(text, str):
+            raise RuntimeError("TASK_FAILED:invalid_text_payload")
+        os_backend.type_text(text)
+        return None
+
+    if operation in ("hotkey", "press"):
+        keys = decision.get("keys")
+        if not isinstance(keys, list) or not keys:
+            raise RuntimeError("TASK_FAILED:invalid_hotkey_format")
+        os_backend.press_keys(keys)
+        return None
+
+    if operation == "command":
+        command = decision.get("command")
+        if not isinstance(command, str) or not command.strip():
+            raise RuntimeError("TASK_FAILED:invalid_command")
+        return os_backend.run_command(command)
+
+    if operation == "install":
+        if installer is None:
+            raise RuntimeError("TASK_FAILED:installer_unavailable")
+        tool = decision.get("tool")
+        if not isinstance(tool, dict):
+            raise RuntimeError("TASK_FAILED:invalid_tool_specification")
+        installer.install_tool(tool)
+        return None
+
+    if operation == "done":
+        return None
+
+    raise RuntimeError(f"TASK_FAILED:unsupported_operation:{operation}")
