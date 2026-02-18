@@ -12,7 +12,6 @@ class BeliefState:
 
     EXPLORATION_C = 1.4
     RISK_LAMBDA = 0.3
-    SOFTMAX_TAU = 0.5
     REWARD_WINDOW = 100
     REGRET_SCALE = 0.05
     PRIOR_ALPHA = 0.001
@@ -29,6 +28,10 @@ class BeliefState:
         self.environment_stability: float = 1.0
         self.commitment_hash: str = "GENESIS"
         self._iteration_counter: int = 0
+
+    # =========================================================
+    # BELIEF UPDATE
+    # =========================================================
 
     def bayesian_update(self, likelihoods: Dict[str, float]) -> None:
         if not likelihoods:
@@ -76,6 +79,10 @@ class BeliefState:
                 total -= p * math.log(p)
         return total
 
+    # =========================================================
+    # ACTION SCORING
+    # =========================================================
+
     def expected_utility(self, action: str) -> float:
         rewards = self.action_rewards.get(action)
         if not rewards:
@@ -98,15 +105,34 @@ class BeliefState:
 
         return mean_reward + exploration
 
+    # =========================================================
+    # CANONICAL THOMPSON SAMPLING
+    # =========================================================
+
     def thompson_sample(self, action: str) -> float:
+        """
+        Canonical Thompson sampling.
+        Strictly excludes neutral rewards (r == 0).
+        """
+
         rewards = self.action_rewards.get(action)
         if not rewards:
             return random.random()
 
-        successes = sum(1 for r in rewards if r > 0)
-        failures = sum(1 for r in rewards if r < 0)
+        successes = 0
+        failures = 0
+
+        for r in rewards:
+            if r > 0:
+                successes += 1
+            elif r < 0:
+                failures += 1
 
         return random.betavariate(successes + 1, failures + 1)
+
+    # =========================================================
+    # REGRET TRACKING
+    # =========================================================
 
     def _get_effective_regret(self, action: str) -> float:
         entry = self.regret.get(action)
@@ -128,32 +154,9 @@ class BeliefState:
         updated = current + regret_value
         self.regret[action] = (updated, self._iteration_counter)
 
-    def softmax_select(self, actions: List[str]) -> str:
-        if not actions:
-            raise ValueError("No actions provided")
-
-        scores = []
-
-        for a in actions:
-            base = self.ucb_score(a)
-            regret_penalty = min(
-                self._get_effective_regret(a) * self.REGRET_SCALE,
-                0.5,
-            )
-            scores.append(base - regret_penalty)
-
-        max_score = max(scores)
-        tau = max(0.15, self.SOFTMAX_TAU)
-
-        shifted = [(s - max_score) / tau for s in scores]
-        exp_scores = [math.exp(min(50, s)) for s in shifted]
-        total = sum(exp_scores)
-
-        if total <= 0:
-            return actions[scores.index(max_score)]
-
-        probabilities = [s / total for s in exp_scores]
-        return random.choices(actions, weights=probabilities, k=1)[0]
+    # =========================================================
+    # RECORDING
+    # =========================================================
 
     def record_action(self, action: str, reward: float):
         self.action_counts[action] = self.action_counts.get(action, 0) + 1
@@ -162,6 +165,10 @@ class BeliefState:
             self.action_rewards[action] = deque(maxlen=self.REWARD_WINDOW)
 
         self.action_rewards[action].append(reward)
+
+    # =========================================================
+    # ENVIRONMENT MODEL
+    # =========================================================
 
     def compute_environment_stability(self, delta: Dict[str, Any]) -> None:
         if not delta:
@@ -181,6 +188,10 @@ class BeliefState:
             0.0,
             min(1.0, self.environment_stability),
         )
+
+    # =========================================================
+    # COMMITMENT HASH
+    # =========================================================
 
     def _stable_float_bytes(self, d: Dict[str, float]) -> bytes:
         parts = []
@@ -209,6 +220,10 @@ class BeliefState:
 
         self.commitment_hash = hashlib.sha256(payload).hexdigest()
 
+    # =========================================================
+    # CONVERGENCE
+    # =========================================================
+
     def converged(
         self,
         *,
@@ -228,6 +243,10 @@ class BeliefState:
             return False
 
         return True
+
+    # =========================================================
+    # SUMMARY
+    # =========================================================
 
     def summary(self) -> Dict[str, Any]:
         return {
