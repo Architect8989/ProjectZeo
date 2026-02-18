@@ -1,6 +1,6 @@
 import time
 import json
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Tuple
 
 from observer.observer_core import ObserverCore
 from operate.utils.operating_system import OperatingSystem
@@ -14,17 +14,6 @@ class InstallationError(RuntimeError):
 
 
 class AutonomousInstaller:
-    """
-    Pure LLM-driven installer.
-
-    HARD CONTRACT:
-    - Browser-driven only
-    - No shell installs
-    - LLM decides actions dynamically
-    - Verification is authoritative
-    - Idempotent
-    - Fail-closed
-    """
 
     MAX_INSTALL_TIME = 15 * 60
     UI_SETTLE_DELAY = 1.0
@@ -55,7 +44,6 @@ class AutonomousInstaller:
         self._llm = llm_callable
         self._verifier = StepVerifier()
 
-        # Sanitizer without full engine construction
         self._sanitizer = ReasoningEngine.__new__(ReasoningEngine)
 
     # =================================================
@@ -68,6 +56,8 @@ class AutonomousInstaller:
 
         name = tool["name"]
         url = tool["official_url"]
+
+        self._validate_url(url)
 
         if self._is_already_installed(tool):
             return
@@ -110,7 +100,7 @@ class AutonomousInstaller:
                     return
                 raise InstallationError("LLM declared done but verification failed")
 
-            self._execute_action(action)
+            self._execute_action(action, perception)
 
             time.sleep(self.UI_SETTLE_DELAY)
 
@@ -119,7 +109,7 @@ class AutonomousInstaller:
         raise InstallationError(f"Installation timed out: {name}")
 
     # =================================================
-    # LLM DECISION LOOP (SANITIZED + FAIL-CLOSED)
+    # DECISION LOOP
     # =================================================
 
     def _decide_next_action(
@@ -156,69 +146,19 @@ class AutonomousInstaller:
         )
 
         decision = self._normalize_llm_response(response)
-
         self._validate_action_schema(decision)
 
         return decision
 
     # =================================================
-    # PERCEPTION SANITIZATION
-    # =================================================
-
-    def _sanitize_perception(
-        self,
-        perception: Optional[Dict[str, Any]],
-    ) -> Dict[str, Any]:
-
-        if not isinstance(perception, dict):
-            return {}
-
-        try:
-            safe = self._sanitizer._sanitize_perception(perception)
-        except Exception:
-            return {}
-
-        try:
-            serialized = json.dumps(safe)
-            if len(serialized) > self.MAX_PERCEPTION_BYTES:
-                return {}
-        except Exception:
-            return {}
-
-        return safe
-
-    # =================================================
-    # RESPONSE NORMALIZATION
-    # =================================================
-
-    def _normalize_llm_response(self, response: Any) -> Dict[str, Any]:
-
-        if isinstance(response, list):
-            if not response:
-                raise InstallationError("LLM returned empty list")
-            response = response[0]
-
-        if not isinstance(response, dict):
-            raise InstallationError("LLM returned invalid decision format")
-
-        return response
-
-    def _validate_action_schema(self, action: Dict[str, Any]) -> None:
-
-        if "operation" not in action:
-            raise InstallationError("Installer decision missing operation")
-
-        allowed = {"click", "type", "hotkey", "wait", "done"}
-        if action["operation"] not in allowed:
-            raise InstallationError(
-                f"Unsupported installer operation: {action['operation']}"
-            )
-
-    # =================================================
     # ACTION EXECUTION
     # =================================================
 
-    def _execute_action(self, action: Dict[str, Any]) -> None:
+    def _execute_action(
+        self,
+        action: Dict[str, Any],
+        perception: Optional[Dict[str, Any]],
+    ) -> None:
 
         op = action.get("operation")
 
@@ -226,7 +166,13 @@ class AutonomousInstaller:
             target = action.get("target")
             if not isinstance(target, str) or not target.strip():
                 raise InstallationError("Missing click target")
-            self._os.click(target)
+
+            coords = self._resolve_click_target(target, perception)
+            if coords is None:
+                raise InstallationError(f"Unable to resolve click target: {target}")
+
+            x, y = coords
+            self._os.click(x, y)
             return
 
         if op == "type":
@@ -238,7 +184,7 @@ class AutonomousInstaller:
 
         if op == "hotkey":
             keys = action.get("keys", [])
-            if not isinstance(keys, list):
+            if not isinstance(keys, list) or not all(isinstance(k, str) for k in keys):
                 raise InstallationError("Invalid hotkey format")
             self._os.press_keys(keys)
             return
@@ -248,6 +194,34 @@ class AutonomousInstaller:
             return
 
         raise InstallationError(f"Unsupported installer operation: {op}")
+
+    def _resolve_click_target(
+        self,
+        target: str,
+        perception: Optional[Dict[str, Any]],
+    ) -> Optional[Tuple[float, float]]:
+
+        if not isinstance(perception, dict):
+            return None
+
+        elements = perception.get("elements", [])
+        if not isinstance(elements, list):
+            return None
+
+        target_lower = target.lower()
+
+        for el in elements:
+            if not isinstance(el, dict):
+                continue
+
+            text = str(el.get("text", "")).lower()
+            if target_lower in text:
+                x = el.get("x")
+                y = el.get("y")
+                if isinstance(x, (int, float)) and isinstance(y, (int, float)):
+                    return float(x), float(y)
+
+        return None
 
     # =================================================
     # VERIFICATION
@@ -321,3 +295,7 @@ class AutonomousInstaller:
 
         if not isinstance(tool.get("official_url"), str) or not tool["official_url"].strip():
             raise InstallationError("Invalid official_url")
+
+    def _validate_url(self, url: str) -> None:
+        if not url.startswith("https://"):
+            raise InstallationError("official_url must use https:// scheme")
