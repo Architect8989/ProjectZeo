@@ -111,8 +111,6 @@ class QwenOllamaAdapter:
                 else get_user_prompt()
             )
 
-            # -------- NON-BLOCKING LLM CALL --------
-
             loop = asyncio.get_running_loop()
 
             def _blocking_call():
@@ -144,7 +142,6 @@ class QwenOllamaAdapter:
 
             operations = self._parse_and_normalize_json(content)
 
-            # Validate list of dicts
             if not isinstance(operations, list):
                 raise RuntimeError("LLM output must be list")
 
@@ -190,7 +187,7 @@ class QwenOllamaAdapter:
                 continue
 
             if "text" not in op:
-                continue  # invalid click → drop
+                continue
 
             try:
                 idx = get_text_element(
@@ -213,7 +210,7 @@ class QwenOllamaAdapter:
                         filtered_ops.append(op)
 
             except Exception:
-                continue  # drop malformed click
+                continue
 
         operations.clear()
         operations.extend(filtered_ops)
@@ -247,14 +244,34 @@ class QwenOllamaAdapter:
         screenshots_dir = os.path.abspath("screenshots")
         os.makedirs(screenshots_dir, exist_ok=True)
 
-        # Hard limit to prevent unbounded growth
-        existing = os.listdir(screenshots_dir)
-        if len(existing) > self.MAX_SCREENSHOT_FILES:
-            for f in existing[: len(existing) - self.MAX_SCREENSHOT_FILES]:
-                try:
-                    os.remove(os.path.join(screenshots_dir, f))
-                except Exception:
-                    pass
+        try:
+            existing = [
+                f for f in os.listdir(screenshots_dir)
+                if os.path.isfile(os.path.join(screenshots_dir, f))
+            ]
+
+            if len(existing) > self.MAX_SCREENSHOT_FILES:
+                # Deterministic oldest-first eviction
+                existing_sorted = sorted(
+                    existing,
+                    key=lambda f: os.path.getmtime(
+                        os.path.join(screenshots_dir, f)
+                    )
+                )
+
+                to_delete = existing_sorted[
+                    : len(existing_sorted) - self.MAX_SCREENSHOT_FILES
+                ]
+
+                for f in to_delete:
+                    try:
+                        os.remove(os.path.join(screenshots_dir, f))
+                    except Exception:
+                        pass
+
+        except Exception:
+            # Fail-closed: never block screenshot capture
+            pass
 
         filename = f"screenshot_{uuid.uuid4().hex}.png"
         path = os.path.join(screenshots_dir, filename)
@@ -268,7 +285,6 @@ class QwenOllamaAdapter:
         text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.MULTILINE)
         text = re.sub(r"\s*```$", "", text, flags=re.MULTILINE).strip()
 
-        # First attempt: direct parse
         try:
             parsed = json.loads(text)
             if isinstance(parsed, dict):
@@ -278,7 +294,6 @@ class QwenOllamaAdapter:
         except Exception:
             pass
 
-        # Robust fallback: minimal non-greedy match
         match = re.search(r"(\{.*?\}|\[.*?\])", text, re.DOTALL)
         if match:
             try:
