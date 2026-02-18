@@ -3,6 +3,7 @@ import os
 import signal
 import atexit
 import sys
+import threading
 from typing import Callable, Optional
 
 from core.mode_controller import ModeController, SystemMode
@@ -28,9 +29,38 @@ from core.planner.execution_planner import ExecutionPlanner
 HEARTBEAT_INTERVAL = 2.0
 MAX_TASK_SECONDS = 90 * 60
 MAX_REPLANS = 3
+WARMUP_STABLE_FRAMES = 3
 
-TASK_START: Optional[float] = None
 
+_TASK_START: Optional[float] = None
+_TASK_LOCK = threading.Lock()
+_SHUTDOWN_EVENT = threading.Event()
+
+
+# ============================================================
+# THREAD-SAFE TASK TIMING
+# ============================================================
+
+def _set_task_start(ts: float):
+    global _TASK_START
+    with _TASK_LOCK:
+        _TASK_START = ts
+
+
+def _clear_task_start():
+    global _TASK_START
+    with _TASK_LOCK:
+        _TASK_START = None
+
+
+def _get_task_start():
+    with _TASK_LOCK:
+        return _TASK_START
+
+
+# ============================================================
+# SAFE SHUTDOWN
+# ============================================================
 
 def _force_safe_shutdown(os_backend, auth_state, reason: str):
     try:
@@ -44,10 +74,16 @@ def _force_safe_shutdown(os_backend, auth_state, reason: str):
     print(f"[SAFE-SHUTDOWN] {reason}", file=sys.stderr)
 
 
+def _graceful_exit(code: int = 1):
+    _SHUTDOWN_EVENT.set()
+    sys.exit(code)
+
+
 def _install_signal_handlers(os_backend, auth_state):
+
     def _signal_handler(signum, frame):
         _force_safe_shutdown(os_backend, auth_state, f"signal-{signum}")
-        os._exit(1)
+        _graceful_exit(1)
 
     atexit.register(_force_safe_shutdown, os_backend, auth_state, "atexit")
     signal.signal(signal.SIGINT, _signal_handler)
@@ -56,29 +92,36 @@ def _install_signal_handlers(os_backend, auth_state):
         signal.signal(signal.SIGQUIT, _signal_handler)
 
 
+# ============================================================
+# UTILITIES
+# ============================================================
+
 def _ingest_latest_perception(observer, world_graph):
     snap = observer.snapshot()
     if not isinstance(snap, dict):
-        return
+        return False
     if not snap.get("perception_available"):
-        return
+        return False
     perception = snap.get("perception")
     if not isinstance(perception, dict):
-        return
+        return False
     world_graph.ingest(perception)
+    return True
 
 
-def _enforce_task_timeout(os_backend, auth_state):
-    global TASK_START
-    if TASK_START is None:
+def _enforce_task_timeout():
+    start = _get_task_start()
+    if start is None:
         return
-    if (time.time() - TASK_START) > MAX_TASK_SECONDS:
+    if (time.time() - start) > MAX_TASK_SECONDS:
         raise RuntimeError("TASK_FAILED:timeout")
 
 
-def main(llm_callable: Callable, model_name: str):
+# ============================================================
+# MAIN ENTRY
+# ============================================================
 
-    global TASK_START
+def main(llm_callable: Callable, model_name: str):
 
     if not callable(llm_callable):
         raise RuntimeError("LLM callable must be provided")
@@ -119,12 +162,22 @@ def main(llm_callable: Callable, model_name: str):
     vision_runtime.start()
     observer_loop.start()
 
-    warmup_deadline = time.time() + 5.0
+    # --------------------------------------------------------
+    # STRONGER WARMUP: require consecutive stable frames
+    # --------------------------------------------------------
+
+    stable_frames = 0
+    warmup_deadline = time.time() + 8.0
+
     while time.time() < warmup_deadline:
         if observer.is_healthy() and vision_runtime.is_healthy():
-            _ingest_latest_perception(observer, world_graph)
-            if world_graph.entity_count() > 0:
-                break
+            if _ingest_latest_perception(observer, world_graph):
+                if world_graph.entity_count() > 0:
+                    stable_frames += 1
+                    if stable_frames >= WARMUP_STABLE_FRAMES:
+                        break
+                else:
+                    stable_frames = 0
         time.sleep(0.1)
 
     snapshot_provider = SnapshotProvider(
@@ -142,87 +195,88 @@ def main(llm_callable: Callable, model_name: str):
     intent_listener = IntentListener(mode, snapshot_provider)
     intent_listener.start()
 
-    while True:
+    try:
 
-        try:
-
-            _enforce_task_timeout(os_backend, auth_state)
-
-            mode.update_observer_health(observer.is_healthy())
-            mode.update_vision_status(vision_runtime.is_healthy())
-
-            if mode.mode == SystemMode.PLANNING:
-                mode.check_planning_timeout()
-
-            if not mode.is_armed():
-                time.sleep(HEARTBEAT_INTERVAL)
-                continue
-
-            TASK_START = time.time()
-            replan_count = 0
-
-            snapshot_id = mode.consume_snapshot()
-            if not snapshot_id:
-                raise RuntimeError("Missing snapshot")
-
-            _ingest_latest_perception(observer, world_graph)
-
-            intent = mode.get_intent()
-            if not intent or not intent.strip():
-                raise RuntimeError("Invalid intent")
-
-            planner = ExecutionPlanner(
-                llm_call=mode.get_llm_callable(),
-                environment_fingerprint=env_fingerprint,
-                world_graph=world_graph,
-            )
-
-            mode.begin_planning()
-
-            execution_plan = planner.create_plan(
-                objective=intent,
-                requirements={
-                    "environment": env_fingerprint,
-                    "tools": env_fingerprint.get("tools", []),
-                },
-                high_level_steps=[{"goal": intent}],
-            )
-
-            mode.attach_execution_plan(f"plan_{int(time.time())}")
-            mode.mark_planning_complete()
-
-            auth_state.persist(
-                execution_mode="EXECUTING",
-                automation_active=True,
-                restore_required=True,
-                last_snapshot_id=snapshot_id,
-                dirty=True,
-            )
-
-            mode.execute()
+        while not _SHUTDOWN_EVENT.is_set():
 
             try:
 
-                while True:
+                _enforce_task_timeout()
 
-                    _enforce_task_timeout(os_backend, auth_state)
+                mode.update_observer_health(observer.is_healthy())
+                mode.update_vision_status(vision_runtime.is_healthy())
 
-                    try:
-                        operate_main(
-                            terminal_prompt=intent,
-                            execution_plan=execution_plan,
-                            planner=planner,
-                            observer=observer,
-                            world_graph=world_graph,
-                            os_backend=os_backend,
-                        )
-                        break
+                if mode.mode == SystemMode.PLANNING:
+                    mode.check_planning_timeout()
 
-                    except RuntimeError as e:
+                if not mode.is_armed():
+                    time.sleep(HEARTBEAT_INTERVAL)
+                    continue
 
-                        msg = str(e)
+                _set_task_start(time.time())
+                replan_count = 0
 
-                        if msg == "REPLAN_REQUIRED":
+                snapshot_id = mode.consume_snapshot()
+                if not snapshot_id:
+                    raise RuntimeError("Missing snapshot")
+
+                _ingest_latest_perception(observer, world_graph)
+
+                intent = mode.get_intent()
+                if not intent or not intent.strip():
+                    raise RuntimeError("Invalid intent")
+
+                planner = ExecutionPlanner(
+                    llm_call=mode.get_llm_callable(),
+                    environment_fingerprint=env_fingerprint,
+                    world_graph=world_graph,
+                )
+
+                mode.begin_planning()
+
+                execution_plan = planner.create_plan(
+                    objective=intent,
+                    requirements={
+                        "environment": env_fingerprint,
+                        "tools": env_fingerprint.get("tools", []),
+                    },
+                    high_level_steps=[{"goal": intent}],
+                )
+
+                mode.attach_execution_plan(f"plan_{int(time.time())}")
+                mode.mark_planning_complete()
+
+                auth_state.persist(
+                    execution_mode="EXECUTING",
+                    automation_active=True,
+                    restore_required=True,
+                    last_snapshot_id=snapshot_id,
+                    dirty=True,
+                )
+
+                mode.execute()
+
+                try:
+
+                    while True:
+
+                        _enforce_task_timeout()
+
+                        try:
+                            operate_main(
+                                terminal_prompt=intent,
+                                execution_plan=execution_plan,
+                                planner=planner,
+                                observer=observer,
+                                world_graph=world_graph,
+                                os_backend=os_backend,
+                            )
+                            break
+
+                        except RuntimeError as e:
+
+                            if str(e) != "REPLAN_REQUIRED":
+                                raise
 
                             replan_count += 1
                             if replan_count > MAX_REPLANS:
@@ -234,7 +288,6 @@ def main(llm_callable: Callable, model_name: str):
 
                             try:
                                 mode.force_observer()
-
                                 new_snapshot_id = snapshot_provider.take_snapshot()
                                 mode.attach_snapshot(new_snapshot_id)
                                 mode.arm(intent)
@@ -266,46 +319,53 @@ def main(llm_callable: Callable, model_name: str):
                             finally:
                                 mode.end_replan_sequence()
 
-                            continue
+                finally:
 
-                        raise
+                    if mode.mode in (SystemMode.EXECUTING, SystemMode.RESTORING):
+                        try:
+                            mode.begin_restoration()
+                            restore_provider.restore_snapshot(snapshot_id)
 
-            finally:
+                            auth_state.persist(
+                                execution_mode="OBSERVER",
+                                automation_active=False,
+                                restore_required=False,
+                                last_snapshot_id=None,
+                                dirty=False,
+                            )
 
-                if mode.mode in (SystemMode.EXECUTING, SystemMode.RESTORING):
+                            mode.complete_execution()
 
-                    try:
-                        mode.begin_restoration()
-                        restore_provider.restore_snapshot(snapshot_id)
+                        except Exception as cleanup_err:
+                            _force_safe_shutdown(
+                                os_backend,
+                                auth_state,
+                                f"restoration_failure:{cleanup_err}",
+                            )
+                            raise
 
-                        auth_state.persist(
-                            execution_mode="OBSERVER",
-                            automation_active=False,
-                            restore_required=False,
-                            last_snapshot_id=None,
-                            dirty=False,
-                        )
+                    observer.reset_for_new_task()
+                    world_graph.reset()
+                    _clear_task_start()
 
-                        mode.complete_execution()
+            except ObserverBlindnessError:
+                _force_safe_shutdown(os_backend, auth_state, "observer_blindness")
+                break
 
-                    except Exception as cleanup_err:
-                        _force_safe_shutdown(
-                            os_backend,
-                            auth_state,
-                            f"restoration_failure:{cleanup_err}",
-                        )
-                        os._exit(1)
+            except Exception as e:
+                _force_safe_shutdown(os_backend, auth_state, f"main_loop_failure:{e}")
+                break
 
-                observer.reset_for_new_task()
-                world_graph.reset()
-                TASK_START = None
+            time.sleep(HEARTBEAT_INTERVAL)
 
-        except ObserverBlindnessError:
-            _force_safe_shutdown(os_backend, auth_state, "observer_blindness")
-            os._exit(1)
+    finally:
+        try:
+            observer_loop.stop()
+        except Exception:
+            pass
+        try:
+            vision_runtime.stop()
+        except Exception:
+            pass
 
-        except Exception as e:
-            _force_safe_shutdown(os_backend, auth_state, f"main_loop_failure:{e}")
-            os._exit(1)
-
-        time.sleep(HEARTBEAT_INTERVAL)
+        _force_safe_shutdown(os_backend, auth_state, "shutdown")
