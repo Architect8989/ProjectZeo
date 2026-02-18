@@ -1,9 +1,8 @@
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, Tuple
 from collections import deque
 import time
 import math
 import hashlib
-import json
 import struct
 
 
@@ -12,7 +11,6 @@ class BeliefState:
     EXPLORATION_C = 1.4
     RISK_LAMBDA = 0.3
     REWARD_WINDOW = 100
-    REGRET_SCALE = 0.05
     PRIOR_ALPHA = 0.01
     REGRET_DECAY = 0.995
     MAX_STATES = 64
@@ -46,8 +44,8 @@ class BeliefState:
 
         for state in all_states:
             prior = self.state_probabilities.get(state, self.PRIOR_ALPHA)
-            likelihood = likelihoods.get(state, self.PRIOR_ALPHA)
-            posterior = prior * max(likelihood, self.PRIOR_ALPHA)
+            likelihood = max(likelihoods.get(state, self.PRIOR_ALPHA), self.PRIOR_ALPHA)
+            posterior = prior * likelihood
             new_belief[state] = posterior
             total += posterior
 
@@ -62,34 +60,32 @@ class BeliefState:
         }
 
         if len(pruned) > self.MAX_STATES:
-            sorted_states = sorted(
-                pruned.items(),
-                key=lambda x: x[1],
-                reverse=True,
-            )[: self.MAX_STATES]
-            pruned = dict(sorted_states)
+            pruned = dict(
+                sorted(pruned.items(), key=lambda x: x[1], reverse=True)[: self.MAX_STATES]
+            )
 
         total = sum(pruned.values())
-        if total > 0:
-            self.state_probabilities = {
-                s: v / total for s, v in pruned.items()
-            }
+        if total <= 0:
+            return
 
-        # entropy floor injection
+        self.state_probabilities = {s: v / total for s, v in pruned.items()}
+
+        # entropy floor injection with renormalization
         if self.entropy() < self.MIN_ENTROPY_FLOOR:
             uniform = 1.0 / len(self.state_probabilities)
-            for k in self.state_probabilities:
-                self.state_probabilities[k] = (
-                    0.95 * self.state_probabilities[k]
-                    + 0.05 * uniform
-                )
+            blended = {
+                k: 0.95 * v + 0.05 * uniform
+                for k, v in self.state_probabilities.items()
+            }
+            total = sum(blended.values())
+            self.state_probabilities = {k: v / total for k, v in blended.items()}
 
     def entropy(self) -> float:
-        total = 0.0
-        for p in self.state_probabilities.values():
-            if p > 0:
-                total -= p * math.log(p)
-        return total
+        return -sum(
+            p * math.log(p)
+            for p in self.state_probabilities.values()
+            if p > 0
+        )
 
     # =========================================================
     # ACTION SCORING
@@ -109,6 +105,7 @@ class BeliefState:
         total_actions = sum(self.action_counts.values()) + 1
         count = self.action_counts.get(action, 0) + 1
         rewards = self.action_rewards.get(action)
+
         mean_reward = sum(rewards) / len(rewards) if rewards else 0.0
 
         exploration = self.EXPLORATION_C * math.sqrt(
@@ -129,18 +126,12 @@ class BeliefState:
         successes = sum(1 for r in rewards if r > 0)
         failures = sum(1 for r in rewards if r < 0)
 
-        # deterministic pseudo-random from commitment hash
-        seed_material = (
-            self.commitment_hash + action
-        ).encode()
-
+        seed_material = (self.commitment_hash + action).encode()
         digest = hashlib.sha256(seed_material).digest()
         deterministic_uniform = struct.unpack("!Q", digest[:8])[0] / 2**64
 
         alpha = successes + 1
         beta = failures + 1
-
-        # Beta mean blended with deterministic uniform
         beta_mean = alpha / (alpha + beta)
 
         return 0.7 * beta_mean + 0.3 * deterministic_uniform
@@ -156,17 +147,18 @@ class BeliefState:
 
         raw_value, last_iter = entry
         delta_iter = self._iteration_counter - last_iter
-        value = raw_value * (self.REGRET_DECAY ** delta_iter)
-        return min(value, self.MAX_REGRET)
+        decayed = raw_value * (self.REGRET_DECAY ** delta_iter)
+        return min(decayed, self.MAX_REGRET)
 
     def update_regret(self, action: str, reward: float, best_reward: float):
         self._iteration_counter += 1
 
         regret_value = best_reward - reward
+        if regret_value <= 0:
+            return
 
         current = self._get_effective_regret(action)
-        updated = current + regret_value
-        updated = max(0.0, min(updated, self.MAX_REGRET))
+        updated = min(current + regret_value, self.MAX_REGRET)
 
         self.regret[action] = (updated, self._iteration_counter)
 
@@ -181,24 +173,18 @@ class BeliefState:
 
         history = self.action_rewards[action]
 
-        # running mean/std normalization
         if history:
             mean = sum(history) / len(history)
             variance = sum((r - mean) ** 2 for r in history) / len(history)
             std = math.sqrt(max(variance, self.NORMALIZE_EPS))
             normalized = (reward - mean) / std
-            normalized = max(
-                -self.REWARD_CLAMP,
-                min(self.REWARD_CLAMP, normalized),
-            )
+            normalized = max(-self.REWARD_CLAMP, min(self.REWARD_CLAMP, normalized))
         else:
             normalized = reward
 
         history.append(normalized)
 
-        self.action_counts[action] = (
-            self.action_counts.get(action, 0) + 1
-        )
+        self.action_counts[action] = self.action_counts.get(action, 0) + 1
 
     # =========================================================
     # ENVIRONMENT MODEL
@@ -218,38 +204,39 @@ class BeliefState:
                 self.environment_stability + 0.05,
             )
 
-        self.environment_stability = max(
-            0.0,
-            min(1.0, self.environment_stability),
-        )
+        self.environment_stability = max(0.0, min(1.0, self.environment_stability))
 
     # =========================================================
     # STABLE COMMITMENT HASH
     # =========================================================
 
-    def _stable_float_bytes(self, d: Dict[str, float]) -> bytes:
-        parts = []
-        for k in sorted(d):
-            parts.append(k.encode())
-            parts.append(struct.pack("!d", float(d[k])))
-        return b"".join(parts)
-
-    def _stable_observation_bytes(self, obs: Dict[str, Any]) -> bytes:
-        parts = []
-        for k in sorted(obs):
-            v = obs[k]
-            parts.append(k.encode())
-            if isinstance(v, float):
-                parts.append(struct.pack("!d", v))
-            else:
-                parts.append(str(v).encode())
-        return b"".join(parts)
+    def _stable_value_bytes(self, value: Any) -> bytes:
+        if isinstance(value, float):
+            return struct.pack("!d", value)
+        if isinstance(value, (int, bool)):
+            return str(value).encode()
+        if isinstance(value, str):
+            return value.encode()
+        if isinstance(value, dict):
+            parts = []
+            for k in sorted(value):
+                parts.append(k.encode())
+                parts.append(self._stable_value_bytes(value[k]))
+            return b"".join(parts)
+        if isinstance(value, list):
+            parts = []
+            for item in value:
+                parts.append(self._stable_value_bytes(item))
+            return b"".join(parts)
+        return str(value).encode()
 
     def commit(self, action: str, observation: Dict[str, Any]) -> None:
 
-        obs_bytes = self._stable_observation_bytes(observation)
-        prob_bytes = self._stable_float_bytes(
-            self.state_probabilities
+        obs_bytes = self._stable_value_bytes(observation)
+
+        prob_bytes = b"".join(
+            k.encode() + struct.pack("!d", v)
+            for k, v in sorted(self.state_probabilities.items())
         )
 
         payload = (
