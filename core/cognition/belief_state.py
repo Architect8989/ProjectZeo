@@ -4,6 +4,7 @@ import time
 import math
 import hashlib
 import struct
+import numpy as np
 
 
 class BeliefState:
@@ -70,7 +71,6 @@ class BeliefState:
 
         self.state_probabilities = {s: v / total for s, v in pruned.items()}
 
-        # entropy floor injection with renormalization
         if self.entropy() < self.MIN_ENTROPY_FLOOR:
             uniform = 1.0 / len(self.state_probabilities)
             blended = {
@@ -115,7 +115,7 @@ class BeliefState:
         return mean_reward + exploration
 
     # =========================================================
-    # DETERMINISTIC THOMPSON
+    # TRUE DETERMINISTIC THOMPSON SAMPLING
     # =========================================================
 
     def thompson_sample(self, action: str) -> float:
@@ -126,15 +126,18 @@ class BeliefState:
         successes = sum(1 for r in rewards if r > 0)
         failures = sum(1 for r in rewards if r < 0)
 
-        seed_material = (self.commitment_hash + action).encode()
+        alpha = successes + 1.0
+        beta = failures + 1.0
+
+        seed_material = f"{self.commitment_hash}:{action}".encode("utf-8")
         digest = hashlib.sha256(seed_material).digest()
-        deterministic_uniform = struct.unpack("!Q", digest[:8])[0] / 2**64
+        seed = int.from_bytes(digest[:8], byteorder="big", signed=False)
 
-        alpha = successes + 1
-        beta = failures + 1
-        beta_mean = alpha / (alpha + beta)
+        rng = np.random.default_rng(seed)
 
-        return 0.7 * beta_mean + 0.3 * deterministic_uniform
+        sample = rng.beta(alpha, beta)
+
+        return float(sample)
 
     # =========================================================
     # REGRET TRACKING
