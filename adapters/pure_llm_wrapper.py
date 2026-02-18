@@ -120,27 +120,26 @@ class PureLLMWrapper:
     def _run_coroutine_safely(self, coro):
 
         try:
-            loop = asyncio.get_running_loop()
-            inside_running_loop = True
+            asyncio.get_running_loop()
+            inside_loop = True
         except RuntimeError:
-            inside_running_loop = False
-            loop = None
+            inside_loop = False
 
-        # No running loop → safe to use asyncio.run
-        if not inside_running_loop:
+        # No running loop → safe direct run
+        if not inside_loop:
             return asyncio.run(coro)
 
-        # Running loop exists → execute coroutine thread-safely
-        def _run_in_thread(target_loop, coroutine):
-            future = asyncio.run_coroutine_threadsafe(
-                coroutine,
-                target_loop,
-            )
-            return future.result()
+        # Running loop → isolate in worker thread with its own loop
+        def _run_in_isolated_loop(coroutine):
+            new_loop = asyncio.new_event_loop()
+            try:
+                asyncio.set_event_loop(new_loop)
+                return new_loop.run_until_complete(coroutine)
+            finally:
+                new_loop.close()
 
         future = PureLLMWrapper._executor.submit(
-            _run_in_thread,
-            loop,
+            _run_in_isolated_loop,
             coro,
         )
 
@@ -207,4 +206,4 @@ class PureLLMWrapper:
         raise RuntimeError(
             f"Model '{self.model_name}' returned unsupported type: "
             f"{type(result)}"
-            )
+                                              )
