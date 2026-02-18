@@ -1,17 +1,33 @@
 from typing import Callable, List, Dict, Any
 from operate.exceptions import ModelNotRecognizedException
 
+# Containment hardening
+from apis_safety_layer import apply_patches
+
 
 # ==================================================
 # MODEL REGISTRY
 # ==================================================
-# Maps model name → adapter class path
-# Fully isolates operate.models.apis
+# Maps model prefix → adapter class path
+# Allows version flexibility while keeping strict mapping
 
 _ADAPTER_REGISTRY: Dict[str, str] = {
-    "qwen2.5-vl:7b-instruct": "adapters.qwen_ollama_adapter.QwenOllamaAdapter",
-    "qwen2.5-vl:3b-instruct": "adapters.qwen_ollama_adapter.QwenOllamaAdapter",
+    "qwen2.5-vl": "adapters.qwen_ollama_adapter.QwenOllamaAdapter",
 }
+
+
+# ==================================================
+# PATCH GUARD
+# ==================================================
+
+_PATCHES_APPLIED = False
+
+
+def _ensure_patches():
+    global _PATCHES_APPLIED
+    if not _PATCHES_APPLIED:
+        apply_patches()
+        _PATCHES_APPLIED = True
 
 
 # ==================================================
@@ -45,9 +61,8 @@ def _import_from_path(path: str):
 class AdapterFactory:
     """
     Clean adapter factory.
-    - No operate.models.apis dependency
-    - No fallback logic
-    - One model → one adapter
+    - Containment patches enforced
+    - Prefix-based model resolution
     - Strict contract: returns (operation_list, error_object)
     """
 
@@ -61,7 +76,21 @@ class AdapterFactory:
         Instantiate adapter for given model.
         """
 
-        adapter_path = _ADAPTER_REGISTRY.get(model_name)
+        if not isinstance(model_name, str) or not model_name.strip():
+            raise ModelNotRecognizedException("Model name must be non-empty string.")
+
+        model_name = model_name.strip()
+
+        # Activate containment patches exactly once
+        _ensure_patches()
+
+        adapter_path = None
+
+        # Prefix-based resolution
+        for prefix, path in _ADAPTER_REGISTRY.items():
+            if model_name.startswith(prefix):
+                adapter_path = path
+                break
 
         if adapter_path is None:
             raise ModelNotRecognizedException(
@@ -70,7 +99,6 @@ class AdapterFactory:
 
         AdapterClass = _import_from_path(adapter_path)
 
-        # Instantiate once per request — kernel can cache if needed
         return AdapterClass(model_name=model_name)
 
     # --------------------------------------------------
@@ -92,7 +120,6 @@ class AdapterFactory:
 
         adapter = AdapterFactory.build_llm(model_name)
 
-        # Adapter must enforce immutability and exception safety internally
         return await adapter.get_next_action(
             messages=messages,
             objective=objective,
