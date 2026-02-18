@@ -129,7 +129,10 @@ class BeliefState:
         alpha = successes + 1.0
         beta = failures + 1.0
 
-        seed_material = f"{self.commitment_hash}:{action}".encode("utf-8")
+        seed_material = (
+            f"{self.commitment_hash}:{action}:{self._iteration_counter}"
+        ).encode("utf-8")
+
         digest = hashlib.sha256(seed_material).digest()
         seed = int.from_bytes(digest[:8], byteorder="big", signed=False)
 
@@ -186,7 +189,6 @@ class BeliefState:
             normalized = reward
 
         history.append(normalized)
-
         self.action_counts[action] = self.action_counts.get(action, 0) + 1
 
     # =========================================================
