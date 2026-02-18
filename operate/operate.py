@@ -252,9 +252,10 @@ def _execute_autonomous_loop(
         except Exception:
             belief.record_action(action_key, reward=-0.5)
 
-            normalized_history = belief.action_rewards.get(action_key, [])
-            normalized_reward = normalized_history[-1] if normalized_history else -0.5
-            best_reward = max(normalized_history) if normalized_history else normalized_reward
+            history = belief.action_rewards.get(action_key, [])
+            normalized_reward = history[-1] if history else -0.5
+            best_reward = max(history) if history else normalized_reward
+
             belief.update_regret(action_key, normalized_reward, best_reward)
 
             stagnant_iterations += 1
@@ -274,9 +275,9 @@ def _execute_autonomous_loop(
         raw_reward = float(verification.confidence) - 0.5
         belief.record_action(action_key, reward=raw_reward)
 
-        normalized_history = belief.action_rewards.get(action_key, [])
-        normalized_reward = normalized_history[-1] if normalized_history else raw_reward
-        best_reward = max(normalized_history) if normalized_history else normalized_reward
+        history = belief.action_rewards.get(action_key, [])
+        normalized_reward = history[-1] if history else raw_reward
+        best_reward = max(history) if history else normalized_reward
 
         belief.update_regret(action_key, normalized_reward, best_reward)
 
