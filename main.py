@@ -73,8 +73,7 @@ def _enforce_task_timeout(os_backend, auth_state):
     if TASK_START is None:
         return
     if (time.time() - TASK_START) > MAX_TASK_SECONDS:
-        _force_safe_shutdown(os_backend, auth_state, "task_timeout")
-        os._exit(1)
+        raise RuntimeError("TASK_FAILED:timeout")
 
 
 def main(llm_callable: Callable, model_name: str):
@@ -203,6 +202,7 @@ def main(llm_callable: Callable, model_name: str):
             mode.execute()
 
             try:
+
                 while True:
 
                     _enforce_task_timeout(os_backend, auth_state)
@@ -226,7 +226,9 @@ def main(llm_callable: Callable, model_name: str):
 
                             replan_count += 1
                             if replan_count > MAX_REPLANS:
-                                raise RuntimeError("TASK_FAILED:max_replans_exceeded")
+                                raise RuntimeError(
+                                    "TASK_FAILED:max_replans_exceeded"
+                                )
 
                             mode.begin_replan_sequence()
 
@@ -238,7 +240,9 @@ def main(llm_callable: Callable, model_name: str):
                                 mode.arm(intent)
 
                                 _ingest_latest_perception(observer, world_graph)
-                                planner.update_world_snapshot(world_graph.snapshot())
+                                planner.update_world_snapshot(
+                                    world_graph.snapshot()
+                                )
 
                                 mode.begin_planning()
 
@@ -267,7 +271,9 @@ def main(llm_callable: Callable, model_name: str):
                         raise
 
             finally:
+
                 if mode.mode in (SystemMode.EXECUTING, SystemMode.RESTORING):
+
                     try:
                         mode.begin_restoration()
                         restore_provider.restore_snapshot(snapshot_id)
@@ -281,9 +287,6 @@ def main(llm_callable: Callable, model_name: str):
                         )
 
                         mode.complete_execution()
-                        observer.reset_for_new_task()
-                        world_graph.reset()
-                        TASK_START = None
 
                     except Exception as cleanup_err:
                         _force_safe_shutdown(
@@ -292,6 +295,10 @@ def main(llm_callable: Callable, model_name: str):
                             f"restoration_failure:{cleanup_err}",
                         )
                         os._exit(1)
+
+                observer.reset_for_new_task()
+                world_graph.reset()
+                TASK_START = None
 
         except ObserverBlindnessError:
             _force_safe_shutdown(os_backend, auth_state, "observer_blindness")
