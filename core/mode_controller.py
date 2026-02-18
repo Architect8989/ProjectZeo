@@ -357,4 +357,4 @@ class ModeController:
                 "execution_plan_attached": self._execution_plan_attached,
                 "execution_plan_id": self._execution_plan_id,
                 "transition_history_depth": len(self._transition_history),
-    }
+        }
