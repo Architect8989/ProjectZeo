@@ -1,34 +1,3 @@
-"""
-adapters/qwen_ollama_adapter.py
-================================
-PATCHES APPLIED:
-
-  ✅  FIX-3 (Forensic Audit): Full conversation history is now forwarded to
-           ollama.chat(). Previously only a single user message was sent,
-           making every inference stateless. The LLM had no memory of prior
-           actions, causing re-execution of already-completed steps and repeated
-           failed click attempts on multi-step tasks.
-
-           New behaviour: the messages list (system prompt + accumulated assistant
-           turns + new user screenshot turn) is forwarded to ollama.chat() as a
-           proper multi-turn conversation.
-
-           The current screenshot is always sent as part of the LATEST user
-           message — older turns carry text summaries of what was done.
-           This keeps the context window bounded while preserving task memory.
-
-  ✅  §R4  (prior): read timeout raised to 120s for CPU inference compatibility.
-  ✅  §R9  (prior): current objective injected into every per-action prompt.
-  ✅  GAP-1 (prior): greedy regex captures full multi-operation JSON arrays.
-  ✅  FIX-5 (prior): EasyOCR init failure is non-fatal (fallback to coord-only).
-
-MODEL PROVIDER INDEPENDENCE:
-  This adapter is the canonical local Ollama adapter. It contains zero
-  hardcoded references to any specific cloud provider. New local models
-  (llama3.2-vision, llava, minicpm-v) can be served by a similar adapter
-  registered in adapters/factory.py without touching this file.
-"""
-
 from __future__ import annotations
 
 import base64
