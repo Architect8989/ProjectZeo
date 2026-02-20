@@ -1,27 +1,3 @@
-"""
-adapters/pure_llm_wrapper.py
-=============================
-PATCHES APPLIED:
-
-  ✅  §1.2 (prior): operate/models/apis.py now exists — ImportError resolved.
-
-  ✅  EVO-3 (Forensic Audit): On AdapterClass instantiation failure the
-           adapter cache is guaranteed clean (try/finally in factory handles this).
-
-  ✅  FUTURE-PROOF (Forensic Audit): PureLLMWrapper is now properly wired as
-           a reachable code path via AdapterFactory._CLOUD_REGISTRY. Any model
-           in that registry gets routed here automatically.
-
-PROVIDER INDEPENDENCE:
-  This wrapper delegates to operate/models/apis.py functions which in turn
-  delegate to operate/legacy/apis.py. Cloud SDK initialisation (OpenAI,
-  Anthropic, Gemini) happens lazily inside each legacy function call.
-  Adding a new cloud model requires only:
-    1. A function in operate/models/apis.py (or operate/legacy/apis.py).
-    2. An entry in the _registry dict below.
-    3. An entry in adapters/factory.py _CLOUD_REGISTRY.
-"""
-
 from __future__ import annotations
 
 import asyncio
