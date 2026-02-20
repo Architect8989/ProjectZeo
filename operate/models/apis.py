@@ -1,27 +1,3 @@
-"""
-operate/models/apis.py
-=======================
-Canonical API namespace for all LLM model call functions.
-
-DESIGN:
-  - Re-exports all callable API functions from operate/legacy/apis.py
-    under the canonical operate.models.apis namespace.
-  - Fully LAZY: importing this module has zero side effects.
-    No SDK is loaded until the specific function is called.
-  - Provider-agnostic: zero references to any cloud SDK here.
-
-EXTENSION:
-  To add a new model function:
-    1. Add implementation in operate/legacy/apis.py.
-    2. Add a delegation wrapper here.
-    3. Register the model in adapters/factory.py _CLOUD_REGISTRY.
-    4. Add to adapters/pure_llm_wrapper.py _resolve_model_function() registry.
-
-PATCHES APPLIED:
-  ✅  §1.2 (prior): File created (was absent — ImportError in pure_llm_wrapper).
-  ✅  §Evo3 (prior): call_claude_3_with_ocr added (was missing — AttributeError).
-"""
-
 from __future__ import annotations
 
 
