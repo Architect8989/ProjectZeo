@@ -1,0 +1,249 @@
+"""
+adapters/pure_llm_wrapper.py
+=============================
+PATCHES APPLIED:
+
+  ✅  §1.2 (prior): operate/models/apis.py now exists — ImportError resolved.
+
+  ✅  EVO-3 (Forensic Audit): On AdapterClass instantiation failure the
+           adapter cache is guaranteed clean (try/finally in factory handles this).
+
+  ✅  FUTURE-PROOF (Forensic Audit): PureLLMWrapper is now properly wired as
+           a reachable code path via AdapterFactory._CLOUD_REGISTRY. Any model
+           in that registry gets routed here automatically.
+
+PROVIDER INDEPENDENCE:
+  This wrapper delegates to operate/models/apis.py functions which in turn
+  delegate to operate/legacy/apis.py. Cloud SDK initialisation (OpenAI,
+  Anthropic, Gemini) happens lazily inside each legacy function call.
+  Adding a new cloud model requires only:
+    1. A function in operate/models/apis.py (or operate/legacy/apis.py).
+    2. An entry in the _registry dict below.
+    3. An entry in adapters/factory.py _CLOUD_REGISTRY.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import inspect
+import copy
+import json
+from typing import Callable, List, Dict, Any, Optional
+from concurrent.futures import ThreadPoolExecutor
+
+from operate.models import apis
+
+
+class PureLLMWrapper:
+    """
+    Unified wrapper for all cloud / legacy LLM providers.
+
+    Exposes the same get_next_action() interface as QwenOllamaAdapter
+    so the kernel treats all LLM providers identically.
+    """
+
+    _patch_applied = False
+    _executor = ThreadPoolExecutor(max_workers=4)
+
+    def __init__(self, model_name: str):
+        if not PureLLMWrapper._patch_applied:
+            from adapters.apis_safety_layer import apply_patches  # noqa: PLC0415
+            apply_patches()
+            PureLLMWrapper._patch_applied = True
+
+        self.model_name = model_name
+
+    # ==================================================
+    # ADAPTER INTERFACE — matches QwenOllamaAdapter
+    # ==================================================
+
+    async def get_next_action(
+        self,
+        messages: List[Dict[str, Any]],
+        objective: Optional[str] = None,
+        session_id: Optional[str] = None,
+    ):
+        """
+        Public adapter interface — identical signature to QwenOllamaAdapter.
+        Returns (ops, None) on success, (None, exception) on error.
+        """
+        try:
+            result = self(
+                messages=messages,
+                objective=objective,
+                session_id=session_id,
+            )
+            return result, None
+        except Exception as exc:
+            return None, exc
+
+    # ==================================================
+    # MODEL RESOLUTION
+    # ==================================================
+
+    def _resolve_model_function(self) -> Callable:
+        """
+        Map model_name to the corresponding API function.
+
+        EXTENSION: add new cloud models here. The function must be exported
+        from operate/models/apis.py.
+        """
+        registry: Dict[str, Callable] = {
+            "gpt-4":              apis.call_gpt_4o,
+            "gpt-4o":             apis.call_gpt_4o,
+            "qwen-vl":            apis.call_qwen_vl_with_ocr,
+            "gpt-4o-with-ocr":   apis.call_gpt_4o_with_ocr,
+            "gpt-4.1-with-ocr":  apis.call_gpt_4_1_with_ocr,
+            "o1-with-ocr":       apis.call_o1_with_ocr,
+            "claude-3":          apis.call_claude_3_with_ocr,
+            "claude-3-opus":     apis.call_claude_3_with_ocr,
+            "claude-3-sonnet":   apis.call_claude_3_with_ocr,
+            "gemini-pro-vision": apis.call_gemini_pro_vision,
+            "llava":             apis.call_ollama_llava,
+            "gpt-4.1-with-ocr":  apis.call_gpt_4_1_with_ocr,
+            "gpt-4o-labeled":    apis.call_gpt_4o_labeled,
+            "gpt-4-with-som":    apis.call_gpt_4o_labeled,
+            "gpt-4-with-ocr":    apis.call_gpt_4o_with_ocr,
+        }
+
+        fn = registry.get(self.model_name)
+        if fn is None:
+            raise ValueError(
+                f"Unsupported model: '{self.model_name}'. "
+                f"Known models: {sorted(registry.keys())}"
+            )
+        return fn
+
+    # ==================================================
+    # PUBLIC CALL INTERFACE
+    # ==================================================
+
+    def __call__(
+        self,
+        messages: List[Dict[str, Any]],
+        objective: Optional[str] = None,
+        session_id: Optional[str] = None,
+        screen_image: Optional[str] = None,
+    ) -> Any:
+
+        model_fn = self._resolve_model_function()
+
+        original_snapshot = copy.deepcopy(messages)
+        messages_copy = copy.deepcopy(messages)
+
+        try:
+            result = self._execute_model(
+                model_fn, messages_copy, objective, session_id, screen_image
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"Model execution failed for '{self.model_name}': {exc}"
+            ) from exc
+
+        if messages_copy != original_snapshot:
+            raise RuntimeError(
+                f"Model '{self.model_name}' mutated input messages (immutability violation)."
+            )
+
+        return self._normalize_output(result)
+
+    # ==================================================
+    # INTERNAL EXECUTION
+    # ==================================================
+
+    def _execute_model(
+        self,
+        model_fn: Callable,
+        messages: List[Dict[str, Any]],
+        objective: Optional[str],
+        session_id: Optional[str],
+        screen_image: Optional[str],
+    ) -> Any:
+
+        if inspect.iscoroutinefunction(model_fn):
+            coro = self._call_with_signature(
+                model_fn, messages, objective, session_id, screen_image
+            )
+            return self._run_coroutine_safely(coro)
+
+        result = self._call_with_signature(
+            model_fn, messages, objective, session_id, screen_image
+        )
+
+        if inspect.iscoroutine(result):
+            return self._run_coroutine_safely(result)
+
+        return result
+
+    def _run_coroutine_safely(self, coro):
+        try:
+            asyncio.get_running_loop()
+            inside_loop = True
+        except RuntimeError:
+            inside_loop = False
+
+        if not inside_loop:
+            return asyncio.run(coro)
+
+        # Inside a running loop — run in isolated thread to avoid deadlock
+        def _run_in_isolated_loop(coroutine):
+            new_loop = asyncio.new_event_loop()
+            try:
+                asyncio.set_event_loop(new_loop)
+                return new_loop.run_until_complete(coroutine)
+            finally:
+                new_loop.close()
+
+        future = PureLLMWrapper._executor.submit(_run_in_isolated_loop, coro)
+        return future.result()
+
+    # ==================================================
+    # SIGNATURE HANDLING
+    # ==================================================
+
+    def _call_with_signature(
+        self,
+        model_fn: Callable,
+        messages: List[Dict[str, Any]],
+        objective: Optional[str],
+        session_id: Optional[str],
+        screen_image: Optional[str],
+    ) -> Any:
+        sig = inspect.signature(model_fn)
+        params = sig.parameters
+
+        if "screen_image" in params:
+            return model_fn(
+                messages,
+                objective=objective,
+                session_id=session_id,
+                screen_image=screen_image,
+            )
+        if "session_id" in params:
+            return model_fn(messages, objective=objective, session_id=session_id)
+        if "objective" in params:
+            return model_fn(messages, objective)
+        return model_fn(messages)
+
+    # ==================================================
+    # OUTPUT NORMALIZATION
+    # ==================================================
+
+    def _normalize_output(self, result: Any) -> Any:
+        if result is None:
+            raise RuntimeError(f"Model '{self.model_name}' returned None.")
+
+        if isinstance(result, (dict, list)):
+            return result
+
+        if isinstance(result, str):
+            try:
+                return json.loads(result)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Model '{self.model_name}' returned non-JSON string."
+                ) from exc
+
+        raise RuntimeError(
+            f"Model '{self.model_name}' returned unsupported type: {type(result)}"
+        )
