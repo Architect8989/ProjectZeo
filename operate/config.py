@@ -1,29 +1,3 @@
-"""
-operate/config.py — Process-global configuration singleton.
-
-PATCHES APPLIED:
-
-  ✅  FIX-1 (Forensic Audit): All cloud SDK imports (anthropic, google-generativeai,
-           openai) are now LAZY — imported only on first use inside the relevant
-           initialize_*() method. Previously these were module-level hard imports
-           that caused ImportError on a raw OS with only Ollama installed, blocking
-           the entire local LLM startup chain.
-
-           Only `ollama` remains as a module-level import (always required).
-
-  ✅  Risk #6a: .env file now written under a threading.Lock().
-
-  ✅  Risk #6b: API key values stored with double-quote wrapping and
-           embedded double-quotes escaped.
-
-EXTENSION CONTRACT:
-  To add a new LLM provider:
-    1. Add an initialize_<provider>() method with a local lazy import.
-    2. Add an api key attribute in __init__ (defaults to None).
-    3. Add a require_api_key() call in validation() if a key is needed.
-  No other files need to change for the config layer.
-"""
-
 import os
 import sys
 import threading
