@@ -1,33 +1,3 @@
-"""
-operate/operate.py — Autonomous execution loop
-===============================================
-PATCHES APPLIED:
-
-  ✅  FIX-5 (Forensic Audit): Click coordinate normalization fixed.
-           Previously _execute_decision() called os_backend.click(float(x), float(y))
-           where x and y are LLM-supplied NORMALIZED values (0.0–1.0).
-           OperatingSystem.click(x, y) expects PIXEL coordinates and divides by
-           screen size — so 0.50 became 0.50/1920 ≈ 0.00026, landing all clicks
-           in the extreme top-left corner.
-
-           Fix: use os_backend.mouse({"x": float(x), "y": float(y)}) which calls
-           _click_at_percentage() directly and correctly scales normalized coords
-           to pixel position. This is consistent with the LLM prompt schema
-           which specifies "x": "0.50" (normalized 0.0–1.0 range).
-
-  ✅  §R1  (prior): _execute_decision() handles 'file_create' and 'verify'.
-  ✅  §R6  (prior): Stagnation limit is step-type-aware (UI=12, command=120).
-  ✅  §1.11 (prior): WAIT → retry loop (not REPLAN_REQUIRED).
-  ✅  §1.11 (prior): run_command() output captured in execution_log and
-           merged into world_graph perception for LLM context.
-
-MODEL INDEPENDENCE:
-  operate.py has zero references to any specific LLM model or provider.
-  It receives the LLM callable through the planner and invokes it via
-  standardised action dispatch. All provider-specific logic lives in the
-  adapter layer.
-"""
-
 from __future__ import annotations
 
 import time
