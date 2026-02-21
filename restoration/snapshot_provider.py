@@ -38,7 +38,11 @@ class SnapshotProvider:
 
     MAX_SNAPSHOTS = 128
     MAX_SNAPSHOT_AGE_SECONDS = 3600
-    ATOMIC_WINDOW_SECONDS = 0.25  # realistic under load (250ms)
+    # RTB-04: Increased from 0.25s to 0.5s. Under OS load, three consecutive
+    # syscalls (cursor + focused_window + active_app) frequently exceeded 250ms,
+    # causing permanent denial-of-service on task arming under adversarial load.
+    # 500ms is still conservative enough to catch genuine OS hangs.
+    ATOMIC_WINDOW_SECONDS = 0.5
 
     # =========================================================
     # INIT
@@ -188,11 +192,25 @@ class SnapshotProvider:
         if (
             not isinstance(focused_window, dict)
             or not isinstance(focused_window.get("title"), str)
-            or not focused_window["title"].strip()
         ):
             raise SnapshotProviderError("Focused window invalid")
 
         window_title = focused_window["title"].strip()
+
+        # FIX-05 (RTB-05): When the desktop is bare (no focused window),
+        # get_focused_window() returns an empty title. The original guard
+        # raised SnapshotProviderError("Focused window invalid") unconditionally,
+        # permanently blocking task arming with no user diagnostic.
+        #
+        # Fallback: use the active application title as the window identity
+        # sentinel. If that is also empty, use the "__bare_desktop__" sentinel
+        # so snapshots can still be taken and restored (restoration will skip
+        # window focus since no window was focused at snapshot time).
+        if not window_title:
+            if isinstance(active_app, dict) and isinstance(active_app.get("title"), str):
+                window_title = active_app["title"].strip()
+            if not window_title:
+                window_title = "__bare_desktop__"
 
         if (
             not isinstance(active_app, dict)
