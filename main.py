@@ -28,7 +28,7 @@ from state.serializer import AuthorityStateSerializer
 from operate.utils.operating_system import OperatingSystem
 from operate.operate import operate_main
 
-from restoration.snapshot_provider import SnapshotProvider
+from restoration.snapshot_provider import SnapshotProvider, SnapshotProviderError
 from restoration.restore_provider import RestoreProvider
 
 from core.planner.execution_planner import ExecutionPlanner
@@ -370,7 +370,22 @@ def main(llm_callable: Callable, model_name: str):
 
                             try:
                                 mode.force_observer()
-                                new_snapshot_id = snapshot_provider.take_snapshot()
+
+                                # HRD-10: SnapshotProviderError (e.g. bare desktop,
+                                # OS load, atomic window exceeded) during replan
+                                # previously propagated to the outer except block
+                                # in main(), triggering _force_safe_shutdown and
+                                # killing the process. A snapshot failure during
+                                # replan is recoverable: continue with the prior
+                                # snapshot_id so the task can still attempt execution.
+                                try:
+                                    new_snapshot_id = snapshot_provider.take_snapshot()
+                                except SnapshotProviderError as snap_err:
+                                    print(
+                                        f"[MAIN] Replan snapshot failed (using prior): {snap_err}",
+                                        file=sys.stderr,
+                                    )
+                                    new_snapshot_id = snapshot_id  # reuse prior snapshot
                                 mode.attach_snapshot(new_snapshot_id)
                                 mode.arm(intent)
 
@@ -530,3 +545,4 @@ def main(llm_callable: Callable, model_name: str):
             pass
 
         _force_safe_shutdown(os_backend, auth_state, "shutdown")
+
