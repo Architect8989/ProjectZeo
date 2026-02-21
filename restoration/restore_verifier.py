@@ -1,24 +1,6 @@
-"""
-restore_verifier.py — Post-restoration verification against snapshot contract.
-
-PATCH (audit Bug #3):
-  _verify_focus() previously used an exact string match on the window ID,
-  while RestoreProvider._validate_window() uses Levenshtein fuzzy matching
-  (distance ≤ MAX_TITLE_DISTANCE = 2).  This asymmetry meant a window that
-  passed RestoreProvider validation could then fail RestoreVerifier
-  verification — producing false "restoration failed" errors.
-
-  Fix: _verify_focus() now uses the same Levenshtein fuzzy logic with
-  MAX_TITLE_DISTANCE = 2 so the two classes are consistent.  Exact match
-  still passes as a special case (distance = 0).
-
-  A new helper _levenshtein() and _normalize_title() mirror the
-  RestoreProvider implementations.
-"""
-
 from __future__ import annotations
 
-from typing import Tuple
+from typing import Optional, Tuple
 
 from restoration.snapshot_types import RestorationSnapshot
 
@@ -33,33 +15,40 @@ class RestoreVerifier:
 
     This verifier does NOT attempt to fix anything.
     It only proves whether restoration succeeded.
+
+    Constructor parameters
+    ----------------------
+    os_backend : object
+        Must implement: get_cursor_position(), get_focused_window(),
+        get_active_application(). Optional: get_window_geometry(),
+        get_window_z_order(), get_browser_state(),
+        get_media_playback_position(), is_automation_active().
+
+    mode_controller : ModeController | None
+        FIX H-04: Injected here rather than via hidden attribute assignment.
+        When provided, _verify_execution_mode() confirms the controller is
+        in OBSERVER mode after restoration. Pass None only in unit tests
+        where mode state is managed externally.
+
+    cursor_tolerance_px : int
+        Maximum pixel distance from snapshot cursor position to pass
+        cursor verification. Should match RestoreProvider.CURSOR_TOLERANCE_PX.
     """
 
-    # PATCH (audit Bug #3): maximum Levenshtein distance to accept as a
-    # "matching" window title.  Must equal RestoreProvider.MAX_TITLE_DISTANCE.
     MAX_TITLE_DISTANCE: int = 2
 
-    def __init__(self, *, os_backend, cursor_tolerance_px: int = 0):
-        """
-        os_backend MUST provide the methods available on OperatingSystem:
-          - get_cursor_position() -> dict {"x": int, "y": int}
-          - get_focused_window()  -> dict {"title": str, ...}
-          - get_active_application() -> dict {"title": str, ...}
-
-        HRD-03 FIX: The original constructor docstring listed three methods
-        that do not exist on OperatingSystem:
-          - get_execution_mode()       → does not exist
-          - is_automation_active()     → does not exist
-          - get_focused_window_id()    → does not exist
-        These methods have been replaced throughout with the correct equivalents.
-
-        OPTIONAL (used if present):
-          - get_window_geometry(window_id)
-          - get_window_z_order(window_id)
-          - get_browser_state()
-          - get_media_playback_position()
-        """
+    def __init__(
+        self,
+        *,
+        os_backend,
+        mode_controller=None,
+        cursor_tolerance_px: int = 0,
+    ):
         self._os = os_backend
+        # FIX H-04: Accept mode_controller as an explicit constructor parameter.
+        # The previous code only checked getattr(self, "_mode_controller", None)
+        # which was never set, making _verify_execution_mode() permanently inert.
+        self._mode_controller = mode_controller
         self._cursor_tol = int(cursor_tolerance_px)
 
     # -------------------------------------------------
@@ -88,25 +77,29 @@ class RestoreVerifier:
     # -------------------------------------------------
 
     def _verify_execution_mode(self) -> None:
-        # HRD-03 FIX: OperatingSystem has no get_execution_mode() method.
-        # RestoreVerifier is now given the mode_controller's current mode
-        # via the verify() call signature, or we check that mode_controller
-        # is in OBSERVER mode. Since RestoreVerifier is called after restoration
-        # completes, we verify via the mode_controller if injected, or skip
-        # this check safely if only an os_backend is available.
-        mode_controller = getattr(self, "_mode_controller", None)
-        if mode_controller is not None:
-            from core.mode_controller import SystemMode
-            if mode_controller.mode is not SystemMode.OBSERVER:
-                raise RestorationVerificationError(
-                    f"Execution mode verification failed: {mode_controller.mode.value}"
-                )
+        """
+        FIX H-04: mode_controller is now properly injected via __init__.
+        Verifies the system is in OBSERVER mode after restoration completes.
+        Skipped only when mode_controller is explicitly None (test contexts).
+        """
+        if self._mode_controller is None:
+            # Explicitly opted out — acceptable in test contexts only.
+            return
+
+        from core.mode_controller import SystemMode
+        current_mode = self._mode_controller.mode
+        if current_mode is not SystemMode.OBSERVER:
+            raise RestorationVerificationError(
+                f"Execution mode verification failed: expected OBSERVER, "
+                f"got {current_mode.value}. Restoration may be incomplete."
+            )
 
     def _verify_input_released(self) -> None:
-        # HRD-03 FIX: OperatingSystem has no is_automation_active() method.
-        # This check is best-effort: if the OS backend exposes the method,
-        # use it; otherwise skip silently (the restoration contract is still
-        # partially verified via cursor + focus checks).
+        """
+        Best-effort check: if the OS backend exposes is_automation_active(),
+        verify automation is no longer active. Skipped silently if the method
+        is absent (OperatingSystem does not expose it by default).
+        """
         if not hasattr(self._os, "is_automation_active"):
             return
         try:
@@ -122,9 +115,6 @@ class RestoreVerifier:
             )
 
     def _verify_cursor(self, snapshot: RestorationSnapshot) -> None:
-        # HRD-03 FIX: OperatingSystem.get_cursor_position() returns a dict
-        # {"x": int, "y": int}, not a (x, y) tuple. The original unpacking
-        # `x, y = self._os.get_cursor_position()` would raise TypeError.
         try:
             cursor = self._os.get_cursor_position()
         except Exception as e:
@@ -151,23 +141,14 @@ class RestoreVerifier:
             raise RestorationVerificationError(
                 f"Cursor position mismatch: "
                 f"expected=({snapshot.cursor.x},{snapshot.cursor.y}) "
-                f"actual=({x},{y})"
+                f"actual=({x},{y}) tolerance={self._cursor_tol}px"
             )
 
     def _verify_focus(self, snapshot: RestorationSnapshot) -> None:
         """
-        HRD-03 FIX + PATCH (audit Bug #3): use Levenshtein fuzzy matching.
-
-        OperatingSystem has no get_focused_window_id() method. The correct
-        method is get_focused_window(), which returns a dict {"title": str, ...}.
-        We extract the title from that dict and apply the same Levenshtein
-        fuzzy matching (distance ≤ MAX_TITLE_DISTANCE) used by RestoreProvider,
-        ensuring the two classes are consistent.
-
-        Skip focus verification when the snapshot used the "__bare_desktop__"
-        sentinel (no window was focused at snapshot time).
+        Uses Levenshtein fuzzy matching (audit Bug #3 fix, preserved).
+        Skips bare-desktop snapshots where no window was focused.
         """
-        # Bare-desktop snapshots have no meaningful window to verify
         if snapshot.focus.window_id == "__bare_desktop__":
             return
 
@@ -212,6 +193,8 @@ class RestoreVerifier:
                     raise RestorationVerificationError(
                         "Window geometry mismatch after restore"
                     )
+            except RestorationVerificationError:
+                raise
             except Exception:
                 pass
 
@@ -224,6 +207,8 @@ class RestoreVerifier:
                     raise RestorationVerificationError(
                         "Window Z-order mismatch after restore"
                     )
+            except RestorationVerificationError:
+                raise
             except Exception:
                 pass
 
@@ -236,6 +221,8 @@ class RestoreVerifier:
                     raise RestorationVerificationError(
                         "Browser state mismatch after restore"
                     )
+            except RestorationVerificationError:
+                raise
             except Exception:
                 pass
 
@@ -248,11 +235,13 @@ class RestoreVerifier:
                     raise RestorationVerificationError(
                         "Media playback position mismatch after restore"
                     )
+            except RestorationVerificationError:
+                raise
             except Exception:
                 pass
 
     # -------------------------------------------------
-    # PATCH helpers (audit Bug #3)
+    # Helpers
     # -------------------------------------------------
 
     @staticmethod
@@ -282,10 +271,6 @@ class RestoreVerifier:
                 curr.append(min(insert, delete, replace))
             prev = curr
         return prev[-1]
-
-    # -------------------------------------------------
-    # Utilities
-    # -------------------------------------------------
 
     def _within_tolerance(
         self,
