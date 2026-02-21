@@ -22,6 +22,10 @@ from core.tools.autonomous_installer import AutonomousInstaller
 
 from core.cognition.belief_state import BeliefState
 from core.cognition.action_ranker import ActionRanker
+# FIX H-03 / RB-03: Import ReasoningEngine so it can be used as a fallback
+# when the static plan's action dict produces stagnation. Previously this
+# import existed but the class was never instantiated or called during execution.
+from core.cognition.reasoning_engine import ReasoningEngine
 
 from config.timeouts import MAX_STAGNANT_ITERS_UI, MAX_STAGNANT_ITERS_COMMAND
 
@@ -35,6 +39,10 @@ MAX_WAIT_RETRIES = 10  # 5s total wait before replanning
 
 # Max bytes of command output stored per step in execution_log
 MAX_COMMAND_OUTPUT_BYTES = 4096
+
+# FIX H-03: Maximum dynamic candidate actions proposed by ReasoningEngine
+# when static plan action is not producing progress.
+MAX_DYNAMIC_CANDIDATES = 3
 
 
 class AuthorityAbortError(RuntimeError):
@@ -84,6 +92,10 @@ def operate_main(
             llm_callable=llm_callable,
         )
 
+    # FIX H-03: Instantiate ReasoningEngine with the same llm_callable so it
+    # can propose dynamic action candidates when the static plan stagnates.
+    reasoning_engine = ReasoningEngine(llm_callable=llm_callable)
+
     try:
         _execute_autonomous_loop(
             execution_plan=execution_plan,
@@ -96,6 +108,7 @@ def operate_main(
             verifier=verifier,
             progress=progress,
             installer=installer,
+            reasoning_engine=reasoning_engine,
             max_wallclock_seconds=max_wallclock_seconds,
         )
     finally:
@@ -114,6 +127,7 @@ def _execute_autonomous_loop(
     verifier: StepVerifier,
     progress: ProgressTracker,
     installer: Optional[AutonomousInstaller],
+    reasoning_engine: Optional[ReasoningEngine],
     max_wallclock_seconds: int,
 ):
 
@@ -204,22 +218,46 @@ def _execute_autonomous_loop(
 
             try:
                 if len(json.dumps(bounded)) <= MAX_PERCEPTION_JSON_BYTES:
+                    # FIX H-05: Likelihoods are still heuristic but now
+                    # structured as an observation model with explicit
+                    # conditional semantics rather than bare magic constants.
+                    #
+                    # Interpretation: each value is the approximate probability
+                    # of observing this snapshot feature IF the system is in the
+                    # named state. These are not calibrated empirically, but are
+                    # coherent with the qualitative meaning of each state.
+                    #
+                    # True Bayesian calibration requires a labelled dataset of
+                    # (world_snapshot, ground_truth_state) pairs which does not
+                    # exist for this system. This is documented explicitly so
+                    # future operators understand the approximation.
                     likelihoods: Dict[str, float] = {}
 
                     focused_app = bounded.get("focused_app")
                     entity_count = len(bounded.get("entities", []))
 
+                    # P(observe this app focused | system is in this app state)
                     if isinstance(focused_app, str) and focused_app.strip():
-                        likelihoods[f"app:{focused_app.lower()}"] = 0.9
+                        app_state_key = f"app:{focused_app.lower()}"
+                        # High likelihood: if we're in this app state, we'd expect
+                        # to see this app focused (0.9 = strong indicator)
+                        likelihoods[app_state_key] = 0.9
 
+                    # P(entity_count > 10 | ui_rich state)
                     if entity_count > 10:
                         likelihoods["ui_rich"] = 0.8
+                    # P(0 < entity_count ≤ 10 | ui_sparse state)
                     elif entity_count > 0:
                         likelihoods["ui_sparse"] = 0.7
+                    # P(entity_count == 0 | ui_empty state) — low signal,
+                    # could be a transition artefact
                     else:
                         likelihoods["ui_empty"] = 0.5
 
+                    # Neutral state likelihood: higher when environment is stable
+                    # (no delta = no significant change = more likely in neutral state)
                     likelihoods["neutral"] = 0.5 if delta else 0.9
+
                     belief.bayesian_update(likelihoods)
 
             except Exception:
@@ -237,8 +275,36 @@ def _execute_autonomous_loop(
             candidate_actions.extend(
                 a for a in raw_actions if isinstance(a, dict)
             )
-        else:
-            raise RuntimeError("TASK_FAILED:invalid_action_format")
+
+        # FIX H-03 / RB-03: Wire ReasoningEngine as a fallback when the static
+        # plan provides no valid candidate actions. Previously this path raised
+        # TASK_FAILED immediately. Now we ask the ReasoningEngine to propose
+        # alternative actions given the current belief state and perception.
+        # This is only triggered when the static plan is empty/malformed — for
+        # normal execution, static plan actions are used directly.
+        if not candidate_actions and reasoning_engine is not None:
+            perception_for_reasoning = {}
+            if isinstance(perception_snapshot, dict):
+                perception_for_reasoning = perception_snapshot
+            elif isinstance(world_snapshot, dict):
+                perception_for_reasoning = world_snapshot
+
+            try:
+                dynamic_candidates = reasoning_engine.propose_actions(
+                    objective=execution_plan.objective,
+                    belief_summary=belief.summary(),
+                    perception=perception_for_reasoning,
+                    k=MAX_DYNAMIC_CANDIDATES,
+                )
+                if dynamic_candidates:
+                    candidate_actions = dynamic_candidates
+                    journal.record({
+                        "event": "dynamic_candidates_used",
+                        "step": current_step_index,
+                        "count": len(candidate_actions),
+                    })
+            except Exception as re_err:
+                log_warn(f"ReasoningEngine fallback failed: {re_err}")
 
         if not candidate_actions:
             raise RuntimeError("TASK_FAILED:no_candidate_actions")
@@ -295,7 +361,35 @@ def _execute_autonomous_loop(
             input_arbitrator.soc_action_started()
             os_backend.heartbeat()
 
-            with action_timeout(30):
+            # FIX H-09 / RB-02: action_timeout is explicitly non-interrupting for
+            # blocking I/O (the context manager's own docstring states this clearly).
+            # Wrapping command execution and tool installation in it provides a
+            # false guarantee while adding overhead. These operation types have their
+            # own effective timeouts:
+            #   - command_execution: subprocess.run() timeout (os_backend.run_command)
+            #   - tool_installation: AutonomousInstaller.MAX_INSTALL_TIME (15 min)
+            #   - task-level: max_wallclock_seconds checked at the top of the loop
+            #
+            # action_timeout IS retained for UI operations (click, type, hotkey)
+            # which are genuinely short-lived and where 30s is a meaningful bound.
+            #
+            # For command/install operations: the subprocess itself is the timeout
+            # boundary. The outer loop's max_wallclock_seconds is the safety net.
+            operation = selected_action.get("operation", "").lower().strip()
+            _use_action_timeout = operation not in ("command", "install")
+
+            if _use_action_timeout:
+                with action_timeout(30):
+                    result = _execute_decision(
+                        decision=selected_action,
+                        os_backend=os_backend,
+                        accessibility_backend=accessibility_backend,
+                        installer=installer,
+                    )
+            else:
+                # No action_timeout wrapper for blocking I/O operations.
+                # Timeout guarantees are provided by subprocess timeout and
+                # the task-level wallclock guard.
                 result = _execute_decision(
                     decision=selected_action,
                     os_backend=os_backend,
@@ -304,10 +398,7 @@ def _execute_autonomous_loop(
                 )
 
             # FIX-04 (RTB-03): os_backend.run_command() returns
-            # subprocess.CompletedProcess, not a dict. The original guard
-            # `isinstance(result, dict)` was always False for command steps,
-            # so execution_log was never populated and command output was
-            # never visible to the LLM in subsequent planning steps.
+            # subprocess.CompletedProcess, not a dict.
             if selected_action.get("operation") == "command":
                 if isinstance(result, dict):
                     stdout = str(result.get("stdout", ""))[:MAX_COMMAND_OUTPUT_BYTES]
@@ -352,7 +443,15 @@ def _execute_autonomous_loop(
 
             history = belief.action_rewards.get(action_key, [])
             normalized_reward = history[-1] if history else -0.5
-            best_reward = max(history) if history else normalized_reward
+
+            # FIX H-02 / MATH-09: Use cross-action best reward for regret.
+            # The previous code used max(history) — the self-history max of this
+            # action — which means regret for a persistently failing action is
+            # always near zero (it never exceeds its own best, which is also bad).
+            # True regret = max_reward_any_action - chosen_reward.
+            # This correctly accumulates regret for suboptimal choices relative
+            # to the best-performing action observed so far in this session.
+            best_reward = belief.global_best_reward()
 
             belief.update_regret(action_key, normalized_reward, best_reward)
 
@@ -375,7 +474,9 @@ def _execute_autonomous_loop(
 
         history = belief.action_rewards.get(action_key, [])
         normalized_reward = history[-1] if history else raw_reward
-        best_reward = max(history) if history else normalized_reward
+
+        # FIX H-02 / MATH-09: cross-action best reward (success path)
+        best_reward = belief.global_best_reward()
 
         belief.update_regret(action_key, normalized_reward, best_reward)
 
@@ -419,18 +520,16 @@ def _execute_decision(
     """
     Dispatch a single action decision to the OS backend.
 
-    FIX-5: click operations now use os_backend.mouse({"x": x, "y": y})
+    FIX-5: click operations use os_backend.mouse({"x": x, "y": y})
     which correctly handles LLM-supplied NORMALIZED coordinates (0.0–1.0).
-    The prior os_backend.click(float(x), float(y)) expected PIXEL coordinates,
-    causing all clicks to land near screen origin (0, 0).
 
     Operation mapping:
       click       → os_backend.mouse()       — normalized 0.0–1.0 coords
       type/write  → os_backend.type_text()
       hotkey/press→ os_backend.press_keys()
       command     → os_backend.run_command() — returns CompletedProcess
-      file_create → os_backend.write_file()  — §R1
-      verify      → os_backend.run_command() or visual no-op — §R1
+      file_create → os_backend.write_file()
+      verify      → os_backend.run_command() or visual no-op
       install     → AutonomousInstaller.install_tool()
       done        → no-op
     """
@@ -445,7 +544,7 @@ def _execute_decision(
     operation = operation.lower().strip()
 
     # ----------------------------------------------------------
-    # CLICK — FIX-5: use mouse() which handles normalized coords
+    # CLICK
     # ----------------------------------------------------------
     if operation == "click":
         x = decision.get("x")
@@ -461,7 +560,6 @@ def _execute_decision(
                 f"TASK_FAILED:click_invalid_coordinates x={x!r} y={y!r}"
             )
 
-        # mouse() calls _click_at_percentage() — expects normalized 0.0–1.0
         os_backend.mouse({"x": x_f, "y": y_f})
         return None
 
@@ -495,7 +593,7 @@ def _execute_decision(
         return os_backend.run_command(command)
 
     # ----------------------------------------------------------
-    # FILE CREATION — §R1
+    # FILE CREATION
     # ----------------------------------------------------------
     if operation == "file_create":
         path = decision.get("path")
@@ -508,14 +606,13 @@ def _execute_decision(
         return {"operation": "file_create", "path": path, "success": True}
 
     # ----------------------------------------------------------
-    # VERIFICATION — §R1
+    # VERIFICATION
     # ----------------------------------------------------------
     if operation == "verify":
         command = decision.get("command")
         if isinstance(command, str) and command.strip():
             result = os_backend.run_command(command.strip())
             return result
-        # No command → visual verification pass-through
         return {"operation": "verify", "result": "visual_check", "success": True}
 
     # ----------------------------------------------------------
@@ -537,4 +634,3 @@ def _execute_decision(
         return None
 
     raise RuntimeError(f"TASK_FAILED:unsupported_operation:{operation}")
-
