@@ -69,6 +69,16 @@ class BeliefState:
         if total <= 0:
             return
 
+        # HRD-06: Entropy floor blending is inoperative for single-state beliefs
+        # because 0.95×1.0 + 0.05×1.0 = 1.0 regardless of the blend. When
+        # pruning collapses belief to a single state, inject a minimum second
+        # state at PRIOR_ALPHA probability before normalizing. This prevents
+        # complete probability collapse and ensures the entropy floor can work.
+        if len(pruned) == 1:
+            (sole_state,) = pruned.keys()
+            pruned["__prior_fallback__"] = self.PRIOR_ALPHA
+            total = sum(pruned.values())
+
         self.state_probabilities = {s: v / total for s, v in pruned.items()}
 
         if self.entropy() < self.MIN_ENTROPY_FLOOR:
@@ -102,7 +112,13 @@ class BeliefState:
         return mean - self.RISK_LAMBDA * variance
 
     def ucb_score(self, action: str) -> float:
-        total_actions = sum(self.action_counts.values()) + 1
+        # HRD-09: On the very first call, sum(action_counts.values()) == 0,
+        # so total_actions = 1, math.log(1) = 0, exploration = 0.0 for ALL
+        # actions. UCB is a dead term on the first iteration, providing no
+        # exploration bonus. Fix: clamp total_actions to ≥ 2 so log() is
+        # always positive, giving a non-zero exploration bonus even before
+        # any actions have been tried.
+        total_actions = max(sum(self.action_counts.values()) + 1, 2)
         count = self.action_counts.get(action, 0) + 1
         rewards = self.action_rewards.get(action)
 
@@ -182,11 +198,21 @@ class BeliefState:
         history = self.action_rewards[action]
 
         if history:
-            mean = sum(history) / len(history)
-            variance = sum((r - mean) ** 2 for r in history) / len(history)
-            std = math.sqrt(max(variance, self.NORMALIZE_EPS))
-            normalized = (reward - mean) / std
-            normalized = max(-self.REWARD_CLAMP, min(self.REWARD_CLAMP, normalized))
+            # HRD-05: With only one prior sample, variance = 0, std ≈ 0.0001
+            # (from the NORMALIZE_EPS floor). Any non-zero r1 produces a
+            # z-score of thousands, immediately clamped to ±REWARD_CLAMP.
+            # This biases early reward distribution toward ±3.0 regardless
+            # of actual outcome quality. Guard: skip z-score normalization
+            # until we have at least 3 samples for a stable variance estimate.
+            if len(history) >= 3:
+                mean = sum(history) / len(history)
+                variance = sum((r - mean) ** 2 for r in history) / len(history)
+                std = math.sqrt(max(variance, self.NORMALIZE_EPS))
+                normalized = (reward - mean) / std
+                normalized = max(-self.REWARD_CLAMP, min(self.REWARD_CLAMP, normalized))
+            else:
+                # Identity scaling for first two samples — preserve raw signal
+                normalized = max(-self.REWARD_CLAMP, min(self.REWARD_CLAMP, reward))
         else:
             normalized = reward
 
@@ -296,3 +322,4 @@ class BeliefState:
             "environment_stability": self.environment_stability,
             "commitment_hash": self.commitment_hash,
         }
+
