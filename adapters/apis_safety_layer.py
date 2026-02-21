@@ -1,24 +1,8 @@
-# adapters/apis_safety_layer.py
-
-"""
-External hardening layer for operate.models.apis
-
-Hard guarantees:
-- No caller message mutation
-- No silent None
-- No cloud fallback chains
-- Deterministic LLM temperature enforcement
-- Screenshot side-effects disabled (ALL write vectors)
-- Strict return validation
-- Idempotent wrapping
-"""
-
 import copy
 import inspect
 import functools
 import types
 import importlib
-import builtins
 import pathlib
 
 _PATCHED = False
@@ -262,8 +246,11 @@ def _disable_screenshot_writes():
                 f"[APIS-SAFETY] Failed to patch PIL save: {e}"
             )
 
-    # ---- Guard builtins.open ----
-    original_open = builtins.open
+    # ---- Guard builtins.open within the apis module namespace only ----
+    # HRD-07: Use _real_open to reference the unpatched built-in open so
+    # that guarded_open can call through to it without recursion.
+    import builtins as _builtins_mod
+    _real_open = _builtins_mod.open
 
     def guarded_open(file, mode="r", *args, **kwargs):
         if "w" in mode or "a" in mode or "x" in mode:
@@ -271,9 +258,19 @@ def _disable_screenshot_writes():
                 raise RuntimeError(
                     "[APIS-SAFETY] Screenshot file write blocked"
                 )
-        return original_open(file, mode, *args, **kwargs)
+        return _real_open(file, mode, *args, **kwargs)
 
-    builtins.open = guarded_open
+    # HRD-07 FIX: The original implementation patched builtins.open globally
+    # for the entire process lifetime. This is an uncontrolled global side
+    # effect that blocks any third-party library writing to a path containing
+    # "screenshot" (e.g. ~/screenshots/backup.png).
+    #
+    # Revised approach: inject guarded_open into the apis module's own
+    # namespace. Python name resolution checks the module's global namespace
+    # before builtins, so direct calls to `open()` within the apis module
+    # will use guarded_open while all other modules continue using the real
+    # builtins.open. This scopes the protection to exactly the risk surface.
+    _m.open = guarded_open  # module-local open shadows builtins within _m
 
     # ---- Guard pathlib writes ----
     original_write_bytes = pathlib.Path.write_bytes
@@ -362,3 +359,4 @@ def _guard_dispatch():
 
     guarded._apis_safety_wrapped = True
     _m2.get_next_action = guarded
+
