@@ -1,43 +1,3 @@
-"""
-core/planner/execution_planner.py
-===================================
-PATCHES APPLIED (Audit Fixes):
-
-  ✅  §R3  (was §planner-6): TaskDecomposer is now wired in.
-           For complex objectives (>60 chars or explicit multi-step tasks),
-           decompose() is called first to break the intent into ordered
-           sub-goals. _expand_goal() is then called per sub-goal.
-           This prevents single-shot planning failures on 20+ step tasks.
-
-  ✅  §Evo4 (was §planner-7): Removed '$(' from DANGEROUS_PATTERNS.
-           Command substitution $(...) is standard in legitimate install
-           scripts.  Replaced with targeted pattern 'eval.*$(' which is
-           the genuinely dangerous form.  curl|bash is kept as it is an
-           audit-logged risk, not a hard block.
-
-  ✅  §1.9 (original): MAX_COMMAND_LENGTH raised from 512 to 2048.
-  ✅  §1.9 (original): _STEP_SCHEMA_BLOCK with full schema injected.
-  ✅  §1.9 (original): _call_llm_sync raises if inside event loop.
-  ✅  §1.9 (original): _call_llm_async exposed as proper coroutine.
-
-  ✅  EVO-1 (Audit): _expand_goal() now retries once on LLM JSON parse
-           or validation failure before propagating PlanningError.
-           Transient LLM output glitches (truncated JSON, stray prose)
-           no longer trigger REPLAN_REQUIRED immediately.
-
-  ✅  EVO-4 (Audit): DECOMPOSE_THRESHOLD_CHARS lowered from 100 to 60.
-           A 40-word multi-stack objective is typically 60–80 chars.
-           The old threshold left complex tasks as single-shot planning,
-           producing incomplete step plans for hackathon-style objectives.
-
-All existing correct behaviours preserved:
-  - ThreadPoolExecutor(max_workers=1)
-  - Step type validation against StepType enum
-  - Duration bounds [0, 600]
-  - MAX_STEPS_PER_GOAL=25 (per sub-goal)
-  - SAFE_ENV_FIELDS filtering
-"""
-
 from __future__ import annotations
 
 from typing import List, Dict, Any, Optional
@@ -411,6 +371,63 @@ class ExecutionPlanner:
 
 
     # ==================================================
+    # HRD-08: TEXT-ONLY LLM CALL (no screenshot)
+    # ==================================================
+
+    def _call_llm_text(self, prompt: str) -> str:
+        """
+        HRD-08: Text-only LLM call for planning prompts.
+
+        Planning prompts are structural (JSON schema generation) and do not
+        need or benefit from a live screenshot. Routing through the vision
+        adapter (get_next_action) unconditionally attaches a screenshot,
+        introducing irrelevant noise that degrades plan quality.
+
+        This method mirrors the pattern in _decompose_if_complex(): call
+        Ollama directly with a text-only chat, then fall back to the
+        message-list path if Ollama is unavailable.
+        """
+        try:
+            import ollama
+            import httpx
+            import os as _os
+
+            _model = getattr(self, "_decompose_model", None)
+            if _model is None:
+                fn = self._llm_call
+                while hasattr(fn, "__wrapped__"):
+                    fn = fn.__wrapped__
+                _model = getattr(fn, "__self__", None)
+                if _model is not None:
+                    _model = getattr(_model, "model_name", None)
+                if _model is None:
+                    _model = _os.environ.get("LLM_MODEL", "qwen2.5-vl:7b-instruct")
+
+            client = ollama.Client(
+                timeout=httpx.Timeout(connect=10.0, read=120.0, write=5.0, pool=2.0)
+            )
+            response = client.chat(
+                model=_model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You are a deterministic planner. Return only valid JSON arrays — no prose, no markdown.",
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                options={"temperature": 0},
+            )
+            if hasattr(response, "message") and hasattr(response.message, "content"):
+                return response.message.content
+            if isinstance(response, dict):
+                return response.get("message", {}).get("content", "")
+            return str(response)
+
+        except Exception:
+            # Fallback to existing sync path (vision adapter with screenshot)
+            return self._call_llm_sync(prompt)
+
+    # ==================================================
     # LOOP-SAFE LLM CALL
     # ==================================================
 
@@ -614,7 +631,13 @@ class ExecutionPlanner:
         last_error: Optional[Exception] = None
         for _attempt in range(2):
             try:
-                raw = self._call_llm_sync(prompt)
+                # HRD-08: Use the text-only LLM call path for planning prompts.
+                # The vision adapter (QwenOllamaAdapter.get_next_action) always
+                # captures a live screenshot and sends it with every prompt.
+                # For text-only planning prompts, the live screen is irrelevant
+                # noise that degrades plan quality and may leak sensitive content.
+                # Route through _call_llm_text() which bypasses the vision adapter.
+                raw = self._call_llm_text(prompt)
                 data = self._extract_json(raw)
 
                 if not isinstance(data, list) or not data:
@@ -708,3 +731,4 @@ class ExecutionPlanner:
                 continue
 
         raise last_error  # type: ignore[misc]
+
