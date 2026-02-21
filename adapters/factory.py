@@ -119,6 +119,28 @@ def _resolve_base_model(model_name: str) -> str:
     return model_name.split(":", 1)[0]
 
 
+def _is_cloud_allowed() -> bool:
+    """
+    FIX H-01 / LLM-01: Cloud access is BLOCKED by default.
+
+    The previous implementation allowed cloud routing unless OLLAMA_ONLY=1
+    was explicitly set. This inverted the security posture: the "no cloud"
+    architectural claim was false by default, requiring an opt-in env var.
+
+    New logic: cloud access is denied unless OLLAMA_ONLY is explicitly set
+    to a falsy value ("0", "false", "no"). run.py sets OLLAMA_ONLY=1 by
+    default and only clears it when --allow-cloud is given on the CLI.
+
+    This makes the Ollama-only guarantee true by default with no operator
+    action required.
+    """
+    import os as _os
+    val = _os.environ.get("OLLAMA_ONLY", "1").strip().lower()
+    # OLLAMA_ONLY=1/true/yes → cloud denied
+    # OLLAMA_ONLY=0/false/no → cloud permitted
+    return val not in ("1", "true", "yes")
+
+
 class AdapterFactory:
 
     @staticmethod
@@ -129,8 +151,9 @@ class AdapterFactory:
         Routing priority:
           1. Cached instance → return immediately.
           2. Local registry match → instantiate registered local adapter.
-          3. Cloud registry match → instantiate PureLLMWrapper.
-          4. Unknown → raise ModelNotRecognizedException.
+          3. Cloud registry match + cloud allowed → PureLLMWrapper.
+          4. Cloud registry match + cloud DENIED → ModelNotRecognizedException.
+          5. Unknown → ModelNotRecognizedException.
         """
         model_name = _validate_model_name(model_name)
         _ensure_patches()
@@ -150,7 +173,6 @@ class AdapterFactory:
             try:
                 instance = AdapterClass(model_name=model_name)
             except Exception:
-                # EVO-3: ensure no partial entry leaks into cache on failure
                 with _ADAPTER_CACHE_LOCK:
                     _ADAPTER_CACHE.pop(model_name, None)
                 raise
@@ -161,15 +183,15 @@ class AdapterFactory:
 
         # --- Route 2: Cloud adapter via PureLLMWrapper ---
         if base_model in _CLOUD_REGISTRY:
-            # HRD-01: When OLLAMA_ONLY=1 is set, reject cloud model requests
-            # entirely rather than routing silently to PureLLMWrapper.
-            # Without this guard, a substituted .env or CLI invocation with a
-            # cloud model name bypasses the Ollama-only constraint completely.
-            import os as _os
-            if _os.environ.get("OLLAMA_ONLY", "").strip() in ("1", "true", "yes"):
+            # FIX H-01: Cloud is BLOCKED by default. The previous guard only
+            # blocked cloud when OLLAMA_ONLY=1 was set; absent the env var,
+            # cloud routing silently succeeded, violating the isolation claim.
+            # Now cloud is denied unless explicitly permitted via _is_cloud_allowed().
+            if not _is_cloud_allowed():
                 raise ModelNotRecognizedException(
-                    f"Model '{model_name}' is a cloud model, but OLLAMA_ONLY=1 is set. "
-                    "Unset OLLAMA_ONLY or use a local model registered in _LOCAL_REGISTRY.\n"
+                    f"Model '{model_name}' is a cloud model, but OLLAMA_ONLY is "
+                    "enforced (default). To enable cloud models, start the system "
+                    "with --allow-cloud or set OLLAMA_ONLY=0 in the environment.\n"
                     f"  Local models: {sorted(_LOCAL_REGISTRY.keys())}"
                 )
 
@@ -192,7 +214,7 @@ class AdapterFactory:
         raise ModelNotRecognizedException(
             f"Model '{model_name}' is not registered.\n"
             f"  Local models:  {sorted(_LOCAL_REGISTRY.keys())}\n"
-            f"  Cloud models:  {sorted(_CLOUD_REGISTRY)}\n"
+            f"  Cloud models:  {sorted(_CLOUD_REGISTRY)} (require --allow-cloud)\n"
             "Add the model to the appropriate registry in adapters/factory.py."
         )
 
@@ -218,4 +240,3 @@ class AdapterFactory:
 # Module-level aliases for backward compatibility
 build_llm = AdapterFactory.build_llm
 get_action = AdapterFactory.get_action
-
