@@ -161,6 +161,18 @@ class AdapterFactory:
 
         # --- Route 2: Cloud adapter via PureLLMWrapper ---
         if base_model in _CLOUD_REGISTRY:
+            # HRD-01: When OLLAMA_ONLY=1 is set, reject cloud model requests
+            # entirely rather than routing silently to PureLLMWrapper.
+            # Without this guard, a substituted .env or CLI invocation with a
+            # cloud model name bypasses the Ollama-only constraint completely.
+            import os as _os
+            if _os.environ.get("OLLAMA_ONLY", "").strip() in ("1", "true", "yes"):
+                raise ModelNotRecognizedException(
+                    f"Model '{model_name}' is a cloud model, but OLLAMA_ONLY=1 is set. "
+                    "Unset OLLAMA_ONLY or use a local model registered in _LOCAL_REGISTRY.\n"
+                    f"  Local models: {sorted(_LOCAL_REGISTRY.keys())}"
+                )
+
             # Lazy import so Ollama-only boots never touch cloud code
             from adapters.pure_llm_wrapper import PureLLMWrapper  # noqa: PLC0415
 
@@ -206,3 +218,4 @@ class AdapterFactory:
 # Module-level aliases for backward compatibility
 build_llm = AdapterFactory.build_llm
 get_action = AdapterFactory.get_action
+
