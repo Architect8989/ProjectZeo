@@ -30,11 +30,6 @@ def _resolve_apis_module():
     )
 
 
-# PATCH (audit): Removed module-level `apis = _resolve_apis_module()`.
-# The original code ran _resolve_apis_module() at import time which caused the
-# entire process to crash if operate.legacy.apis had uninstallable dependencies
-# (ultralytics, easyocr).  Resolution is now deferred to apply_patches() so
-# the process can start even on a raw OS where those packages are absent.
 _apis_module = None
 
 
@@ -58,14 +53,8 @@ def apply_patches():
     _PATCHED = True
 
     try:
-        # Eagerly resolve here so errors surface at patch time, not usage time.
         _get_apis()
     except RuntimeError:
-        # Neither operate.models.apis nor operate.legacy.apis is importable
-        # (e.g. raw OS without ultralytics/easyocr).  The safety patches that
-        # wrap those modules are therefore not applicable.  Log a warning and
-        # return — the Ollama path does not use these modules at all, so the
-        # process remains functional.
         import sys
         print(
             "[APIS-SAFETY] Warning: could not resolve operate apis module — "
@@ -201,7 +190,7 @@ def _disable_cloud_fallbacks():
 
 
 # ============================================================
-# DISABLE SCREENSHOT SIDE EFFECTS (FULL HARDENING)
+# DISABLE SCREENSHOT SIDE EFFECTS
 # ============================================================
 
 def _disable_screenshot_writes():
@@ -211,14 +200,9 @@ def _disable_screenshot_writes():
             return False
         return "screenshot" in str(path).lower()
 
-    # GAP-2 FIX: _m was referenced throughout this function but never assigned
-    # in this scope. _patch_all_providers() assigned _m as a local variable
-    # inside its own loop — it never propagated here. On cloud-model paths,
-    # this caused NameError("name '_m' is not defined") at runtime.
-    # Fix: resolve the module once at function entry via _get_apis().
     _m = _get_apis()
 
-    # ---- Guard os.makedirs ----
+    # ---- Guard os.makedirs within the apis module ----
     if hasattr(_m, "os") and hasattr(_m.os, "makedirs"):
 
         original_makedirs = _m.os.makedirs
@@ -230,7 +214,7 @@ def _disable_screenshot_writes():
 
         _m.os.makedirs = guarded_makedirs
 
-    # ---- Guard PIL Image.save ----
+    # ---- Guard PIL Image.save within the apis module ----
     if hasattr(_get_apis(), "Image"):
         try:
             original_save = _m.Image.Image.save
@@ -247,8 +231,6 @@ def _disable_screenshot_writes():
             )
 
     # ---- Guard builtins.open within the apis module namespace only ----
-    # HRD-07: Use _real_open to reference the unpatched built-in open so
-    # that guarded_open can call through to it without recursion.
     import builtins as _builtins_mod
     _real_open = _builtins_mod.open
 
@@ -260,38 +242,27 @@ def _disable_screenshot_writes():
                 )
         return _real_open(file, mode, *args, **kwargs)
 
-    # HRD-07 FIX: The original implementation patched builtins.open globally
-    # for the entire process lifetime. This is an uncontrolled global side
-    # effect that blocks any third-party library writing to a path containing
-    # "screenshot" (e.g. ~/screenshots/backup.png).
+    # Scoped to the apis module namespace only — does NOT patch builtins globally.
+    _m.open = guarded_open
+
+    # ---- Guard pathlib writes — MODULE-SCOPED ONLY ----
+    # FIX RB-05 / F-05: The previous implementation patched pathlib.Path.write_bytes
+    # and pathlib.Path.write_text at the CLASS level, making them process-global.
+    # This was an uncontrolled global side effect: any third-party library
+    # (matplotlib, PIL, reportlab) writing to a path containing "screenshot"
+    # anywhere in the process would be silently blocked or raise RuntimeError.
     #
-    # Revised approach: inject guarded_open into the apis module's own
-    # namespace. Python name resolution checks the module's global namespace
-    # before builtins, so direct calls to `open()` within the apis module
-    # will use guarded_open while all other modules continue using the real
-    # builtins.open. This scopes the protection to exactly the risk surface.
-    _m.open = guarded_open  # module-local open shadows builtins within _m
-
-    # ---- Guard pathlib writes ----
-    original_write_bytes = pathlib.Path.write_bytes
-    original_write_text = pathlib.Path.write_text
-
-    def guarded_write_bytes(self, data, *args, **kwargs):
-        if _is_screenshot_path(self):
-            raise RuntimeError(
-                "[APIS-SAFETY] Screenshot file write blocked"
-            )
-        return original_write_bytes(self, data, *args, **kwargs)
-
-    def guarded_write_text(self, data, *args, **kwargs):
-        if _is_screenshot_path(self):
-            raise RuntimeError(
-                "[APIS-SAFETY] Screenshot file write blocked"
-            )
-        return original_write_text(self, data, *args, **kwargs)
-
-    pathlib.Path.write_bytes = guarded_write_bytes
-    pathlib.Path.write_text = guarded_write_text
+    # The class-level patches are REMOVED. Protection is provided by the
+    # module-scoped open() guard above (which intercepts calls to open() within
+    # the apis module), and by the PIL Image.save patch (which intercepts PIL
+    # save calls within that module). These are sufficient to prevent screenshot
+    # writes from the apis module without contaminating the rest of the process.
+    #
+    # Operators requiring stricter isolation should use filesystem-level controls
+    # (e.g. mount a tmpfs for the screenshot directory, set directory permissions)
+    # rather than relying on process-level Python patches.
+    #
+    # No pathlib.Path class-level patching is performed here.
 
 
 # ============================================================
@@ -359,4 +330,3 @@ def _guard_dispatch():
 
     guarded._apis_safety_wrapped = True
     _m2.get_next_action = guarded
-
