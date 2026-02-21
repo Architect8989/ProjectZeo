@@ -345,19 +345,24 @@ class QwenOllamaAdapter:
 
             response = await loop.run_in_executor(self._executor, _blocking_call)
 
-        content = _extract_response_content(response)
-        operations = self._parse_and_normalize_json(content)
+            # FIX-01 (RTB-01): All post-processing that references jpeg_tmp.name
+            # MUST happen inside this with block. The NamedTemporaryFile is deleted
+            # by the OS when the context manager exits (delete=True). Moving these
+            # calls outside caused FileNotFoundError in OCR, silently dropping all
+            # text-anchored click operations.
+            content = _extract_response_content(response)
+            operations = self._parse_and_normalize_json(content)
 
-        if not isinstance(operations, list):
-            raise RuntimeError("LLM output must be a JSON array")
+            if not isinstance(operations, list):
+                raise RuntimeError("LLM output must be a JSON array")
 
-        # Filter to valid operation dicts only
-        operations = [
-            op for op in operations
-            if isinstance(op, dict) and "operation" in op
-        ]
+            # Filter to valid operation dicts only
+            operations = [
+                op for op in operations
+                if isinstance(op, dict) and "operation" in op
+            ]
 
-        self._resolve_click_coordinates(operations, jpeg_tmp.name)
+            self._resolve_click_coordinates(operations, jpeg_tmp.name)
 
         return operations
 
