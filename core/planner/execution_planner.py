@@ -1,3 +1,43 @@
+"""
+core/planner/execution_planner.py
+===================================
+PATCHES APPLIED (Audit Fixes):
+
+  ✅  §R3  (was §planner-6): TaskDecomposer is now wired in.
+           For complex objectives (>60 chars or explicit multi-step tasks),
+           decompose() is called first to break the intent into ordered
+           sub-goals. _expand_goal() is then called per sub-goal.
+           This prevents single-shot planning failures on 20+ step tasks.
+
+  ✅  §Evo4 (was §planner-7): Removed '$(' from DANGEROUS_PATTERNS.
+           Command substitution $(...) is standard in legitimate install
+           scripts.  Replaced with targeted pattern 'eval.*$(' which is
+           the genuinely dangerous form.  curl|bash is kept as it is an
+           audit-logged risk, not a hard block.
+
+  ✅  §1.9 (original): MAX_COMMAND_LENGTH raised from 512 to 2048.
+  ✅  §1.9 (original): _STEP_SCHEMA_BLOCK with full schema injected.
+  ✅  §1.9 (original): _call_llm_sync raises if inside event loop.
+  ✅  §1.9 (original): _call_llm_async exposed as proper coroutine.
+
+  ✅  EVO-1 (Audit): _expand_goal() now retries once on LLM JSON parse
+           or validation failure before propagating PlanningError.
+           Transient LLM output glitches (truncated JSON, stray prose)
+           no longer trigger REPLAN_REQUIRED immediately.
+
+  ✅  EVO-4 (Audit): DECOMPOSE_THRESHOLD_CHARS lowered from 100 to 60.
+           A 40-word multi-stack objective is typically 60–80 chars.
+           The old threshold left complex tasks as single-shot planning,
+           producing incomplete step plans for hackathon-style objectives.
+
+All existing correct behaviours preserved:
+  - ThreadPoolExecutor(max_workers=1)
+  - Step type validation against StepType enum
+  - Duration bounds [0, 600]
+  - MAX_STEPS_PER_GOAL=25 (per sub-goal)
+  - SAFE_ENV_FIELDS filtering
+"""
+
 from __future__ import annotations
 
 from typing import List, Dict, Any, Optional
@@ -731,4 +771,3 @@ class ExecutionPlanner:
                 continue
 
         raise last_error  # type: ignore[misc]
-
