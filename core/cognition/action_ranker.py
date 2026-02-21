@@ -14,12 +14,26 @@ class ActionRanker:
     - No randomness
     - Stable action identity
     - Single Thompson source (delegated to BeliefState)
-    - Bounded exploration bonus
+    - Bounded exploration bonus (both above AND below zero)
+
+    FIX MATH-05: exploration_bonus was previously only clamped at the top
+    (min(bonus, MAX_EXPLORATION_BONUS)). When ucb_full < mean_reward (which
+    happens for well-explored actions whose UCB exploration term has shrunk
+    below the mean), exploration_bonus became negative and unclamped, applying
+    a significant penalty to well-known high-performing actions. This
+    suppressed exploitation of the best-known action in favour of less-explored
+    alternatives — the opposite of correct UCB behaviour.
+
+    Fix: clamp exploration_bonus to [0.0, MAX_EXPLORATION_BONUS]. A UCB
+    score below the mean reward simply means "no additional exploration
+    incentive" — it should never penalise the action. Zero is the correct
+    floor.
     """
 
     MIN_TAU = 0.15
     MAX_TAU = 1.5
     MAX_EXPLORATION_BONUS = 1.0  # prevent UCB domination
+    MIN_EXPLORATION_BONUS = 0.0  # FIX MATH-05: prevent exploitation suppression
 
     # ==================================================
     # ACTION SELECTION (DETERMINISTIC)
@@ -49,10 +63,15 @@ class ActionRanker:
                 if rewards else 0.0
             )
 
+            # FIX MATH-05: clamp to [MIN_EXPLORATION_BONUS, MAX_EXPLORATION_BONUS].
+            # When ucb_full < mean_reward (fully-exploited action), the raw
+            # bonus is negative, incorrectly penalising actions that already
+            # have a good track record. Clamping at zero means "no extra
+            # exploration incentive" — not "this action is worse than we know."
             exploration_bonus = ucb_full - mean_reward
-            exploration_bonus = min(
-                exploration_bonus,
-                self.MAX_EXPLORATION_BONUS,
+            exploration_bonus = max(
+                self.MIN_EXPLORATION_BONUS,
+                min(exploration_bonus, self.MAX_EXPLORATION_BONUS),
             )
 
             # Delegated Thompson (single coherent implementation)
