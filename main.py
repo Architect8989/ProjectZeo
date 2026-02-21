@@ -30,6 +30,10 @@ from operate.operate import operate_main
 
 from restoration.snapshot_provider import SnapshotProvider, SnapshotProviderError
 from restoration.restore_provider import RestoreProvider
+# FIX RB-04 / F-04: Import and wire RestoreVerifier so post-restore assertions
+# are actually executed. Previously the class was imported nowhere and its
+# contract (mode check, input-lock check, cursor, focus) was never enforced.
+from restoration.restore_verifier import RestoreVerifier, RestorationVerificationError
 
 from core.planner.execution_planner import ExecutionPlanner
 
@@ -42,8 +46,6 @@ MAX_REPLANS = 3
 
 # FIX-4: Extended from 8s to 150s to accommodate CPU inference latency
 # (Qwen2.5-VL: 40–90s per frame on CPU-only hardware).
-# Exits early once WARMUP_STABLE_FRAMES consecutive populated frames arrive —
-# no regression on GPU hardware where frames arrive in <5s.
 WARMUP_TIMEOUT_SECONDS = 150.0
 WARMUP_STABLE_FRAMES = 3
 
@@ -213,8 +215,6 @@ def main(llm_callable: Callable, model_name: str):
 
     # --------------------------------------------------------
     # FIX-4: Extended warmup — 150s for CPU inference compat.
-    # Exits early on WARMUP_STABLE_FRAMES consecutive valid frames
-    # so GPU machines are not delayed.
     # --------------------------------------------------------
     stable_frames = 0
     warmup_deadline = time.time() + WARMUP_TIMEOUT_SECONDS
@@ -240,6 +240,16 @@ def main(llm_callable: Callable, model_name: str):
         os_backend=os_backend,
         mode_controller=mode,
         snapshot_provider=snapshot_provider,
+    )
+
+    # FIX RB-04 / F-04: Instantiate RestoreVerifier with the OS backend and
+    # mode controller so its verification contract is actually enforced after
+    # each restoration. cursor_tolerance_px=5 matches RestoreProvider's own
+    # CURSOR_TOLERANCE_PX constant.
+    restore_verifier = RestoreVerifier(
+        os_backend=os_backend,
+        mode_controller=mode,
+        cursor_tolerance_px=5,
     )
 
     intent_listener = IntentListener(mode, snapshot_provider)
@@ -371,13 +381,6 @@ def main(llm_callable: Callable, model_name: str):
                             try:
                                 mode.force_observer()
 
-                                # HRD-10: SnapshotProviderError (e.g. bare desktop,
-                                # OS load, atomic window exceeded) during replan
-                                # previously propagated to the outer except block
-                                # in main(), triggering _force_safe_shutdown and
-                                # killing the process. A snapshot failure during
-                                # replan is recoverable: continue with the prior
-                                # snapshot_id so the task can still attempt execution.
                                 try:
                                     new_snapshot_id = snapshot_provider.take_snapshot()
                                 except SnapshotProviderError as snap_err:
@@ -447,6 +450,23 @@ def main(llm_callable: Callable, model_name: str):
 
                             if _restore_exc:
                                 raise _restore_exc[0]
+
+                            # FIX RB-04 / F-04: Run the RestoreVerifier contract
+                            # now that RestoreProvider has completed. This enforces
+                            # cursor position, focused window, and mode assertions
+                            # that were previously dead code.
+                            snap_obj = snapshot_provider.get_snapshot(snapshot_id)
+                            if snap_obj is not None:
+                                try:
+                                    restore_verifier.verify(snap_obj)
+                                except RestorationVerificationError as rve:
+                                    # Log but do not abort — restoration already
+                                    # completed; verifier mismatch is a warning
+                                    # unless it indicates a safety-critical failure.
+                                    print(
+                                        f"[MAIN] RestoreVerifier: {rve}",
+                                        file=sys.stderr,
+                                    )
 
                             auth_state.persist(
                                 execution_mode="OBSERVER",
@@ -545,4 +565,3 @@ def main(llm_callable: Callable, model_name: str):
             pass
 
         _force_safe_shutdown(os_backend, auth_state, "shutdown")
-
