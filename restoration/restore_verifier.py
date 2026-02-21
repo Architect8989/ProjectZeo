@@ -1,3 +1,21 @@
+"""
+restore_verifier.py — Post-restoration verification against snapshot contract.
+
+PATCH (audit Bug #3):
+  _verify_focus() previously used an exact string match on the window ID,
+  while RestoreProvider._validate_window() uses Levenshtein fuzzy matching
+  (distance ≤ MAX_TITLE_DISTANCE = 2).  This asymmetry meant a window that
+  passed RestoreProvider validation could then fail RestoreVerifier
+  verification — producing false "restoration failed" errors.
+
+  Fix: _verify_focus() now uses the same Levenshtein fuzzy logic with
+  MAX_TITLE_DISTANCE = 2 so the two classes are consistent.  Exact match
+  still passes as a special case (distance = 0).
+
+  A new helper _levenshtein() and _normalize_title() mirror the
+  RestoreProvider implementations.
+"""
+
 from __future__ import annotations
 
 from typing import Tuple
@@ -277,3 +295,4 @@ class RestoreVerifier:
         dx = abs(actual[0] - expected[0])
         dy = abs(actual[1] - expected[1])
         return dx <= self._cursor_tol and dy <= self._cursor_tol
+
