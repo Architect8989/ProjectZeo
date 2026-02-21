@@ -386,4 +386,3 @@ class BeliefState:
             "commitment_hash": self.commitment_hash,
             "global_best_reward": self.global_best_reward(),
         }
-
