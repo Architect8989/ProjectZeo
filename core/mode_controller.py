@@ -1,23 +1,3 @@
-"""
-core/mode_controller.py
-========================
-PATCHES APPLIED (Audit Fixes):
-
-  ✅  §R8  (was §mc-6): Added MAX_ARMED_SECONDS = 30.0 and check_armed_timeout()
-           method.  Previously the system could be stuck in ARMED indefinitely
-           if begin_planning() was never called (e.g. LLM callable unavailable).
-           check_armed_timeout() force-resets to OBSERVER and raises
-           ModeTransitionError so the main loop can recover cleanly.
-
-All existing correct behaviours preserved:
-  - 5-mode state machine: OBSERVER → ARMED → PLANNING → EXECUTING → RESTORING
-  - All transition guards (mode pre-conditions, vision/observer health checks)
-  - MAX_PLANNING_SECONDS = 60.0 planning timeout
-  - force_observer() emergency bypass
-  - Durable fsync'd transition log at logs/mode_transitions.jsonl
-  - MAX_TRANSITION_HISTORY = 2000 in-memory ring buffer
-"""
-
 import time
 import threading
 import json
@@ -62,7 +42,7 @@ class ModeController:
     MAX_PLANNING_SECONDS = 60.0
     MAX_PLAN_ID_LENGTH = 128
 
-    # PATCH §R8: ARMED mode timeout — prevents infinite ARMED stall
+    # §R8: ARMED mode timeout — prevents infinite ARMED stall
     MAX_ARMED_SECONDS = 30.0
 
     _MODULE_ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -268,24 +248,12 @@ class ModeController:
             ):
                 raise PlanningTimeoutError("Planning timeout exceeded")
 
-    # PATCH §R8: ARMED mode timeout guard
     def check_armed_timeout(self) -> None:
         """
         Detect and recover from infinite ARMED stall.
 
-        ARMED has no timeout by default — if begin_planning() is never called
-        (e.g. LLM callable unavailable, internal error before planner construction)
-        the system silently sits in ARMED until the process is killed.
-
-        This method is called from the main heartbeat loop alongside
-        check_planning_timeout(). On timeout it force-resets to OBSERVER
-        and raises ArmedTimeoutError so the main loop can log and recover.
-
-        DEF-5 FIX: The decision to raise ArmedTimeoutError is captured as a
-        boolean flag INSIDE the lock, so no other thread can race between the
-        lock release and the raise. Previously the check was performed outside
-        the lock, which could cause the raise to be skipped or to misfire if
-        another thread changed _mode or _failure_reason between the two reads.
+        DEF-5 FIX preserved: raise decision captured inside the lock so no
+        thread can race between the lock release and the raise.
         """
         _should_raise = False
         _elapsed = 0.0
@@ -296,7 +264,6 @@ class ModeController:
 
             _elapsed = time.time() - self._mode_entered_at
             if _elapsed > self.MAX_ARMED_SECONDS:
-                # Force reset to OBSERVER inside the lock so no race is possible
                 self._input_locked = False
                 self._snapshot_id = None
                 self._snapshot_consumed = False
@@ -312,14 +279,11 @@ class ModeController:
                 self._commit_transition(
                     SystemMode.OBSERVER,
                     f"armed_timeout_recovery (elapsed={_elapsed:.1f}s)",
-                    True,  # forced=True
+                    True,
                 )
 
-                # Capture raise decision while still holding the lock — DEF-5
                 _should_raise = True
 
-        # Raise OUTSIDE the lock (never hold a lock across exception raise),
-        # but the decision was made atomically inside it — no race possible.
         if _should_raise:
             raise ArmedTimeoutError(
                 f"ARMED mode timed out after {self.MAX_ARMED_SECONDS}s — "
@@ -428,6 +392,13 @@ class ModeController:
 
         self._transition_history.append(entry)
 
+        # FIX F-03 / RB-08: Always close the file descriptor in a finally block.
+        # Previously, if os.write() or os.fsync() raised (e.g. disk full), the
+        # fd was never closed, leaking a file descriptor on every transition.
+        # Under adversarial disk-full conditions this would exhaust the system fd
+        # limit, silently breaking all further transition logging.
+        fd = None
+        dir_fd = None
         try:
             fd = os.open(
                 self.TRANSITION_LOG_PATH,
@@ -436,17 +407,29 @@ class ModeController:
             )
             os.write(fd, (json.dumps(entry, sort_keys=True) + "\n").encode())
             os.fsync(fd)
-            os.close(fd)
+        except Exception:
+            pass
+        finally:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except Exception:
+                    pass
 
+        try:
             dir_fd = os.open(
                 str(self.TRANSITION_LOG_PATH.parent),
                 os.O_RDONLY,
             )
             os.fsync(dir_fd)
-            os.close(dir_fd)
-
         except Exception:
             pass
+        finally:
+            if dir_fd is not None:
+                try:
+                    os.close(dir_fd)
+                except Exception:
+                    pass
 
     # ==================================================
     # EMERGENCY RECOVERY
@@ -461,8 +444,7 @@ class ModeController:
           - replan sequences that must restart from a clean slate
           - ARMED timeout recovery (check_armed_timeout)
 
-        This method MUST NOT raise. Any downstream code that depends on
-        normal guard semantics must handle the resulting OBSERVER state.
+        This method MUST NOT raise.
         """
         with self._lock:
             self._input_locked = False
@@ -480,7 +462,7 @@ class ModeController:
             self._commit_transition(
                 SystemMode.OBSERVER,
                 "forced_observer_recovery",
-                True,  # forced=True — recorded in transition log
+                True,
             )
 
     # ==================================================
