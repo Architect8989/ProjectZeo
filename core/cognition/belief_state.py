@@ -20,6 +20,11 @@ class BeliefState:
     NORMALIZE_EPS = 1e-8
     REWARD_CLAMP = 3.0
 
+    # FIX H-10: probability below which __prior_fallback__ is pruned after
+    # each update cycle to prevent indefinite accumulation of the injected
+    # anti-collapse state.
+    _FALLBACK_PRUNE_THRESHOLD = PRIOR_ALPHA * 2.0
+
     def __init__(self):
         self.created_at = time.time()
         self.state_probabilities: Dict[str, float] = {"neutral": 1.0}
@@ -72,8 +77,7 @@ class BeliefState:
         # HRD-06: Entropy floor blending is inoperative for single-state beliefs
         # because 0.95×1.0 + 0.05×1.0 = 1.0 regardless of the blend. When
         # pruning collapses belief to a single state, inject a minimum second
-        # state at PRIOR_ALPHA probability before normalizing. This prevents
-        # complete probability collapse and ensures the entropy floor can work.
+        # state at PRIOR_ALPHA probability so the entropy floor can work.
         if len(pruned) == 1:
             (sole_state,) = pruned.keys()
             pruned["__prior_fallback__"] = self.PRIOR_ALPHA
@@ -89,6 +93,29 @@ class BeliefState:
             }
             total = sum(blended.values())
             self.state_probabilities = {k: v / total for k, v in blended.items()}
+
+        # FIX H-10: Prune __prior_fallback__ once its probability falls below
+        # the prune threshold. Without this, the fallback state accumulates
+        # across hundreds of updates — it can never be eliminated by the pruning
+        # logic above because it is re-injected every time the belief collapses
+        # to a single state. As the real distribution grows richer, the fallback
+        # probability decays toward PRIOR_ALPHA / (N * PRIOR_ALPHA + 1) but
+        # never reaches zero, permanently biasing entropy readings upward.
+        #
+        # Prune it explicitly when it is safely below 2×PRIOR_ALPHA — at that
+        # probability it contributes less than 0.02 nats to entropy (~0.1% of
+        # a uniform-2 distribution), making its removal statistically negligible.
+        fallback_prob = self.state_probabilities.get("__prior_fallback__", 0.0)
+        if 0.0 < fallback_prob <= self._FALLBACK_PRUNE_THRESHOLD:
+            pruned_dist = {
+                k: v for k, v in self.state_probabilities.items()
+                if k != "__prior_fallback__"
+            }
+            if pruned_dist:
+                # Re-normalise after removal
+                total = sum(pruned_dist.values())
+                if total > 0:
+                    self.state_probabilities = {k: v / total for k, v in pruned_dist.items()}
 
     def entropy(self) -> float:
         return -sum(
@@ -112,12 +139,8 @@ class BeliefState:
         return mean - self.RISK_LAMBDA * variance
 
     def ucb_score(self, action: str) -> float:
-        # HRD-09: On the very first call, sum(action_counts.values()) == 0,
-        # so total_actions = 1, math.log(1) = 0, exploration = 0.0 for ALL
-        # actions. UCB is a dead term on the first iteration, providing no
-        # exploration bonus. Fix: clamp total_actions to ≥ 2 so log() is
-        # always positive, giving a non-zero exploration bonus even before
-        # any actions have been tried.
+        # HRD-09: clamp total_actions ≥ 2 so log() is always positive,
+        # giving a non-zero exploration bonus even before any actions are tried.
         total_actions = max(sum(self.action_counts.values()) + 1, 2)
         count = self.action_counts.get(action, 0) + 1
         rewards = self.action_rewards.get(action)
@@ -139,8 +162,14 @@ class BeliefState:
         if not rewards:
             return 0.5
 
-        # Convert normalized reward signal into pseudo success probability
-        # Clamp to [-CLAMP, +CLAMP], map to [0,1]
+        # Map normalized reward signal to Beta distribution parameters.
+        # MATH-08 note: rewards in the deque are a mix of raw values (first
+        # 1–2 samples, clamped to ±REWARD_CLAMP) and z-score-normalized values
+        # (samples 3+, also clamped). Both are in the range [-3.0, +3.0], so
+        # the scaling to [0, 1] via (r + 3.0) / 6.0 is valid for both regimes.
+        # The scale discontinuity at sample 3 affects early Beta shape but not
+        # the long-run mean — both raw and normalized signals center near 0 for
+        # neutral actions.
         scaled = [(r + self.REWARD_CLAMP) / (2 * self.REWARD_CLAMP) for r in rewards]
         scaled = [min(1.0, max(0.0, v)) for v in scaled]
 
@@ -175,6 +204,22 @@ class BeliefState:
         return min(decayed, self.MAX_REGRET)
 
     def update_regret(self, action: str, reward: float, best_reward: float):
+        """
+        Update regret for this action.
+
+        Parameters
+        ----------
+        action : str
+            The action key that was taken.
+        reward : float
+            The normalized reward received for this action (post-window).
+        best_reward : float
+            FIX H-02 / MATH-09: The CROSS-ACTION best reward observed in the
+            current session — i.e. max over all actions' reward histories, not
+            just the self-history of this action. Callers (operate.py) are
+            responsible for computing this correctly. See operate.py for the
+            corrected computation.
+        """
         self._iteration_counter += 1
 
         regret_value = best_reward - reward
@@ -198,12 +243,8 @@ class BeliefState:
         history = self.action_rewards[action]
 
         if history:
-            # HRD-05: With only one prior sample, variance = 0, std ≈ 0.0001
-            # (from the NORMALIZE_EPS floor). Any non-zero r1 produces a
-            # z-score of thousands, immediately clamped to ±REWARD_CLAMP.
-            # This biases early reward distribution toward ±3.0 regardless
-            # of actual outcome quality. Guard: skip z-score normalization
-            # until we have at least 3 samples for a stable variance estimate.
+            # HRD-05: Skip z-score normalization until ≥ 3 samples to avoid
+            # extreme z-scores from near-zero variance with 1–2 samples.
             if len(history) >= 3:
                 mean = sum(history) / len(history)
                 variance = sum((r - mean) ** 2 for r in history) / len(history)
@@ -218,6 +259,28 @@ class BeliefState:
 
         history.append(normalized)
         self.action_counts[action] = self.action_counts.get(action, 0) + 1
+
+    # =========================================================
+    # GLOBAL BEST REWARD (for correct regret computation)
+    # =========================================================
+
+    def global_best_reward(self) -> float:
+        """
+        FIX H-02 / MATH-09: Return the best reward seen across ALL actions in
+        the current session's sliding window.
+
+        Callers should use this value as best_reward in update_regret() to
+        compute true opportunity cost (regret = best_possible - chosen),
+        not just the self-history max which makes regret near-zero for any
+        action that has ever succeeded once.
+
+        Returns 0.0 if no actions have been recorded yet.
+        """
+        best = 0.0
+        for history in self.action_rewards.values():
+            if history:
+                best = max(best, max(history))
+        return best
 
     # =========================================================
     # ENVIRONMENT MODEL
@@ -321,5 +384,5 @@ class BeliefState:
             "progress_score": self.progress_score,
             "environment_stability": self.environment_stability,
             "commitment_hash": self.commitment_hash,
+            "global_best_reward": self.global_best_reward(),
         }
-
