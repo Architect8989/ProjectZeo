@@ -264,12 +264,29 @@ class StepVerifier:
         if not tool:
             return False, "tool missing", {}
 
-        tool_path = shutil.which(tool)
+        # FIX-02 (RTB-02): step.action["tool"] is the full tool spec dict
+        # (e.g. {"name": "node", "official_url": ..., ...}), not a bare string.
+        # shutil.which() requires a str — passing the dict raises TypeError,
+        # which was caught by the outer except and returned confidence=0.0,
+        # causing every TOOL_INSTALLATION verification to fail unconditionally.
+        if isinstance(tool, dict):
+            tool_name = tool.get("name")
+            if not isinstance(tool_name, str) or not tool_name.strip():
+                return False, "tool name missing or invalid", {}
+            tool_name = tool_name.strip()
+        elif isinstance(tool, str):
+            tool_name = tool.strip()
+            if not tool_name:
+                return False, "tool name empty", {}
+        else:
+            return False, f"tool has unexpected type: {type(tool).__name__}", {}
+
+        tool_path = shutil.which(tool_name)
 
         if not tool_path:
-            return False, "tool not found", {}
+            return False, f"tool '{tool_name}' not found on PATH", {"tool_name": tool_name}
 
-        return True, "", {"tool_path": tool_path}
+        return True, "", {"tool_name": tool_name, "tool_path": tool_path}
 
     # =================================================
     # UI VERIFICATION (CAUSAL + STRICT)
@@ -309,3 +326,4 @@ class StepVerifier:
                 pass
 
         return False, "no UI evidence detected", {}
+
