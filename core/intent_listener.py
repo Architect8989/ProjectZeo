@@ -1,25 +1,3 @@
-"""
-core/intent_listener.py
-========================
-PATCH AUDIT FIX:
-
-  ⚠️  §1.7: INTENT_FILE = "/tmp/projectzeo.intent" is hardcoded to Linux /tmp.
-            On macOS the default temp dir is /var/folders/... and on Windows
-            it is %TEMP% — the hardcoded path fails silently on non-Linux hosts.
-            FIX: Use tempfile.gettempdir() to resolve the platform's temp dir
-            at runtime, giving "/<tmpdir>/projectzeo.intent" cross-platform.
-            The file-security checks (uid match, mode 0o077 mask, symlink guard)
-            are preserved — they degrade gracefully on Windows where os.getuid()
-            is unavailable (returns None → uid check is skipped safely).
-
-  ✅  All existing correct behaviours preserved:
-        - Non-blocking stdin poll via select.select()
-        - O_NOFOLLOW symlink guard
-        - INTENT_MAX_BYTES=4096 ceiling
-        - Auto-delete after successful read
-        - 100ms poll interval
-"""
-
 from __future__ import annotations
 
 import threading
@@ -159,8 +137,18 @@ class IntentListener:
             if current_uid is not None and st.st_uid != current_uid:
                 return None
 
-            # Permission check: file must not be world/group readable
-            if (st.st_mode & 0o077) != 0:
+            # FIX-03 (RTB-07): The original check `(st.st_mode & 0o077) != 0`
+            # rejected any file with group or world read permissions. On Linux,
+            # the default umask is 0o022, producing mode 0o644 (group-readable).
+            # This caused intent files written with the default umask to be
+            # silently consumed and discarded — the user's intent was lost with
+            # no diagnostic. The README documented no chmod 600 requirement.
+            #
+            # Revised policy: only reject files that are world-writable (0o002)
+            # or group-writable (0o020), which are genuine privilege-escalation
+            # risks. Group-readable (0o040) and world-readable (0o004) files
+            # are accepted, consistent with the default umask on most systems.
+            if (st.st_mode & 0o022) != 0:
                 return None
 
             if st.st_size <= 0 or st.st_size > self.INTENT_MAX_BYTES:
@@ -191,3 +179,4 @@ class IntentListener:
 
         intent = data.strip()
         return intent if intent else None
+
