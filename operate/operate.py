@@ -303,11 +303,35 @@ def _execute_autonomous_loop(
                     installer=installer,
                 )
 
-            # PATCH §1.11: capture command output into execution_log
-            if selected_action.get("operation") == "command" and isinstance(result, dict):
-                stdout = str(result.get("stdout", ""))[:MAX_COMMAND_OUTPUT_BYTES]
-                stderr = str(result.get("stderr", ""))[:MAX_COMMAND_OUTPUT_BYTES]
-                exit_code = result.get("returncode", result.get("exit_code"))
+            # FIX-04 (RTB-03): os_backend.run_command() returns
+            # subprocess.CompletedProcess, not a dict. The original guard
+            # `isinstance(result, dict)` was always False for command steps,
+            # so execution_log was never populated and command output was
+            # never visible to the LLM in subsequent planning steps.
+            if selected_action.get("operation") == "command":
+                if isinstance(result, dict):
+                    stdout = str(result.get("stdout", ""))[:MAX_COMMAND_OUTPUT_BYTES]
+                    stderr = str(result.get("stderr", ""))[:MAX_COMMAND_OUTPUT_BYTES]
+                    exit_code = result.get("returncode", result.get("exit_code"))
+                elif hasattr(result, "stdout"):
+                    # subprocess.CompletedProcess — decode bytes if needed
+                    _stdout_raw = result.stdout
+                    _stderr_raw = result.stderr
+                    stdout = (
+                        _stdout_raw.decode("utf-8", errors="replace")
+                        if isinstance(_stdout_raw, bytes)
+                        else str(_stdout_raw or "")
+                    )[:MAX_COMMAND_OUTPUT_BYTES]
+                    stderr = (
+                        _stderr_raw.decode("utf-8", errors="replace")
+                        if isinstance(_stderr_raw, bytes)
+                        else str(_stderr_raw or "")
+                    )[:MAX_COMMAND_OUTPUT_BYTES]
+                    exit_code = getattr(result, "returncode", None)
+                else:
+                    stdout = stderr = ""
+                    exit_code = None
+
                 execution_log[current_step_index] = {
                     "command": selected_action.get("command", ""),
                     "stdout": stdout,
