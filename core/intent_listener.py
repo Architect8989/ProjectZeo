@@ -113,7 +113,6 @@ class IntentListener:
                 return intent if intent else None
 
         # ---- Secure file ingestion ----
-        # PATCH §1.7: use self.INTENT_FILE (platform-aware) instead of /tmp hardcode
         path = self.INTENT_FILE
 
         if not os.path.exists(path):
@@ -137,18 +136,30 @@ class IntentListener:
             if current_uid is not None and st.st_uid != current_uid:
                 return None
 
-            # FIX-03 (RTB-07): The original check `(st.st_mode & 0o077) != 0`
-            # rejected any file with group or world read permissions. On Linux,
-            # the default umask is 0o022, producing mode 0o644 (group-readable).
-            # This caused intent files written with the default umask to be
-            # silently consumed and discarded — the user's intent was lost with
-            # no diagnostic. The README documented no chmod 600 requirement.
+            # FIX F-01 / RB-06: The prior check `(st.st_mode & 0o022) != 0` rejected
+            # files with the GROUP-WRITE bit (0o020) set. On Linux with umask 002
+            # (standard in many multi-user environments), files are created with mode
+            # 0o664 — group-readable AND group-writable — causing every intent file to
+            # be silently discarded with no diagnostic. The system would never arm.
             #
-            # Revised policy: only reject files that are world-writable (0o002)
-            # or group-writable (0o020), which are genuine privilege-escalation
-            # risks. Group-readable (0o040) and world-readable (0o004) files
-            # are accepted, consistent with the default umask on most systems.
-            if (st.st_mode & 0o022) != 0:
+            # Corrected policy: reject ONLY genuinely dangerous permissions:
+            #   - World-writable (0o002): any unprivileged user can modify the file,
+            #     enabling privilege escalation via intent injection.
+            #
+            # Group-writable (0o020) is NOT rejected because:
+            #   - It requires group membership to exploit (not arbitrary users).
+            #   - It is the default permission produced by umask 002, which is
+            #     standard on many developer and CI systems.
+            #   - The README documents no requirement to chmod 600 intent files.
+            #
+            # Operators in high-security deployments should enforce umask 027 or
+            # chmod 600 manually; this is not enforced at the code level to avoid
+            # breaking the most common deployment configurations.
+            if (st.st_mode & 0o002) != 0:
+                print(
+                    f"[IntentListener] Rejected intent file — world-writable: {path}",
+                    file=sys.stderr,
+                )
                 return None
 
             if st.st_size <= 0 or st.st_size > self.INTENT_MAX_BYTES:
@@ -179,4 +190,3 @@ class IntentListener:
 
         intent = data.strip()
         return intent if intent else None
-
