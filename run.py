@@ -1,24 +1,3 @@
-"""
-run.py
-=======
-PATCHES APPLIED (Audit Fixes):
-
-  ✅  §R1  (was §run-4): Dual-path async detection now catches only the
-           'no running event loop' RuntimeError, not ALL RuntimeErrors.
-           Genuine errors from asyncio.run() no longer re-route to the
-           thread path — they propagate correctly.
-
-  ✅  §R2  (was §run-5): The tuple/bare-list dual-path is preserved but
-           now documented explicitly. The adapter contract is enforced via
-           a clear check rather than implicit fallthrough.
-
-All existing correct behaviours preserved:
-  - Model resolution from CLI arg or LLM_MODEL env var
-  - LLM_THREAD_TIMEOUT_SECONDS from shared config
-  - Thread-isolated coroutine execution for nested event loops
-  - get_next_action() adapter interface enforcement
-"""
-
 import os
 import sys
 import asyncio
@@ -30,21 +9,51 @@ from main import main
 from config.timeouts import LLM_THREAD_TIMEOUT_SECONDS
 
 
-def resolve_model_name() -> str:
-    if len(sys.argv) > 1:
-        model = sys.argv[1].strip()
-        if model:
-            return model
+# ---------------------------------------------------------------------------
+# CLI ARGUMENT PARSING
+# ---------------------------------------------------------------------------
 
-    model = os.getenv("LLM_MODEL")
-    if model and model.strip():
-        return model.strip()
+def _parse_args():
+    """
+    Minimal argument parser. Does not use argparse to avoid extra deps.
 
-    raise RuntimeError(
-        "No model specified. "
-        "Pass model as CLI argument or set LLM_MODEL environment variable."
-    )
+    Recognised flags:
+        --allow-cloud   Permit cloud model names to be routed through
+                        PureLLMWrapper. Without this flag, only models
+                        registered in adapters/factory._LOCAL_REGISTRY
+                        are accepted. Default: DENIED.
 
+    Positional argument (required):
+        model_name      First non-flag argument is treated as the model name.
+                        Can also be supplied via LLM_MODEL env var.
+
+    Returns (model_name: str, allow_cloud: bool)
+    """
+    args = sys.argv[1:]
+    allow_cloud = "--allow-cloud" in args
+    positional = [a for a in args if not a.startswith("--")]
+
+    model: str | None = None
+    if positional:
+        model = positional[0].strip() or None
+
+    if not model:
+        model = os.getenv("LLM_MODEL", "").strip() or None
+
+    if not model:
+        raise RuntimeError(
+            "No model specified. "
+            "Pass model as CLI argument or set LLM_MODEL environment variable.\n"
+            "Example: python run.py qwen2.5-vl:7b-instruct\n"
+            "         LLM_MODEL=qwen2.5-vl:7b-instruct python run.py"
+        )
+
+    return model, allow_cloud
+
+
+# ---------------------------------------------------------------------------
+# THREAD-SAFE COROUTINE EXECUTOR
+# ---------------------------------------------------------------------------
 
 def _run_coroutine_threadsafe(coro) -> Any:
     """
@@ -75,14 +84,17 @@ def _run_coroutine_threadsafe(coro) -> Any:
     return result_container.get("result")
 
 
+# ---------------------------------------------------------------------------
+# LLM CALLABLE FACTORY
+# ---------------------------------------------------------------------------
+
 def _make_llm_callable(adapter):
     """
     Wrap async adapter into a safe synchronous callable
     compatible with ExecutionPlanner.
 
-    PATCH §R1: asyncio.get_running_loop() catch now only re-routes on
-    the specific 'no current event loop' RuntimeError.  All other errors
-    propagate normally so genuine failures are not swallowed.
+    PATCH §R1: asyncio.get_running_loop() catch only re-routes on
+    the specific RuntimeError from no running loop. Genuine errors propagate.
     """
 
     if not hasattr(adapter, "get_next_action"):
@@ -98,13 +110,11 @@ def _make_llm_callable(adapter):
             )
 
         try:
-            # PATCH §R1: detect running loop safely, then isolate
             _inside_loop = False
             try:
                 asyncio.get_running_loop()
                 _inside_loop = True
             except RuntimeError:
-                # No running loop — safe to use asyncio.run() directly
                 _inside_loop = False
 
             if _inside_loop:
@@ -115,13 +125,12 @@ def _make_llm_callable(adapter):
         except Exception as e:
             raise RuntimeError(f"LLM adapter invocation failed: {e}") from e
 
-        # PATCH §R2: explicit contract — adapter returns (ops, err) tuple OR bare list
+        # PATCH §R2: explicit contract enforcement
         if isinstance(result, tuple) and len(result) == 2:
             ops, err = result
             if err:
                 raise RuntimeError(f"LLM adapter error: {err}")
         elif isinstance(result, list):
-            # Bare list return — treat as ops with no error
             ops = result
         else:
             raise RuntimeError(
@@ -137,8 +146,32 @@ def _make_llm_callable(adapter):
     return _call
 
 
+# ---------------------------------------------------------------------------
+# ENTRY POINT
+# ---------------------------------------------------------------------------
+
 if __name__ == "__main__":
-    model_name = resolve_model_name()
+    model_name, allow_cloud = _parse_args()
+
+    # FIX F-02: Persist the resolved model name into the environment so that
+    # all downstream text-only Ollama calls (ExecutionPlanner._call_llm_text,
+    # _decompose_if_complex) see the operator-specified model instead of the
+    # hardcoded fallback "qwen2.5-vl:7b-instruct".
+    os.environ["LLM_MODEL"] = model_name
+
+    # FIX H-01: Enforce OLLAMA_ONLY by default unless --allow-cloud was given.
+    # The factory checks this env var before routing to PureLLMWrapper.
+    if not allow_cloud:
+        os.environ.setdefault("OLLAMA_ONLY", "1")
+    else:
+        # Explicit opt-in: unset the flag so the factory allows cloud routing.
+        os.environ.pop("OLLAMA_ONLY", None)
+        print(
+            "[run.py] WARNING: --allow-cloud is set. Cloud API routing is ENABLED. "
+            "Ensure API keys are intentionally configured.",
+            file=sys.stderr,
+        )
+
     adapter = build_llm(model_name)
     llm_callable = _make_llm_callable(adapter)
     main(llm_callable, model_name=model_name)
