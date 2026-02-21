@@ -1,17 +1,8 @@
-"""
-Restoration Snapshot Types
-
-Authoritative immutable structures describing pre-hijack workspace state.
-
-NO OS logic.
-NO restoration logic.
-Pure contract objects.
-"""
-
 from __future__ import annotations
 
+import hashlib
+import json
 import time
-import uuid
 from dataclasses import dataclass, field
 from typing import Optional, Dict, Any
 
@@ -81,6 +72,43 @@ class RestorationSnapshot:
     # ----------------------------
 
     @staticmethod
+    def _derive_snapshot_id(
+        *,
+        cursor: CursorState,
+        focus: FocusState,
+        application: ApplicationState,
+        execution_mode: str,
+        captured_at: float,
+    ) -> str:
+        """
+        FIX H-07: Generate a deterministic content-addressed snapshot ID.
+
+        The ID is SHA-256 of the canonical JSON representation of the core
+        snapshot fields. This replaces uuid.uuid4() which produced random IDs
+        that broke commitment chain reproducibility across restarts.
+
+        Fields included: cursor (x, y), focus (window_id), application
+        (process_name), execution_mode, captured_at (rounded to millisecond
+        to avoid float representation drift between Python versions).
+        """
+        canonical = json.dumps(
+            {
+                "cursor_x": cursor.x,
+                "cursor_y": cursor.y,
+                "window_id": focus.window_id,
+                "process_name": application.process_name,
+                "execution_mode": execution_mode,
+                # Round to nearest millisecond to avoid cross-platform float drift
+                "captured_at_ms": round(captured_at * 1000),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        # Use first 32 hex chars (128 bits) — negligible collision risk
+        return digest[:32]
+
+    @staticmethod
     def create(
         *,
         cursor: CursorState,
@@ -90,9 +118,19 @@ class RestorationSnapshot:
         metadata: Optional[Dict[str, Any]] = None,
     ) -> "RestorationSnapshot":
 
+        captured_at = time.time()
+
+        snapshot_id = RestorationSnapshot._derive_snapshot_id(
+            cursor=cursor,
+            focus=focus,
+            application=application,
+            execution_mode=execution_mode,
+            captured_at=captured_at,
+        )
+
         snapshot = RestorationSnapshot(
-            snapshot_id=str(uuid.uuid4()),
-            captured_at=time.time(),
+            snapshot_id=snapshot_id,
+            captured_at=captured_at,
             cursor=cursor,
             focus=focus,
             application=application,
@@ -146,4 +184,5 @@ class RestorationSnapshot:
                 "pid": self.application.pid,
             },
             "metadata": dict(self.metadata),
-                }
+        }
+
