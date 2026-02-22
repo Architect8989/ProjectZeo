@@ -34,7 +34,7 @@ class InstallationError(RuntimeError):
 #   _LINUX_HAS_APT = bool(shutil.which("apt-get"))
 # This caused the lookup table to permanently reflect the pre-install
 # state.  If apt-get is installed mid-session (unusual but possible),
-# the table would still claim it'silable.
+# the table would still claim it's unavailable.
 #
 # Fix: wrap detection in a function that is called at install time,
 # not at import time.
