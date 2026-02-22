@@ -495,12 +495,34 @@ def main(llm_callable: Callable, model_name: str):
                                 try:
                                     restore_verifier.verify(snap_obj)
                                 except RestorationVerificationError as rve:
-                                    # Log but do not abort — restoration already
-                                    # completed; verifier mismatch is a warning
-                                    # unless it indicates a safety-critical failure.
+                                    # FIX H1: Restoration verification failure is
+                                    # now a HARD FAILURE, not a warning.
+                                    #
+                                    # The system claimed "deterministic verification
+                                    # (fail-closed)" but the original code caught
+                                    # RestorationVerificationError, printed a warning,
+                                    # and continued execution — silently ignoring that
+                                    # the post-restore workspace state does not match
+                                    # the pre-task snapshot.
+                                    #
+                                    # Fix: print a HARD FAILURE message and re-raise.
+                                    # The re-raised exception propagates to the outer
+                                    # "except Exception as cleanup_err" block, which
+                                    # calls _force_safe_shutdown() — the same path as
+                                    # any other restoration failure. The system is now
+                                    # actually fail-closed.
+                                    #
+                                    # Note: restoration itself already completed
+                                    # (cursor moved, window focused). Verification
+                                    # failure means the post-restore state does not
+                                    # match expectations — a genuine anomaly that must
+                                    # not be swallowed.
                                     print(
-                                        f"[MAIN] RestoreVerifier: {rve}",
+                                        f"[MAIN] RestoreVerifier HARD FAILURE: {rve}",
                                         file=sys.stderr,
+                                    )
+                                    raise RestorationVerificationError(
+                                        f"Post-restore verification failed: {rve}"
                                     )
 
                             auth_state.persist(
