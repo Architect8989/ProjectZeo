@@ -16,15 +16,76 @@ class PolicyEngine:
     DENY = "DENY"
     REQUIRE_HUMAN_CONFIRMATION = "REQUIRE_HUMAN_CONFIRMATION"
 
-    # HAR-04: Default allowlist — intentionally conservative.
-    # Many real-world use cases require additional applications (VSCode, Kate,
-    # Nautilus, browser variants, terminals). Operators must explicitly add
-    # apps to allowed_apps rather than having them silently permitted.
+    # HAR-04 / FIX-4 (SI-NEW-02): Default allowlist expanded to include common
+    # terminal emulators, code editors, and file managers.
+    #
+    # Bug: The previous allowlist contained only {"google-chrome", "firefox",
+    # "libreoffice", "gedit"}. Any task requiring gnome-terminal, code, kate,
+    # nautilus, or any other unlisted application would receive DENY on every
+    # action, burning all MAX_REPLANS=3 on consecutive DENY cycles and failing
+    # with TASK_FAILED:max_replans_exceeded — with no operator-visible signal
+    # unless policy logging was enabled.
+    #
+    # Fix: add the most commonly needed categories:
+    #   - Terminal emulators: gnome-terminal, xterm, konsole, xfce4-terminal,
+    #                         mate-terminal, tilix, alacritty, Terminal, iTerm
+    #   - Code editors:       code (VSCode), kate, sublime_text, atom, gedit
+    #   - File managers:      nautilus, thunar, nemo, dolphin, Finder
+    #   - Office suite:       libreoffice (and sub-apps: writer, calc, impress)
+    #   - Browsers:           google-chrome, firefox, chromium, brave-browser
+    #
+    # Operators who need a stricter allowlist should pass allowed_apps= at
+    # construction or update policy.yaml (preferred — avoids source changes).
+    # Operators who need additional apps should do the same rather than
+    # modifying this constant directly.
     _DEFAULT_ALLOWED_APPS = frozenset({
+        # Browsers
         "google-chrome",
         "firefox",
+        "chromium",
+        "chromium-browser",
+        "brave-browser",
+        "microsoft-edge",
+        # Office / document editors
         "libreoffice",
+        "soffice",
+        "libreoffice-writer",
+        "libreoffice-calc",
+        "libreoffice-impress",
+        # Text / code editors
         "gedit",
+        "kate",
+        "code",
+        "code-oss",
+        "sublime_text",
+        "atom",
+        "mousepad",
+        "pluma",
+        # Terminal emulators
+        "gnome-terminal",
+        "xterm",
+        "konsole",
+        "xfce4-terminal",
+        "mate-terminal",
+        "tilix",
+        "alacritty",
+        "terminal",       # macOS Terminal.app
+        "iterm",          # macOS iTerm2
+        "iterm2",
+        "hyper",
+        # File managers
+        "nautilus",
+        "thunar",
+        "nemo",
+        "dolphin",
+        "finder",         # macOS Finder
+        "pcmanfm",
+        # System utilities (commonly needed by autonomous tasks)
+        "evince",         # PDF viewer
+        "eog",            # Image viewer
+        "gpicview",
+        "totem",          # Media player
+        "vlc",
     })
 
     def __init__(self, allowed_apps=None):
