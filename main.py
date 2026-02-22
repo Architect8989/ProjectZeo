@@ -38,6 +38,24 @@ from restoration.restore_verifier import RestoreVerifier, RestorationVerificatio
 from core.planner.execution_planner import ExecutionPlanner
 
 
+def _shutdown_executor(executor, wait: bool = False) -> None:
+    """
+    RB-08 FIX: Python 3.8 compatibility for ThreadPoolExecutor.shutdown().
+
+    The cancel_futures parameter was added in Python 3.9. Calling
+    executor.shutdown(wait=False, cancel_futures=True) on Python 3.8 raises
+    TypeError: shutdown() got an unexpected keyword argument 'cancel_futures'.
+
+    This helper calls shutdown() with cancel_futures only when the runtime
+    supports it (Python >= 3.9); falls back to shutdown(wait=wait) on 3.8.
+    """
+    if sys.version_info >= (3, 9):
+        executor.shutdown(wait=wait, cancel_futures=True)
+    else:
+        executor.shutdown(wait=wait)
+
+
+
 # PATCH §1.5: reduced from 2.0s to 0.25s for lower intent-to-task latency
 HEARTBEAT_INTERVAL = 0.25
 
@@ -325,9 +343,7 @@ def main(llm_callable: Callable, model_name: str):
                 # GAP-3 FIX: shutdown previous planner executor before replacing
                 if _current_planner is not None:
                     try:
-                        _current_planner._executor.shutdown(
-                            wait=False, cancel_futures=True
-                        )
+                        _shutdown_executor(_current_planner._executor, wait=False)
                     except Exception:
                         pass
 
@@ -603,7 +619,7 @@ def main(llm_callable: Callable, model_name: str):
         # GAP-3: shutdown last active planner executor on exit
         if _current_planner is not None:
             try:
-                _current_planner._executor.shutdown(wait=False, cancel_futures=True)
+                _shutdown_executor(_current_planner._executor, wait=False)
             except Exception:
                 pass
         try:
