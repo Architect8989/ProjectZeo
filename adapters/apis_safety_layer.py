@@ -282,27 +282,29 @@ def _disable_screenshot_writes():
                 f"[APIS-SAFETY] Failed to patch PIL save: {e}"
             )
 
-    # ---- Guard builtins.open GLOBALLY ----
-    # SI-02 FIX: Install guarded_open on builtins.open, not just on the
-    # legacy module's namespace attribute.
+    # ---- Guard builtins.open with frame inspection ----
+    # HARDEN-2 (SI-NEW-01): Install guarded_open on builtins.open, but scope
+    # the interception to calls that originate from within the operate apis
+    # modules (operate.legacy.apis, operate.models.apis).
     #
-    # Bug: The previous code set `legacy.open = guarded_open`, which only
-    # intercepts calls that explicitly use `legacy.open(...)`. All Python
-    # modules that call the built-in `open()` directly (which is every module
-    # by default) bypass this guard entirely — it never fires.
+    # The previous implementation blocked ALL process-wide open() calls to
+    # paths containing "screenshot" regardless of call origin. This caused:
+    #   - Legitimate writes to paths like "screenshots/log.txt" to silently fail
+    #   - Any directory named "screenshot" to be write-blocked system-wide
+    #   - No timeout or scope limit — permanent process-wide side effect
     #
-    # Root cause: Python name resolution for `open` in any module goes to
-    # builtins.open unless the module explicitly defines or imports a local
-    # `open`. Setting a module-level attribute has no effect on how other
-    # modules resolve `open`.
+    # Fix: use inspect.stack() to check the call origin before blocking. Only
+    # calls where any frame's module name matches the operate apis pattern are
+    # intercepted. All other callers pass through to the real open() unchanged.
+    # This preserves the safety invariant while eliminating false-positive blocks
+    # on legitimate writes from unrelated code.
     #
-    # Fix: patch builtins.open directly. This intercepts ALL open() calls
-    # across the entire process, regardless of which module makes them.
-    # We store the original as _real_open and restore it in a matching
-    # uninstall() function for testability and cleanup.
-    #
-    # Safety: guarded_open only blocks writes to paths that look like
-    # screenshot files. All other open() calls pass through unchanged.
+    # Performance note: inspect.stack() is O(depth) per open() call, which is
+    # acceptable because guarded_open is only reached after the path-substring
+    # check (cheap) and the mode-write check (cheap) both pass. The full stack
+    # walk only runs for write opens to screenshot-like paths — a rare event in
+    # production. In tests with many open() calls on non-screenshot paths the
+    # overhead is zero (early return before inspect.stack()).
     import builtins as _builtins_mod
     _real_open = getattr(_builtins_mod, "_original_open_pre_safety_patch", None)
     if _real_open is None:
@@ -310,15 +312,42 @@ def _disable_screenshot_writes():
         _real_open = _builtins_mod.open
         _builtins_mod._original_open_pre_safety_patch = _real_open
 
+    # Modules whose open() calls should be subject to screenshot-write blocking.
+    _APIS_MODULE_PATTERNS = (
+        "operate.legacy.apis",
+        "operate.models.apis",
+        "operate/legacy/apis",
+        "operate/models/apis",
+    )
+
     def guarded_open(file, mode="r", *args, **kwargs):
-        if "w" in str(mode) or "a" in str(mode) or "x" in str(mode):
-            if _is_screenshot_path(file):
-                raise RuntimeError(
-                    "[APIS-SAFETY] Screenshot file write blocked"
-                )
+        # Fast path: not a write mode → pass through immediately
+        if not ("w" in str(mode) or "a" in str(mode) or "x" in str(mode)):
+            return _real_open(file, mode, *args, **kwargs)
+        # Fast path: not a screenshot-like path → pass through immediately
+        if not _is_screenshot_path(file):
+            return _real_open(file, mode, *args, **kwargs)
+        # Slow path: write to a screenshot-like path — check call origin.
+        # Only block if the call originates from within the operate apis modules.
+        try:
+            stack = inspect.stack()
+            for frame_info in stack:
+                filename = frame_info.filename or ""
+                module = (frame_info.frame.f_globals.get("__name__") or "")
+                if any(pat in filename or pat in module for pat in _APIS_MODULE_PATTERNS):
+                    raise RuntimeError(
+                        "[APIS-SAFETY] Screenshot file write blocked "
+                        f"(origin: {module or filename})"
+                    )
+        except RuntimeError:
+            raise
+        except Exception:
+            # inspect.stack() failure — fail open (don't block unrelated code)
+            pass
         return _real_open(file, mode, *args, **kwargs)
 
-    # Install on builtins so ALL modules are covered
+    # Install on builtins so ALL modules are covered, but only apis-origin
+    # screenshot writes are blocked (frame inspection above).
     if not getattr(_builtins_mod, "_safety_open_installed", False):
         _builtins_mod.open = guarded_open
         _builtins_mod._safety_open_installed = True
