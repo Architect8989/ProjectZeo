@@ -4,31 +4,13 @@ import logging
 _logger = logging.getLogger(__name__)
 
 
+class PolicyViolationError(RuntimeError):
+    
+    pass
+
+
 class PolicyEngine:
-    """
-    PURE POLICY ORACLE.
-    Decides permission only. Never executes. Never prompts.
-
-    HAR-04: allowed_apps is a HARDCODED ALLOWLIST.
-    -------------------------------------------------
-    Only the four applications below are permitted for autonomous interaction.
-    Any application not in this set receives DENY.
-
-    To extend the allowlist for your deployment, subclass PolicyEngine and
-    override allowed_apps, or construct with a custom set:
-
-        engine = PolicyEngine(allowed_apps={"code", "terminal", "gedit"})
-
-    Operator configuration instructions:
-      1. Review which applications the agent needs access to.
-      2. Confirm each application is safe for autonomous interaction.
-      3. Pass the full set to the constructor or update the class default.
-      4. Restart the system — policy is read at runtime per validate() call.
-
-    A startup log warning is emitted if the active application is not in the
-    allowlist (see warn_if_unlisted()). This surfaces silent DENY to operators
-    who have not yet extended the allowlist for their use case.
-    """
+    
 
     ALLOW = "ALLOW"
     DENY = "DENY"
