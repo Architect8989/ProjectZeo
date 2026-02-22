@@ -7,7 +7,7 @@ from typing import Any, Dict, Optional, List
 from authority.authority_policy import AuthorityDecision
 from authority.input_arbitrator import InputArbitrator
 
-from core.safety.action_timeout import action_timeout
+from core.safety.action_timeout import action_timeout, run_with_timeout
 from core.telemetry.logger import log_warn
 
 from operate.utils.operating_system import OperatingSystem
@@ -515,14 +515,32 @@ def _execute_autonomous_loop(
             operation = selected_action.get("operation", "").lower().strip()
             _use_action_timeout = operation not in ("command", "install")
 
+            # AT-01 FIX: Replace plain `with action_timeout(30): result = _execute_decision(...)`
+            # with run_with_timeout(), which UNBLOCKS THE CALLING THREAD if the UI
+            # operation stalls on a frozen display or input queue.
+            #
+            # The action_timeout() context manager alone is advisory-only — it fires
+            # at Python yield points AFTER the guarded code returns. Any blocking
+            # pyautogui/X11 call (e.g. mouse() stalling on a frozen display) would
+            # run indefinitely with only the context manager. The docstring in
+            # action_timeout explicitly states: "operate.py uses run_with_timeout()
+            # inside the action_timeout block to combine both."
+            #
+            # run_with_timeout() submits the callable to _UI_EXECUTOR (single-worker
+            # ThreadPoolExecutor) and calls future.result(timeout=30). The calling
+            # thread is unblocked after 30s regardless of whether the background
+            # thread is still blocked on a native OS call.
             if _use_action_timeout:
-                with action_timeout(30):
-                    result = _execute_decision(
+                result = run_with_timeout(
+                    lambda: _execute_decision(
                         decision=selected_action,
                         os_backend=os_backend,
                         accessibility_backend=accessibility_backend,
                         installer=installer,
-                    )
+                    ),
+                    seconds=30,
+                    operation_hint=operation,
+                )
             else:
                 # No action_timeout wrapper for blocking I/O operations.
                 # Timeout guarantees are provided by subprocess timeout and
