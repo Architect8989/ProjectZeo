@@ -1,36 +1,3 @@
-"""
-Plan Verifier
-
-Purpose:
-Authoritative pre-execution verification of an ExecutionPlan.
-
-This module:
-- DOES NOT execute
-- DOES NOT touch OS
-- DOES NOT read screen
-- DOES NOT perform UI actions
-- DOES NOT modify plans
-
-It is the FINAL gate before execution.
-If this verifier fails, execution MUST NOT start.
-
-PATCH (audit Bug #2):
-  The original code unconditionally raised PlanVerificationError on any
-  TOOL_INSTALLATION step ("forbidden until installer exists").  However:
-    • ExecutionPlan.schema explicitly includes StepType.TOOL_INSTALLATION.
-    • operate.py dispatches TOOL_INSTALLATION steps to
-      AutonomousInstaller.install_tool().
-    • main.py wires the installer into operate_main().
-  The installer is therefore present and integrated.  Keeping the hard
-  rejection caused every plan that contained tool-installation steps to
-  fail the verification gate before execution could begin — a latent bug.
-
-  Fix: TOOL_INSTALLATION steps are now accepted.  A TOOL_INSTALLATION
-  step still must have a valid 'tool' dict with an 'official_url' that
-  starts with 'https://' (enforcement delegated to the planner, verified
-  here at the action-shape level).
-"""
-
 from typing import Set, Dict, List
 
 from core.schemas.execution_plan import ExecutionPlan, ExecutionStep, StepType
@@ -155,7 +122,11 @@ class PlanVerifier:
                     )
 
             if step.type == StepType.UI_INTERACTION:
-                if "op" not in step.action:
+                # FIX RTB-01: ExecutionPlanner generates actions with key
+                # "operation", not "op". The original "op" check caused every
+                # plan containing a UI_INTERACTION step to raise
+                # PlanVerificationError before execution could begin.
+                if "operation" not in step.action:
                     raise PlanVerificationError(
                         f"Step {step.id} missing UI operation"
                     )
