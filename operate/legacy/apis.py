@@ -46,9 +46,35 @@ config = Config()
 _OCR_READER = None
 
 def _get_ocr_reader():
+    """
+    FIX RB-4: Guard against null easyocr module before calling Reader().
+
+    Bug: easyocr was imported with try/except at module level, setting it to
+    None on ImportError (FIX-02/RB-A4). However, _get_ocr_reader() called
+    easyocr.Reader(["en"]) unconditionally, raising:
+        AttributeError: 'NoneType' object has no attribute 'Reader'
+
+    This crash path is not exercised by the primary Ollama/QwenOllamaAdapter
+    flow (which has its own guarded OCR initialisation), but is a latent
+    crash for any caller of this legacy module on systems without EasyOCR.
+
+    Fix: raise a clear ImportError (not AttributeError) when easyocr is None,
+    matching the standard behaviour of a conditionally-available dependency.
+    """
     global _OCR_READER
-    if _OCR_READER is None:
-        _OCR_READER = easyocr.Reader(["en"])
+    if _OCR_READER is not None:
+        return _OCR_READER
+
+    if easyocr is None:
+        raise ImportError(
+            "easyocr is not installed. Install it with: pip install easyocr
+"
+            "On Ollama-only deployments, text-based click resolution via the "
+            "legacy APIs module is unavailable. Use QwenOllamaAdapter instead, "
+            "which has its own fault-tolerant OCR initialisation."
+        )
+
+    _OCR_READER = easyocr.Reader(["en"])
     return _OCR_READER
 
 async def get_next_action(model, messages, objective, session_id):
