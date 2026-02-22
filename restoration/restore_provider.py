@@ -169,6 +169,13 @@ class RestoreProvider:
         if not isinstance(window_id, str) or not window_id.strip():
             return
 
+        # FIX-01 / SI-01: bare-desktop sentinel — no window to focus.
+        # RestoreVerifier._verify_focus() already guards against this sentinel
+        # (it returns early). _restore_window must do the same to prevent
+        # focus_window() from raising OSError and breaking the restore sequence.
+        if window_id == "__bare_desktop__":
+            return
+
         try:
             self._os.focus_window({"title": window_id})
         except OSError:
@@ -267,6 +274,21 @@ class RestoreProvider:
         return self._levenshtein(expected, actual) <= self.MAX_TITLE_DISTANCE
 
     def _validate_window(self, current_window, snapshot) -> bool:
+        # FIX-01 / SI-01: Symmetric guard matching _validate_application().
+        #
+        # When the snapshot was taken on a bare desktop (no window focused),
+        # focus.window_id is "__bare_desktop__".  No window focus can be
+        # verified; returning True here allows the restoration to complete
+        # without the 5-retry loop that previously always failed and raised
+        # RestorationError("Post-restore verification failed") for every
+        # bare-desktop task (RB-A1 / RB-A3 runtime blockers).
+        #
+        # _restore_window() also guards this sentinel (returns early without
+        # calling focus_window()), so the OS backend is never asked to focus
+        # a non-existent window.
+        if snapshot.focus.window_id == "__bare_desktop__":
+            return True
+
         if (
             not isinstance(current_window, dict)
             or not isinstance(current_window.get("title"), str)
