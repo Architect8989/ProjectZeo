@@ -179,11 +179,29 @@ class IntentListener:
                 except Exception:
                     pass
 
-        if should_delete:
+        # RB-A5 FIX: If data was successfully read but is empty or whitespace-only,
+        # emit a diagnostic warning to stderr and do NOT delete the file.
+        # Previously the file was silently consumed and discarded, leaving the
+        # operator with no indication of why the system failed to arm. The operator
+        # must re-write a valid intent to arm; discarding their (possibly accidental)
+        # whitespace-only file without warning creates a silent failure mode.
+        if should_delete and data is not None:
+            intent = data.strip()
+            if not intent:
+                print(
+                    f"[IntentListener] Discarded intent file — content is empty or "
+                    f"whitespace-only: {path!r}. Re-write the file with a valid intent "
+                    f"string to arm the system. File has NOT been deleted.",
+                    file=sys.stderr,
+                )
+                # Do not delete: leave the file in place so the operator can inspect it.
+                return None
+            # Non-empty content — safe to delete and return.
             try:
                 os.remove(path)
             except Exception:
                 pass
+            return intent
 
         if not data:
             return None
