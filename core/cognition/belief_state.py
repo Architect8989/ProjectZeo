@@ -89,6 +89,25 @@ class BeliefState:
         )
         self._iteration_counter: int = 0
 
+        # MR-01a FIX: Track consecutive high-stability observations for
+        # the conservative authority gate in operate.py. The gate requires
+        # 3 consecutive readings above 0.7 before asserting soc_confident
+        # for high-risk operations.
+        self.consecutive_high_stability_count: int = 0
+
+        # MR-04 FIX: Per-call sample counter for Thompson sampling seeds.
+        # _iteration_counter only increments in update_regret(). All Thompson
+        # samples within a single selection round share the same counter value,
+        # giving them identical seeds when only action string differs slightly.
+        # _sample_counter increments on EVERY thompson_sample() call, providing
+        # a unique component for each sample within a round.
+        self._sample_counter: int = 0
+
+        # MR-05 FIX: Dynamic regret decay computed from plan horizon.
+        # Default is the class constant; call set_plan_horizon() once the
+        # execution plan is loaded to tune decay to the actual task length.
+        self._regret_decay: float = self.REGRET_DECAY
+
     # =========================================================
     # BELIEF UPDATE
     # =========================================================
@@ -136,13 +155,33 @@ class BeliefState:
 
      
         if self.entropy() < self.MIN_ENTROPY_FLOOR:
-            uniform = 1.0 / len(self.state_probabilities)
-            blended = {
-                k: 0.95 * v + 0.05 * uniform
-                for k, v in self.state_probabilities.items()
-            }
-            total = sum(blended.values())
-            self.state_probabilities = {k: v / total for k, v in blended.items()}
+            # MR-02 FIX: Proportional entropy floor blending.
+            # ─────────────────────────────────────────────────────────────
+            # Bug: fixed blend weight 0.05 regardless of collapse severity.
+            # At entropy = 0.01 nats (near-total collapse), one blend
+            # restores only ~0.05 nats — still far below the 0.30 floor.
+            # The old loop took 15–20 iterations to converge.
+            #
+            # Fix: set blend weight proportional to the entropy deficit
+            # (how far below the floor we are), capped at MAX_BLEND_WEIGHT.
+            # This guarantees convergence in ≤ 3–5 iterations at any
+            # collapse level.
+            # ─────────────────────────────────────────────────────────────
+            _MAX_BLEND_WEIGHT = 0.30
+            for _ in range(20):  # safety cap — should converge in < 5
+                _H = self.entropy()
+                if _H >= self.MIN_ENTROPY_FLOOR:
+                    break
+                _deficit = self.MIN_ENTROPY_FLOOR - _H
+                _w = min(_deficit / self.MIN_ENTROPY_FLOOR, _MAX_BLEND_WEIGHT)
+                _n = len(self.state_probabilities)
+                blended = {
+                    k: (1.0 - _w) * v + _w / _n
+                    for k, v in self.state_probabilities.items()
+                }
+                _total = sum(blended.values())
+                if _total > 0:
+                    self.state_probabilities = {k: v / _total for k, v in blended.items()}
 
         fallback_prob = self.state_probabilities.get("__prior_fallback__", 0.0)
         if 0.0 < fallback_prob <= self._FALLBACK_PRUNE_THRESHOLD:
@@ -211,12 +250,15 @@ class BeliefState:
         alpha = 1.0 + sum(scaled)
         beta = 1.0 + sum(1.0 - v for v in scaled)
 
-        # HAR-06 (MS-03): Use self.commitment_hash (seeded from intent_hash at
-        # construction) rather than a constant "GENESIS" so that two replans of
-        # the same objective produce distinct seed sequences.  Within a single
-        # task attempt the sequence remains deterministic.
+        # HAR-06 (MS-03) + MR-04 FIX: Seed incorporates both _iteration_counter
+        # (advances per regret update — unique across rounds) and _sample_counter
+        # (advances per thompson_sample() call — unique within a round).
+        # Previously all samples in the same selection round shared the same
+        # _iteration_counter, making seeds identical when action strings are
+        # similar. _sample_counter eliminates this within-round collision.
+        self._sample_counter += 1
         seed_material = (
-            f"{self.commitment_hash}:{action}:{self._iteration_counter}"
+            f"{self.commitment_hash}:{action}:{self._iteration_counter}:{self._sample_counter}"
         ).encode("utf-8")
 
         digest = hashlib.sha256(seed_material).digest()
@@ -239,19 +281,48 @@ class BeliefState:
 
         raw_value, last_iter = entry
         delta_iter = self._iteration_counter - last_iter
-        decayed = raw_value * (self.REGRET_DECAY ** delta_iter)
+        # MR-05 FIX: Use _regret_decay (instance, tuned to plan horizon)
+        # instead of the class-level REGRET_DECAY constant.
+        decayed = raw_value * (self._regret_decay ** delta_iter)
         decayed = min(decayed, self.MAX_REGRET)
 
-        # MATH-07 FIX: Persist the decayed value back to storage so that
-        # summary() and any future calls see the current decayed value, not
-        # the stale peak. Without this, the stored raw_value accumulates at
-        # the historical peak forever — queries use the correct decayed value
-        # but storage remains misleading for debugging and any code that reads
-        # self.regret directly.
         if delta_iter > 0:
             self.regret[action] = (decayed, self._iteration_counter)
 
         return decayed
+
+    def set_plan_horizon(self, total_steps: int, iters_per_step: int = 13) -> None:
+        """
+        MR-05 FIX: Compute regret decay dynamically based on the plan horizon.
+
+        The goal: regret on early actions decays to ≤5% of its original value
+        by the end of the plan. At REGRET_DECAY=0.995 (legacy constant), regret
+        at iteration 1 decays to only ~19.7% by task end (325 iterations for a
+        25-step plan) — still heavily distorting action selection near the end.
+
+        Formula:
+            target_fraction = 0.05  (5% of original)
+            total_iters = total_steps * iters_per_step
+            decay = target_fraction^(1 / total_iters)
+
+        For a 25-step plan: decay = 0.05^(1/325) ≈ 0.9909
+        For a 10-step plan: decay = 0.05^(1/130) ≈ 0.9773
+
+        Call this once after the execution plan is loaded, before the first
+        iteration of the execution loop.
+
+        Parameters
+        ----------
+        total_steps : int
+            Number of real plan steps (excluding the DONE sentinel).
+        iters_per_step : int
+            Expected iterations per step (default 13, matching
+            MAX_STAGNANT_ITERS_COMMAND + slack).
+        """
+        total_iters = max(total_steps * iters_per_step, 1)
+        target_fraction = 0.05  # regret decays to 5% by plan end
+        self._regret_decay = target_fraction ** (1.0 / total_iters)
+
 
     def update_regret(self, action: str, reward: float, best_reward: float):
         """
@@ -390,11 +461,20 @@ class BeliefState:
 
         if significant:
             self.environment_stability *= 0.8
+            # MR-01a FIX: Reset the consecutive high-stability counter on
+            # any significant change so the 3-obs gate cannot be satisfied
+            # across a stability boundary.
+            self.consecutive_high_stability_count = 0
         else:
             self.environment_stability = min(
                 1.0,
                 self.environment_stability + 0.05,
             )
+            # MR-01a FIX: Increment consecutive counter when stable.
+            if self.environment_stability > 0.7:
+                self.consecutive_high_stability_count += 1
+            else:
+                self.consecutive_high_stability_count = 0
 
         self.environment_stability = max(0.0, min(1.0, self.environment_stability))
 
