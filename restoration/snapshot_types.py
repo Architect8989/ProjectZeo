@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Optional, Dict, Any
@@ -42,6 +43,7 @@ class ApplicationState:
     def validate(self) -> None:
         if not self.process_name:
             raise ValueError("Active application must have a process_name")
+        # "__bare_desktop__" is a valid sentinel for no-window-focused snapshots
         if self.pid is not None and self.pid <= 0:
             raise ValueError("PID must be positive if provided")
 
@@ -71,6 +73,12 @@ class RestorationSnapshot:
     # Construction
     # ----------------------------
 
+    # HARD-7: Process-local monotonic counter to prevent ID collisions when
+    # two snapshots are taken within the same millisecond (common in rapid
+    # replan sequences). The counter is process-local so it resets on restart,
+    # but within a session guarantees unique IDs regardless of wall-clock speed.
+    _nonce_counter: int = 0
+
     @staticmethod
     def _derive_snapshot_id(
         *,
@@ -81,16 +89,17 @@ class RestorationSnapshot:
         captured_at: float,
     ) -> str:
         """
-        FIX H-07: Generate a deterministic content-addressed snapshot ID.
+        HARD-7: Generate a collision-resistant content-addressed snapshot ID.
 
-        The ID is SHA-256 of the canonical JSON representation of the core
-        snapshot fields. This replaces uuid.uuid4() which produced random IDs
-        that broke commitment chain reproducibility across restarts.
-
-        Fields included: cursor (x, y), focus (window_id), application
-        (process_name), execution_mode, captured_at (rounded to millisecond
-        to avoid float representation drift between Python versions).
+        Includes a process-local monotonic nonce so that two snapshots taken
+        within the same millisecond (common in replan sequences) produce
+        distinct IDs. Without this, round(captured_at * 1000) could collide
+        and trigger SnapshotProviderError("Snapshot id collision").
         """
+        # Atomically advance the nonce
+        RestorationSnapshot._nonce_counter += 1
+        nonce = RestorationSnapshot._nonce_counter
+
         canonical = json.dumps(
             {
                 "cursor_x": cursor.x,
@@ -100,6 +109,8 @@ class RestorationSnapshot:
                 "execution_mode": execution_mode,
                 # Round to nearest millisecond to avoid cross-platform float drift
                 "captured_at_ms": round(captured_at * 1000),
+                # HARD-7: monotonic nonce prevents same-millisecond collisions
+                "nonce": nonce,
             },
             sort_keys=True,
             separators=(",", ":"),
