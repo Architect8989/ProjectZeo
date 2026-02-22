@@ -1,15 +1,3 @@
-"""
-screenshot.py — Cross-platform screen capture utility.
-
-PATCH (audit Bug #1):
-  Xlib imports moved from module-level into the Linux branch.
-  Previously `import Xlib.display`, `Xlib.X`, `Xlib.Xutil` at the top
-  of the file raised ImportError on macOS and Windows, making the entire
-  module non-importable on those platforms.  The fix defers those imports
-  to the Linux code path so Windows and macOS can import this module
-  without python-xlib installed.
-"""
-
 import os
 import platform
 import subprocess
@@ -54,14 +42,27 @@ def capture_screen_with_cursor(file_path):
 def compress_screenshot(raw_screenshot_filename, screenshot_filename):
     """
     Convert a raw screenshot to JPEG, compositing transparency over white.
+
+    FIX RTB-06: PIL palette-mode ("P") images with transparency are a
+    single-band image — img.split() returns one band, so split()[3] raises
+    IndexError. The transparency information on palette images is stored in
+    img.info["transparency"], not as a fourth channel. Convert "P" images to
+    "RGBA" first so the standard RGBA compositing path can apply uniformly.
     """
     with Image.open(raw_screenshot_filename) as img:
-        # Handle alpha channel (RGBA/LA/P-with-transparency)
-        if img.mode in ("RGBA", "LA") or (
-            img.mode == "P" and "transparency" in img.info
-        ):
+        # Step 1: Convert palette-mode (P/PA) to RGBA so transparency is
+        # represented as a proper alpha channel that split()[3] can access.
+        if img.mode == "P":
+            img = img.convert("RGBA")
+
+        # Step 2: Composite any alpha channel over a white background.
+        if img.mode in ("RGBA", "LA"):
             background = Image.new("RGB", img.size, (255, 255, 255))
-            background.paste(img, mask=img.split()[3])  # 3 = alpha channel
+            # split()[3] is valid here: RGBA has 4 bands, LA has 2 bands with
+            # alpha at index 1 — handle both.
+            bands = img.split()
+            alpha = bands[3] if img.mode == "RGBA" else bands[1]
+            background.paste(img, mask=alpha)
             background.save(screenshot_filename, "JPEG", quality=85)
         else:
             img.convert("RGB").save(screenshot_filename, "JPEG", quality=85)
