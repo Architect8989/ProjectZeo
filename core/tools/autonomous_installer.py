@@ -34,7 +34,7 @@ class InstallationError(RuntimeError):
 #   _LINUX_HAS_APT = bool(shutil.which("apt-get"))
 # This caused the lookup table to permanently reflect the pre-install
 # state.  If apt-get is installed mid-session (unusual but possible),
-# the table would still claim it's unavailable.
+# the table would still claim it'silable.
 #
 # Fix: wrap detection in a function that is called at install time,
 # not at import time.
@@ -287,16 +287,15 @@ class AutonomousInstaller:
         self._llm = llm_callable
         self._verifier = StepVerifier()
 
-        # HARD-8: ReasoningEngine.__new__(ReasoningEngine) skips __init__,
-        # leaving self._llm unset on the sanitizer. Since only
-        # _sanitize_perception() is used (which doesn't touch self._llm),
-        # create a dedicated minimal sanitizer object instead of misusing
-        # __new__ on a class that requires constructor arguments.
-        class _PerceptionSanitizer:
-            """Minimal sanitizer that exposes only _sanitize_perception()."""
-            MAX_PERCEPTION_BYTES = 10_000
-
-        self._sanitizer = _PerceptionSanitizer()
+        # SI-03 FIX: Removed the dead _PerceptionSanitizer inner class and the
+        # self._sanitizer assignment. The inner class declared MAX_PERCEPTION_BYTES
+        # but exposed no methods and was never called — self._sanitizer was assigned
+        # but never referenced. The HARD-8 comment claimed the class avoided
+        # ReasoningEngine.__new__() misuse, which was accurate, but the sanitizer
+        # object itself was entirely unused. _sanitize_perception() is defined
+        # directly on AutonomousInstaller and called via self._sanitize_perception().
+        # Removing the dead object eliminates the misleading HARD-8 commentary and
+        # the false impression that sanitization is delegated to a nested class.
 
         # Pre-compile dangerous-pattern regexes once at construction time.
         self._compiled_dangerous = [
@@ -415,57 +414,64 @@ class AutonomousInstaller:
             except Exception:
                 return False
 
-        # --- Tier 3: DEF-7(b) LLM text-only fallback for unknown tools ---
-        # The lookup table is finite. For tools not listed, ask the LLM for a
-        # terminal install command via a text-only prompt. This avoids browser UI
-        # for the vast majority of CLI tools while staying purely autonomous.
-        # We use a dedicated system prompt that instructs the model to return ONLY
-        # a shell command — not UI click operations — so the interface mismatch
-        # from the original DEF-2 bug cannot recur here.
+        # --- Tier 3: FIX-03 (RB-A2) — Direct text-only Ollama call ---
+        #
+        # Original defect: self._llm() was routed through _make_llm_callable →
+        # QwenOllamaAdapter.get_next_action(), which captures a live screenshot
+        # and ALWAYS returns List[dict] of UI operations (click/type/hotkey).
+        # The Tier-3 branch expected a plain shell command string.
+        # _normalize_llm_command() extracted first.get("command") from a click
+        # dict → None. llm_cmd was None. Tier-3 silently returned False and
+        # fell through to _browser_ui_install(), which hangs on headless systems.
+        #
+        # Fix: bypass self._llm entirely. Call the Ollama HTTP client directly
+        # using a text-only chat (no screenshot), identical to the pattern used
+        # by ExecutionPlanner._call_llm_text(). This guarantees a plain text
+        # response suitable for shell execution.
         try:
+            import os as _os_mod
+            import ollama as _ollama
+            import httpx as _httpx
+
+            # Resolve the model name: prefer explicit env var, fall back to default.
+            _model = _os_mod.environ.get("LLM_MODEL", "qwen2.5-vl:7b-instruct")
+
             pkg_mgr = _get_linux_pkg_manager() if os_name == "Linux" else ""
             pkg_mgr_hint = f" Package manager available: {pkg_mgr}." if pkg_mgr else ""
 
-            messages = [
-                {
-                    "role": "system",
-                    "content": (
-                        "You are a shell command generator. "
-                        "Respond with ONLY a single shell command string — "
-                        "no JSON, no explanation, no markdown. "
-                        "The command must install the requested tool on the target OS."
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": (
-                        f"OS: {os_name}.{pkg_mgr_hint}\n"
-                        f"Tool to install: {name}\n"
-                        "Return one shell command to install it."
-                    ),
-                },
-            ]
-
-            response = self._llm(
-                messages=messages,
-                objective=f"Get install command for {name}",
-                session_id="installer_cmd_lookup",
+            client = _ollama.Client(
+                timeout=_httpx.Timeout(connect=10.0, read=60.0, write=5.0, pool=2.0)
+            )
+            response = client.chat(
+                model=_model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a shell command generator. "
+                            "Respond with ONLY a single shell command string — "
+                            "no JSON, no explanation, no markdown. "
+                            "The command must install the requested tool on the target OS."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": (
+                            f"OS: {os_name}.{pkg_mgr_hint}\n"
+                            f"Tool to install: {name}\n"
+                            "Return one shell command to install it."
+                        ),
+                    },
+                ],
+                options={"temperature": 0},
             )
 
-            # Normalise response to a plain string command
+            # Extract plain text from Ollama response object (≥0.2 and legacy dict)
             llm_cmd: Optional[str] = None
-
-            if isinstance(response, str):
-                llm_cmd = response.strip()
-            elif isinstance(response, list) and response:
-                first = response[0]
-                if isinstance(first, dict):
-                    # If the LLM returned a JSON action dict, extract command field
-                    llm_cmd = first.get("command") or first.get("text")
-                elif isinstance(first, str):
-                    llm_cmd = first.strip()
+            if hasattr(response, "message") and hasattr(response.message, "content"):
+                llm_cmd = response.message.content
             elif isinstance(response, dict):
-                llm_cmd = response.get("command") or response.get("content")
+                llm_cmd = response.get("message", {}).get("content")
 
             if isinstance(llm_cmd, str):
                 llm_cmd = llm_cmd.strip().strip("`\"'")
