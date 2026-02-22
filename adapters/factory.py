@@ -71,20 +71,32 @@ _ADAPTER_CACHE_LOCK = threading.Lock()           # guards _ADAPTER_CACHE reads/w
 _ADAPTER_BUILD_LOCKS: Dict[str, threading.Lock] = {}  # per-model construction mutex
 _BUILD_LOCKS_LOCK = threading.Lock()             # guards _ADAPTER_BUILD_LOCKS itself
 
-# HAR-08: Freeze the cloud-isolation enforcement decision at module import time.
+# HAR-08 / FIX RB-2: Freeze the cloud-isolation enforcement decision at module
+# import time.
 #
-# _is_cloud_allowed() previously read os.environ["OLLAMA_ONLY"] on every call
-# to build_llm(). Any code that mutated os.environ after startup could silently
-# bypass cloud isolation for new model names (the adapter cache — FIX-05 —
-# prevents re-construction for already-seen models, but not for novel ones).
+# CORRECTNESS INVARIANT:
+#   This freeze is ONLY correct if os.environ["OLLAMA_ONLY"] is set or cleared
+#   BEFORE this module is imported. run.py is responsible for this — it parses
+#   --allow-cloud from sys.argv at the very top of its file (before any import
+#   statements) and mutates os.environ unconditionally.
 #
-# Fix: snapshot the env var once at module load time and store the result in
-# this constant. _is_cloud_allowed() returns the frozen bool, making it immune
-# to post-startup env mutations. The decision is made at the earliest possible
-# point — module import — before any adapter construction occurs.
+#   If this module is imported before run.py sets the env var — e.g. by an
+#   alternative entry point, a test harness, or any import at the top of
+#   another module that transitively imports this one — the freeze will capture
+#   the default "1" (cloud-denied), which is the SAFE default.  Tests that need
+#   cloud routing MUST set os.environ["OLLAMA_ONLY"] = "0" before importing.
+#
+# CORRECTNESS DEPENDENCY:
+#   run.py ensures os.environ["OLLAMA_ONLY"] is set/cleared BEFORE this line
+#   runs. Any alternative entry point must replicate that setup.
+#
+# SECURITY INVARIANT:
+#   After this line, no runtime mutation of os.environ["OLLAMA_ONLY"] can
+#   bypass cloud isolation. The frozen bool is immutable for the process
+#   lifetime.
 import os as _os_module
 _raw_ollama_only = _os_module.environ.get("OLLAMA_ONLY", "1").strip().lower()
-# OLLAMA_ONLY=1/true/yes → cloud denied (Ollama-only mode)
+# OLLAMA_ONLY=1/true/yes → cloud denied (Ollama-only mode, safe default)
 # OLLAMA_ONLY=0/false/no → cloud permitted (--allow-cloud path)
 _OLLAMA_ONLY_ENFORCEMENT_FROZEN: bool = _raw_ollama_only not in ("1", "true", "yes")
 del _raw_ollama_only  # remove intermediate from module namespace
@@ -159,29 +171,18 @@ def _resolve_base_model(model_name: str) -> str:
 
 def _is_cloud_allowed() -> bool:
     """
-    FIX H-01 / LLM-01: Cloud access is BLOCKED by default.
+    FIX RB-2 / H-01: Cloud access is BLOCKED by default.
 
-    The previous implementation allowed cloud routing unless OLLAMA_ONLY=1
-    was explicitly set. This inverted the security posture: the "no cloud"
-    architectural claim was false by default, requiring an opt-in env var.
+    Returns the value of _OLLAMA_ONLY_ENFORCEMENT_FROZEN which was captured
+    once at module import time. This makes the enforcement boundary immune to
+    post-startup os.environ mutations.
 
-    New logic: cloud access is denied unless OLLAMA_ONLY is explicitly set
-    to a falsy value ("0", "false", "no"). run.py sets OLLAMA_ONLY=1 by
-    default and only clears it when --allow-cloud is given on the CLI.
+    CORRECTNESS DEPENDENCY (FIX RB-2):
+        The freeze is only correct if run.py (or the test harness) set
+        os.environ["OLLAMA_ONLY"] BEFORE this module was imported.
+        See the HAR-08 comment at the module level for the full invariant.
 
-    This makes the Ollama-only guarantee true by default with no operator
-    action required.
-
-    HAR-08 FIX: The enforcement decision is now read ONCE at module import
-    time and stored in the module-level constant _OLLAMA_ONLY_ENFORCEMENT_FROZEN
-    below. _is_cloud_allowed() returns the frozen value on every subsequent
-    call, preventing post-startup mutation of os.environ["OLLAMA_ONLY"] from
-    bypassing the cloud isolation boundary.
-
-    Without this freeze, any code that executes `os.environ["OLLAMA_ONLY"] = "0"`
-    after startup would allow cloud adapter construction on the next build_llm()
-    call — even if the user launched with --allow-cloud absent. The adapter cache
-    (FIX-05) limits the risk to new/unseen model names, but does not eliminate it.
+    Returns True if cloud routing is permitted, False if Ollama-only is enforced.
     """
     return _OLLAMA_ONLY_ENFORCEMENT_FROZEN
 
@@ -242,15 +243,16 @@ class AdapterFactory:
 
             # --- Route 2: Cloud adapter via PureLLMWrapper ---
             if base_model in _CLOUD_REGISTRY:
-                # FIX H-01: Cloud is BLOCKED by default. The previous guard only
-                # blocked cloud when OLLAMA_ONLY=1 was set; absent the env var,
-                # cloud routing silently succeeded, violating the isolation claim.
-                # Now cloud is denied unless explicitly permitted via _is_cloud_allowed().
+                # FIX RB-2 / H-01: Cloud is BLOCKED by default.
+                # _is_cloud_allowed() returns the value frozen at import time.
+                # For this to return True, run.py must have cleared OLLAMA_ONLY
+                # from os.environ BEFORE this module was imported.
                 if not _is_cloud_allowed():
                     raise ModelNotRecognizedException(
                         f"Model '{model_name}' is a cloud model, but OLLAMA_ONLY is "
                         "enforced (default). To enable cloud models, start the system "
-                        "with --allow-cloud or set OLLAMA_ONLY=0 in the environment.\n"
+                        "with --allow-cloud or set OLLAMA_ONLY=0 in the environment "
+                        "BEFORE importing this module.\n"
                         f"  Local models: {sorted(_LOCAL_REGISTRY.keys())}"
                     )
 
