@@ -199,7 +199,13 @@ class PureLLMWrapper:
             finally:
                 new_loop.close()
 
-        future = PureLLMWrapper._executor.submit(_run_in_isolated_loop, coro)
+        # RB-NEW-01 FIX: Use self._executor (instance attribute) not
+        # PureLLMWrapper._executor (class attribute that does not exist).
+        # The RB-07 fix converted _executor to an instance attribute in __init__,
+        # but left this call-site referencing the class. Without this fix,
+        # any cloud-model call on an async call-stack raises:
+        #   AttributeError: type object 'PureLLMWrapper' has no attribute '_executor'
+        future = self._executor.submit(_run_in_isolated_loop, coro)
         return future.result()
 
     # ==================================================
