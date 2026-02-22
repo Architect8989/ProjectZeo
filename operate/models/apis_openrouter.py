@@ -1,16 +1,3 @@
-"""
-operate/models/apis_openrouter.py
-==================================
-PATCH: Previously raised RuntimeError at module import when OPENROUTER_API_KEY
-       was absent (audit ❌ FAIL §1.13).  On a raw OS with no cloud key the
-       entire import chain crashed — even for Ollama-only workflows.
-
-FIXES APPLIED:
-  ❌  RuntimeError at import if OPENROUTER_API_KEY missing → deferred to call time
-  ⚠️  _generate_session_id used asyncio.get_event_loop() (deprecated) → fixed
-  ℹ️  MAX_RESPONSE_BYTES check now applied before json.loads to prevent OOM
-"""
-
 from __future__ import annotations
 
 import os
@@ -118,7 +105,7 @@ async def get_next_action(
     payload = {
         "model": model,
         "messages": [system_guard] + messages,
-        "temperature": 0.2,
+        "temperature": 0,  # HAR-02: deterministic — matches Ollama paths (was 0.2)
         "max_tokens": 1024,
     }
 
