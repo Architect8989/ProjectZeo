@@ -46,14 +46,19 @@ def _get_apis() -> object:
 # ============================================================
 
 def apply_patches():
-    global _PATCHED
-    if _PATCHED:
-        return
-
-    _PATCHED = True
-
+    # DETERMINISM FIX (double-wrap): Store the applied flag as an attribute on
+    # the target apis module rather than as a module-level bool on this safety
+    # layer. If this module is reloaded (importlib.reload) the local _PATCHED
+    # bool resets to False and patches would be applied again, double-wrapping
+    # already-wrapped functions.
+    #
+    # Storing the flag on the target module survives reloads of this module
+    # because the apis module object identity is preserved across reloads of
+    # the safety layer. Even if the apis module itself is reloaded, _wrap_provider
+    # guards against double-wrapping via the _apis_safety_wrapped attribute on
+    # each function object.
     try:
-        _get_apis()
+        apis = _get_apis()
     except RuntimeError:
         import sys
         print(
@@ -62,6 +67,10 @@ def apply_patches():
             file=sys.stderr,
         )
         return
+
+    if getattr(apis, "_safety_patches_applied", False):
+        return
+    setattr(apis, "_safety_patches_applied", True)
 
     _patch_all_providers()
     _disable_cloud_fallbacks()
@@ -162,17 +171,37 @@ def _wrap_provider(fn):
 # ============================================================
 
 def _patch_all_providers():
+    """
+    HARD-5: Patch both the wrapper module (operate.models.apis) AND the
+    legacy implementation module (operate.legacy.apis).
 
-    for name in dir(_get_apis()):
+    The previous implementation only patched the thin wrapper layer. Any code
+    that imports from operate.legacy.apis directly (bypassing the wrapper)
+    received no safety-layer enforcement. Cloud API functions in the legacy
+    module were unpatched — immutability enforcement, temperature injection,
+    and validation did not apply to them.
 
-        if not name.startswith("call_"):
-            continue
+    Fix: apply _wrap_provider() to both modules' call_* functions.
+    """
+    modules_to_patch = []
 
-        _m = _get_apis()
-        attr = getattr(_m, name)
+    # Primary (wrapper) module — always present
+    modules_to_patch.append(_get_apis())
 
-        if isinstance(attr, types.FunctionType):
-            setattr(_m, name, _wrap_provider(attr))
+    # Legacy implementation module — best-effort
+    try:
+        legacy = importlib.import_module("operate.legacy.apis")
+        modules_to_patch.append(legacy)
+    except Exception:
+        pass  # Legacy module absent — acceptable on Ollama-only installs
+
+    for _m in modules_to_patch:
+        for name in dir(_m):
+            if not name.startswith("call_"):
+                continue
+            attr = getattr(_m, name)
+            if isinstance(attr, types.FunctionType):
+                setattr(_m, name, _wrap_provider(attr))
 
 
 # ============================================================
@@ -245,24 +274,18 @@ def _disable_screenshot_writes():
     # Scoped to the apis module namespace only — does NOT patch builtins globally.
     _m.open = guarded_open
 
-    # ---- Guard pathlib writes — MODULE-SCOPED ONLY ----
-    # FIX RB-05 / F-05: The previous implementation patched pathlib.Path.write_bytes
-    # and pathlib.Path.write_text at the CLASS level, making them process-global.
-    # This was an uncontrolled global side effect: any third-party library
-    # (matplotlib, PIL, reportlab) writing to a path containing "screenshot"
-    # anywhere in the process would be silently blocked or raise RuntimeError.
-    #
-    # The class-level patches are REMOVED. Protection is provided by the
-    # module-scoped open() guard above (which intercepts calls to open() within
-    # the apis module), and by the PIL Image.save patch (which intercepts PIL
-    # save calls within that module). These are sufficient to prevent screenshot
-    # writes from the apis module without contaminating the rest of the process.
-    #
-    # Operators requiring stricter isolation should use filesystem-level controls
-    # (e.g. mount a tmpfs for the screenshot directory, set directory permissions)
-    # rather than relying on process-level Python patches.
-    #
-    # No pathlib.Path class-level patching is performed here.
+    # INERT SCOPE FIX: operate.models.apis currently does not call open()
+    # directly, so the guard above is forward-looking only. Apply the same
+    # guard to operate.legacy.apis which DOES use open() extensively for
+    # screenshot file reads. This ensures the write guard actually fires
+    # on any path through the legacy module that writes to a screenshot path.
+    try:
+        legacy = importlib.import_module("operate.legacy.apis")
+        if not getattr(legacy, "_open_safety_guarded", False):
+            legacy.open = guarded_open
+            setattr(legacy, "_open_safety_guarded", True)
+    except Exception:
+        pass  # Legacy module absent — acceptable on Ollama-only installs
 
 
 # ============================================================
