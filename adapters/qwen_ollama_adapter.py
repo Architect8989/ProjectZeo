@@ -6,6 +6,7 @@ import logging
 import re
 import sys
 import threading
+import time
 import asyncio
 import copy
 import tempfile
@@ -35,7 +36,20 @@ config = Config()
 _OCR_READER = None
 _OCR_LOCK = threading.Lock()
 _OCR_WARMUP_TIMEOUT_SECONDS = 120
+
+# RTB-07 FIX: Replace permanent _OCR_UNAVAILABLE bool with a cooldown-based
+# retry mechanism. Previously, one EasyOCR failure at cold-start permanently
+# disabled OCR for the process lifetime. Any subsequent task that required
+# text-label click resolution failed silently because the flag could never
+# recover within a session.
+#
+# Fix: record the timestamp of the last failure. After _OCR_RETRY_COOLDOWN_SECONDS
+# (300s = 5 min), allow one retry attempt. This lets OCR recover automatically
+# after transient failures (network timeout during model weight download, GPU
+# warm-up delay) without requiring a process restart.
 _OCR_UNAVAILABLE = False
+_OCR_LAST_FAILURE_TS: float = 0.0
+_OCR_RETRY_COOLDOWN_SECONDS = 300.0
 
 
 def _get_ocr_reader():
@@ -43,19 +57,32 @@ def _get_ocr_reader():
     EasyOCR initialisation is non-fatal (FIX-5).
     On a raw OS with no network, the model download (~150 MB) may fail.
     Falls back to coordinate-only mode when OCR is unavailable.
+
+    RTB-07: After _OCR_RETRY_COOLDOWN_SECONDS from the last failure,
+    clears the unavailable flag and retries initialisation once, allowing
+    recovery from transient cold-start failures.
     """
-    global _OCR_READER, _OCR_UNAVAILABLE
+    global _OCR_READER, _OCR_UNAVAILABLE, _OCR_LAST_FAILURE_TS
 
     if _OCR_READER is not None:
         return _OCR_READER
+
     if _OCR_UNAVAILABLE:
-        return None
+        # RTB-07: check if cooldown has elapsed — if so, allow retry
+        if time.monotonic() - _OCR_LAST_FAILURE_TS < _OCR_RETRY_COOLDOWN_SECONDS:
+            return None
+        # Cooldown elapsed — fall through to retry
 
     with _OCR_LOCK:
+        # Re-check under lock (double-checked locking)
         if _OCR_READER is not None:
             return _OCR_READER
         if _OCR_UNAVAILABLE:
-            return None
+            if time.monotonic() - _OCR_LAST_FAILURE_TS < _OCR_RETRY_COOLDOWN_SECONDS:
+                return None
+            # Reset flag to attempt re-initialisation
+            _OCR_UNAVAILABLE = False
+            logger.info("[QwenOllamaAdapter] OCR cooldown elapsed — retrying EasyOCR init.")
 
         logger.warning(
             "[QwenOllamaAdapter] Initialising EasyOCR reader. "
@@ -99,13 +126,15 @@ def _get_ocr_reader():
 
         except Exception as exc:
             _OCR_UNAVAILABLE = True
+            _OCR_LAST_FAILURE_TS = time.monotonic()
             logger.warning(
                 f"[QwenOllamaAdapter] EasyOCR unavailable: {exc}. "
+                f"Will retry after {_OCR_RETRY_COOLDOWN_SECONDS}s. "
                 "Falling back to coordinate-only click resolution."
             )
             print(
                 f"[QwenOllamaAdapter] WARNING: EasyOCR unavailable ({exc}). "
-                "Coordinate-only mode active.",
+                f"Coordinate-only mode active. Retry in {_OCR_RETRY_COOLDOWN_SECONDS}s.",
                 file=sys.stderr,
                 flush=True,
             )
