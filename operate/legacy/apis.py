@@ -5,7 +5,20 @@ import os
 import time
 import traceback
 
-import easyocr
+# FIX-02 (RB-A4): Deferred / optional easyocr import.
+#
+# Previously "import easyocr" at module level caused a crash on any machine
+# where EasyOCR is not installed (Ollama-only, CI, headless containers).
+# apis_safety_layer._patch_all_providers() → apply_patches() → _ensure_patches()
+# → build_llm() imported this module, triggering the crash before any task ran.
+#
+# Fix: wrap at module level with try/except. The lazy _get_ocr_reader() guard
+# raises a clear ImportError only when OCR is actually requested — not at import.
+try:
+    import easyocr as easyocr
+except ImportError:
+    easyocr = None  # type: ignore[assignment]
+
 import ollama
 import pkg_resources
 from PIL import Image
