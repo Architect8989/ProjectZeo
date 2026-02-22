@@ -75,11 +75,32 @@ class RestoreVerifier:
         Raises RestorationVerificationError on failure.
         Returns None on success.
 
+        FIX H1 (fail-closed contract):
+        --------------------------------
+        This verifier raises RestorationVerificationError on any mismatch.
+        The CALLER (main.py) is responsible for treating this as a hard failure.
+
+        As of the H1 patch, main.py's except block re-raises
+        RestorationVerificationError so it propagates to the outer cleanup
+        handler and triggers _force_safe_shutdown(). The system is now
+        actually fail-closed: verification failure shuts down execution rather
+        than continuing with an unknown workspace state.
+
+        Previously main.py caught RestorationVerificationError and logged a
+        warning, then continued execution — a silent swallow that made the
+        "fail-closed verification" claim false.
+
+        Contract:
+          - OBSERVER mode after restoration (requires mode_controller).
+          - Input locks released (is_automation_active() if available).
+          - Cursor within cursor_tolerance_px of snapshot position.
+          - Focused window title within MAX_TITLE_DISTANCE edits of snapshot title.
+          - Extended checks (geometry, z-order, browser, media) are best-effort.
+
         HAR-07: On verification failure, emits a structured audit event to the
-        authority_state (if provided) by setting verification_warning=True.
-        This surfaces verification mismatches in the authority audit record
-        rather than only printing to stderr and allowing execution to continue
-        silently.
+        authority_state (if provided) by setting verification_warning=True so
+        that verification failures are surfaced in the authority audit record
+        rather than only printed to stderr.
         """
         try:
             self._verify_execution_mode()
