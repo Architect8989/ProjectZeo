@@ -215,9 +215,17 @@ def main(llm_callable: Callable, model_name: str):
 
     # --------------------------------------------------------
     # FIX-4: Extended warmup — 150s for CPU inference compat.
+    # RB-A8 FIX: Track whether warmup fully stabilised and emit a structured
+    # warning if it did not. On bare/near-empty desktops, entity_count() may
+    # stay at 0 for the entire warmup window. The loop silently exits and
+    # take_snapshot() is called on an empty world model, yielding a plan with
+    # zero screen context. The fix surfaces this condition to operators via a
+    # structured stderr warning with actionable guidance, and records a
+    # degraded-warmup flag on auth_state for post-hoc audit review.
     # --------------------------------------------------------
     stable_frames = 0
     warmup_deadline = time.time() + WARMUP_TIMEOUT_SECONDS
+    _warmup_achieved = False
 
     while time.time() < warmup_deadline:
         if observer.is_healthy() and vision_runtime.is_healthy():
@@ -225,10 +233,32 @@ def main(llm_callable: Callable, model_name: str):
                 if world_graph.entity_count() > 0:
                     stable_frames += 1
                     if stable_frames >= WARMUP_STABLE_FRAMES:
+                        _warmup_achieved = True
                         break
                 else:
                     stable_frames = 0
         time.sleep(0.1)
+
+    if not _warmup_achieved:
+        print(
+            f"[WARMUP] WARNING: warmup did not reach {WARMUP_STABLE_FRAMES} stable frames "
+            f"within {WARMUP_TIMEOUT_SECONDS:.0f}s. "
+            f"entity_count={world_graph.entity_count()}, stable_frames={stable_frames}. "
+            f"Proceeding with degraded world model — plan quality may be reduced. "
+            f"If running on a bare desktop, ensure at least one application window is "
+            f"visible before arming, or increase WARMUP_TIMEOUT_SECONDS.",
+            file=sys.stderr,
+        )
+        try:
+            auth_state.record_event({
+                "event": "warmup_degraded",
+                "stable_frames_achieved": stable_frames,
+                "required": WARMUP_STABLE_FRAMES,
+                "entity_count": world_graph.entity_count(),
+                "timeout_seconds": WARMUP_TIMEOUT_SECONDS,
+            })
+        except Exception:
+            pass  # auth_state record failure must not block startup
 
     snapshot_provider = SnapshotProvider(
         observer=observer,
