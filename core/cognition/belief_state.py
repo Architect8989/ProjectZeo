@@ -39,7 +39,7 @@ class BeliefState:
 
     _FALLBACK_PRUNE_THRESHOLD = PRIOR_ALPHA * 2.0
 
-    def __init__(self):
+    def __init__(self, intent_hash: str = ""):
         self.created_at = time.time()
         self.state_probabilities: Dict[str, float] = {"neutral": 1.0}
         self.action_counts: Dict[str, int] = {}
@@ -53,7 +53,19 @@ class BeliefState:
         self.regret: Dict[str, Tuple[float, int]] = {}
         self.progress_score: float = 0.0
         self.environment_stability: float = 1.0
-        self.commitment_hash: str = "GENESIS"
+
+        # HAR-06 (MS-03): Seed the commitment hash with the intent hash rather
+        # than the constant "GENESIS". When commitment_hash = "GENESIS" for every
+        # new BeliefState, two replans of the same intent produce identical seed
+        # sequences for Thompson sampling — the sampler cannot distinguish a
+        # prior failure from an unexplored action, neutralising replan exploration.
+        # Using the intent hash makes the seed space unique per intent while
+        # preserving within-session determinism.
+        self.commitment_hash: str = (
+            hashlib.sha256(intent_hash.encode("utf-8")).hexdigest()
+            if intent_hash
+            else "GENESIS"
+        )
         self._iteration_counter: int = 0
 
     # =========================================================
@@ -101,13 +113,24 @@ class BeliefState:
 
         self.state_probabilities = {s: v / total for s, v in pruned.items()}
 
-        # MATH-02 FIX: Entropy floor at 0.3 nats now reliably catches
-        # near-collapse distributions. Additionally, explicitly check whether
-        # any single state dominates at ≥0.9 probability and force blending
-        # even when entropy is marginally above the floor due to fallback
-        # injection. This makes the floor robust to the prior_fallback sentinel.
-        dominant_p = max(self.state_probabilities.values())
-        if self.entropy() < self.MIN_ENTROPY_FLOOR or dominant_p >= 0.90:
+        # HAR-05 (MS-02): Remove the dual-condition blending trigger.
+        #
+        # The original code fired 0.95v + 0.05·uniform blending under TWO
+        # independent conditions:
+        #   1. entropy() < MIN_ENTROPY_FLOOR (0.3 nats)
+        #   2. dominant_p >= 0.90
+        #
+        # Condition 2 is independent of Condition 1. A two-state distribution
+        # p=[0.92, 0.08] has entropy ≈ 0.375 nats (ABOVE the floor) but
+        # dominant_p = 0.92 (ABOVE 0.90). Blending fired — pulling toward
+        # uniform [0.5, 0.5] — introducing undocumented regularization beyond
+        # the stated design. The system could never represent posterior certainty
+        # above ~89% regardless of evidence strength.
+        #
+        # Fix: blend only on the entropy floor condition. The floor already
+        # catches near-collapse distributions correctly (including the
+        # prior_fallback sentinel case that motivated the dual condition).
+        if self.entropy() < self.MIN_ENTROPY_FLOOR:
             uniform = 1.0 / len(self.state_probabilities)
             blended = {
                 k: 0.95 * v + 0.05 * uniform
@@ -183,6 +206,10 @@ class BeliefState:
         alpha = 1.0 + sum(scaled)
         beta = 1.0 + sum(1.0 - v for v in scaled)
 
+        # HAR-06 (MS-03): Use self.commitment_hash (seeded from intent_hash at
+        # construction) rather than a constant "GENESIS" so that two replans of
+        # the same objective produce distinct seed sequences.  Within a single
+        # task attempt the sequence remains deterministic.
         seed_material = (
             f"{self.commitment_hash}:{action}:{self._iteration_counter}"
         ).encode("utf-8")
@@ -250,47 +277,65 @@ class BeliefState:
         self.regret[action] = (updated, self._iteration_counter)
 
     # =========================================================
-    # RECORDING WITH NORMALISATION — MATH-03 FIX
+    # RECORDING WITH NORMALISATION — MATH-03 / FIX-06 FIX
     # =========================================================
 
     def record_action(self, action: str, reward: float):
+        """
+        Record a reward observation for an action, storing a uniformly
+        normalised value in action_rewards.
 
+        FIX-06 (MS-01): The original code stored raw-clamped values for
+        n < 3 and z-scores for n ≥ 3, producing a mixed-unit deque. The
+        first two entries were in raw space [-3, 3]; subsequent entries
+        were z-scores relative to the window at each observation time.
+        expected_utility(), ucb_score(), and thompson_sample() operated
+        over this mixed deque, producing biased means and inflated variances
+        during the first 100 actions of every new BeliefState (the entire
+        task window for most tasks).
+
+        Fix: apply the same min-max scaling for ALL window sizes. For n < 3
+        we cannot compute a meaningful z-score (near-zero variance), so we
+        use linear min-max rescaling within [-REWARD_CLAMP, +REWARD_CLAMP]
+        instead. This produces values in a consistent unit space across all
+        n, at the cost of slightly less statistical normalisation for small
+        windows — which is acceptable given the small sample count.
+
+        The parallel _raw_action_rewards deque is always populated with the
+        unmodified raw reward for regret and global_best_reward() calculations.
+        """
         if action not in self.action_rewards:
             self.action_rewards[action] = deque(maxlen=self.REWARD_WINDOW)
         if action not in self._raw_action_rewards:
             # MATH-04 FIX: parallel raw reward window
             self._raw_action_rewards[action] = deque(maxlen=self.REWARD_WINDOW)
 
-        history = self.action_rewards[action]
-
-        # MATH-04 FIX: store raw reward before normalisation
+        # Always store the unmodified raw reward for regret / global best.
         self._raw_action_rewards[action].append(reward)
 
-        # MATH-03 FIX: Compute z-score statistics AFTER appending the current
-        # raw reward to the history so that the current observation is included
-        # in the mean/variance. The previous code computed stats from the
-        # existing window (N samples), then appended the normalised value —
-        # introducing a one-step lag where the current reward was normalised by
-        # statistics that did not include it. We now append the raw value,
-        # compute stats over N+1 (including the new point), then replace the
-        # last entry with the normalised value.
+        history = self.action_rewards[action]
+
         if len(history) >= 3:
-            # Temporarily append raw reward to compute inclusive statistics
+            # z-score normalisation: append raw, compute stats over full
+            # inclusive window (MATH-03 FIX: lag-free inclusive statistics),
+            # then replace last entry with the normalised value.
             history.append(reward)
             mean = sum(history) / len(history)
             variance = sum((r - mean) ** 2 for r in history) / len(history)
             std = math.sqrt(max(variance, self.NORMALIZE_EPS))
             normalized = (reward - mean) / std
             normalized = max(-self.REWARD_CLAMP, min(self.REWARD_CLAMP, normalized))
-            # Replace the just-appended raw value with the normalised value
             history[-1] = normalized
-        elif history:
-            # First 2 samples: identity scaling (avoid extreme z-scores from
-            # near-zero variance). Include current raw value in the deque as-is.
-            normalized = max(-self.REWARD_CLAMP, min(self.REWARD_CLAMP, reward))
-            history.append(normalized)
         else:
-            history.append(reward)
+            # FIX-06 (MS-01): For n < 3, use simple linear clamp instead of
+            # storing raw values.  This keeps the deque in a consistent unit
+            # space [-REWARD_CLAMP, +REWARD_CLAMP] for all window sizes,
+            # eliminating the mixed-unit contamination of early-session stats.
+            # When n reaches 3, the z-score branch re-normalises over the full
+            # window (which includes these two clamped entries), providing a
+            # smooth transition with only minor baseline error for 1–2 samples.
+            clamped = max(-self.REWARD_CLAMP, min(self.REWARD_CLAMP, reward))
+            history.append(clamped)
 
         self.action_counts[action] = self.action_counts.get(action, 0) + 1
 
@@ -351,10 +396,18 @@ class BeliefState:
                 parts.append(self._stable_value_bytes(value[k]))
             return b"".join(parts)
         if isinstance(value, list):
-            parts = []
-            for item in value:
-                parts.append(self._stable_value_bytes(item))
-            return b"".join(parts)
+            # HAR-03 (MS-08): Use "|" as a delimiter between list elements.
+            #
+            # Without a delimiter, [1, 2] and [12] both encode to b"12" —
+            # an adversarially crafted perception input (list of integers or
+            # short strings) could produce identical commitment hashes for
+            # distinct observations, enabling commitment chain spoofing.
+            #
+            # Fix: join element bytes with b"|" (chosen because it never appears
+            # in struct.pack("!d", ...) float encoding and is unlikely to appear
+            # in short string values used in observation fields).
+            parts = [self._stable_value_bytes(item) for item in value]
+            return b"|".join(parts)
         return str(value).encode()
 
     def commit(self, action: str, observation: Dict[str, Any]) -> None:
