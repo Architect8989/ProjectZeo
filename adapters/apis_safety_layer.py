@@ -271,14 +271,18 @@ def _disable_screenshot_writes():
                 )
         return _real_open(file, mode, *args, **kwargs)
 
-    # Scoped to the apis module namespace only — does NOT patch builtins globally.
-    _m.open = guarded_open
-
-    # INERT SCOPE FIX: operate.models.apis currently does not call open()
-    # directly, so the guard above is forward-looking only. Apply the same
-    # guard to operate.legacy.apis which DOES use open() extensively for
-    # screenshot file reads. This ensures the write guard actually fires
-    # on any path through the legacy module that writes to a screenshot path.
+    # SI-05 FIX: Do NOT set _m.open = guarded_open on the wrapper module.
+    #
+    # operate.models.apis (the thin wrapper module) contains NO direct open()
+    # calls — it delegates all I/O to operate.legacy.apis via _legacy(). Setting
+    # _m.open on the wrapper module is structurally inert: no code in that module
+    # namespace calls open(), so the guard never fires. The previous dual-patch
+    # approach created a false sense of security while the actual enforcement
+    # relied entirely on the legacy-module patch below.
+    #
+    # Corrected policy: apply guarded_open ONLY to operate.legacy.apis, which is
+    # the module that actually calls open() for screenshot file reads/writes.
+    # The wrapper module namespace is NOT patched — no benefit, no confusion.
     try:
         legacy = importlib.import_module("operate.legacy.apis")
         if not getattr(legacy, "_open_safety_guarded", False):
