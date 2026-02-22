@@ -2,6 +2,7 @@
 
 from typing import List, Dict, Any
 import math
+import random
 import hashlib
 import json
 
@@ -36,7 +37,7 @@ class ActionRanker:
     MIN_EXPLORATION_BONUS = 0.0  # FIX MATH-05: prevent exploitation suppression
 
     # ==================================================
-    # ACTION SELECTION (DETERMINISTIC)
+    # ACTION SELECTION (DETERMINISTIC except for tie-breaking)
     # ==================================================
 
     def select(
@@ -110,11 +111,25 @@ class ActionRanker:
 
         probabilities = [s / total for s in exp_scores]
 
-        # Deterministic: choose highest probability
-        selected_index = max(
-            range(len(actions)),
-            key=lambda i: probabilities[i],
-        )
+        # MR-03 FIX: Uniform random tie-breaking among equally-scoring actions.
+        # ─────────────────────────────────────────────────────────────────
+        # Bug: max(range(len(actions)), key=lambda i: probabilities[i]) uses
+        # Python's max() which returns the LAST maximum when multiple actions
+        # share the highest probability. In the common case where all actions
+        # are unseen (probabilities are equal), this always picks the last
+        # action in the list — biasing exploration toward the end of whatever
+        # ordering the planner happened to produce.
+        #
+        # Fix: collect all maximally-scoring actions and choose uniformly at
+        # random. This gives true uniform exploration when no history exists
+        # and preserves correct exploitation when one action is clearly better.
+        # ─────────────────────────────────────────────────────────────────
+        max_prob = max(probabilities)
+        candidates = [
+            i for i, p in enumerate(probabilities)
+            if abs(p - max_prob) < 1e-9
+        ]
+        selected_index = random.choice(candidates)
 
         return actions[selected_index]
 
