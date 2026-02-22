@@ -1,5 +1,40 @@
 import os
 import sys
+
+def _early_parse_args() -> bool:
+    """
+    Parse --allow-cloud from sys.argv BEFORE any imports execute.
+
+    Returns True if --allow-cloud is present, False otherwise.
+
+    This is intentionally minimal — full argument validation happens in
+    _parse_args() after all imports are complete.
+    """
+    return "--allow-cloud" in sys.argv
+
+
+# Resolve the operator's cloud intent at the earliest possible moment.
+_allow_cloud_early = _early_parse_args()
+
+if not _allow_cloud_early:
+    # Default: Ollama-only. Set explicitly (don't rely on default in factory.py)
+    # so the freeze always sees "1" when --allow-cloud is absent.
+    os.environ["OLLAMA_ONLY"] = "1"
+else:
+    # Explicit --allow-cloud: clear the env var so factory.py freeze sees a
+    # falsy/absent value and permits cloud routing.
+    os.environ.pop("OLLAMA_ONLY", None)
+    # Warn early so operators see this even if something crashes during import.
+    print(
+        "[run.py] WARNING: --allow-cloud is set. Cloud API routing is ENABLED. "
+        "Ensure API keys are intentionally configured.",
+        file=sys.stderr,
+    )
+
+# ===========================================================================
+# Imports — factory.py freeze now captures the correct OLLAMA_ONLY value.
+# ===========================================================================
+
 import asyncio
 import threading
 from typing import Any
@@ -10,18 +45,15 @@ from config.timeouts import LLM_THREAD_TIMEOUT_SECONDS
 
 
 # ---------------------------------------------------------------------------
-# CLI ARGUMENT PARSING
+# CLI ARGUMENT PARSING (full)
 # ---------------------------------------------------------------------------
 
 def _parse_args():
     """
-    Minimal argument parser. Does not use argparse to avoid extra deps.
+    Full argument parser. Called after imports.
 
     Recognised flags:
-        --allow-cloud   Permit cloud model names to be routed through
-                        PureLLMWrapper. Without this flag, only models
-                        registered in adapters/factory._LOCAL_REGISTRY
-                        are accepted. Default: DENIED.
+        --allow-cloud   Permit cloud model routing (processed pre-import above).
 
     Positional argument (required):
         model_name      First non-flag argument is treated as the model name.
@@ -153,24 +185,15 @@ def _make_llm_callable(adapter):
 if __name__ == "__main__":
     model_name, allow_cloud = _parse_args()
 
-    # FIX F-02: Persist the resolved model name into the environment so that
-    # all downstream text-only Ollama calls (ExecutionPlanner._call_llm_text,
-    # _decompose_if_complex) see the operator-specified model instead of the
-    # hardcoded fallback "qwen2.5-vl:7b-instruct".
+    # FIX F-02: Persist the resolved model name so all downstream text-only
+    # Ollama calls see the operator-specified model.
     os.environ["LLM_MODEL"] = model_name
 
-    # FIX H-01: Enforce OLLAMA_ONLY by default unless --allow-cloud was given.
-    # The factory checks this env var before routing to PureLLMWrapper.
-    if not allow_cloud:
-        os.environ.setdefault("OLLAMA_ONLY", "1")
-    else:
-        # Explicit opt-in: unset the flag so the factory allows cloud routing.
-        os.environ.pop("OLLAMA_ONLY", None)
-        print(
-            "[run.py] WARNING: --allow-cloud is set. Cloud API routing is ENABLED. "
-            "Ensure API keys are intentionally configured.",
-            file=sys.stderr,
-        )
+    # OLLAMA_ONLY was already set/cleared above before factory import.
+    # The factory freeze has already captured the correct value.
+    # Do NOT mutate os.environ["OLLAMA_ONLY"] again here — factory.py's
+    # module-level freeze is immutable; any mutation after import is silently
+    # ignored by the enforcement boundary.
 
     adapter = build_llm(model_name)
     llm_callable = _make_llm_callable(adapter)
