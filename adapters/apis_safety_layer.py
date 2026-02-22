@@ -78,6 +78,29 @@ def apply_patches():
     _guard_dispatch()
 
 
+def uninstall_patches():
+    """
+    SI-02 FIX: Restore builtins.open to its original value.
+
+    Call this in test teardown or when completely shutting down the safety
+    layer. Without this, builtins.open remains patched for the process
+    lifetime, which is usually correct for production but interferes with
+    test isolation if tests do not use subprocess isolation.
+    """
+    import builtins as _builtins_mod
+    original = getattr(_builtins_mod, "_original_open_pre_safety_patch", None)
+    if original is not None:
+        _builtins_mod.open = original
+        try:
+            del _builtins_mod._original_open_pre_safety_patch
+        except AttributeError:
+            pass
+        try:
+            del _builtins_mod._safety_open_installed
+        except AttributeError:
+            pass
+
+
 # ============================================================
 # CORE PROVIDER WRAPPER
 # ============================================================
@@ -259,30 +282,48 @@ def _disable_screenshot_writes():
                 f"[APIS-SAFETY] Failed to patch PIL save: {e}"
             )
 
-    # ---- Guard builtins.open within the apis module namespace only ----
+    # ---- Guard builtins.open GLOBALLY ----
+    # SI-02 FIX: Install guarded_open on builtins.open, not just on the
+    # legacy module's namespace attribute.
+    #
+    # Bug: The previous code set `legacy.open = guarded_open`, which only
+    # intercepts calls that explicitly use `legacy.open(...)`. All Python
+    # modules that call the built-in `open()` directly (which is every module
+    # by default) bypass this guard entirely — it never fires.
+    #
+    # Root cause: Python name resolution for `open` in any module goes to
+    # builtins.open unless the module explicitly defines or imports a local
+    # `open`. Setting a module-level attribute has no effect on how other
+    # modules resolve `open`.
+    #
+    # Fix: patch builtins.open directly. This intercepts ALL open() calls
+    # across the entire process, regardless of which module makes them.
+    # We store the original as _real_open and restore it in a matching
+    # uninstall() function for testability and cleanup.
+    #
+    # Safety: guarded_open only blocks writes to paths that look like
+    # screenshot files. All other open() calls pass through unchanged.
     import builtins as _builtins_mod
-    _real_open = _builtins_mod.open
+    _real_open = getattr(_builtins_mod, "_original_open_pre_safety_patch", None)
+    if _real_open is None:
+        # First install — save the true original
+        _real_open = _builtins_mod.open
+        _builtins_mod._original_open_pre_safety_patch = _real_open
 
     def guarded_open(file, mode="r", *args, **kwargs):
-        if "w" in mode or "a" in mode or "x" in mode:
+        if "w" in str(mode) or "a" in str(mode) or "x" in str(mode):
             if _is_screenshot_path(file):
                 raise RuntimeError(
                     "[APIS-SAFETY] Screenshot file write blocked"
                 )
         return _real_open(file, mode, *args, **kwargs)
 
-    # SI-05 FIX: Do NOT set _m.open = guarded_open on the wrapper module.
-    #
-    # operate.models.apis (the thin wrapper module) contains NO direct open()
-    # calls — it delegates all I/O to operate.legacy.apis via _legacy(). Setting
-    # _m.open on the wrapper module is structurally inert: no code in that module
-    # namespace calls open(), so the guard never fires. The previous dual-patch
-    # approach created a false sense of security while the actual enforcement
-    # relied entirely on the legacy-module patch below.
-    #
-    # Corrected policy: apply guarded_open ONLY to operate.legacy.apis, which is
-    # the module that actually calls open() for screenshot file reads/writes.
-    # The wrapper module namespace is NOT patched — no benefit, no confusion.
+    # Install on builtins so ALL modules are covered
+    if not getattr(_builtins_mod, "_safety_open_installed", False):
+        _builtins_mod.open = guarded_open
+        _builtins_mod._safety_open_installed = True
+
+    # Also patch the legacy module attribute for backwards compatibility
     try:
         legacy = importlib.import_module("operate.legacy.apis")
         if not getattr(legacy, "_open_safety_guarded", False):
