@@ -559,6 +559,36 @@ def _execute_decision(
                 f"TASK_FAILED:click_invalid_coordinates x={x!r} y={y!r}"
             )
 
+        # RB-A7 FIX: Coordinate space guard.
+        #
+        # os_backend.mouse() expects NORMALIZED coordinates in [0.0, 1.0].
+        # QwenOllamaAdapter._resolve_click_coordinates() resolves OCR text
+        # anchors by calling get_text_coordinates() which may return absolute
+        # pixel values (e.g. x=847, y=512 on a 1920×1080 display).
+        #
+        # Heuristic: if either coordinate exceeds 1.0, assume the pair is in
+        # absolute pixel space and normalise using the screen dimensions
+        # reported by os_backend. This is safe because:
+        #   - Legitimate normalised coords are in [0.0, 1.0]; values >1.0 are
+        #     unambiguously absolute pixels.
+        #   - Normalised coords very close to 1.0 (e.g. 0.999) remain
+        #     unchanged, so the guard does not distort already-normalised input.
+        #   - If os_backend.screen_size() is unavailable, fall through to the
+        #     raw values and let the backend raise its own error.
+        if x_f > 1.0 or y_f > 1.0:
+            try:
+                screen_w, screen_h = os_backend.screen_size()
+                if screen_w > 0 and screen_h > 0:
+                    x_f = x_f / screen_w
+                    y_f = y_f / screen_h
+            except Exception:
+                pass  # screen_size() unavailable — pass raw values through
+
+        # Clamp to [0.0, 1.0] after any normalization to guard against
+        # out-of-range LLM outputs regardless of coordinate origin.
+        x_f = max(0.0, min(1.0, x_f))
+        y_f = max(0.0, min(1.0, y_f))
+
         os_backend.mouse({"x": x_f, "y": y_f})
         return None
 
