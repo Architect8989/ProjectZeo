@@ -91,7 +91,13 @@ def _headless_capture(file_path: str) -> None:
             capture_output=True,
             timeout=5,
         )
-        if result.returncode == 0 and result.stdout:
+        # HARDEN-5 FIX: Check len(result.stdout) > 0 before writing.
+        # Older scrot versions (< 1.0) do not support the "-" (stdout) flag.
+        # They return exit code 0 with empty stdout, causing a zero-byte PNG
+        # file to be written and the function to return success silently. All
+        # downstream processing then fails on the empty/invalid image with
+        # cryptic PIL errors instead of a clear VisionUnavailableError.
+        if result.returncode == 0 and len(result.stdout) > 0:
             with open(file_path, "wb") as f:
                 f.write(result.stdout)
             return
