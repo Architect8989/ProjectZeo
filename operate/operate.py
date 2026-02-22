@@ -97,7 +97,10 @@ def operate_main(
     reasoning_engine = ReasoningEngine(llm_callable=llm_callable)
 
     try:
+        # FIX M-1: Pass terminal_prompt through to _execute_autonomous_loop so
+        # BeliefState can be seeded with the intent hash (HAR-06/MS-03 fix).
         _execute_autonomous_loop(
+            terminal_prompt=terminal_prompt,
             execution_plan=execution_plan,
             observer=observer,
             world_graph=world_graph,
@@ -117,6 +120,7 @@ def operate_main(
 
 def _execute_autonomous_loop(
     *,
+    terminal_prompt: str,          # FIX M-1: required for BeliefState seeding
     execution_plan: ExecutionPlan,
     observer,
     world_graph,
@@ -139,7 +143,19 @@ def _execute_autonomous_loop(
         "objective": execution_plan.objective,
     })
 
-    belief = BeliefState()
+    # FIX M-1 (HAR-06/MS-03): Pass terminal_prompt as intent_hash so Thompson
+    # sampling is seeded uniquely per task intent.
+    #
+    # The bug: _execute_autonomous_loop called BeliefState() with no arguments.
+    # BeliefState.__init__ defaults intent_hash="" → commitment_hash="GENESIS"
+    # for every task. With an identical seed, Thompson samples are identical
+    # across all replans of the same task — the sampler cannot distinguish a
+    # prior failure from an unexplored action, neutralising replan exploration.
+    #
+    # Fix: pass terminal_prompt so commitment_hash = SHA-256(intent) — unique
+    # per user objective, preserving within-session determinism while ensuring
+    # distinct seed sequences across replans and across different tasks.
+    belief = BeliefState(intent_hash=terminal_prompt)
     action_ranker = ActionRanker()
 
     # PATCH §1.11: bounded command output log fed into world_graph
@@ -496,10 +512,23 @@ def _execute_autonomous_loop(
             journal.record({"event": "execution_complete"})
             return
 
+        # FIX M-5 / H4: Exclude the DONE sentinel step from plan_steps_total.
+        #
+        # Bug: len(execution_plan.steps) included the synthetic DONE step
+        # appended by ExecutionPlanner.create_plan(). At the convergence check,
+        # current_step_index (= steps_completed) was always < len(steps) because
+        # the DONE step is at index len-1 and the DONE branch above returns
+        # before ever reaching this code. converged() therefore always returned
+        # False — the fast-exit was permanently dead code.
+        #
+        # Fix: _real_steps = len(steps) - 1 excludes the DONE sentinel.
+        # When all real work steps are completed (current_step_index == _real_steps),
+        # converged() can now return True and fire the fast-exit path.
+        _real_steps = max(len(execution_plan.steps) - 1, 1)
         if belief.converged(
             min_iterations=3,
             current_iteration=iteration,
-            plan_steps_total=len(execution_plan.steps),
+            plan_steps_total=_real_steps,
             steps_completed=current_step_index,
         ):
             journal.record({"event": "execution_converged"})
@@ -568,24 +597,42 @@ def _execute_decision(
         #
         # Heuristic: if either coordinate exceeds 1.0, assume the pair is in
         # absolute pixel space and normalise using the screen dimensions
-        # reported by os_backend. This is safe because:
-        #   - Legitimate normalised coords are in [0.0, 1.0]; values >1.0 are
-        #     unambiguously absolute pixels.
-        #   - Normalised coords very close to 1.0 (e.g. 0.999) remain
-        #     unchanged, so the guard does not distort already-normalised input.
-        #   - If os_backend.screen_size() is unavailable, fall through to the
-        #     raw values and let the backend raise its own error.
+        # reported by os_backend.
         if x_f > 1.0 or y_f > 1.0:
+            # FIX RB-1: If screen_size() is unavailable, raise a hard error
+            # instead of silently clamping to (1.0, 1.0).
+            #
+            # Bug: the original code caught all exceptions from screen_size()
+            # with "except: pass" then let x_f/y_f proceed unchanged into
+            # max(0.0, min(1.0, x_f)) — mapping absolute pixels like x=1200
+            # to 1.0, which is the right edge of the screen. Every text-targeted
+            # click silently fired at the bottom-right corner, burning replan
+            # budget with zero diagnostic output.
+            #
+            # Fix: raise RuntimeError("TASK_FAILED:...") so the stagnation
+            # counter increments, the journal records the failure reason, and
+            # operators see an actionable error instead of mysterious misclicks.
             try:
                 screen_w, screen_h = os_backend.screen_size()
                 if screen_w > 0 and screen_h > 0:
                     x_f = x_f / screen_w
                     y_f = y_f / screen_h
-            except Exception:
-                pass  # screen_size() unavailable — pass raw values through
+                else:
+                    raise RuntimeError(
+                        "TASK_FAILED:click_screen_size_zero "
+                        f"screen=({screen_w},{screen_h}) raw=({x_f},{y_f})"
+                    )
+            except RuntimeError:
+                # Re-raise our own TASK_FAILED errors unchanged.
+                raise
+            except Exception as _sse:
+                raise RuntimeError(
+                    f"TASK_FAILED:click_screen_size_unavailable "
+                    f"raw=({x_f},{y_f}) reason={_sse}"
+                ) from _sse
 
-        # Clamp to [0.0, 1.0] after any normalization to guard against
-        # out-of-range LLM outputs regardless of coordinate origin.
+        # Clamp to [0.0, 1.0] after normalisation to guard against minor
+        # floating-point overshoot (e.g. from integer division rounding).
         x_f = max(0.0, min(1.0, x_f))
         y_f = max(0.0, min(1.0, y_f))
 
