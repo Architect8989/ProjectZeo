@@ -16,13 +16,27 @@ class BeliefState:
     REGRET_DECAY = 0.995
     MAX_STATES = 64
     MAX_REGRET = 100.0
-    MIN_ENTROPY_FLOOR = 0.1
+
+    # MATH-02 FIX: Raise MIN_ENTROPY_FLOOR from 0.1 to 0.3.
+    # With __prior_fallback__ at PRIOR_ALPHA=0.01 and a dominant state at
+    # p≈0.99, entropy ≈ 0.08 nats — below 0.1. But the fallback injection
+    # lifts entropy to ≈0.14 nats which is above 0.1, making the floor
+    # inoperative in all realistic belief collapse scenarios. 0.3 nats
+    # corresponds roughly to a 2-state distribution at p=[0.93, 0.07] —
+    # the floor now actively blends any near-collapse belief, providing the
+    # exploration protection it was designed to give.
+    MIN_ENTROPY_FLOOR = 0.3
+
     NORMALIZE_EPS = 1e-8
     REWARD_CLAMP = 3.0
 
-    # FIX H-10: probability below which __prior_fallback__ is pruned after
-    # each update cycle to prevent indefinite accumulation of the injected
-    # anti-collapse state.
+    # MATH-08 FIX: Use only the most recent THOMPSON_WINDOW samples for Beta
+    # parameter estimation. With REWARD_WINDOW=100, Alpha+Beta≈102 and the
+    # Beta distribution variance≈0.0024 — effectively degenerate (near-mean
+    # for all mature actions). THOMPSON_WINDOW=20 keeps variance≈0.012,
+    # preserving meaningful exploration spread even for well-explored actions.
+    THOMPSON_WINDOW = 20
+
     _FALLBACK_PRUNE_THRESHOLD = PRIOR_ALPHA * 2.0
 
     def __init__(self):
@@ -30,6 +44,12 @@ class BeliefState:
         self.state_probabilities: Dict[str, float] = {"neutral": 1.0}
         self.action_counts: Dict[str, int] = {}
         self.action_rewards: Dict[str, deque] = {}
+        # MATH-04 FIX: Track raw (pre-normalisation) rewards in a parallel
+        # structure. The normalised action_rewards deque feeds UCB/Thompson/
+        # expected_utility. The raw deque feeds regret and global_best_reward()
+        # so regret is measured in interpretable units (confidence delta ∈ [-0.5, 0.5])
+        # rather than session-relative z-scores.
+        self._raw_action_rewards: Dict[str, deque] = {}
         self.regret: Dict[str, Tuple[float, int]] = {}
         self.progress_score: float = 0.0
         self.environment_stability: float = 1.0
@@ -74,10 +94,6 @@ class BeliefState:
         if total <= 0:
             return
 
-        # HRD-06: Entropy floor blending is inoperative for single-state beliefs
-        # because 0.95×1.0 + 0.05×1.0 = 1.0 regardless of the blend. When
-        # pruning collapses belief to a single state, inject a minimum second
-        # state at PRIOR_ALPHA probability so the entropy floor can work.
         if len(pruned) == 1:
             (sole_state,) = pruned.keys()
             pruned["__prior_fallback__"] = self.PRIOR_ALPHA
@@ -85,7 +101,13 @@ class BeliefState:
 
         self.state_probabilities = {s: v / total for s, v in pruned.items()}
 
-        if self.entropy() < self.MIN_ENTROPY_FLOOR:
+        # MATH-02 FIX: Entropy floor at 0.3 nats now reliably catches
+        # near-collapse distributions. Additionally, explicitly check whether
+        # any single state dominates at ≥0.9 probability and force blending
+        # even when entropy is marginally above the floor due to fallback
+        # injection. This makes the floor robust to the prior_fallback sentinel.
+        dominant_p = max(self.state_probabilities.values())
+        if self.entropy() < self.MIN_ENTROPY_FLOOR or dominant_p >= 0.90:
             uniform = 1.0 / len(self.state_probabilities)
             blended = {
                 k: 0.95 * v + 0.05 * uniform
@@ -94,17 +116,6 @@ class BeliefState:
             total = sum(blended.values())
             self.state_probabilities = {k: v / total for k, v in blended.items()}
 
-        # FIX H-10: Prune __prior_fallback__ once its probability falls below
-        # the prune threshold. Without this, the fallback state accumulates
-        # across hundreds of updates — it can never be eliminated by the pruning
-        # logic above because it is re-injected every time the belief collapses
-        # to a single state. As the real distribution grows richer, the fallback
-        # probability decays toward PRIOR_ALPHA / (N * PRIOR_ALPHA + 1) but
-        # never reaches zero, permanently biasing entropy readings upward.
-        #
-        # Prune it explicitly when it is safely below 2×PRIOR_ALPHA — at that
-        # probability it contributes less than 0.02 nats to entropy (~0.1% of
-        # a uniform-2 distribution), making its removal statistically negligible.
         fallback_prob = self.state_probabilities.get("__prior_fallback__", 0.0)
         if 0.0 < fallback_prob <= self._FALLBACK_PRUNE_THRESHOLD:
             pruned_dist = {
@@ -112,7 +123,6 @@ class BeliefState:
                 if k != "__prior_fallback__"
             }
             if pruned_dist:
-                # Re-normalise after removal
                 total = sum(pruned_dist.values())
                 if total > 0:
                     self.state_probabilities = {k: v / total for k, v in pruned_dist.items()}
@@ -139,8 +149,6 @@ class BeliefState:
         return mean - self.RISK_LAMBDA * variance
 
     def ucb_score(self, action: str) -> float:
-        # HRD-09: clamp total_actions ≥ 2 so log() is always positive,
-        # giving a non-zero exploration bonus even before any actions are tried.
         total_actions = max(sum(self.action_counts.values()) + 1, 2)
         count = self.action_counts.get(action, 0) + 1
         rewards = self.action_rewards.get(action)
@@ -154,7 +162,7 @@ class BeliefState:
         return mean_reward + exploration
 
     # =========================================================
-    # TRUE DETERMINISTIC THOMPSON SAMPLING
+    # THOMPSON SAMPLING — MATH-08 FIX
     # =========================================================
 
     def thompson_sample(self, action: str) -> float:
@@ -162,15 +170,14 @@ class BeliefState:
         if not rewards:
             return 0.5
 
-        # Map normalized reward signal to Beta distribution parameters.
-        # MATH-08 note: rewards in the deque are a mix of raw values (first
-        # 1–2 samples, clamped to ±REWARD_CLAMP) and z-score-normalized values
-        # (samples 3+, also clamped). Both are in the range [-3.0, +3.0], so
-        # the scaling to [0, 1] via (r + 3.0) / 6.0 is valid for both regimes.
-        # The scale discontinuity at sample 3 affects early Beta shape but not
-        # the long-run mean — both raw and normalized signals center near 0 for
-        # neutral actions.
-        scaled = [(r + self.REWARD_CLAMP) / (2 * self.REWARD_CLAMP) for r in rewards]
+        # MATH-08 FIX: Use only the most recent THOMPSON_WINDOW samples for
+        # Beta parameter estimation. Using all REWARD_WINDOW=100 samples drives
+        # Alpha+Beta≈102 (variance≈0.0024), effectively degenerating Thompson
+        # sampling to the mean for any mature action. With THOMPSON_WINDOW=20,
+        # variance≈0.012 — enough spread to maintain exploration diversity.
+        recent = list(rewards)[-self.THOMPSON_WINDOW:]
+
+        scaled = [(r + self.REWARD_CLAMP) / (2 * self.REWARD_CLAMP) for r in recent]
         scaled = [min(1.0, max(0.0, v)) for v in scaled]
 
         alpha = 1.0 + sum(scaled)
@@ -190,7 +197,7 @@ class BeliefState:
         return float(sample)
 
     # =========================================================
-    # REGRET TRACKING
+    # REGRET TRACKING — MATH-07 FIX
     # =========================================================
 
     def _get_effective_regret(self, action: str) -> float:
@@ -201,7 +208,18 @@ class BeliefState:
         raw_value, last_iter = entry
         delta_iter = self._iteration_counter - last_iter
         decayed = raw_value * (self.REGRET_DECAY ** delta_iter)
-        return min(decayed, self.MAX_REGRET)
+        decayed = min(decayed, self.MAX_REGRET)
+
+        # MATH-07 FIX: Persist the decayed value back to storage so that
+        # summary() and any future calls see the current decayed value, not
+        # the stale peak. Without this, the stored raw_value accumulates at
+        # the historical peak forever — queries use the correct decayed value
+        # but storage remains misleading for debugging and any code that reads
+        # self.regret directly.
+        if delta_iter > 0:
+            self.regret[action] = (decayed, self._iteration_counter)
+
+        return decayed
 
     def update_regret(self, action: str, reward: float, best_reward: float):
         """
@@ -210,15 +228,15 @@ class BeliefState:
         Parameters
         ----------
         action : str
-            The action key that was taken.
         reward : float
-            The normalized reward received for this action (post-window).
+            MATH-04 FIX: Must be a RAW reward (confidence delta, not z-score).
+            Callers (operate.py) should pass `raw_reward` directly, not the
+            normalised value from `action_rewards`. This makes regret meaningful
+            across sessions and comparable between actions with different
+            sample-count histories.
         best_reward : float
-            FIX H-02 / MATH-09: The CROSS-ACTION best reward observed in the
-            current session — i.e. max over all actions' reward histories, not
-            just the self-history of this action. Callers (operate.py) are
-            responsible for computing this correctly. See operate.py for the
-            corrected computation.
+            The best RAW reward observed across all actions this session.
+            Use `global_best_reward()` which now reads from `_raw_action_rewards`.
         """
         self._iteration_counter += 1
 
@@ -232,52 +250,65 @@ class BeliefState:
         self.regret[action] = (updated, self._iteration_counter)
 
     # =========================================================
-    # RECORDING WITH NORMALIZATION
+    # RECORDING WITH NORMALISATION — MATH-03 FIX
     # =========================================================
 
     def record_action(self, action: str, reward: float):
 
         if action not in self.action_rewards:
             self.action_rewards[action] = deque(maxlen=self.REWARD_WINDOW)
+        if action not in self._raw_action_rewards:
+            # MATH-04 FIX: parallel raw reward window
+            self._raw_action_rewards[action] = deque(maxlen=self.REWARD_WINDOW)
 
         history = self.action_rewards[action]
 
-        if history:
-            # HRD-05: Skip z-score normalization until ≥ 3 samples to avoid
-            # extreme z-scores from near-zero variance with 1–2 samples.
-            if len(history) >= 3:
-                mean = sum(history) / len(history)
-                variance = sum((r - mean) ** 2 for r in history) / len(history)
-                std = math.sqrt(max(variance, self.NORMALIZE_EPS))
-                normalized = (reward - mean) / std
-                normalized = max(-self.REWARD_CLAMP, min(self.REWARD_CLAMP, normalized))
-            else:
-                # Identity scaling for first two samples — preserve raw signal
-                normalized = max(-self.REWARD_CLAMP, min(self.REWARD_CLAMP, reward))
-        else:
-            normalized = reward
+        # MATH-04 FIX: store raw reward before normalisation
+        self._raw_action_rewards[action].append(reward)
 
-        history.append(normalized)
+        # MATH-03 FIX: Compute z-score statistics AFTER appending the current
+        # raw reward to the history so that the current observation is included
+        # in the mean/variance. The previous code computed stats from the
+        # existing window (N samples), then appended the normalised value —
+        # introducing a one-step lag where the current reward was normalised by
+        # statistics that did not include it. We now append the raw value,
+        # compute stats over N+1 (including the new point), then replace the
+        # last entry with the normalised value.
+        if len(history) >= 3:
+            # Temporarily append raw reward to compute inclusive statistics
+            history.append(reward)
+            mean = sum(history) / len(history)
+            variance = sum((r - mean) ** 2 for r in history) / len(history)
+            std = math.sqrt(max(variance, self.NORMALIZE_EPS))
+            normalized = (reward - mean) / std
+            normalized = max(-self.REWARD_CLAMP, min(self.REWARD_CLAMP, normalized))
+            # Replace the just-appended raw value with the normalised value
+            history[-1] = normalized
+        elif history:
+            # First 2 samples: identity scaling (avoid extreme z-scores from
+            # near-zero variance). Include current raw value in the deque as-is.
+            normalized = max(-self.REWARD_CLAMP, min(self.REWARD_CLAMP, reward))
+            history.append(normalized)
+        else:
+            history.append(reward)
+
         self.action_counts[action] = self.action_counts.get(action, 0) + 1
 
     # =========================================================
-    # GLOBAL BEST REWARD (for correct regret computation)
+    # GLOBAL BEST REWARD — MATH-04 FIX
     # =========================================================
 
     def global_best_reward(self) -> float:
         """
-        FIX H-02 / MATH-09: Return the best reward seen across ALL actions in
-        the current session's sliding window.
-
-        Callers should use this value as best_reward in update_regret() to
-        compute true opportunity cost (regret = best_possible - chosen),
-        not just the self-history max which makes regret near-zero for any
-        action that has ever succeeded once.
+        MATH-04 FIX: Return the best RAW reward seen across all actions this
+        session. Uses _raw_action_rewards (pre-normalisation) so regret is
+        computed in interpretable units (confidence delta ∈ [-0.5, 0.5])
+        rather than session-relative z-scores.
 
         Returns 0.0 if no actions have been recorded yet.
         """
         best = 0.0
-        for history in self.action_rewards.values():
+        for history in self._raw_action_rewards.values():
             if history:
                 best = max(best, max(history))
         return best
