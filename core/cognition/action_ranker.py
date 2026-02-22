@@ -99,10 +99,10 @@ class ActionRanker:
         max_score = max(scores)
         shifted = [(s - max_score) / tau for s in scores]
 
-        exp_scores = [
-            math.exp(min(50.0, s))
-            for s in shifted
-        ]
+        # Deterministic softmax — shift ensures max shifted value is 0.0,
+        # so exp(s) ≤ 1 for all s. The min(50.0, s) clamp that was here is
+        # dead code (MATH-05) and has been removed to avoid confusion.
+        exp_scores = [math.exp(s) for s in shifted]
         total = sum(exp_scores)
 
         if total <= 0.0:
