@@ -441,19 +441,12 @@ def _execute_autonomous_loop(
         except Exception:
             belief.record_action(action_key, reward=-0.5)
 
-            history = belief.action_rewards.get(action_key, [])
-            normalized_reward = history[-1] if history else -0.5
-
-            # FIX H-02 / MATH-09: Use cross-action best reward for regret.
-            # The previous code used max(history) — the self-history max of this
-            # action — which means regret for a persistently failing action is
-            # always near zero (it never exceeds its own best, which is also bad).
-            # True regret = max_reward_any_action - chosen_reward.
-            # This correctly accumulates regret for suboptimal choices relative
-            # to the best-performing action observed so far in this session.
+            # MATH-04 FIX: Pass raw reward (-0.5 for failure) to update_regret,
+            # not the normalised value from the history deque. Regret must be
+            # in raw (confidence delta) units so it is meaningful across sessions
+            # and comparable between actions with different sample-count histories.
             best_reward = belief.global_best_reward()
-
-            belief.update_regret(action_key, normalized_reward, best_reward)
+            belief.update_regret(action_key, -0.5, best_reward)
 
             stagnant_iterations += 1
             if stagnant_iterations >= stagnant_limit:
@@ -472,13 +465,11 @@ def _execute_autonomous_loop(
         raw_reward = float(verification.confidence) - 0.5
         belief.record_action(action_key, reward=raw_reward)
 
-        history = belief.action_rewards.get(action_key, [])
-        normalized_reward = history[-1] if history else raw_reward
-
-        # FIX H-02 / MATH-09: cross-action best reward (success path)
+        # MATH-04 FIX: Pass raw_reward directly to update_regret so regret is
+        # tracked in interpretable confidence-delta units, not session-relative
+        # z-scores. global_best_reward() now reads from _raw_action_rewards.
         best_reward = belief.global_best_reward()
-
-        belief.update_regret(action_key, normalized_reward, best_reward)
+        belief.update_regret(action_key, raw_reward, best_reward)
 
         if not verification.success:
             stagnant_iterations += 1
@@ -489,6 +480,14 @@ def _execute_autonomous_loop(
 
         stagnant_iterations = 0
         belief.progress_score += verification.progress_score
+
+        # MATH-01 / HARD-1: Advance the commitment chain after each successful
+        # step. Without this, commitment_hash stays "GENESIS" for the entire
+        # task lifetime, making Thompson sampling deterministically seeded only
+        # by (action_key, iteration_count). The commit() call hashes the
+        # action key + current observation into the chain so each step's
+        # Thompson sample is cryptographically dependent on execution history.
+        belief.commit(action_key, perception_snapshot or {})
 
         previous_perception = perception_snapshot
         current_step_index += 1
