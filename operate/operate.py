@@ -22,10 +22,14 @@ from core.tools.autonomous_installer import AutonomousInstaller
 
 from core.cognition.belief_state import BeliefState
 from core.cognition.action_ranker import ActionRanker
-# FIX H-03 / RB-03: Import ReasoningEngine so it can be used as a fallback
-# when the static plan's action dict produces stagnation. Previously this
-# import existed but the class was never instantiated or called during execution.
 from core.cognition.reasoning_engine import ReasoningEngine
+
+# SI-01 FIX: Import PolicyEngine so it can be instantiated and called in
+# the execution path. Previously PolicyEngine was defined, unit-tested, and
+# completely unreachable at runtime — the allowlist of permitted applications
+# was dead code. Every application could be launched or clicked regardless
+# of configuration.
+from policy.engine import PolicyEngine, PolicyViolationError
 
 from config.timeouts import MAX_STAGNANT_ITERS_UI, MAX_STAGNANT_ITERS_COMMAND
 
@@ -68,6 +72,30 @@ def operate_main(
 
     os_backend = os_backend or OperatingSystem()
 
+    # SI-01 FIX: Instantiate PolicyEngine here so it is active for the
+    # entire task execution. The engine is passed into the loop so it can
+    # validate every action before _execute_decision() is called.
+    #
+    # Configuration: load from policy.yaml if it exists, otherwise use
+    # the default conservative allowlist. Operators should extend the
+    # allowlist in policy.yaml rather than modifying source code.
+    policy_engine = PolicyEngine()
+    try:
+        import os as _os_mod, yaml as _yaml  # type: ignore[import]
+        _policy_path = _os_mod.path.join(
+            _os_mod.path.dirname(__file__), "..", "policy.yaml"
+        )
+        if _os_mod.path.exists(_policy_path):
+            with open(_policy_path, "r") as _pf:
+                _pcfg = _yaml.safe_load(_pf) or {}
+            _allowed = _pcfg.get("allowed_apps")
+            if isinstance(_allowed, list):
+                policy_engine = PolicyEngine(allowed_apps=set(_allowed))
+    except ImportError:
+        pass  # PyYAML not installed — use default allowlist
+    except Exception:
+        pass  # Config parse error — use default allowlist (fail-open for config)
+
     try:
         accessibility_backend = AccessibilityBackend()
         if observer is not None:
@@ -80,7 +108,13 @@ def operate_main(
     verifier = StepVerifier()
     progress = ProgressTracker(execution_plan)
 
-    llm_callable = getattr(planner, "_llm_call", None)
+    # SI-03 FIX: Use public get_llm_callable() instead of accessing the
+    # private _llm_call attribute directly. If the planner doesn't expose
+    # this method, fall back to the private attribute with a clear error.
+    if hasattr(planner, "get_llm_callable"):
+        llm_callable = planner.get_llm_callable()
+    else:
+        llm_callable = getattr(planner, "_llm_call", None)
     if not callable(llm_callable):
         raise RuntimeError("Planner LLM callable unavailable")
 
@@ -112,6 +146,7 @@ def operate_main(
             progress=progress,
             installer=installer,
             reasoning_engine=reasoning_engine,
+            policy_engine=policy_engine,
             max_wallclock_seconds=max_wallclock_seconds,
         )
     finally:
@@ -132,6 +167,7 @@ def _execute_autonomous_loop(
     progress: ProgressTracker,
     installer: Optional[AutonomousInstaller],
     reasoning_engine: Optional[ReasoningEngine],
+    policy_engine: PolicyEngine,   # SI-01 FIX: required, not optional
     max_wallclock_seconds: int,
 ):
 
@@ -336,10 +372,16 @@ def _execute_autonomous_loop(
             "command", "install", "file_create"
         }
 
+        # MR-01a: Compute soc_confident once; reused in retry loop below.
+        # (The full gate computation with consecutive-obs check happens later,
+        # inside the try block after PolicyEngine validation. Here we use the
+        # lightweight single-obs form for the initial authority pre-check.)
+        _soc_initial = belief.environment_stability > 0.7
+
         authority = input_arbitrator.evaluate(
             input_event_ts=time.monotonic(),
             high_risk=is_high_risk,
-            soc_confident=belief.environment_stability > 0.7,
+            soc_confident=_soc_initial,
         )
 
         if authority == AuthorityDecision.ABORT:
@@ -376,6 +418,85 @@ def _execute_autonomous_loop(
         try:
             input_arbitrator.soc_action_started()
             os_backend.heartbeat()
+
+            # SI-01 FIX: Validate action against PolicyEngine BEFORE executing.
+            # This is the enforcement point for the application allowlist.
+            # If accessibility_backend is available, we get the real AT-SPI
+            # node for role/app validation. If not (Windows, non-AT-SPI Linux),
+            # we use a lightweight dict-based node built from perception data.
+            _policy_node = None
+            if accessibility_backend is not None:
+                try:
+                    _policy_node = accessibility_backend.get_focused_node()
+                except Exception:
+                    _policy_node = None
+
+            # Lightweight fallback node that reads from world_snapshot when
+            # AT-SPI is unavailable.
+            if _policy_node is None:
+                _focused_app = ""
+                if isinstance(world_snapshot, dict):
+                    _focused_app = str(world_snapshot.get("focused_app", ""))
+
+                class _LightweightNode:
+                    """Minimal AT-SPI-compatible node built from perception."""
+                    def getRoleName(self):
+                        return "unknown"
+                    @property
+                    def name(self):
+                        return ""
+                    def getApplication(self):
+                        class _App:
+                            name = _focused_app
+                        return _App()
+
+                _policy_node = _LightweightNode()
+
+            _policy_verdict, _policy_reason = policy_engine.validate(
+                _policy_node,
+                selected_action.get("operation", ""),
+            )
+
+            if _policy_verdict == PolicyEngine.DENY:
+                journal.record({
+                    "event": "policy_violation",
+                    "action": selected_action.get("operation"),
+                    "reason": _policy_reason,
+                    "step": current_step_index,
+                })
+                # Policy violations count as stagnation — they will trigger
+                # REPLAN_REQUIRED once the stagnant limit is exceeded, allowing
+                # the planner to route around the blocked application.
+                raise PolicyViolationError(
+                    f"PolicyEngine DENY: {_policy_reason}"
+                )
+
+            if _policy_verdict == PolicyEngine.REQUIRE_HUMAN_CONFIRMATION:
+                journal.record({
+                    "event": "policy_human_confirmation_required",
+                    "action": selected_action.get("operation"),
+                    "reason": _policy_reason,
+                    "step": current_step_index,
+                })
+                # Treat as WAIT — re-evaluate after brief pause
+                raise RuntimeError("REPLAN_REQUIRED")
+
+            # MR-01a FIX: Conservative authority gate.
+            # ─────────────────────────────────────────────────────────────
+            # Bug: soc_confident = belief.environment_stability > 0.7 fires
+            # on a SINGLE observation exceeding the threshold. Because the
+            # stability scalar is derived from uncalibrated Bayesian likelihoods,
+            # a single well-perceived frame can push it above 0.7 and open the
+            # CONTINUE gate for high-risk operations.
+            #
+            # Fix: require 3 consecutive high-stability observations (>0.7)
+            # before asserting soc_confident for high-risk actions. Low-risk
+            # actions retain the single-observation gate for latency reasons.
+            # ─────────────────────────────────────────────────────────────
+            if is_high_risk:
+                soc_confident = belief.consecutive_high_stability_count >= 3
+            else:
+                soc_confident = belief.environment_stability > 0.7
 
             # FIX H-09 / RB-02: action_timeout is explicitly non-interrupting for
             # blocking I/O (the context manager's own docstring states this clearly).
