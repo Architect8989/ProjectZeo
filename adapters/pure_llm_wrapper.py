@@ -19,7 +19,21 @@ class PureLLMWrapper:
     """
 
     _patch_applied = False
-    _executor = ThreadPoolExecutor(max_workers=4)
+
+    # RB-07 FIX: _executor is now an INSTANCE attribute (created in __init__),
+    # not a class attribute.
+    #
+    # Bug: _executor = ThreadPoolExecutor(max_workers=4) as a class attribute
+    # means ALL instances share the same executor. In multi-adapter scenarios
+    # (e.g. during replan that replaces the planner, creating a new adapter
+    # instance), the first instance's __del__ or shutdown() call would destroy
+    # the executor for all other live instances. Any in-flight coroutine
+    # running in the second instance would then receive RuntimeError from the
+    # destroyed pool.
+    #
+    # Fix: instantiate a fresh executor per instance in __init__, with a
+    # matching __del__ for graceful cleanup. Each adapter now has independent
+    # lifecycle management.
 
     def __init__(self, model_name: str):
         if not PureLLMWrapper._patch_applied:
@@ -28,6 +42,16 @@ class PureLLMWrapper:
             PureLLMWrapper._patch_applied = True
 
         self.model_name = model_name
+
+        # RB-07 FIX: Instance-level executor with independent lifecycle.
+        self._executor = ThreadPoolExecutor(max_workers=4)
+
+    def __del__(self):
+        """Gracefully shut down the instance executor on garbage collection."""
+        try:
+            self._executor.shutdown(wait=False)
+        except Exception:
+            pass
 
     # ==================================================
     # ADAPTER INTERFACE — matches QwenOllamaAdapter
