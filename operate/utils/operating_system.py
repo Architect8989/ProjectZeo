@@ -9,6 +9,11 @@ from typing import Optional, Dict
 
 from operate.utils.misc import convert_percent_to_decimal
 
+try:
+    from config.timeouts import INSTALL_COMMAND_TIMEOUT_SECONDS as _INSTALL_TIMEOUT
+except ImportError:
+    _INSTALL_TIMEOUT = 300
+
 pyautogui.FAILSAFE = True
 
 
@@ -77,7 +82,7 @@ class OperatingSystem:
     # COMMANDS / FILES
     # =================================================
 
-    def exec(self, cmd: str, *, sudo: bool = False) -> subprocess.CompletedProcess:
+    def exec(self, cmd: str, *, sudo: bool = False, timeout: Optional[int] = None) -> subprocess.CompletedProcess:
         if not isinstance(cmd, str) or not cmd.strip():
             raise RuntimeError("exec(): invalid command")
 
@@ -85,12 +90,22 @@ class OperatingSystem:
         if sudo and hasattr(os, "geteuid") and os.geteuid() != 0:
             full_cmd = f"sudo {cmd}"
 
-        result = subprocess.run(
-            full_cmd,
-            shell=True,
-            capture_output=True,
-            text=True,
-        )
+        # FIX RTB-04: Pass timeout to subprocess.run() so hung installs
+        # (apt-get, npm install, curl) do not block the execute thread
+        # indefinitely. Default is None (no limit) for general commands;
+        # callers may pass INSTALL_COMMAND_TIMEOUT_SECONDS explicitly.
+        try:
+            result = subprocess.run(
+                full_cmd,
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(
+                f"exec(): command timed out after {timeout}s: {cmd!r}"
+            ) from exc
 
         return result
 
@@ -346,13 +361,17 @@ class OperatingSystem:
         """Alias for press() — required by operate.py and autonomous_installer.py."""
         self.press(keys)
 
-    def run_command(self, command: str) -> subprocess.CompletedProcess:
+    def run_command(self, command: str, *, timeout: Optional[int] = _INSTALL_TIMEOUT) -> subprocess.CompletedProcess:
         """
-        Alias for exec() — required by operate.py.
+        Alias for exec() — required by operate.py and autonomous_installer.py.
+
+        FIX RTB-04: Passes INSTALL_COMMAND_TIMEOUT_SECONDS as the default
+        timeout so install commands (apt-get, npm, curl) cannot hang indefinitely.
+        Pass timeout=None explicitly if no limit is desired for short commands.
 
         Returns the CompletedProcess so callers can inspect stdout/stderr/returncode.
         """
-        return self.exec(command)
+        return self.exec(command, timeout=timeout)
 
     def open_browser(self) -> None:
         """
