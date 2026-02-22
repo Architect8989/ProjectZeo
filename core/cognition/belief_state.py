@@ -89,6 +89,25 @@ class BeliefState:
         )
         self._iteration_counter: int = 0
 
+        # HARDEN-4 (M-NEW-02): _iteration_counter and _sample_counter are
+        # TRANSIENT — they are NOT persisted and reset to 0 on every process
+        # restart / new BeliefState construction.
+        #
+        # Implication for restart reproducibility:
+        #   - commitment_hash IS reproducible across restarts: it is re-seeded
+        #     from SHA-256(intent_hash) at construction, so the same intent
+        #     always produces the same genesis hash.
+        #   - Thompson sampling seed chain is NOT reproducible across restarts:
+        #     seeds incorporate _iteration_counter and _sample_counter values
+        #     which restart at 0. Even with the same intent and action sequence,
+        #     samples after a restart differ from those in the original run.
+        #
+        # This is EXPECTED BEHAVIOUR. Full restart reproducibility would require
+        # persisting and restoring these counters alongside the commitment_hash —
+        # a deliberate design trade-off. Operators relying on exact Thompson
+        # reproducibility across restarts must implement their own counter
+        # persistence and call BeliefState with a pre-seeded commitment_hash.
+
         # MR-01a FIX: Track consecutive high-stability observations for
         # the conservative authority gate in operate.py. The gate requires
         # 3 consecutive readings above 0.7 before asserting soc_confident
@@ -496,18 +515,30 @@ class BeliefState:
                 parts.append(self._stable_value_bytes(value[k]))
             return b"".join(parts)
         if isinstance(value, list):
-            # HAR-03 (MS-08): Use "|" as a delimiter between list elements.
+            # HARDEN-1 (M-NEW-01): Replace b"|".join(...) with length-prefixed
+            # encoding to eliminate the delimiter-byte collision risk.
             #
-            # Without a delimiter, [1, 2] and [12] both encode to b"12" —
-            # an adversarially crafted perception input (list of integers or
-            # short strings) could produce identical commitment hashes for
-            # distinct observations, enabling commitment chain spoofing.
+            # Bug: The previous delimiter b"|" (byte value 0x7C = 124) can appear
+            # in IEEE 754 struct.pack("!d", v) float encodings. Two distinct lists
+            # [f1, f2] and [f1 + delta] could theoretically produce identical byte
+            # sequences when the boundary byte of an encoded float coincidentally
+            # equals 0x7C — breaking commitment hash uniqueness.
             #
-            # Fix: join element bytes with b"|" (chosen because it never appears
-            # in struct.pack("!d", ...) float encoding and is unlikely to appear
-            # in short string values used in observation fields).
-            parts = [self._stable_value_bytes(item) for item in value]
-            return b"|".join(parts)
+            # The code comment claiming b"|" "never appears" in float packing was
+            # false. Many double-precision floats produce byte sequences containing
+            # 0x7C. While exploitation requires adversarially crafted observation
+            # dicts, natural perception data could also trigger this in practice.
+            #
+            # Fix: length-prefix each serialised element with its byte count as a
+            # 4-byte big-endian unsigned integer. This makes the boundary between
+            # elements unambiguous: the decoder always reads 4 bytes for length,
+            # then exactly that many bytes for the payload — no in-band delimiter
+            # needed. Two distinct lists can never produce the same encoding.
+            result = b""
+            for item in value:
+                item_bytes = self._stable_value_bytes(item)
+                result += struct.pack("!I", len(item_bytes)) + item_bytes
+            return result
         return str(value).encode()
 
     def commit(self, action: str, observation: Dict[str, Any]) -> None:
