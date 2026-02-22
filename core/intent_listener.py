@@ -10,6 +10,54 @@ import tempfile
 from typing import Optional
 
 
+def atomic_write_intent(intent_text: str, intent_file: str = None) -> None:
+    """
+    Write an intent string to the intent file atomically.
+
+    RB-06 FIX: The IntentListener polls at 100ms. A non-atomic write (open,
+    write, close) creates a race window where the listener can read a partial
+    intent if it polls between the open and the final close. The result is a
+    truncated intent string being silently discarded (UTF-8 strict decode
+    fails on a partial multi-byte sequence) or misinterpreted.
+
+    Fix: write to a .tmp sibling file, then os.replace() to the target path.
+    os.replace() is atomic on POSIX (rename syscall) and atomic on Windows
+    (MoveFileExW with MOVEFILE_REPLACE_EXISTING). The listener only ever
+    reads complete files.
+
+    Parameters
+    ----------
+    intent_text : str
+        The intent string to write. Must be non-empty and ≤ 4096 bytes
+        when encoded as UTF-8.
+    intent_file : str, optional
+        Destination path. Defaults to IntentListener.INTENT_FILE.
+    """
+    if intent_file is None:
+        intent_file = IntentListener.INTENT_FILE
+
+    encoded = intent_text.encode("utf-8")
+    if len(encoded) > IntentListener.INTENT_MAX_BYTES:
+        raise ValueError(
+            f"Intent text exceeds {IntentListener.INTENT_MAX_BYTES} byte limit "
+            f"({len(encoded)} bytes encoded)"
+        )
+    if not encoded:
+        raise ValueError("Intent text must be non-empty")
+
+    tmp_path = intent_file + ".tmp"
+    try:
+        with open(tmp_path, "wb") as f:
+            f.write(encoded)
+        os.replace(tmp_path, intent_file)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
 class IntentListener:
 
     POLL_INTERVAL = 0.1
@@ -102,7 +150,27 @@ class IntentListener:
 
             if ready:
                 try:
-                    data = sys.stdin.readline()
+                    # RB-06 FIX: Bounded readline via read() with a size limit.
+                    # readline() has no built-in size limit — a malicious or
+                    # accidental multi-megabyte line would load it entirely into
+                    # memory before the caller can check. The file-path ingestion
+                    # already enforces INTENT_MAX_BYTES (4096) via os.read(); the
+                    # stdin path must match that guarantee.
+                    #
+                    # Strategy: read at most INTENT_MAX_BYTES + 1 bytes. If the
+                    # result exceeds the limit, the line is overlong — discard
+                    # it with a diagnostic and return None. The +1 allows us to
+                    # detect truncation (len == limit+1) vs. a line that happens
+                    # to land exactly on the limit.
+                    raw = sys.stdin.read(self.INTENT_MAX_BYTES + 1)
+                    if len(raw) > self.INTENT_MAX_BYTES:
+                        print(
+                            f"[IntentListener] Discarded stdin intent — exceeds "
+                            f"{self.INTENT_MAX_BYTES} byte limit.",
+                            file=sys.stderr,
+                        )
+                        return None
+                    data = raw
                 except Exception:
                     return None
 
