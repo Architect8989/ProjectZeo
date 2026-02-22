@@ -69,6 +69,12 @@ class PureLLMWrapper:
             "gpt-4o":             apis.call_gpt_4o,
             "qwen-vl":            apis.call_qwen_vl_with_ocr,
             "gpt-4o-with-ocr":   apis.call_gpt_4o_with_ocr,
+            # SI-08 FIX: Removed duplicate key "gpt-4.1-with-ocr" that appeared
+            # twice in this dict. Python silently uses the last definition when a
+            # dict literal contains duplicate keys. While both entries mapped to
+            # the same function (call_gpt_4_1_with_ocr), the duplication signals
+            # an unmaintained registry where a future silent overwrite could
+            # introduce a hard-to-detect routing bug.
             "gpt-4.1-with-ocr":  apis.call_gpt_4_1_with_ocr,
             "o1-with-ocr":       apis.call_o1_with_ocr,
             "claude-3":          apis.call_claude_3_with_ocr,
@@ -76,7 +82,6 @@ class PureLLMWrapper:
             "claude-3-sonnet":   apis.call_claude_3_with_ocr,
             "gemini-pro-vision": apis.call_gemini_pro_vision,
             "llava":             apis.call_ollama_llava,
-            "gpt-4.1-with-ocr":  apis.call_gpt_4_1_with_ocr,
             "gpt-4o-labeled":    apis.call_gpt_4o_labeled,
             "gpt-4-with-som":    apis.call_gpt_4o_labeled,
             "gpt-4-with-ocr":    apis.call_gpt_4o_with_ocr,
