@@ -143,6 +143,15 @@ class ExecutionPlanner:
             re.compile(p, re.IGNORECASE) for p in self.DANGEROUS_PATTERNS
         ]
 
+        # DETERMINISM FIX (_decompose_model dead attribute): Extract the
+        # underlying model name from the llm_call closure once at construction
+        # time and cache it as self._model_name. The previous code used
+        # getattr(self, "_decompose_model", None) in both _decompose_if_complex
+        # and _call_llm_text — this attribute was never set, so the check always
+        # returned None and fell through to the __wrapped__ introspection chain
+        # on every call. Caching it here eliminates the repeated dead check.
+        self._model_name: Optional[str] = self._extract_model_name(llm_call)
+
         if world_graph is not None:
             self.update_world_snapshot(world_graph.snapshot())
         else:
@@ -152,6 +161,25 @@ class ExecutionPlanner:
                 "entity_count": 0,
                 "timestamp": None,
             }
+
+    @staticmethod
+    def _extract_model_name(llm_call) -> Optional[str]:
+        """
+        Attempt to extract the model name from the llm_call closure.
+        Walks __wrapped__ chains (decorator wrappers) and reads model_name
+        from the underlying adapter instance if present.
+        Returns the env-var default if introspection fails.
+        """
+        import os as _os
+        fn = llm_call
+        while hasattr(fn, "__wrapped__"):
+            fn = fn.__wrapped__
+        adapter = getattr(fn, "__self__", None)
+        if adapter is not None:
+            name = getattr(adapter, "model_name", None)
+            if isinstance(name, str) and name.strip():
+                return name.strip()
+        return _os.environ.get("LLM_MODEL", "qwen2.5-vl:7b-instruct")
 
     # ==================================================
 
@@ -302,21 +330,11 @@ class ExecutionPlanner:
                     import ollama
                     import httpx
 
-                    # Determine model name from self._llm_call closure if possible
-                    # Otherwise use the default. We access the adapter via the
-                    # mode controller's cached adapter when available.
-                    _model = getattr(self, "_decompose_model", None)
-                    if _model is None:
-                        # Attempt to read model name from the llm_call closure
-                        fn = self._llm_call
-                        while hasattr(fn, "__wrapped__"):
-                            fn = fn.__wrapped__
-                        _model = getattr(fn, "__self__", None)
-                        if _model is not None:
-                            _model = getattr(_model, "model_name", None)
-                        if _model is None:
-                            import os
-                            _model = os.environ.get("LLM_MODEL", "qwen2.5-vl:7b-instruct")
+                    # Use the cached model name resolved at construction time.
+                    # The previous getattr(self, "_decompose_model", None) was
+                    # permanently None (the attribute was never set), causing
+                    # repeated unnecessary closure introspection on every call.
+                    _model = self._model_name
 
                     client = ollama.Client(
                         timeout=httpx.Timeout(connect=10.0, read=120.0, write=5.0, pool=2.0)
@@ -390,18 +408,12 @@ class ExecutionPlanner:
         try:
             import ollama
             import httpx
-            import os as _os
 
-            _model = getattr(self, "_decompose_model", None)
-            if _model is None:
-                fn = self._llm_call
-                while hasattr(fn, "__wrapped__"):
-                    fn = fn.__wrapped__
-                _model = getattr(fn, "__self__", None)
-                if _model is not None:
-                    _model = getattr(_model, "model_name", None)
-                if _model is None:
-                    _model = _os.environ.get("LLM_MODEL", "qwen2.5-vl:7b-instruct")
+            # Use the model name cached at construction time (see _extract_model_name).
+            # The previous getattr(self, "_decompose_model", None) was permanently
+            # None — the attribute was never set — causing repeated closure
+            # introspection on every planning call.
+            _model = self._model_name
 
             client = ollama.Client(
                 timeout=httpx.Timeout(connect=10.0, read=120.0, write=5.0, pool=2.0)
@@ -423,9 +435,16 @@ class ExecutionPlanner:
                 return response.get("message", {}).get("content", "")
             return str(response)
 
-        except Exception:
-            # Fallback to existing sync path (vision adapter with screenshot)
-            return self._call_llm_sync(prompt)
+        except Exception as exc:
+            # HARD-3: The text-only guarantee must be enforced, not best-effort.
+            # Silently falling back to _call_llm_sync() routes planning prompts
+            # through the vision adapter, which attaches an irrelevant screenshot
+            # to a structural JSON-generation prompt and degrades plan quality.
+            # If the direct Ollama call fails, raise PlanningError rather than
+            # masking the failure with a vision-adapter call.
+            raise PlanningError(
+                f"Text-only LLM call failed — Ollama may be unavailable: {exc}"
+            ) from exc
 
     # ==================================================
     # LOOP-SAFE LLM CALL
