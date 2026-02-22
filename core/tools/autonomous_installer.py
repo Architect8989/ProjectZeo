@@ -272,6 +272,7 @@ class AutonomousInstaller:
         observer: ObserverCore,
         os_backend: OperatingSystem,
         llm_callable,
+        shared_ollama_client=None,
     ):
         if not isinstance(observer, ObserverCore):
             raise InstallationError("Observer required")
@@ -286,6 +287,12 @@ class AutonomousInstaller:
         self._os = os_backend
         self._llm = llm_callable
         self._verifier = StepVerifier()
+
+        # RB-05 FIX: Accept a shared Ollama client to avoid creating new
+        # ollama.Client() instances on every _try_terminal_install() call.
+        # Repeated Client() construction without teardown exhausts the httpx
+        # connection pool under rapid replan loops with unknown tools.
+        self._shared_ollama_client = shared_ollama_client
 
         # SI-03 FIX: Removed the dead _PerceptionSanitizer inner class and the
         # self._sanitizer assignment. The inner class declared MAX_PERCEPTION_BYTES
@@ -439,9 +446,15 @@ class AutonomousInstaller:
             pkg_mgr = _get_linux_pkg_manager() if os_name == "Linux" else ""
             pkg_mgr_hint = f" Package manager available: {pkg_mgr}." if pkg_mgr else ""
 
-            client = _ollama.Client(
-                timeout=_httpx.Timeout(connect=10.0, read=60.0, write=5.0, pool=2.0)
-            )
+            # RB-05 FIX: Reuse shared_ollama_client if provided by caller
+            # (operate_main passes the planner's existing client). Only create
+            # a new client when running standalone (no shared client available).
+            if self._shared_ollama_client is not None:
+                client = self._shared_ollama_client
+            else:
+                client = _ollama.Client(
+                    timeout=_httpx.Timeout(connect=10.0, read=60.0, write=5.0, pool=2.0)
+                )
             response = client.chat(
                 model=_model,
                 messages=[
@@ -617,7 +630,41 @@ class AutonomousInstaller:
                     f"{target!r} (no OCR match and no x/y coordinates)"
                 )
 
-            self._os.click(coords[0], coords[1])
+            # RB-04 FIX: Coordinate normalization guard.
+            # ─────────────────────────────────────────────────────────────
+            # operate.py's _execute_decision() normalizes absolute pixel
+            # coords before calling os_backend.mouse(), but this installer
+            # path calls self._os.click() directly without normalization.
+            # LLM-generated coordinates (e.g. x=847, y=512 on 1920×1080)
+            # land at the wrong screen position when os_backend expects
+            # normalized [0.0, 1.0] values.
+            #
+            # Fix: if either coordinate exceeds 1.0, assume absolute pixel
+            # space and normalize using the screen dimensions from os_backend.
+            # ─────────────────────────────────────────────────────────────
+            cx, cy = coords
+            if cx > 1.0 or cy > 1.0:
+                try:
+                    sw, sh = self._os.screen_size()
+                    if sw > 0 and sh > 0:
+                        cx = cx / sw
+                        cy = cy / sh
+                    else:
+                        raise InstallationError(
+                            f"screen_size() returned zero dimensions: ({sw},{sh})"
+                        )
+                except InstallationError:
+                    raise
+                except Exception as _e:
+                    raise InstallationError(
+                        f"Cannot normalize click coords ({cx},{cy}): {_e}"
+                    ) from _e
+
+            # Clamp after normalization to guard floating-point overshoot
+            cx = max(0.0, min(1.0, cx))
+            cy = max(0.0, min(1.0, cy))
+
+            self._os.click(cx, cy)
             return
 
         if op == "type":
