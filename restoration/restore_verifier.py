@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import logging
+import time
 from typing import Optional, Tuple
 
 from restoration.snapshot_types import RestorationSnapshot
+
+_logger = logging.getLogger(__name__)
 
 
 class RestorationVerificationError(RuntimeError):
@@ -33,6 +37,12 @@ class RestoreVerifier:
     cursor_tolerance_px : int
         Maximum pixel distance from snapshot cursor position to pass
         cursor verification. Should match RestoreProvider.CURSOR_TOLERANCE_PX.
+
+    authority_state : object | None
+        HAR-07: Optional authority state object. When provided and verification
+        fails, RestoreVerifier sets verification_warning=True on the object so
+        that verification failures are surfaced in the authority audit record
+        rather than only printed to stderr.
     """
 
     MAX_TITLE_DISTANCE: int = 2
@@ -43,6 +53,7 @@ class RestoreVerifier:
         os_backend,
         mode_controller=None,
         cursor_tolerance_px: int = 0,
+        authority_state=None,
     ):
         self._os = os_backend
         # FIX H-04: Accept mode_controller as an explicit constructor parameter.
@@ -50,6 +61,8 @@ class RestoreVerifier:
         # which was never set, making _verify_execution_mode() permanently inert.
         self._mode_controller = mode_controller
         self._cursor_tol = int(cursor_tolerance_px)
+        # HAR-07: Optional authority state for structured audit event emission.
+        self._authority_state = authority_state
 
     # -------------------------------------------------
     # Public API
@@ -61,16 +74,72 @@ class RestoreVerifier:
 
         Raises RestorationVerificationError on failure.
         Returns None on success.
-        """
-        self._verify_execution_mode()
-        self._verify_input_released()
-        self._verify_cursor(snapshot)
-        self._verify_focus(snapshot)
 
-        self._verify_window_geometry(snapshot)
-        self._verify_window_z_order(snapshot)
-        self._verify_browser_state(snapshot)
-        self._verify_media_position(snapshot)
+        HAR-07: On verification failure, emits a structured audit event to the
+        authority_state (if provided) by setting verification_warning=True.
+        This surfaces verification mismatches in the authority audit record
+        rather than only printing to stderr and allowing execution to continue
+        silently.
+        """
+        try:
+            self._verify_execution_mode()
+            self._verify_input_released()
+            self._verify_cursor(snapshot)
+            self._verify_focus(snapshot)
+
+            self._verify_window_geometry(snapshot)
+            self._verify_window_z_order(snapshot)
+            self._verify_browser_state(snapshot)
+            self._verify_media_position(snapshot)
+
+        except RestorationVerificationError as exc:
+            # HAR-07: Emit structured audit event on verification failure.
+            # Previously failures were only printed to stderr (effectively silent
+            # in production) and execution proceeded. Now the authority_state is
+            # marked with verification_warning=True so the audit record reflects
+            # the mismatch and callers can inspect or block execution accordingly.
+            self._emit_verification_warning(snapshot, exc)
+            raise
+
+    def _emit_verification_warning(
+        self,
+        snapshot: RestorationSnapshot,
+        error: RestorationVerificationError,
+    ) -> None:
+        """
+        HAR-07: Emit a structured verification failure audit event.
+
+        Marks authority_state.verification_warning = True (when available)
+        and logs a structured WARNING entry. The log entry includes the
+        snapshot_id, captured_at, and the specific mismatch reason so that
+        post-hoc audit review can identify which tasks had imperfect restoration.
+        """
+        event = {
+            "event": "RESTORATION_VERIFICATION_FAILURE",
+            "timestamp": time.time(),
+            "snapshot_id": snapshot.snapshot_id,
+            "snapshot_captured_at": snapshot.captured_at,
+            "restoration_scope": "cursor_and_focus_only",
+            "mismatch_reason": str(error),
+        }
+
+        _logger.warning(
+            "RestoreVerifier: verification failure for snapshot %s — %s. "
+            "Restoration scope is cursor and focus only; file/browser/clipboard "
+            "state is NOT restored. Event: %s",
+            snapshot.snapshot_id,
+            error,
+            event,
+        )
+
+        # Mark authority_state if injected — surfaces mismatch in audit record.
+        if self._authority_state is not None:
+            try:
+                self._authority_state.verification_warning = True
+            except Exception:
+                # authority_state may be read-only or not support this attribute;
+                # never let audit instrumentation crash the verification path.
+                pass
 
     # -------------------------------------------------
     # Verification Steps
@@ -280,4 +349,3 @@ class RestoreVerifier:
         dx = abs(actual[0] - expected[0])
         dy = abs(actual[1] - expected[1])
         return dx <= self._cursor_tol and dy <= self._cursor_tol
-
