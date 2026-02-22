@@ -107,14 +107,59 @@ class SnapshotProvider:
         return snapshot.snapshot_id
 
     def get_snapshot(self, snapshot_id: str) -> Optional[RestorationSnapshot]:
+        """
+        FIX H7: Enforce TTL at retrieval time, not only during store_snapshot().
 
+        Bug: MAX_SNAPSHOT_AGE_SECONDS = 3600 was only applied inside
+        _evict_stale(), which ran during store_snapshot(). get_snapshot()
+        returned any snapshot regardless of age. A snapshot taken before a
+        long planning warmup phase (up to 210s = planning 60s + warmup 150s)
+        could still be retrieved and restored — but more critically, a snapshot
+        taken before a multi-hour idle period could survive in memory and be
+        restored from hours-old workspace state with no diagnostic.
+
+        Fix: check TTL here. If the snapshot has aged past MAX_SNAPSHOT_AGE_SECONDS,
+        evict it from the registry, print a diagnostic, and return None. The
+        caller (main.py) treats None as a missing snapshot and proceeds to safe
+        shutdown / skip restoration — the correct behaviour for expired state.
+
+        The TTL check uses captured_at_wallclock from snapshot.metadata (set at
+        capture time by _capture_snapshot). If the field is missing or unparseable,
+        the snapshot is treated as non-expired (fail-open for the TTL check only;
+        the restoration itself is still guarded by mode and verifier checks).
+        """
         if not isinstance(snapshot_id, str) or not snapshot_id:
             return None
 
+        now = time.time()
+
         with self._lock:
             snap = self._snapshots.get(snapshot_id)
-            if snap:
-                self._snapshots.move_to_end(snapshot_id)
+            if snap is None:
+                return None
+
+            # FIX H7: Enforce TTL at retrieval time.
+            captured = snap.metadata.get("captured_at_wallclock", now)
+            try:
+                captured = float(captured)
+            except Exception:
+                # Unparseable timestamp — treat as non-expired (fail-open for TTL).
+                captured = now
+
+            age_seconds = now - captured
+            if age_seconds > self.MAX_SNAPSHOT_AGE_SECONDS:
+                # Snapshot is stale — evict and return None.
+                self._snapshots.pop(snapshot_id, None)
+                import sys as _sys
+                print(
+                    f"[SnapshotProvider] Snapshot {snapshot_id[:12]}… expired "
+                    f"({round(age_seconds, 1)}s old, max "
+                    f"{self.MAX_SNAPSHOT_AGE_SECONDS}s). Evicted. Returning None.",
+                    file=_sys.stderr,
+                )
+                return None
+
+            self._snapshots.move_to_end(snapshot_id)
             return snap
 
     # =========================================================
