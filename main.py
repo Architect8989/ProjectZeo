@@ -451,10 +451,15 @@ def main(llm_callable: Callable, model_name: str):
                             if _restore_exc:
                                 raise _restore_exc[0]
 
-                            # FIX RB-04 / F-04: Run the RestoreVerifier contract
-                            # now that RestoreProvider has completed. This enforces
-                            # cursor position, focused window, and mode assertions
-                            # that were previously dead code.
+                            # FIX RTB-03: complete_execution() must be called
+                            # BEFORE restore_verifier.verify() so the mode is
+                            # already OBSERVER when _verify_execution_mode()
+                            # checks it. Previously verify() was called while
+                            # the mode was still RESTORING, causing the mode
+                            # assertion to always fail silently and masking any
+                            # genuine post-restore mode anomalies.
+                            mode.complete_execution()
+
                             snap_obj = snapshot_provider.get_snapshot(snapshot_id)
                             if snap_obj is not None:
                                 try:
@@ -475,8 +480,6 @@ def main(llm_callable: Callable, model_name: str):
                                 last_snapshot_id=None,
                                 dirty=False,
                             )
-
-                            mode.complete_execution()
 
                         except Exception as cleanup_err:
                             _force_safe_shutdown(
