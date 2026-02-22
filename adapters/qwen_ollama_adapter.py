@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import os
 import re
 import sys
 import threading
@@ -317,14 +318,33 @@ class QwenOllamaAdapter:
             history_messages = history_messages[-self.MAX_HISTORY_TURNS:]
 
         # --- Capture live screenshot ---
-        with (
-            tempfile.NamedTemporaryFile(suffix=".png", delete=True) as raw_tmp,
-            tempfile.NamedTemporaryFile(suffix=".jpeg", delete=True) as jpeg_tmp,
-        ):
-            capture_screen_with_cursor(raw_tmp.name)
-            compress_screenshot(raw_tmp.name, jpeg_tmp.name)
+        # RB-03 FIX: Windows NamedTemporaryFile PermissionError.
+        # ─────────────────────────────────────────────────────────────────
+        # On Windows, NamedTemporaryFile(delete=True) keeps the OS file
+        # handle open until the `with` block exits. A second open() call
+        # on the same path raises PermissionError because Windows does not
+        # allow a second handle while the first is open with exclusive access.
+        #
+        # Fix: create both temp files with delete=False, close each handle
+        # immediately, perform all I/O, then unlink in a finally block.
+        # This is safe on all platforms (Linux/macOS unlink semantics
+        # differ but the explicit cleanup is harmless).
+        # ─────────────────────────────────────────────────────────────────
+        raw_tmp_name = None
+        jpeg_tmp_name = None
+        try:
+            _rtf = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+            raw_tmp_name = _rtf.name
+            _rtf.close()  # release handle so capture can write it
 
-            with open(jpeg_tmp.name, "rb") as f:
+            _jtf = tempfile.NamedTemporaryFile(suffix=".jpeg", delete=False)
+            jpeg_tmp_name = _jtf.name
+            _jtf.close()  # release handle before compress writes it
+
+            capture_screen_with_cursor(raw_tmp_name)
+            compress_screenshot(raw_tmp_name, jpeg_tmp_name)
+
+            with open(jpeg_tmp_name, "rb") as f:
                 img_base64 = base64.b64encode(f.read()).decode("utf-8")
 
             # --- Build per-action user prompt ---
@@ -374,11 +394,9 @@ class QwenOllamaAdapter:
 
             response = await loop.run_in_executor(self._executor, _blocking_call)
 
-            # FIX-01 (RTB-01): All post-processing that references jpeg_tmp.name
-            # MUST happen inside this with block. The NamedTemporaryFile is deleted
-            # by the OS when the context manager exits (delete=True). Moving these
-            # calls outside caused FileNotFoundError in OCR, silently dropping all
-            # text-anchored click operations.
+            # All post-processing that references jpeg_tmp_name MUST happen
+            # inside this try block while the file still exists on disk.
+            # The finally clause below deletes it.
             content = _extract_response_content(response)
             operations = self._parse_and_normalize_json(content)
 
@@ -391,9 +409,18 @@ class QwenOllamaAdapter:
                 if isinstance(op, dict) and "operation" in op
             ]
 
-            self._resolve_click_coordinates(operations, jpeg_tmp.name)
+            self._resolve_click_coordinates(operations, jpeg_tmp_name)
 
-        return operations
+            return operations
+
+        finally:
+            # RB-03 FIX: Explicit cleanup — safe on all platforms.
+            for _tmp_path in (raw_tmp_name, jpeg_tmp_name):
+                if _tmp_path is not None:
+                    try:
+                        os.unlink(_tmp_path)
+                    except OSError:
+                        pass
 
     # ==========================================================
     # OCR RESOLUTION (FAIL-CLOSED)
