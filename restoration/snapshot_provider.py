@@ -286,6 +286,58 @@ class SnapshotProvider:
 
         # ---------------- METADATA (CANONICALIZED) ----------------
 
+        # SI-05 FIX: Populate metadata['extended'] with observable OS state
+        # so RestoreVerifier's extended checks can actually fire.
+        #
+        # Bug: metadata['extended'] was always set to {} — an empty dict.
+        # RestoreVerifier._verify_extended() iterates over metadata['extended']
+        # and only runs checks when keys are present. With an empty dict, ALL
+        # extended checks (window geometry, process list, browser state) were
+        # permanently skipped. The extended verification path was dead code.
+        #
+        # Fix: populate with the lightweight fields that can be captured
+        # cross-platform without heavy dependencies:
+        #   - window_geometry: via xdotool (Linux) or approximate
+        #   - process_snapshot: names of running processes via psutil
+        #
+        # Browser state (CDP) and cryptographic file hashes are P3 items
+        # and not included here; this patch covers the minimum viable
+        # extended capture that makes verification non-trivially useful.
+        extended: dict = {}
+
+        # Window geometry (Linux/xdotool)
+        try:
+            import subprocess as _sp  # noqa: PLC0415
+            _wid_result = _sp.run(
+                ["xdotool", "getactivewindow"],
+                capture_output=True,
+                timeout=2,
+            )
+            if _wid_result.returncode == 0:
+                _wid = _wid_result.stdout.strip().decode("utf-8", errors="replace")
+                _geo_result = _sp.run(
+                    ["xdotool", "getwindowgeometry", _wid],
+                    capture_output=True,
+                    timeout=2,
+                )
+                if _geo_result.returncode == 0:
+                    extended["window_geometry"] = _geo_result.stdout.decode(
+                        "utf-8", errors="replace"
+                    ).strip()
+        except Exception:
+            pass  # xdotool absent or failed — non-fatal
+
+        # Active process snapshot (psutil — cross-platform)
+        try:
+            import psutil as _psutil  # noqa: PLC0415
+            extended["processes"] = sorted(
+                {p.name() for p in _psutil.process_iter(["name"]) if p.name()}
+            )
+        except ImportError:
+            pass  # psutil not installed — skip
+        except Exception:
+            pass  # process iteration failed — non-fatal
+
         metadata = {
             "schema_version": self.SNAPSHOT_SCHEMA_VERSION,
             "captured_at_monotonic": float(t_end),
@@ -296,6 +348,7 @@ class SnapshotProvider:
                 capture_duration * 1000.0,
                 6,
             ),
+            "extended": extended,
         }
 
         metadata = json.loads(
@@ -317,3 +370,4 @@ class SnapshotProvider:
         )
 
         return snapshot
+
