@@ -274,15 +274,64 @@ class RestoreVerifier:
     # EXTENDED VERIFICATION (BEST-EFFORT)
     # -------------------------------------------------
 
+    # HARDEN-3 FIX: _GEOMETRY_MISMATCH_IS_HARD_FAILURE controls whether a
+    # window geometry mismatch raises RestorationVerificationError (hard failure)
+    # or emits a WARNING log and continues (soft failure).
+    #
+    # Audit finding: window managers legitimately resize, snap, or tile windows
+    # during task execution. A geometry mismatch after restoration is
+    # informational — it does NOT prove incomplete restoration. The previous
+    # implementation raised a hard RestorationVerificationError for any geometry
+    # difference, causing false-positive shutdown on tiling WMs, Wayland
+    # compositors, and any environment where window geometry is not stable.
+    #
+    # New behaviour:
+    #   - If geometry change is within _GEOMETRY_TOLERANCE_PX pixels on all sides
+    #     → treated as normal WM rounding, silently accepted.
+    #   - If geometry change exceeds tolerance → WARNING logged, execution continues.
+    #     Hard failure is NOT raised by default.
+    #   - Set _GEOMETRY_MISMATCH_IS_HARD_FAILURE = True (e.g. in policy.yaml or
+    #     subclass) to restore the previous strict behaviour for environments where
+    #     geometry stability is guaranteed (e.g. locked-down kiosks).
+    _GEOMETRY_MISMATCH_IS_HARD_FAILURE: bool = False
+    _GEOMETRY_TOLERANCE_PX: int = 10  # pixels; covers WM rounding and DPI scaling
+
     def _verify_window_geometry(self, snapshot: RestorationSnapshot) -> None:
         geom = snapshot.metadata.get("extended", {}).get("window_geometry")
         if geom is not None and hasattr(self._os, "get_window_geometry"):
             try:
                 current = self._os.get_window_geometry(snapshot.focus.window_id)
                 if current != geom:
-                    raise RestorationVerificationError(
-                        "Window geometry mismatch after restore"
-                    )
+                    # Check if the delta is within the tolerance threshold.
+                    within_tolerance = False
+                    try:
+                        if isinstance(current, dict) and isinstance(geom, dict):
+                            deltas = [
+                                abs(current.get(k, 0) - geom.get(k, 0))
+                                for k in ("x", "y", "width", "height")
+                                if k in geom or k in current
+                            ]
+                            within_tolerance = all(
+                                d <= self._GEOMETRY_TOLERANCE_PX for d in deltas
+                            )
+                    except Exception:
+                        within_tolerance = False
+
+                    if not within_tolerance:
+                        msg = (
+                            f"Window geometry changed after restore: "
+                            f"snapshot={geom!r} current={current!r}. "
+                            "This may be a legitimate window manager resize. "
+                            "Set RestoreVerifier._GEOMETRY_MISMATCH_IS_HARD_FAILURE=True "
+                            "to treat this as a hard failure."
+                        )
+                        if self._GEOMETRY_MISMATCH_IS_HARD_FAILURE:
+                            raise RestorationVerificationError(msg)
+                        else:
+                            _logger.warning(
+                                "RestoreVerifier: %s (soft failure — execution continues)",
+                                msg,
+                            )
             except RestorationVerificationError:
                 raise
             except Exception:
