@@ -8,6 +8,27 @@ import numpy as np
 
 
 class BeliefState:
+    """
+    Probabilistic belief state tracking for autonomous execution.
+
+    CALIBRATION DISCLAIMER (Audit Finding H3 / M-4):
+    -------------------------------------------------
+    The Bayesian likelihoods used in operate.py (0.9, 0.8, 0.7, 0.5) are
+    heuristic constants, NOT empirically calibrated probabilities.
+
+    True calibration requires a labelled dataset of (world_snapshot,
+    ground_truth_state) pairs which does not exist for this system.
+
+    IMPLICATION: self.state_probabilities values are RELATIVE SCORES used
+    for exploration decisions, not absolute probability estimates. Code that
+    treats them as calibrated probabilities (e.g. P(in_state_X) > 0.95) will
+    produce results that are statistically meaningless in an absolute sense,
+    though the relative ordering of states remains useful for action selection.
+
+    The environment_stability scalar (used by authority arbitration) is derived
+    from the "significant_change" boolean in perception deltas and is NOT
+    affected by the uncalibrated likelihoods.
+    """
 
     EXPLORATION_C = 1.4
     RISK_LAMBDA = 0.3
@@ -113,23 +134,7 @@ class BeliefState:
 
         self.state_probabilities = {s: v / total for s, v in pruned.items()}
 
-        # HAR-05 (MS-02): Remove the dual-condition blending trigger.
-        #
-        # The original code fired 0.95v + 0.05·uniform blending under TWO
-        # independent conditions:
-        #   1. entropy() < MIN_ENTROPY_FLOOR (0.3 nats)
-        #   2. dominant_p >= 0.90
-        #
-        # Condition 2 is independent of Condition 1. A two-state distribution
-        # p=[0.92, 0.08] has entropy ≈ 0.375 nats (ABOVE the floor) but
-        # dominant_p = 0.92 (ABOVE 0.90). Blending fired — pulling toward
-        # uniform [0.5, 0.5] — introducing undocumented regularization beyond
-        # the stated design. The system could never represent posterior certainty
-        # above ~89% regardless of evidence strength.
-        #
-        # Fix: blend only on the entropy floor condition. The floor already
-        # catches near-collapse distributions correctly (including the
-        # prior_fallback sentinel case that motivated the dual condition).
+     
         if self.entropy() < self.MIN_ENTROPY_FLOOR:
             uniform = 1.0 / len(self.state_probabilities)
             blended = {
@@ -277,7 +282,7 @@ class BeliefState:
         self.regret[action] = (updated, self._iteration_counter)
 
     # =========================================================
-    # RECORDING WITH NORMALISATION — MATH-03 / FIX-06 FIX
+    # RECORDING WITH NORMALISATION — MATH-03 / FIX-06 / FIX H6/M-2
     # =========================================================
 
     def record_action(self, action: str, reward: float):
@@ -294,12 +299,17 @@ class BeliefState:
         during the first 100 actions of every new BeliefState (the entire
         task window for most tasks).
 
-        Fix: apply the same min-max scaling for ALL window sizes. For n < 3
-        we cannot compute a meaningful z-score (near-zero variance), so we
-        use linear min-max rescaling within [-REWARD_CLAMP, +REWARD_CLAMP]
-        instead. This produces values in a consistent unit space across all
-        n, at the cost of slightly less statistical normalisation for small
-        windows — which is acceptable given the small sample count.
+        FIX H6/M-2 (n=3 deque boundary contamination):
+        At the transition when len(history) first reaches 3 (after append),
+        entries 0 and 1 are linearly-clamped values while entry 2 is the
+        raw reward being z-scored for the first time. Computing z-score stats
+        over this mixed window biases mean and std, contaminating the score.
+
+        Fix: on the n==3 transition, re-normalise ALL entries in the window
+        using the same z-score parameters. This ensures all three entries share
+        the same unit space. For n > 3, prior entries are already z-scored from
+        previous calls and re-normalisation is effectively a no-op (they rescale
+        coherently about the same mean).
 
         The parallel _raw_action_rewards deque is always populated with the
         unmodified raw reward for regret and global_best_reward() calculations.
@@ -318,22 +328,32 @@ class BeliefState:
         if len(history) >= 3:
             # z-score normalisation: append raw, compute stats over full
             # inclusive window (MATH-03 FIX: lag-free inclusive statistics),
-            # then replace last entry with the normalised value.
+            # then re-normalise ALL entries.
             history.append(reward)
             mean = sum(history) / len(history)
             variance = sum((r - mean) ** 2 for r in history) / len(history)
             std = math.sqrt(max(variance, self.NORMALIZE_EPS))
-            normalized = (reward - mean) / std
-            normalized = max(-self.REWARD_CLAMP, min(self.REWARD_CLAMP, normalized))
-            history[-1] = normalized
+
+            # FIX H6/M-2: Re-normalise EVERY entry in the window, not just the
+            # latest. On the transition at n==3, entries 0 and 1 are clamped
+            # linear values; without this re-normalisation they contaminate the
+            # z-score window. For n > 3, existing entries are already z-scored
+            # and re-normalise coherently (no statistical regression for mature
+            # windows).
+            new_history = []
+            for raw_val in history:
+                nv = (raw_val - mean) / std
+                new_history.append(max(-self.REWARD_CLAMP, min(self.REWARD_CLAMP, nv)))
+            history.clear()
+            history.extend(new_history)
         else:
             # FIX-06 (MS-01): For n < 3, use simple linear clamp instead of
             # storing raw values.  This keeps the deque in a consistent unit
             # space [-REWARD_CLAMP, +REWARD_CLAMP] for all window sizes,
             # eliminating the mixed-unit contamination of early-session stats.
-            # When n reaches 3, the z-score branch re-normalises over the full
-            # window (which includes these two clamped entries), providing a
-            # smooth transition with only minor baseline error for 1–2 samples.
+            # When n reaches 3, the z-score branch re-normalises all entries
+            # over the full inclusive window — including these clamped entries —
+            # eliminating the boundary contamination identified in H6/M-2.
             clamped = max(-self.REWARD_CLAMP, min(self.REWARD_CLAMP, reward))
             history.append(clamped)
 
@@ -429,7 +449,7 @@ class BeliefState:
         self.commitment_hash = hashlib.sha256(payload).hexdigest()
 
     # =========================================================
-    # CONVERGENCE
+    # CONVERGENCE — FIX M-5 / H4
     # =========================================================
 
     def converged(
@@ -440,7 +460,17 @@ class BeliefState:
         plan_steps_total: int = 0,
         steps_completed: int = 0,
     ) -> bool:
+        """
+        Return True when all real plan steps are completed.
 
+        FIX M-5 / H4: The caller (operate.py) is now responsible for passing
+        plan_steps_total = len(execution_plan.steps) - 1 to exclude the DONE
+        sentinel step. This method itself is unchanged — the fix is in how
+        operate.py computes _real_steps before calling converged().
+
+        When plan_steps_total excludes the sentinel, steps_completed ==
+        plan_steps_total correctly signals completion of all real work steps.
+        """
         if current_iteration < min_iterations:
             return False
 
