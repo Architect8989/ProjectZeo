@@ -24,7 +24,16 @@ class RestoreProvider:
     MAX_LEDGER_ENTRIES = 10_000
     MAX_TITLE_DISTANCE = 2
 
-    _RESTORE_LEDGER_PATH = os.path.join("memory", "restore_ledger.json")
+    # HARD-6: Use an absolute path anchored to the directory containing this
+    # file rather than os.path.join("memory", ...) which resolves relative to
+    # os.getcwd(). If the process is started from a different working directory,
+    # the relative path creates the ledger in a different location, causing
+    # prior completed snapshots to not be found and allowing duplicate restorations.
+    _RESTORE_LEDGER_PATH = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "memory",
+        "restore_ledger.json",
+    )
 
     def __init__(
         self,
@@ -38,7 +47,7 @@ class RestoreProvider:
         self._snapshot_provider = snapshot_provider
         self._lock = threading.Lock()
 
-        os.makedirs("memory", exist_ok=True)
+        os.makedirs(os.path.dirname(self._RESTORE_LEDGER_PATH), exist_ok=True)
         self._completed_snapshots: Set[str] = self._load_ledger()
 
     # =========================================================
@@ -270,6 +279,13 @@ class RestoreProvider:
         return self._strict_match(expected, actual)
 
     def _validate_application(self, current_app, snapshot) -> bool:
+        # FIX RTB-02: When the snapshot was taken on a bare desktop (no focused
+        # application), application.process_name is "__bare_desktop__". No
+        # application focus can be verified; skip the fuzzy match and return True
+        # so restoration can complete without a spurious verification failure.
+        if snapshot.application.process_name == "__bare_desktop__":
+            return True
+
         if (
             not isinstance(current_app, dict)
             or not isinstance(current_app.get("title"), str)
