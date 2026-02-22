@@ -1,54 +1,9 @@
-"""
-core/tools/autonomous_installer.py
-=====================================
-PATCHES APPLIED (Audit Fixes):
-
-  ✅  §R2  (was §inst-5 CRITICAL): _try_terminal_install() previously sent a
-           text-only JSON question to the vision LLM (QwenOllamaAdapter) which
-           responds with UI click operations, not install commands.
-           The JSON parse always failed, causing silent fallthrough to browser UI.
-
-           FIX: Replaced LLM-based command lookup with a two-tier strategy:
-             1. Use pre-specified install_commands from the tool dict (plan-supplied).
-             2. Fall back to a curated COMMON_INSTALL_COMMANDS lookup table
-                covering the most common dev tools on Linux/macOS/Windows.
-             3. Only if both fail, fall through to browser UI.
-
-           This avoids sending a factual question to a vision model while still
-           achieving autonomous terminal installation without scripted workflows.
-
-  ✅  §DEF-7: Two sub-fixes applied:
-           (a) OS package manager detection (_LINUX_HAS_APT, _LINUX_HAS_SNAP)
-               moved from module import time to a lazy runtime function
-               _get_linux_pkg_manager(). This prevents the lookup table from
-               permanently reflecting a pre-install state on systems where
-               apt-get or snap are installed mid-session.
-           (b) When a tool is not in COMMON_INSTALL_COMMANDS and no
-               install_commands are provided, _try_terminal_install() now
-               asks the LLM for a plain-text install command via a text-only
-               prompt (not a vision prompt). The LLM callable is used with a
-               system message that suppresses vision output and requests only
-               a shell command string. This extends coverage beyond the finite
-               lookup table without browser UI for common CLI tools.
-           Cmd+L. Added explicit browser-open fallback chain in OS backend.
-
-  ✅  §1.10 (original): Terminal install always attempted FIRST.
-  ✅  §1.10 (original): LLM x/y coordinate fallback for graphical buttons.
-  ✅  §1.10 (original): official_url required in tool dict.
-
-All existing correct behaviours preserved:
-  - _validate_url() enforces https://
-  - _sanitize_perception() bounds entity lists
-  - _normalize_llm_response() / _validate_action_schema()
-  - MAX_INSTALL_TIME=15 minutes
-  - Post-install verification via StepVerifier
-"""
-
 from __future__ import annotations
 
 import platform
 import time
 import json
+import re
 from typing import Dict, Any, Optional, Tuple, List
 
 from observer.observer_core import ObserverCore
@@ -294,6 +249,23 @@ class AutonomousInstaller:
 
     REQUIRED_FIELDS = {"name", "official_url"}
 
+    # HARD-2: Patterns that must never be executed from LLM-generated commands.
+    # Mirrors ExecutionPlanner.DANGEROUS_PATTERNS. Applied in Tier-3 LLM fallback
+    # before run_command() is called to prevent prompt-injection exploits.
+    _DANGEROUS_PATTERNS = [
+        r"\brm\s+-rf\b",
+        r"\bdd\b",
+        r"\bmkfs\b",
+        r"\bformat\b",
+        r"\bchmod\s+777\b",
+        r"\bnc\b",
+        r"\bnetcat\b",
+        r"\bcrontab\b",
+        r"^\s*at\s",
+        r"\bbase64\b.*-d",
+        r"\beval\b.*\$\(",
+    ]
+
     def __init__(
         self,
         *,
@@ -315,7 +287,38 @@ class AutonomousInstaller:
         self._llm = llm_callable
         self._verifier = StepVerifier()
 
-        self._sanitizer = ReasoningEngine.__new__(ReasoningEngine)
+        # HARD-8: ReasoningEngine.__new__(ReasoningEngine) skips __init__,
+        # leaving self._llm unset on the sanitizer. Since only
+        # _sanitize_perception() is used (which doesn't touch self._llm),
+        # create a dedicated minimal sanitizer object instead of misusing
+        # __new__ on a class that requires constructor arguments.
+        class _PerceptionSanitizer:
+            """Minimal sanitizer that exposes only _sanitize_perception()."""
+            MAX_PERCEPTION_BYTES = 10_000
+
+        self._sanitizer = _PerceptionSanitizer()
+
+        # Pre-compile dangerous-pattern regexes once at construction time.
+        self._compiled_dangerous = [
+            re.compile(p, re.IGNORECASE) for p in self._DANGEROUS_PATTERNS
+        ]
+
+    def _validate_llm_command(self, cmd: str) -> None:
+        """
+        HARD-2: Reject LLM-generated commands that match DANGEROUS_PATTERNS.
+
+        run_command() executes with shell=True, so an unvalidated LLM response
+        like 'rm -rf /' or 'dd if=/dev/zero of=/dev/sda' would be executed
+        directly. Validate before execution.
+
+        Raises InstallationError if the command is dangerous.
+        """
+        for pattern in self._compiled_dangerous:
+            if pattern.search(cmd):
+                raise InstallationError(
+                    f"LLM-generated install command rejected — "
+                    f"matches dangerous pattern {pattern.pattern!r}: {cmd!r}"
+                )
 
     # =================================================
     # PUBLIC API
@@ -388,7 +391,11 @@ class AutonomousInstaller:
                 if isinstance(cmd, str) and cmd.strip():
                     try:
                         result = self._os.run_command(cmd.strip())
-                        if isinstance(result, dict) and result.get("returncode", 1) == 0:
+                        # FIX RTB-05: run_command() returns subprocess.CompletedProcess,
+                        # not a dict. The previous isinstance(result, dict) check was
+                        # always False, so success was never detected and all commands
+                        # always ran even after the first one succeeded.
+                        if hasattr(result, "returncode") and result.returncode == 0:
                             return True
                         # Try next command if this one failed
                     except Exception:
@@ -464,6 +471,10 @@ class AutonomousInstaller:
                 llm_cmd = llm_cmd.strip().strip("`\"'")
 
             if llm_cmd and len(llm_cmd) > 4 and "\n" not in llm_cmd:
+                # HARD-2: Validate LLM-generated command against DANGEROUS_PATTERNS
+                # before execution. LLM responses are untrusted and could contain
+                # destructive commands (rm -rf /, dd if=/dev/zero) via prompt injection.
+                self._validate_llm_command(llm_cmd)
                 self._os.run_command(llm_cmd)
                 return True
 
