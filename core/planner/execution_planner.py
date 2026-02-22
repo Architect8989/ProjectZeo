@@ -152,6 +152,22 @@ class ExecutionPlanner:
         # on every call. Caching it here eliminates the repeated dead check.
         self._model_name: Optional[str] = self._extract_model_name(llm_call)
 
+        # FIX-07 (RB-A6): Cache a single shared Ollama client at construction time.
+        # Previously both _call_llm_text() and the _llm_text_call closure inside
+        # _decompose_if_complex() created a new ollama.Client() on every call —
+        # each with its own independent connection pool. Under concurrent replan/
+        # decompose sequences, pool exhaustion caused HTTP stream contention and
+        # timeouts. A single shared client eliminates repeated construction cost.
+        self._ollama_client = None
+        try:
+            import ollama as _ollama_mod
+            import httpx as _httpx_mod
+            self._ollama_client = _ollama_mod.Client(
+                timeout=_httpx_mod.Timeout(connect=10.0, read=120.0, write=5.0, pool=2.0)
+            )
+        except Exception:
+            self._ollama_client = None  # _call_llm_text will raise PlanningError on use
+
         if world_graph is not None:
             self.update_world_snapshot(world_graph.snapshot())
         else:
@@ -336,9 +352,10 @@ class ExecutionPlanner:
                     # repeated unnecessary closure introspection on every call.
                     _model = self._model_name
 
-                    client = ollama.Client(
-                        timeout=httpx.Timeout(connect=10.0, read=120.0, write=5.0, pool=2.0)
-                    )
+                    # FIX-07: Use shared client from outer scope (__init__).
+                    client = self._ollama_client
+                    if client is None:
+                        raise RuntimeError("Ollama client unavailable")
                     response = client.chat(
                         model=_model,
                         messages=[
@@ -415,9 +432,10 @@ class ExecutionPlanner:
             # introspection on every planning call.
             _model = self._model_name
 
-            client = ollama.Client(
-                timeout=httpx.Timeout(connect=10.0, read=120.0, write=5.0, pool=2.0)
-            )
+            # FIX-07 (RB-A6): Use shared client cached in __init__.
+            client = self._ollama_client
+            if client is None:
+                raise RuntimeError("Ollama client not available (construction failed)")
             response = client.chat(
                 model=_model,
                 messages=[
@@ -437,11 +455,6 @@ class ExecutionPlanner:
 
         except Exception as exc:
             # HARD-3: The text-only guarantee must be enforced, not best-effort.
-            # Silently falling back to _call_llm_sync() routes planning prompts
-            # through the vision adapter, which attaches an irrelevant screenshot
-            # to a structural JSON-generation prompt and degrades plan quality.
-            # If the direct Ollama call fails, raise PlanningError rather than
-            # masking the failure with a vision-adapter call.
             raise PlanningError(
                 f"Text-only LLM call failed — Ollama may be unavailable: {exc}"
             ) from exc
