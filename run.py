@@ -21,9 +21,17 @@ if not _allow_cloud_early:
     # so the freeze always sees "1" when --allow-cloud is absent.
     os.environ["OLLAMA_ONLY"] = "1"
 else:
-    # Explicit --allow-cloud: clear the env var so factory.py freeze sees a
-    # falsy/absent value and permits cloud routing.
-    os.environ.pop("OLLAMA_ONLY", None)
+    # Explicit --allow-cloud: set OLLAMA_ONLY="0" so factory.py freeze
+    # sees a falsy value and permits cloud routing.
+    #
+    # RB-NEW-02 FIX: The previous code used os.environ.pop("OLLAMA_ONLY", None).
+    # factory.py reads: os.environ.get("OLLAMA_ONLY", "1").strip().lower()
+    # When the key is absent, get() returns the default "1" (cloud-blocked),
+    # making --allow-cloud permanently non-functional (cloud always blocked).
+    #
+    # Fix: set "0" explicitly so the freeze captures the correct value and
+    # _OLLAMA_ONLY_ENFORCEMENT_FROZEN = True (cloud permitted).
+    os.environ["OLLAMA_ONLY"] = "0"
     # Warn early so operators see this even if something crashes during import.
     print(
         "[run.py] WARNING: --allow-cloud is set. Cloud API routing is ENABLED. "
