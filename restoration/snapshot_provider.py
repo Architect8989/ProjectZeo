@@ -215,11 +215,12 @@ class SnapshotProvider:
         if (
             not isinstance(active_app, dict)
             or not isinstance(active_app.get("title"), str)
-            or not active_app["title"].strip()
         ):
-            raise SnapshotProviderError("Active application invalid")
-
-        app_title = active_app["title"].strip()
+            # FIX RTB-02: If active_app is entirely missing/malformed,
+            # use the bare-desktop sentinel rather than raising an error.
+            app_title = "__bare_desktop__"
+        else:
+            app_title = active_app["title"].strip() or "__bare_desktop__"
 
         # ---------------- STATE OBJECTS ----------------
 
