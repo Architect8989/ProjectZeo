@@ -56,8 +56,46 @@ _PATCH_LOCK = threading.Lock()
 _MODEL_PATTERN = re.compile(r"^[a-zA-Z0-9.\-_:/]+$")
 
 # §R3: module-level adapter cache — one instance per model name.
+# FIX-05 (SI-04): Per-model construction locks prevent the double-construction
+# race where two concurrent threads both find a cache miss, both construct an
+# adapter (duplicating warmup side effects: Ollama client creation, thread pool
+# allocation), and the second writer silently overwrites the first — leaking
+# the first adapter's ThreadPoolExecutor and any other resources it holds.
+#
+# Pattern: _ADAPTER_CACHE stores finished instances; _ADAPTER_BUILD_LOCKS
+# stores per-model RLock objects.  A thread acquiring a model lock, finding
+# no cached instance, builds one, stores it, and releases.  A second concurrent
+# thread blocks on the lock and finds the cached instance on release.
 _ADAPTER_CACHE: Dict[str, Any] = {}
-_ADAPTER_CACHE_LOCK = threading.Lock()
+_ADAPTER_CACHE_LOCK = threading.Lock()           # guards _ADAPTER_CACHE reads/writes
+_ADAPTER_BUILD_LOCKS: Dict[str, threading.Lock] = {}  # per-model construction mutex
+_BUILD_LOCKS_LOCK = threading.Lock()             # guards _ADAPTER_BUILD_LOCKS itself
+
+# HAR-08: Freeze the cloud-isolation enforcement decision at module import time.
+#
+# _is_cloud_allowed() previously read os.environ["OLLAMA_ONLY"] on every call
+# to build_llm(). Any code that mutated os.environ after startup could silently
+# bypass cloud isolation for new model names (the adapter cache — FIX-05 —
+# prevents re-construction for already-seen models, but not for novel ones).
+#
+# Fix: snapshot the env var once at module load time and store the result in
+# this constant. _is_cloud_allowed() returns the frozen bool, making it immune
+# to post-startup env mutations. The decision is made at the earliest possible
+# point — module import — before any adapter construction occurs.
+import os as _os_module
+_raw_ollama_only = _os_module.environ.get("OLLAMA_ONLY", "1").strip().lower()
+# OLLAMA_ONLY=1/true/yes → cloud denied (Ollama-only mode)
+# OLLAMA_ONLY=0/false/no → cloud permitted (--allow-cloud path)
+_OLLAMA_ONLY_ENFORCEMENT_FROZEN: bool = _raw_ollama_only not in ("1", "true", "yes")
+del _raw_ollama_only  # remove intermediate from module namespace
+
+
+def _get_model_build_lock(model_name: str) -> threading.Lock:
+    """Return the per-model build lock, creating it if it doesn't exist."""
+    with _BUILD_LOCKS_LOCK:
+        if model_name not in _ADAPTER_BUILD_LOCKS:
+            _ADAPTER_BUILD_LOCKS[model_name] = threading.Lock()
+        return _ADAPTER_BUILD_LOCKS[model_name]
 
 
 def _ensure_patches() -> None:
@@ -133,12 +171,19 @@ def _is_cloud_allowed() -> bool:
 
     This makes the Ollama-only guarantee true by default with no operator
     action required.
+
+    HAR-08 FIX: The enforcement decision is now read ONCE at module import
+    time and stored in the module-level constant _OLLAMA_ONLY_ENFORCEMENT_FROZEN
+    below. _is_cloud_allowed() returns the frozen value on every subsequent
+    call, preventing post-startup mutation of os.environ["OLLAMA_ONLY"] from
+    bypassing the cloud isolation boundary.
+
+    Without this freeze, any code that executes `os.environ["OLLAMA_ONLY"] = "0"`
+    after startup would allow cloud adapter construction on the next build_llm()
+    call — even if the user launched with --allow-cloud absent. The adapter cache
+    (FIX-05) limits the risk to new/unseen model names, but does not eliminate it.
     """
-    import os as _os
-    val = _os.environ.get("OLLAMA_ONLY", "1").strip().lower()
-    # OLLAMA_ONLY=1/true/yes → cloud denied
-    # OLLAMA_ONLY=0/false/no → cloud permitted
-    return val not in ("1", "true", "yes")
+    return _OLLAMA_ONLY_ENFORCEMENT_FROZEN
 
 
 class AdapterFactory:
@@ -149,74 +194,81 @@ class AdapterFactory:
         Build and cache an LLM adapter for the given model name.
 
         Routing priority:
-          1. Cached instance → return immediately.
-          2. Local registry match → instantiate registered local adapter.
-          3. Cloud registry match + cloud allowed → PureLLMWrapper.
-          4. Cloud registry match + cloud DENIED → ModelNotRecognizedException.
-          5. Unknown → ModelNotRecognizedException.
+          1. Cached instance → return immediately (fast path, no lock contention).
+          2. Per-model build lock → acquire, re-check cache (double-checked locking).
+          3. Local registry match → instantiate registered local adapter.
+          4. Cloud registry match + cloud allowed → PureLLMWrapper.
+          5. Cloud registry match + cloud DENIED → ModelNotRecognizedException.
+          6. Unknown → ModelNotRecognizedException.
+
+        FIX-05 (SI-04): The original code checked the cache under the global
+        lock, released it, constructed the adapter (potentially expensive),
+        then re-acquired the global lock to write.  Two concurrent threads
+        entering simultaneously both saw a cache miss, both constructed adapter
+        instances (duplicating Ollama client warmup, ThreadPoolExecutor
+        allocation, etc.), and the second write silently overwrote the first —
+        leaking the first adapter's executor permanently.
+
+        Fix: per-model build locks ensure only one thread constructs each model.
+        The global cache lock is held only for the O(1) dict read/write steps.
         """
         model_name = _validate_model_name(model_name)
         _ensure_patches()
 
-        # §R3: return cached adapter if already built
+        # Fast path: return cached adapter without acquiring build lock.
         with _ADAPTER_CACHE_LOCK:
             if model_name in _ADAPTER_CACHE:
                 return _ADAPTER_CACHE[model_name]
 
-        base_model = _resolve_base_model(model_name)
+        # Slow path: acquire per-model build lock.
+        build_lock = _get_model_build_lock(model_name)
+        with build_lock:
+            # Double-checked locking: another thread may have completed
+            # construction while we waited for the build lock.
+            with _ADAPTER_CACHE_LOCK:
+                if model_name in _ADAPTER_CACHE:
+                    return _ADAPTER_CACHE[model_name]
 
-        # --- Route 1: Local adapter ---
-        local_path = _LOCAL_REGISTRY.get(base_model)
-        if local_path is not None:
-            AdapterClass = _import_class(local_path)
-            instance = None
-            try:
+            base_model = _resolve_base_model(model_name)
+
+            # --- Route 1: Local adapter ---
+            local_path = _LOCAL_REGISTRY.get(base_model)
+            if local_path is not None:
+                AdapterClass = _import_class(local_path)
                 instance = AdapterClass(model_name=model_name)
-            except Exception:
                 with _ADAPTER_CACHE_LOCK:
-                    _ADAPTER_CACHE.pop(model_name, None)
-                raise
+                    _ADAPTER_CACHE[model_name] = instance
+                return instance
 
-            with _ADAPTER_CACHE_LOCK:
-                _ADAPTER_CACHE[model_name] = instance
-            return instance
+            # --- Route 2: Cloud adapter via PureLLMWrapper ---
+            if base_model in _CLOUD_REGISTRY:
+                # FIX H-01: Cloud is BLOCKED by default. The previous guard only
+                # blocked cloud when OLLAMA_ONLY=1 was set; absent the env var,
+                # cloud routing silently succeeded, violating the isolation claim.
+                # Now cloud is denied unless explicitly permitted via _is_cloud_allowed().
+                if not _is_cloud_allowed():
+                    raise ModelNotRecognizedException(
+                        f"Model '{model_name}' is a cloud model, but OLLAMA_ONLY is "
+                        "enforced (default). To enable cloud models, start the system "
+                        "with --allow-cloud or set OLLAMA_ONLY=0 in the environment.\n"
+                        f"  Local models: {sorted(_LOCAL_REGISTRY.keys())}"
+                    )
 
-        # --- Route 2: Cloud adapter via PureLLMWrapper ---
-        if base_model in _CLOUD_REGISTRY:
-            # FIX H-01: Cloud is BLOCKED by default. The previous guard only
-            # blocked cloud when OLLAMA_ONLY=1 was set; absent the env var,
-            # cloud routing silently succeeded, violating the isolation claim.
-            # Now cloud is denied unless explicitly permitted via _is_cloud_allowed().
-            if not _is_cloud_allowed():
-                raise ModelNotRecognizedException(
-                    f"Model '{model_name}' is a cloud model, but OLLAMA_ONLY is "
-                    "enforced (default). To enable cloud models, start the system "
-                    "with --allow-cloud or set OLLAMA_ONLY=0 in the environment.\n"
-                    f"  Local models: {sorted(_LOCAL_REGISTRY.keys())}"
-                )
+                # Lazy import so Ollama-only boots never touch cloud code
+                from adapters.pure_llm_wrapper import PureLLMWrapper  # noqa: PLC0415
 
-            # Lazy import so Ollama-only boots never touch cloud code
-            from adapters.pure_llm_wrapper import PureLLMWrapper  # noqa: PLC0415
-
-            instance = None
-            try:
                 instance = PureLLMWrapper(model_name=base_model)
-            except Exception:
                 with _ADAPTER_CACHE_LOCK:
-                    _ADAPTER_CACHE.pop(model_name, None)
-                raise
+                    _ADAPTER_CACHE[model_name] = instance
+                return instance
 
-            with _ADAPTER_CACHE_LOCK:
-                _ADAPTER_CACHE[model_name] = instance
-            return instance
-
-        # --- Route 3: Unknown ---
-        raise ModelNotRecognizedException(
-            f"Model '{model_name}' is not registered.\n"
-            f"  Local models:  {sorted(_LOCAL_REGISTRY.keys())}\n"
-            f"  Cloud models:  {sorted(_CLOUD_REGISTRY)} (require --allow-cloud)\n"
-            "Add the model to the appropriate registry in adapters/factory.py."
-        )
+            # --- Route 3: Unknown ---
+            raise ModelNotRecognizedException(
+                f"Model '{model_name}' is not registered.\n"
+                f"  Local models:  {sorted(_LOCAL_REGISTRY.keys())}\n"
+                f"  Cloud models:  {sorted(_CLOUD_REGISTRY)} (require --allow-cloud)\n"
+                "Add the model to the appropriate registry in adapters/factory.py."
+            )
 
     @staticmethod
     async def get_action(
