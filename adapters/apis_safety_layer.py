@@ -112,8 +112,21 @@ def _wrap_provider(fn):
 
     is_async = inspect.iscoroutinefunction(fn)
 
-    def _validate_no_mutation(snapshot, caller_messages, name):
-        if caller_messages != snapshot:
+    def _validate_no_mutation(snapshot, checked_copy, name):
+        # H2 FIX: Compare the deep copy that was passed to the provider
+        # (checked_copy = safe_messages) against the snapshot taken of it
+        # before the call. This detects whether the provider mutated the
+        # message list it received.
+        #
+        # Previous bug: the function compared 'caller_snapshot' against
+        # 'messages' (the original caller reference). The provider only ever
+        # receives 'safe_messages' (a deep copy) — it has no reference to
+        # 'messages'. Therefore 'messages' can never be mutated by the provider
+        # and the check always passed, making mutation detection a structural
+        # no-op. Swapping to compare caller_snapshot against safe_messages
+        # makes the check meaningful: if the provider mutated its copy of the
+        # message list, we catch it here.
+        if checked_copy != snapshot:
             raise RuntimeError(
                 f"[APIS-SAFETY] Provider mutated caller messages: {name}"
             )
@@ -153,7 +166,8 @@ def _wrap_provider(fn):
                     f"[APIS-SAFETY] {fn.__name__} failed: {e}"
                 ) from e
 
-            _validate_no_mutation(caller_snapshot, messages, fn.__name__)
+            # H2 FIX: pass safe_messages (what fn received) not messages (original)
+            _validate_no_mutation(caller_snapshot, safe_messages, fn.__name__)
             _validate_result(result, fn.__name__)
 
             return result
@@ -180,7 +194,8 @@ def _wrap_provider(fn):
                     f"[APIS-SAFETY] {fn.__name__} failed: {e}"
                 ) from e
 
-            _validate_no_mutation(caller_snapshot, messages, fn.__name__)
+            # H2 FIX: pass safe_messages (what fn received) not messages (original)
+            _validate_no_mutation(caller_snapshot, safe_messages, fn.__name__)
             _validate_result(result, fn.__name__)
 
             return result
