@@ -17,10 +17,27 @@ class InputArbitrator:
     - Watchdog thread can be cleanly stopped
     """
 
-    EMERGENCY_RECLAIM_TIMEOUT_SECONDS = 8.0
+    # FIX-M2 (RB-2): Raised from 8.0s to 180.0s.
+    #
+    # Root cause: The 8-second limit was calibrated for GPU inference (< 5s per
+    # LLM call). On CPU hardware, LLM text planning calls take 40–90 seconds.
+    # soc_action_started() was called only once per action execution in operate.py.
+    # During LLM planning, no SOC heartbeat reached the watchdog. After 8 seconds
+    # of inactivity, _forced_release=True was set permanently, and
+    # clear_emergency_reclaim() was never called from any production code path —
+    # making the watchdog a one-way latch that killed every CPU task.
+    #
+    # Fix: 180 seconds covers worst-case CPU inference latency (90s) with 2x
+    # safety margin. Operators on GPU hardware can lower this at construction:
+    #     InputArbitrator(emergency_reclaim_timeout=15.0)
+    #
+    # Additionally, operate.py now calls soc_action_started() at the START of
+    # each loop iteration (not just inside the action execution block) so the
+    # watchdog heartbeat is refreshed even during planning delays.
+    EMERGENCY_RECLAIM_TIMEOUT_SECONDS = 180.0
     WATCHDOG_INTERVAL_SECONDS = 0.5
 
-    def __init__(self):
+    def __init__(self, emergency_reclaim_timeout: float = None):
         self.tracker = InputTracker()
         self.policy = AuthorityPolicy()
 
@@ -29,6 +46,14 @@ class InputArbitrator:
 
         self._forced_release: bool = False
         self._lock = threading.Lock()
+
+        # FIX-M2: Allow override of the emergency reclaim timeout at construction.
+        # GPU operators can pass emergency_reclaim_timeout=15.0; CPU operators
+        # use the default 180.0.
+        if emergency_reclaim_timeout is not None:
+            self._timeout = float(emergency_reclaim_timeout)
+        else:
+            self._timeout = self.EMERGENCY_RECLAIM_TIMEOUT_SECONDS
 
         self._stop_event = threading.Event()
         self._watchdog_thread = threading.Thread(
@@ -133,7 +158,7 @@ class InputArbitrator:
                     continue
 
                 idle = self._clock() - self._last_soc_action_mono
-                if idle > self.EMERGENCY_RECLAIM_TIMEOUT_SECONDS:
+                if idle > self._timeout:
                     self._forced_release = True
 
     # -------------------------------------------------
@@ -145,5 +170,5 @@ class InputArbitrator:
             return {
                 "forced_release": self._forced_release,
                 "last_soc_action_mono": self._last_soc_action_mono,
-                "timeout_seconds": self.EMERGENCY_RECLAIM_TIMEOUT_SECONDS,
+                "timeout_seconds": self._timeout,
         }
