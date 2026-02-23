@@ -11,18 +11,7 @@ from typing import Optional
 
 
 def atomic_write_intent(intent_text: str, intent_file: str = None) -> None:
-    """
-    Write an intent string to the intent file atomically.
-
-    RB-06 FIX: The IntentListener polls at 100ms. A non-atomic write (open,
-    write, close) creates a race window where the listener can read a partial
-    intent if it polls between the open and the final close.
-
-    Fix: write to a .tmp sibling file, then os.replace() to the target path.
-    os.replace() is atomic on POSIX (rename syscall) and atomic on Windows
-    (MoveFileExW with MOVEFILE_REPLACE_EXISTING). The listener only ever
-    reads complete files.
-    """
+   
     if intent_file is None:
         intent_file = IntentListener.INTENT_FILE
 
@@ -53,24 +42,7 @@ class IntentListener:
     POLL_INTERVAL = 0.1
     INTENT_MAX_BYTES = 4096
 
-    # FIX RB-3: Replace tempfile.gettempdir() path with a project-relative path.
-    #
-    # Bug: INTENT_FILE = os.path.join(tempfile.gettempdir(), "projectzeo.intent")
-    # resolves to /tmp/projectzeo.intent on Linux.  The bundled intent file
-    # lives at temp/arm_system.intent (relative to project root).  The listener
-    # polled /tmp/projectzeo.intent while the file to be read was elsewhere —
-    # the system never entered ARMED state in default deployment.
-    #
-    # Fix: resolve the path relative to this file's location at import time.
-    # This is robust against:
-    #   - Different working directories at process startup
-    #   - Containerised deployments that mount the project at a non-CWD path
-    #   - Operator scripts that write to temp/arm_system.intent expecting it to
-    #     be picked up automatically
-    #
-    # Deployment note: operators can override INTENT_FILE after import by
-    # assigning IntentListener.INTENT_FILE = "/custom/path" before calling
-    # IntentListener.__init__(). This class attribute is mutable.
+    
     _PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[1]
     INTENT_FILE: str = str(_PROJECT_ROOT / "temp" / "arm_system.intent")
 
@@ -118,33 +90,53 @@ class IntentListener:
                     time.sleep(self.POLL_INTERVAL)
                     continue
 
-                intent = self._read_intent()
+                
+                intent, intent_file_path = self._peek_intent()
 
                 if not intent:
                     time.sleep(self.POLL_INTERVAL)
                     continue
 
+                # ---- Arm sequence ----
+                arm_failure_reason: Optional[str] = None
+                snapshot_id: Optional[str] = None
+
                 try:
                     snapshot_id = self.snapshot_provider.take_snapshot()
-                except Exception:
+                except Exception as _snap_err:
+                    arm_failure_reason = f"snapshot_failed: {_snap_err}"
+
+                if arm_failure_reason is None and not snapshot_id:
+                    arm_failure_reason = "snapshot_returned_none"
+
+                if arm_failure_reason is None:
+                    try:
+                        self.mode.attach_snapshot(snapshot_id)
+                    except Exception as _attach_err:
+                        arm_failure_reason = f"attach_snapshot_failed: {_attach_err}"
+
+                if arm_failure_reason is None:
+                    try:
+                        self.mode.arm(intent=intent)
+                    except Exception as _arm_err:
+                        arm_failure_reason = f"arm_failed: {_arm_err}"
+
+                if arm_failure_reason is not None:
+                    # Arming failed — leave intent file in place so operator
+                    # does not have to re-write it. Write a sidecar so the
+                    # failure reason is visible without watching stderr.
+                    self._write_arm_failure_sidecar(arm_failure_reason, intent)
+                    print(
+                        f"[IntentListener] Arm sequence failed ({arm_failure_reason}). "
+                        "Intent file preserved — system will retry on next poll.",
+                        file=sys.stderr,
+                    )
                     time.sleep(self.POLL_INTERVAL)
                     continue
 
-                if not snapshot_id:
-                    time.sleep(self.POLL_INTERVAL)
-                    continue
-
-                try:
-                    self.mode.attach_snapshot(snapshot_id)
-                except Exception:
-                    time.sleep(self.POLL_INTERVAL)
-                    continue
-
-                try:
-                    self.mode.arm(intent=intent)
-                except Exception:
-                    time.sleep(self.POLL_INTERVAL)
-                    continue
+                # ---- Arm succeeded — now safe to consume (delete) the intent file ----
+                self._consume_intent(intent_file_path)
+                self._write_arm_success_sidecar()
 
             except Exception:
                 time.sleep(self.POLL_INTERVAL)
@@ -153,7 +145,183 @@ class IntentListener:
     # Input sources
     # ==================================================
 
+    def _peek_intent(self) -> tuple:
+        """
+        RB-6 FIX: Read the intent without deleting the file.
+
+        Returns (intent_text, file_path_or_None).
+          - intent_text: the stripped, prefix-cleaned intent string, or None
+          - file_path_or_None: the path of the intent file that was read
+            (None for stdin input or when no intent was found)
+
+        The caller is responsible for calling _consume_intent(file_path)
+        after successfully arming, and for calling _write_arm_failure_sidecar()
+        on failure.
+        """
+        # ---- Non-blocking interactive stdin ----
+        if sys.stdin and sys.stdin.isatty():
+            try:
+                ready, _, _ = select.select([sys.stdin], [], [], 0.0)
+            except Exception:
+                ready = []
+
+            if ready:
+                try:
+                    raw = sys.stdin.readline()
+                    if len(raw.encode("utf-8", errors="replace")) > self.INTENT_MAX_BYTES:
+                        print(
+                            f"[IntentListener] Discarded stdin intent — exceeds "
+                            f"{self.INTENT_MAX_BYTES} byte limit.",
+                            file=sys.stderr,
+                        )
+                        return None, None
+                    data = raw
+                except Exception:
+                    return None, None
+
+                if not data:
+                    return None, None
+
+                intent = self._strip_arm_prefix(data.strip())
+                return (intent if intent else None), None
+
+        # ---- Secure file peek (no deletion) ----
+        path = self.INTENT_FILE
+
+        if not os.path.exists(path):
+            return None, None
+
+        fd = None
+        data = None
+
+        try:
+            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+            fd = os.open(path, flags)
+
+            st = os.fstat(fd)
+
+            if not stat.S_ISREG(st.st_mode):
+                return None, None
+
+            current_uid = getattr(os, "getuid", lambda: None)()
+            if current_uid is not None and st.st_uid != current_uid:
+                return None, None
+
+            if (st.st_mode & 0o002) != 0:
+                print(
+                    f"[IntentListener] Rejected intent file — world-writable: {path}",
+                    file=sys.stderr,
+                )
+                return None, None
+
+            if st.st_size <= 0 or st.st_size > self.INTENT_MAX_BYTES:
+                return None, None
+
+            raw = os.read(fd, self.INTENT_MAX_BYTES)
+            data = raw.decode("utf-8", errors="strict")
+
+        except Exception:
+            return None, None
+
+        finally:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except Exception:
+                    pass
+
+        if data is None:
+            return None, None
+
+        intent = self._strip_arm_prefix(data.strip())
+        if not intent:
+            print(
+                f"[IntentListener] Discarded intent file — content is empty or "
+                f"whitespace-only after stripping ARM: prefix: {path!r}. "
+                f"Re-write the file with a valid intent string. File NOT deleted.",
+                file=sys.stderr,
+            )
+            return None, None
+
+        return intent, path
+
+    def _consume_intent(self, file_path: Optional[str]) -> None:
+        """
+        RB-6 FIX: Delete the intent file after a successful arm.
+
+        Only called when mode.arm() has returned without raising, so the
+        intent is guaranteed to have been acted upon before it disappears.
+        """
+        if file_path is None:
+            return  # stdin input — nothing to delete
+        try:
+            os.remove(file_path)
+        except Exception:
+            pass  # Best-effort; file may already be absent
+
+    def _write_arm_failure_sidecar(
+        self, reason: str, intent: str
+    ) -> None:
+        """
+        RB-6 FIX: Write a structured JSON sidecar on arm failure.
+
+        Path: temp/arm_failure.json (sibling of the intent file directory).
+        Operators watching temp/ can detect failures without tailing stderr.
+        """
+        import json as _json
+        _sidecar_dir = os.path.dirname(self.INTENT_FILE)
+        _sidecar_path = os.path.join(_sidecar_dir, "arm_failure.json")
+        try:
+            os.makedirs(_sidecar_dir, exist_ok=True)
+            payload = {
+                "event": "arm_failure",
+                "reason": reason,
+                "intent_preview": intent[:80],
+                "timestamp": time.time(),
+            }
+            _tmp = _sidecar_path + ".tmp"
+            with open(_tmp, "w", encoding="utf-8") as _f:
+                _json.dump(payload, _f)
+            os.replace(_tmp, _sidecar_path)
+        except Exception:
+            pass  # Sidecar write is best-effort
+
+    def _write_arm_success_sidecar(self) -> None:
+        """
+        RB-6 FIX: Write a structured JSON sidecar on successful arm.
+
+        Clears any prior arm_failure.json and writes arm_success.json so
+        monitoring tools can distinguish a recovered system from a stuck one.
+        """
+        import json as _json
+        _sidecar_dir = os.path.dirname(self.INTENT_FILE)
+        _success_path = os.path.join(_sidecar_dir, "arm_success.json")
+        _failure_path = os.path.join(_sidecar_dir, "arm_failure.json")
+        try:
+            os.makedirs(_sidecar_dir, exist_ok=True)
+            payload = {"event": "arm_success", "timestamp": time.time()}
+            _tmp = _success_path + ".tmp"
+            with open(_tmp, "w", encoding="utf-8") as _f:
+                _json.dump(payload, _f)
+            os.replace(_tmp, _success_path)
+            # Clear stale failure sidecar if present
+            try:
+                os.remove(_failure_path)
+            except OSError:
+                pass
+        except Exception:
+            pass  # Sidecar write is best-effort
+
     def _read_intent(self) -> Optional[str]:
+        """
+        Legacy single-return interface kept for backward compatibility.
+        New code should use _peek_intent() + _consume_intent().
+
+        NOTE: This method still deletes the file on success (original
+        behaviour). It is NOT used by _listen_loop() anymore; _listen_loop
+        now uses _peek_intent() + _consume_intent() so deletion is deferred
+        until after arm() succeeds.
+        """
 
         # ---- Non-blocking interactive stdin ----
         if sys.stdin and sys.stdin.isatty():
@@ -273,15 +441,7 @@ class IntentListener:
     # ==================================================
 
     def _strip_arm_prefix(self, text: str) -> str:
-        """
-        FIX RB-3: Strip the 'ARM:' prefix if present (case-insensitive).
-
-        The bundled temp/arm_system.intent ships with:
-            ARM: investigate deployment issue
-
-        Without stripping, "ARM: " becomes the first word of the task objective
-        sent to the LLM, degrading plan quality and causing confusing logs.
-        """
+        
         stripped = text.strip()
         if stripped.upper().startswith(self._ARM_PREFIX):
             stripped = stripped[len(self._ARM_PREFIX):].strip()
