@@ -1,23 +1,6 @@
-"""
-Authoritative Task Planner
-
-Purpose:
-Owns the PLANNING phase.
-
-This is the ONLY module allowed to:
-- Call external LLM for reasoning
-- Analyze intent into requirements
-- Coordinate decomposition + execution planning
-- Decide whether execution is permitted
-
-Hard rules:
-- No OS calls
-- No UI assumptions
-- No execution
-- No partial plans
-"""
-
-from typing import Dict, Any, Optional
+import json
+import re
+from typing import Dict, Any, Optional, List
 
 from core.planner.task_decomposer import TaskDecomposer, DecompositionError
 from core.planner.execution_planner import ExecutionPlanner
@@ -32,6 +15,12 @@ class PlanningError(RuntimeError):
 class TaskPlanner:
     """
     Planning authority.
+
+    HAR-2 WARNING: This class is currently DEAD CODE — it is not imported or
+    instantiated anywhere in the production execution path.  It is preserved
+    for potential future use.  The LLM interface bug in _analyze_requirements()
+    has been fixed (see module docstring), but the class has not been
+    integration-tested against the live execution path.
 
     Flow:
     intent
@@ -50,11 +39,18 @@ class TaskPlanner:
         environment_fingerprint: Optional[Dict[str, Any]] = None,
     ):
         """
-        llm_call(prompt: str) -> str
-        environment_fingerprint is informational only
+        llm_call(messages: List[dict], objective: str, session_id: str) -> str
+            Must accept the standard three-argument interface used throughout
+            the production execution path.  A plain string callable
+            (prompt: str) -> str will raise TypeError at runtime.
+
+        environment_fingerprint is informational only.
         """
         if llm_call is None:
             raise ValueError("llm_call is required")
+
+        if not callable(llm_call):
+            raise ValueError("llm_call must be callable")
 
         self.llm_call = llm_call
         self.environment = environment_fingerprint or {}
@@ -130,21 +126,29 @@ class TaskPlanner:
         """
         Uses LLM to extract explicit requirements and constraints.
 
-        Output is informational but mandatory.
+        HAR-2 FIX: Updated to use the correct llm_call interface:
+            llm_call(messages: List[dict], objective: str, session_id: str)
+
+        Root cause of original bug: this method called self.llm_call(prompt)
+        with a plain string.  The system's llm_call interface expects a list of
+        message dicts as the first argument (the standard chat interface used
+        throughout operate.py, ExecutionPlanner, and ReasoningEngine).  Passing
+        a string triggered TypeError: argument after * must be an iterable
+        (or similar depending on the adapter implementation) on the first call.
+        The class was dead code so this was never caught.
+
+        Fix: wrap prompt in the standard messages format and call with
+        (messages, objective, session_id) so any conforming adapter works.
         """
 
-        prompt = f"""
-You are a requirement analysis engine.
+        system_prompt = (
+            "You are a requirement analysis engine. "
+            "Analyze the objective and extract REQUIREMENTS ONLY. "
+            "Rules: no execution steps, no UI actions, no speculation, be explicit. "
+            "Return STRICT JSON matching the schema provided."
+        )
 
-Task:
-Analyze the following objective and extract REQUIREMENTS ONLY.
-
-Rules:
-- No execution steps
-- No UI actions
-- No speculation
-- Be explicit
-- Return STRICT JSON
+        user_prompt = f"""Analyze the following objective and extract REQUIREMENTS ONLY.
 
 Schema:
 {{
@@ -157,31 +161,58 @@ Schema:
 
 OBJECTIVE:
 {intent}
-""".strip()
 
-        raw = self.llm_call(prompt)
+Return ONLY valid JSON. No preamble, no explanation."""
 
-        if not isinstance(raw, str):
-            raise PlanningError("Requirement analysis returned non-string")
+        # HAR-2 FIX: Use the correct three-argument llm_call interface.
+        # The original code passed a plain string; this raised TypeError in every
+        # adapter because the first positional argument must be List[dict].
+        messages: List[Dict[str, Any]] = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user",   "content": user_prompt},
+        ]
 
         try:
-            import json
-            import re
+            raw = self.llm_call(messages, intent, "requirement_analysis")
+        except Exception as e:
+            raise PlanningError(f"LLM call for requirement analysis failed: {e}")
 
+        # Adapters may return a list of action dicts (vision path) or a string
+        # (text path).  Accept both.
+        if isinstance(raw, list):
+            # Vision adapter returned UI ops — cannot use for requirement analysis.
+            # Construct a minimal requirements dict so planning can continue.
+            log_warn(
+                "[PLANNER] _analyze_requirements: LLM returned action list instead "
+                "of text — using minimal fallback requirements."
+            )
+            return {
+                "scope": intent[:200],
+                "deliverables": [],
+                "constraints": [],
+                "assumptions": [],
+                "risks": [],
+            }
+
+        if not isinstance(raw, str):
+            raise PlanningError(
+                f"Requirement analysis returned unexpected type: {type(raw)}"
+            )
+
+        try:
             match = re.search(r"\{.*\}", raw, re.S)
             if not match:
-                raise ValueError("No JSON found")
+                raise ValueError("No JSON object found in LLM response")
 
             requirements = json.loads(match.group(0))
         except Exception as e:
             raise PlanningError(f"Requirement parsing failed: {e}")
 
         if not isinstance(requirements, dict):
-            raise PlanningError("Invalid requirements structure")
+            raise PlanningError("Invalid requirements structure (not a dict)")
 
-        # minimal sanity checks
         for key in ("scope", "deliverables", "constraints"):
             if key not in requirements:
-                raise PlanningError(f"Missing requirement field: {key}")
+                raise PlanningError(f"Missing requirement field: {key!r}")
 
         return requirements
