@@ -28,6 +28,29 @@ class PlanVerifier:
         if not isinstance(plan.steps, list) or not plan.steps:
             raise PlanVerificationError("ExecutionPlan contains no steps")
 
+        # RB-3 FIX: Reject plans that contain ONLY a DONE step (trivial plan).
+        #
+        # Root cause: PlanVerifier accepted any plan that satisfied the schema,
+        # including a single-step DONE-only plan. The LLM could produce this for
+        # any short objective (e.g. just {"type": "done", ...}). The execution
+        # loop immediately exits on the first DONE step, reporting task success
+        # with zero actions taken — a silent no-op.
+        #
+        # Fix: require at least one non-DONE step. A valid plan must have
+        # meaningful work before terminating. Raises PlanVerificationError with
+        # a diagnostic so the planner retries with a substantive plan.
+        non_done_steps = [
+            s for s in plan.steps
+            if isinstance(s, ExecutionStep) and s.type is not StepType.DONE
+        ]
+        if not non_done_steps:
+            raise PlanVerificationError(
+                "ExecutionPlan contains no actionable steps — only a DONE step. "
+                "The planner must produce at least one UI_INTERACTION, "
+                "COMMAND_EXECUTION, FILE_CREATION, VERIFICATION, or "
+                "TOOL_INSTALLATION step before DONE."
+            )
+
         self._verify_step_objects(plan)
         self._verify_step_ids(plan)
         self._verify_dependencies(plan)
