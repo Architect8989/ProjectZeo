@@ -215,8 +215,24 @@ class BeliefState:
         return mean - self.RISK_LAMBDA * variance
 
     def ucb_score(self, action: str) -> float:
+        # FIX-14: Return float('inf') for unvisited actions so UCB1's
+        # "must explore" guarantee is preserved.
+        #
+        # Bug: count = self.action_counts.get(action, 0) + 1 always added 1,
+        # giving unvisited actions an effective count of 1. This suppressed the
+        # log(N)/count → ∞ singularity that UCB1 uses as the "must explore"
+        # signal. Cold-start exploration was degraded — actions seen once were
+        # treated the same as actions never seen. The algorithm could commit to
+        # a suboptimal action after a single trial.
+        #
+        # Fix: return float('inf') for count=0 actions, which is the standard
+        # UCB1 behaviour. This guarantees every action is tried at least once
+        # before any is repeated, preserving the regret bound.
+        count = self.action_counts.get(action, 0)
+        if count == 0:
+            return float('inf')  # Must explore: standard UCB1 guarantee
+
         total_actions = max(sum(self.action_counts.values()) + 1, 2)
-        count = self.action_counts.get(action, 0) + 1
         rewards = self.action_rewards.get(action)
 
         mean_reward = sum(rewards) / len(rewards) if rewards else 0.0
