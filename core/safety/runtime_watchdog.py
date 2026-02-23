@@ -6,7 +6,7 @@ from collections import deque
 
 
 MAX_RUNTIME_SECONDS = 3600          # 1 hour per task
-MAX_MEMORY_MB = 4096                # 4GB resident set
+MAX_MEMORY_MB = 4096                # 4 GB resident set
 MAX_CPU_PERCENT = 90                # sustained CPU
 
 CPU_SAMPLE_INTERVAL = 0.1           # seconds
@@ -32,6 +32,7 @@ class RuntimeWatchdog:
     - No false positives on short CPU spikes
     - Best-effort only (cannot interrupt blocking ops)
     - Deterministic violation semantics
+    - Thread-safe start_time reset via property (FIX SI-2 / RB-A2)
 
     FIX RB-4: CPU checking can be paused during LLM inference.
 
@@ -41,20 +42,27 @@ class RuntimeWatchdog:
     inference and forces _force_safe_shutdown(), aborting every task on CPU-only
     hardware.
 
-    Usage pattern in main.py / run.py:
-        watchdog.pause_cpu()
-        try:
-            result = llm_adapter.get_next_action(...)
-        finally:
-            watchdog.resume_cpu()
+    FIX SI-2 / RB-A2: start_time is now a thread-safe property.
 
-    This preserves CPU monitoring for all non-inference phases (UI operations,
-    command execution, restoration) while suppressing false positives during
-    legitimate heavy computation.
+    Previous code stored start_time as a plain instance attribute. main.py reset
+    it at the start of each task via:
+        watchdog.start_time = time.time()
+    while check() read it concurrently on the watchdog thread with no lock.
+    This was a data race: a torn read of the float could produce a wildly wrong
+    elapsed value, causing spurious TIME_LIMIT violations mid-task.
+
+    Fix: protect start_time reads and writes with _start_time_lock. The property
+    getter/setter acquire the lock, making cross-thread access safe. The public
+    API is unchanged — callers still write `watchdog.start_time = time.time()`.
     """
 
     def __init__(self):
-        self.start_time = time.time()
+        # FIX SI-2 / RB-A2: Dedicated lock for start_time access.
+        # Separate from _cpu_pause_lock so CPU pause/resume does not block
+        # time-limit checks and vice versa.
+        self._start_time_lock = threading.Lock()
+        self._start_time: float = time.time()
+
         self.process = psutil.Process(os.getpid())
 
         # Sliding window of CPU samples
@@ -71,6 +79,35 @@ class RuntimeWatchdog:
             self.process.cpu_percent(interval=None)
         except Exception:
             pass
+
+    # =================================================
+    # START TIME PROPERTY (FIX SI-2 / RB-A2)
+    # =================================================
+
+    @property
+    def start_time(self) -> float:
+        """
+        Thread-safe read of the per-task start timestamp.
+
+        check() reads this on a background thread; main.py writes it from the
+        main thread when a new task begins. The lock prevents torn reads.
+        """
+        with self._start_time_lock:
+            return self._start_time
+
+    @start_time.setter
+    def start_time(self, value: float) -> None:
+        """
+        Thread-safe write of the per-task start timestamp.
+
+        Called from main.py at the start of each task:
+            watchdog.start_time = time.time()
+
+        The lock prevents check() from reading a partially written value while
+        this assignment is in progress.
+        """
+        with self._start_time_lock:
+            self._start_time = float(value)
 
     # =================================================
     # CPU PAUSE / RESUME  [FIX RB-4]
@@ -108,6 +145,9 @@ class RuntimeWatchdog:
 
     def check(self):
         now = time.time()
+        # FIX SI-2 / RB-A2: Read start_time through the property so the lock
+        # is held for the duration of the read, preventing torn-read races with
+        # the main-thread writer.
         elapsed = now - self.start_time
 
         # --- TIME LIMIT ---
