@@ -171,9 +171,37 @@ class AuthorityStateSerializer:
         restore_required: bool,
         last_snapshot_id: Optional[str],
         dirty: bool,
+        thompson_state: Optional[Dict[str, Any]] = None,
     ) -> None:
         """
         Persist authority state atomically.
+
+        FIX H-17: Optional thompson_state persists BeliefState counters so
+        Thompson sampling is reproducible across process restarts.
+
+        thompson_state dict schema:
+          {
+            "iteration_counter": int,   # belief._iteration_counter
+            "sample_counter":    int,   # belief._sample_counter
+            "commitment_hash":   str,   # belief.commitment_hash (hex)
+          }
+
+        Usage in main.py (before the operate_main call):
+          auth_state.persist(
+              ...,
+              thompson_state={
+                  "iteration_counter": belief._iteration_counter,
+                  "sample_counter":    belief._sample_counter,
+                  "commitment_hash":   belief.commitment_hash,
+              },
+          )
+
+        On restore (after auth_state.load()):
+          ts = persisted.get("thompson_state") or {}
+          belief._iteration_counter = ts.get("iteration_counter", 0)
+          belief._sample_counter    = ts.get("sample_counter", 0)
+          if "commitment_hash" in ts:
+              belief.commitment_hash = ts["commitment_hash"]
         """
         state = {
             "version": _AUTH_STATE_VERSION,
@@ -184,6 +212,12 @@ class AuthorityStateSerializer:
             "dirty": bool(dirty),
             "updated_at": time.time(),
         }
+        if thompson_state is not None:
+            state["thompson_state"] = {
+                "iteration_counter": int(thompson_state.get("iteration_counter", 0)),
+                "sample_counter":    int(thompson_state.get("sample_counter", 0)),
+                "commitment_hash":   str(thompson_state.get("commitment_hash", "")),
+            }
 
         with self._lock:
             self._atomic_write(state)
