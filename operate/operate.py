@@ -219,6 +219,32 @@ def _execute_autonomous_loop(
             journal.record({"event": "execution_complete"})
             return
 
+        # FIX-M6 (RB-2 / SI-2): Signal SOC liveness at the START of each
+        # iteration, not only inside the action execution try-block.
+        #
+        # Bug: soc_action_started() was called once, inside the try block after
+        # all authority/policy checks. During LLM planning (40–90s on CPU), no
+        # heartbeat reached the watchdog between the previous iteration's
+        # soc_action_started() call and the next one. With the old 8-second
+        # timeout, _forced_release was set to True after the first LLM call,
+        # making all subsequent evaluate() calls return RELEASE permanently.
+        # clear_emergency_reclaim() was never called from any production path.
+        #
+        # Fix: call soc_action_started() here (top of loop) so the 180-second
+        # watchdog timer resets on every iteration, even those dominated by
+        # LLM inference time. This is the "heartbeat during planning" option
+        # described in the audit as FIX option (c). The raised timeout (180s,
+        # FIX-M2) provides additional safety margin.
+        input_arbitrator.soc_action_started()
+
+        # FIX-M6 (SI-2): Also clear any prior forced release at the start of
+        # each iteration. If the watchdog fired during a previous stalled
+        # iteration and _forced_release was set, it must be cleared before we
+        # can re-evaluate authority for the current iteration. Without this,
+        # a single watchdog fire permanently kills all subsequent actions for
+        # the task (one-way latch behaviour described in the audit).
+        input_arbitrator.clear_emergency_reclaim()
+
         iteration += 1
         current_step = execution_plan.steps[current_step_index]
 
@@ -416,6 +442,11 @@ def _execute_autonomous_loop(
             raise RuntimeError("REPLAN_REQUIRED")
 
         try:
+            # NOTE: soc_action_started() was moved to the TOP of the loop
+            # iteration (FIX-M6) to keep the watchdog alive during LLM planning.
+            # The call below is retained as a secondary heartbeat specifically
+            # for the action execution phase, giving the watchdog two refresh
+            # points per iteration: (1) planning start, (2) execution start.
             input_arbitrator.soc_action_started()
             os_backend.heartbeat()
 
@@ -438,6 +469,27 @@ def _execute_autonomous_loop(
                 if isinstance(world_snapshot, dict):
                     _focused_app = str(world_snapshot.get("focused_app", ""))
 
+                # FIX-M5 / HARD-7 (RB-5 / SI-HARD-7): Use a non-empty sentinel
+                # when focused_app is absent rather than returning "".
+                #
+                # Bug: when _focused_app is "" (falsy), PolicyEngine.validate()
+                # produced app = "unknown" via the falsy check:
+                #     app = app_obj.name.lower() if app_obj and app_obj.name else "unknown"
+                # This triggered the hard-deny "Application identity unavailable"
+                # for EVERY action during the observer warmup phase (up to 150s)
+                # and any time the world graph hadn't populated focused_app yet.
+                #
+                # Fix: use "__unknown_app__" as the sentinel. PolicyEngine will
+                # still deny it (it's not in allowed_apps), but:
+                # 1. The deny reason is "Unauthorized application: '__unknown_app__'"
+                #    rather than "Application identity unavailable" — operator-visible.
+                # 2. The app name is non-empty, so the allowlist check path is taken
+                #    rather than the identity-failure path, giving a meaningful reason.
+                # 3. Operators who want to permit actions during warmup can add
+                #    "__unknown_app__" to allowed_apps explicitly, rather than having
+                #    no configuration handle for this case at all.
+                _sentinel_app = _focused_app if _focused_app.strip() else "__unknown_app__"
+
                 class _LightweightNode:
                     """Minimal AT-SPI-compatible node built from perception."""
                     def getRoleName(self):
@@ -447,7 +499,7 @@ def _execute_autonomous_loop(
                         return ""
                     def getApplication(self):
                         class _App:
-                            name = _focused_app
+                            name = _sentinel_app
                         return _App()
 
                 _policy_node = _LightweightNode()
