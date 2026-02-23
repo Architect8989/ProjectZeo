@@ -365,19 +365,36 @@ class BeliefState:
     # GLOBAL BEST REWARD — MATH-04 FIX
     # =========================================================
 
-    def global_best_reward(self) -> float:
+    def global_best_reward(self):
         """
-        MATH-04 FIX: Return the best RAW reward seen across all actions this
-        session. Uses _raw_action_rewards (pre-normalisation) so regret is
-        computed in interpretable units (confidence delta ∈ [-0.5, 0.5])
-        rather than session-relative z-scores.
+        HAR-1 (MATH-1): Return the best RAW reward seen across all actions
+        this session, or None if no actions have been recorded yet.
 
-        Returns 0.0 if no actions have been recorded yet.
+        MATH-1 root cause: the original implementation initialised best=0.0
+        and unconditionally returned 0.0 when no raw rewards had been
+        recorded.  In uniformly failing contexts (all rewards at -0.5),
+        regret = 0.0 - (-0.5) = 0.5 for EVERY action — a constant that
+        provides no discrimination between better and worse actions.  The
+        regret signal was effectively disabled in the most important scenario:
+        when the agent is failing and needs to differentiate actions.
+
+        Fix: return None when no rewards have been recorded, and let callers
+        skip the regret update when best_reward is None.  When rewards exist,
+        return the true maximum over raw rewards (which may be negative).
+        This ensures regret = best - reward correctly discriminates between
+        actions even when all rewards are negative.
+
+        Returns float or None:
+          - None:  no actions recorded yet (caller should skip regret update)
+          - float: true maximum raw reward over all recorded actions
+                   (may be negative if all actions have failed so far)
         """
-        best = 0.0
+        best = None
         for history in self._raw_action_rewards.values():
             if history:
-                best = max(best, max(history))
+                local_max = max(history)
+                if best is None or local_max > best:
+                    best = local_max
         return best
 
     # =========================================================
