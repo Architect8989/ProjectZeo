@@ -203,6 +203,31 @@ class ExecutionPlanner:
         if isinstance(snapshot, dict):
             self._world_snapshot = snapshot
 
+    # FIX-C4 (RB-3): Expose a public get_llm_callable() method so callers do
+    # not need to access the private _llm_call attribute directly.
+    #
+    # Root cause: operate.py checks `if hasattr(planner, "get_llm_callable")`
+    # and falls back to `getattr(planner, "_llm_call", None)` if not found.
+    # This fallback works today because the private attribute exists, but is
+    # fragile: a rename of _llm_call to _llm_callable (common pattern) would
+    # silently make llm_callable=None, causing
+    #     RuntimeError("Planner LLM callable unavailable")
+    # on the first task — with no test catching it because the attribute is
+    # accessed dynamically.
+    #
+    # Fix: add the public method so the hasattr() branch in operate.py is
+    # always taken, eliminating the fragile private-attribute fallback.
+    def get_llm_callable(self):
+        """
+        FIX-C4 (RB-3): Public accessor for the LLM callable.
+
+        Returns the callable stored in self._llm_call.  Provides a stable
+        public contract so operate.py does not need to reach into private
+        attributes.  Callers should use this method instead of accessing
+        _llm_call directly.
+        """
+        return self._llm_call
+
     def refresh_environment(self, new_fingerprint: Dict[str, Any]) -> None:
         """
         PATCH §R5: Refresh environment fingerprint after tool installs.
