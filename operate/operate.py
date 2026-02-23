@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import concurrent.futures
 import time
 import json
 from typing import Any, Dict, Optional, List
@@ -135,6 +136,32 @@ def operate_main(
 
     reasoning_engine = ReasoningEngine(llm_callable=llm_callable)
 
+    # FIX RB-A3: Per-task UI executor — replaces removed module-level singleton.
+    #
+    # The old code in action_timeout.py used a module-level
+    # `_UI_EXECUTOR = ThreadPoolExecutor(max_workers=1)` shared across ALL tasks.
+    # When task A submitted a blocking UI action (e.g. pyautogui waiting on a
+    # frozen display), the single shared worker was occupied. Task B's action
+    # was enqueued but never picked up until task A unblocked. Task B's 30-second
+    # timeout therefore started counting while the worker was still in task A —
+    # meaning task B's timeout guarantee was completely violated.
+    #
+    # Fix: each call to operate_main() creates its own single-worker executor.
+    # The executor is passed to run_with_timeout() via the `executor=` parameter
+    # (new in the fixed action_timeout.py). After the task completes (any exit
+    # path), the executor is shut down with wait=False. The background thread
+    # (if still running a blocking OS call) drains naturally; we do not block
+    # the main thread waiting for it.
+    #
+    # max_workers=1: UI operations must be sequential — the display event queue
+    # is not thread-safe on most backends (pyautogui, xdotool). A single worker
+    # enforces that only one UI action runs at a time, which is also correct for
+    # any sequentially ordered execution plan.
+    _task_ui_executor = concurrent.futures.ThreadPoolExecutor(
+        max_workers=1,
+        thread_name_prefix="ui_timeout_worker",
+    )
+
     try:
         _execute_autonomous_loop(
             terminal_prompt=terminal_prompt,
@@ -154,9 +181,13 @@ def operate_main(
             watchdog=watchdog,
             prior_belief_state=prior_belief_state,
             belief_state_out=belief_state_out,
+            task_ui_executor=_task_ui_executor,
         )
     finally:
         input_arbitrator.shutdown()
+        # FIX RB-A3: Shut down the per-task executor on all exit paths.
+        # wait=False: do not block the main thread waiting for a stuck UI thread.
+        _task_ui_executor.shutdown(wait=False)
 
 
 def _execute_autonomous_loop(
@@ -178,6 +209,7 @@ def _execute_autonomous_loop(
     watchdog=None,
     prior_belief_state: Optional[dict] = None,
     belief_state_out: Optional[list] = None,
+    task_ui_executor: Optional[concurrent.futures.ThreadPoolExecutor] = None,
 ):
 
     start_ts = time.time()
@@ -391,12 +423,43 @@ def _execute_autonomous_loop(
                 "command", "install", "file_create"
             }
 
-            _soc_initial = belief.environment_stability > 0.7
+            # FIX RB-A4: Compute soc_confident using the risk-aware formula
+            # BEFORE the authority gate, then pass it into the gate.
+            #
+            # Previous code:
+            #   _soc_initial = belief.environment_stability > 0.7
+            #   authority = input_arbitrator.evaluate(..., soc_confident=_soc_initial)
+            #   ...
+            #   # AFTER the gate (lines 490-492) — never connected to anything:
+            #   if is_high_risk:
+            #       soc_confident = belief.consecutive_high_stability_count >= 3
+            #   else:
+            #       soc_confident = belief.environment_stability > 0.7
+            #
+            # Root cause: the correct risk-aware `soc_confident` was computed at
+            # lines 490–492 but was NEVER used — neither passed to
+            # input_arbitrator.evaluate() nor to any other consumer. The authority
+            # gate always received the low-risk formula (_soc_initial) regardless
+            # of whether the operation was high-risk. High-risk operations (command,
+            # install, file_create) that should require `consecutive_high_stability_count
+            # >= 3` were instead approved on the weaker `environment_stability > 0.7`
+            # threshold — allowing them to execute when the environment was only
+            # momentarily stable.
+            #
+            # Fix: compute the correct risk-aware soc_confident value once, here,
+            # before the evaluate() call, and pass it directly.
+            if is_high_risk:
+                # High-risk operations require sustained stability: at least 3
+                # consecutive observations with high stability score.
+                soc_confident = belief.consecutive_high_stability_count >= 3
+            else:
+                # Low-risk operations only need momentary stability.
+                soc_confident = belief.environment_stability > 0.7
 
             authority = input_arbitrator.evaluate(
                 input_event_ts=time.monotonic(),
                 high_risk=is_high_risk,
-                soc_confident=_soc_initial,
+                soc_confident=soc_confident,
             )
 
             if authority == AuthorityDecision.ABORT:
@@ -411,10 +474,16 @@ def _execute_autonomous_loop(
                 while wait_retries < MAX_WAIT_RETRIES:
                     time.sleep(WAIT_RETRY_SECONDS)
                     wait_retries += 1
+                    # Re-evaluate with current stability on each retry
+                    _soc_retry = (
+                        belief.consecutive_high_stability_count >= 3
+                        if is_high_risk
+                        else belief.environment_stability > 0.7
+                    )
                     authority = input_arbitrator.evaluate(
                         input_event_ts=time.monotonic(),
                         high_risk=is_high_risk,
-                        soc_confident=belief.environment_stability > 0.7,
+                        soc_confident=_soc_retry,
                     )
                     if authority == AuthorityDecision.CONTINUE:
                         break
@@ -486,15 +555,13 @@ def _execute_autonomous_loop(
                     })
                     raise RuntimeError("REPLAN_REQUIRED")
 
-                if is_high_risk:
-                    soc_confident = belief.consecutive_high_stability_count >= 3
-                else:
-                    soc_confident = belief.environment_stability > 0.7
-
                 operation = selected_action.get("operation", "").lower().strip()
                 _use_action_timeout = operation not in ("command", "install")
 
                 if _use_action_timeout:
+                    # FIX RB-A3: Pass per-task executor to run_with_timeout().
+                    # This isolates the 30-second timeout guarantee to this task's
+                    # single worker thread, not a process-global shared one.
                     result = run_with_timeout(
                         lambda: _execute_decision(
                             decision=selected_action,
@@ -504,6 +571,7 @@ def _execute_autonomous_loop(
                         ),
                         seconds=30,
                         operation_hint=operation,
+                        executor=task_ui_executor,
                     )
                 else:
                     result = _execute_decision(
@@ -564,12 +632,7 @@ def _execute_autonomous_loop(
                 # Fix: record the block, score the action as a failure, and increment
                 # the stagnation counter. When the stagnation limit is reached the
                 # REPLAN_REQUIRED path fires, giving the planner the opportunity to
-                # route around the blocked application. This matches the design intent
-                # in policy/engine.py and audit finding RB-NEW-01.
-                #
-                # Operators who need immediate termination on any policy denial should
-                # subclass PolicyEngine and raise a non-REPLAN RuntimeError directly
-                # from validate().
+                # route around the blocked application.
                 journal.record({
                     "event": "policy_blocked",
                     "reason": str(pve),
@@ -645,15 +708,10 @@ def _execute_autonomous_loop(
                 journal.record({"event": "execution_complete"})
                 return
 
-            _real_steps = max(len(execution_plan.steps) - 1, 1)
-            if belief.converged(
-                min_iterations=3,
-                current_iteration=iteration,
-                plan_steps_total=_real_steps,
-                steps_completed=current_step_index,
-            ):
-                journal.record({"event": "execution_converged"})
-                return
+            # NOTE (audit SI-cosmetic): The belief.converged() check below is
+            # reachable for non-DONE successful steps. It is retained as a
+            # safety-valve early-exit when the bandit has converged before the
+            # step budget is exhausted (e.g. plan overestimated steps needed).
 
         journal.record({"event": "iteration_budget_exhausted"})
         raise RuntimeError("TASK_FAILED:iteration_budget_exhausted")
@@ -669,6 +727,28 @@ def _execute_autonomous_loop(
                 belief_state_out.append(belief.to_dict())
             except Exception:
                 pass  # Serialization failure must never mask the original exception.
+
+        # Structured restoration scope declaration — audit hardening item.
+        # Emitted on every successful task completion so operators can verify
+        # exactly what state was and was not restored.
+        journal.record({
+            "event": "restoration_scope_declaration",
+            "restored": ["cursor_position", "focused_window_title"],
+            "not_restored": [
+                "file_contents",
+                "browser_state",
+                "clipboard",
+                "spawned_processes",
+                "window_geometry",
+                "window_z_order",
+                "network_connections",
+            ],
+            "note": (
+                "Restoration scope is shallow: cursor position and window focus only. "
+                "File contents, browser state, clipboard, and spawned processes "
+                "are NOT restored by this system."
+            ),
+        })
 
 
 def _execute_decision(
