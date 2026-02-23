@@ -7,36 +7,7 @@ import json
 
 
 class ActionRanker:
-    """
-    Deterministic action selector.
-
-    Guarantees:
-    - No randomness: tie-breaking is derived from belief_state.commitment_hash
-      (a SHA-256 chain seeded per intent), not from Python's process-level RNG.
-    - Stable action identity
-    - Single Thompson source (delegated to BeliefState)
-    - Bounded exploration bonus (both above AND below zero)
-
-    FIX HARD-1 (SI-4 / §3.2): The previous implementation used random.choice()
-    for tie-breaking, which was non-deterministic across runs. The docstring
-    claimed "No randomness" while the code comments admitted "Uniform random
-    tie-breaking" — a direct contradiction. Tie-breaking is now derived from
-    commitment_hash bytes, making action selection fully reproducible for
-    identical inputs.
-
-    FIX MATH-05: exploration_bonus was previously only clamped at the top
-    (min(bonus, MAX_EXPLORATION_BONUS)). When ucb_full < mean_reward (which
-    happens for well-explored actions whose UCB exploration term has shrunk
-    below the mean), exploration_bonus became negative and unclamped, applying
-    a significant penalty to well-known high-performing actions. This
-    suppressed exploitation of the best-known action in favour of less-explored
-    alternatives — the opposite of correct UCB behaviour.
-
-    Fix: clamp exploration_bonus to [0.0, MAX_EXPLORATION_BONUS]. A UCB
-    score below the mean reward simply means "no additional exploration
-    incentive" — it should never penalise the action. Zero is the correct
-    floor.
-    """
+    
 
     MIN_TAU = 0.15
     MAX_TAU = 1.5
@@ -85,10 +56,33 @@ class ActionRanker:
             # Delegated Thompson (single coherent implementation)
             thompson = belief_state.thompson_sample(key)
 
+            # Fix 13: Adaptive scoring weights.
+            # Fixed weights (0.6 EU, 0.2 explore, 0.2 Thompson) are problematic
+            # because as an action matures (high visit count), Thompson and UCB
+            # both converge toward their means — the exploration components
+            # become redundant but still consume 40% of the score, leaving
+            # less room for EU (exploitation) when it is most informative.
+            #
+            # Fix: shift weight from Thompson toward EU linearly as visit count
+            # grows, saturating at EXPLOIT_SATURATION_N visits.
+            # At n=0:   EU=0.50, explore=0.25, Thompson=0.25
+            # At n=50:  EU=0.75, explore=0.20, Thompson=0.05
+            # Weights always sum to 1.0 (verified by construction below).
+            n = belief_state.action_counts.get(key, 0)
+            _EXPLOIT_SATURATION_N = 50
+            _t = min(1.0, n / _EXPLOIT_SATURATION_N)  # 0.0 (new) → 1.0 (mature)
+
+            # Thompson shifts from 0.25 → 0.05 as action matures
+            w_thompson = 0.25 - 0.20 * _t
+            # Explore stays roughly constant (slight decay)
+            w_explore = 0.25 - 0.05 * _t
+            # EU absorbs the rest — grows from 0.50 → 0.90
+            w_eu = 1.0 - w_thompson - w_explore
+
             combined = (
-                0.6 * eu
-                + 0.2 * exploration_bonus
-                + 0.2 * thompson
+                w_eu * eu
+                + w_explore * exploration_bonus
+                + w_thompson * thompson
             )
 
             scores.append(combined)
