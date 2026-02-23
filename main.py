@@ -398,6 +398,24 @@ def main(llm_callable: Callable, model_name: str):
 
                 _task_succeeded = False
 
+                # MATH-NEW-03 FIX: Cross-replan BeliefState persistence.
+                #
+                # Root cause: each replan called operate_main() fresh, constructing
+                # a new BeliefState from scratch. The bandit forgot all action counts,
+                # regret history, Welford statistics, and Thompson counter state from
+                # prior attempts. On a second replan, low-reward actions already
+                # identified as problematic were re-explored from the uninformative
+                # uniform prior.
+                #
+                # Fix: _belief_state_out is a single-element list that operate_main()
+                # populates (via belief_state_out= parameter) with the serialized
+                # BeliefState after every loop exit — success, REPLAN_REQUIRED, or
+                # TASK_FAILED. On each replan, the prior state is forwarded as
+                # prior_belief_state= so the new run reconstructs the bandit from
+                # the full history of the previous run rather than starting over.
+                _belief_state_out: list = []
+                _prior_belief_state: Optional[dict] = None
+
                 try:
                     while not _SHUTDOWN_EVENT.is_set():
                         _enforce_task_timeout()
@@ -410,7 +428,9 @@ def main(llm_callable: Callable, model_name: str):
                                 observer=observer,
                                 world_graph=world_graph,
                                 os_backend=os_backend,
-                                watchdog=watchdog,   # RB-1 FIX: active during execution
+                                watchdog=watchdog,
+                                prior_belief_state=_prior_belief_state,   # MATH-NEW-03
+                                belief_state_out=_belief_state_out,       # MATH-NEW-03
                             )
                             _task_succeeded = True
                             break
@@ -418,6 +438,11 @@ def main(llm_callable: Callable, model_name: str):
                         except RuntimeError as e:
                             if str(e) != "REPLAN_REQUIRED":
                                 raise
+
+                            # Capture belief state for the next replan attempt.
+                            _prior_belief_state = (
+                                _belief_state_out[0] if _belief_state_out else None
+                            )
 
                             replan_count += 1
                             if replan_count > MAX_REPLANS:
