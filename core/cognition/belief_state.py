@@ -18,24 +18,13 @@ class BeliefState:
     MAX_STATES = 64
     MAX_REGRET = 100.0
 
-    # MATH-02 FIX: Raise MIN_ENTROPY_FLOOR from 0.1 to 0.3.
-    # With __prior_fallback__ at PRIOR_ALPHA=0.01 and a dominant state at
-    # p≈0.99, entropy ≈ 0.08 nats — below 0.1. But the fallback injection
-    # lifts entropy to ≈0.14 nats which is above 0.1, making the floor
-    # inoperative in all realistic belief collapse scenarios. 0.3 nats
-    # corresponds roughly to a 2-state distribution at p=[0.93, 0.07] —
-    # the floor now actively blends any near-collapse belief, providing the
-    # exploration protection it was designed to give.
+    
     MIN_ENTROPY_FLOOR = 0.3
 
     NORMALIZE_EPS = 1e-8
     REWARD_CLAMP = 3.0
 
-    # MATH-08 FIX: Use only the most recent THOMPSON_WINDOW samples for Beta
-    # parameter estimation. With REWARD_WINDOW=100, Alpha+Beta≈102 and the
-    # Beta distribution variance≈0.0024 — effectively degenerate (near-mean
-    # for all mature actions). THOMPSON_WINDOW=20 keeps variance≈0.012,
-    # preserving meaningful exploration spread even for well-explored actions.
+    
     THOMPSON_WINDOW = 20
 
     _FALLBACK_PRUNE_THRESHOLD = PRIOR_ALPHA * 2.0
@@ -45,23 +34,14 @@ class BeliefState:
         self.state_probabilities: Dict[str, float] = {"neutral": 1.0}
         self.action_counts: Dict[str, int] = {}
         self.action_rewards: Dict[str, deque] = {}
-        # MATH-04 FIX: Track raw (pre-normalisation) rewards in a parallel
-        # structure. The normalised action_rewards deque feeds UCB/Thompson/
-        # expected_utility. The raw deque feeds regret and global_best_reward()
-        # so regret is measured in interpretable units (confidence delta ∈ [-0.5, 0.5])
-        # rather than session-relative z-scores.
+        
+        
         self._raw_action_rewards: Dict[str, deque] = {}
         self.regret: Dict[str, Tuple[float, int]] = {}
         self.progress_score: float = 0.0
         self.environment_stability: float = 1.0
 
-        # HAR-06 (MS-03): Seed the commitment hash with the intent hash rather
-        # than the constant "GENESIS". When commitment_hash = "GENESIS" for every
-        # new BeliefState, two replans of the same intent produce identical seed
-        # sequences for Thompson sampling — the sampler cannot distinguish a
-        # prior failure from an unexplored action, neutralising replan exploration.
-        # Using the intent hash makes the seed space unique per intent while
-        # preserving within-session determinism.
+        
         self.commitment_hash: str = (
             hashlib.sha256(intent_hash.encode("utf-8")).hexdigest()
             if intent_hash
@@ -69,50 +49,17 @@ class BeliefState:
         )
         self._iteration_counter: int = 0
 
-        # HARDEN-4 (M-NEW-02): _iteration_counter and _sample_counter are
-        # TRANSIENT — they are NOT persisted and reset to 0 on every process
-        # restart / new BeliefState construction.
-        #
-        # Implication for restart reproducibility:
-        #   - commitment_hash IS reproducible across restarts: it is re-seeded
-        #     from SHA-256(intent_hash) at construction, so the same intent
-        #     always produces the same genesis hash.
-        #   - Thompson sampling seed chain is NOT reproducible across restarts:
-        #     seeds incorporate _iteration_counter and _sample_counter values
-        #     which restart at 0. Even with the same intent and action sequence,
-        #     samples after a restart differ from those in the original run.
-        #
-        # This is EXPECTED BEHAVIOUR. Full restart reproducibility would require
-        # persisting and restoring these counters alongside the commitment_hash —
-        # a deliberate design trade-off. Operators relying on exact Thompson
-        # reproducibility across restarts must implement their own counter
-        # persistence and call BeliefState with a pre-seeded commitment_hash.
-
-        # MR-01a FIX: Track consecutive high-stability observations for
-        # the conservative authority gate in operate.py. The gate requires
-        # 3 consecutive readings above 0.7 before asserting soc_confident
-        # for high-risk operations.
+        
         self.consecutive_high_stability_count: int = 0
 
-        # MR-04 FIX: Per-call sample counter for Thompson sampling seeds.
-        # _iteration_counter only increments in update_regret(). All Thompson
-        # samples within a single selection round share the same counter value,
-        # giving them identical seeds when only action string differs slightly.
-        # _sample_counter increments on EVERY thompson_sample() call, providing
-        # a unique component for each sample within a round.
+        
         self._sample_counter: int = 0
 
-        # MR-05 FIX: Dynamic regret decay computed from plan horizon.
-        # Default is the class constant; call set_plan_horizon() once the
-        # execution plan is loaded to tune decay to the actual task length.
+        
         self._regret_decay: float = self.REGRET_DECAY
 
-        # Fix 11 (Welford): per-action running statistics for incremental
-        # z-score normalisation. Using Welford's online algorithm means only
-        # the NEW reward entry is normalised relative to running mean/variance.
-        # Historical entries remain stable (their normalised values do not
-        # change when a new reward arrives). This replaces the previous
-        # bulk re-normalisation that made all historical utilities non-stationary.
+        
+        
         self._welford_n: Dict[str, int] = {}          # count of rewards seen
         self._welford_mean: Dict[str, float] = {}     # running mean
         self._welford_M2: Dict[str, float] = {}       # running sum of squared deviations
@@ -164,18 +111,7 @@ class BeliefState:
 
      
         if self.entropy() < self.MIN_ENTROPY_FLOOR:
-            # MR-02 FIX: Proportional entropy floor blending.
-            # ─────────────────────────────────────────────────────────────
-            # Bug: fixed blend weight 0.05 regardless of collapse severity.
-            # At entropy = 0.01 nats (near-total collapse), one blend
-            # restores only ~0.05 nats — still far below the 0.30 floor.
-            # The old loop took 15–20 iterations to converge.
-            #
-            # Fix: set blend weight proportional to the entropy deficit
-            # (how far below the floor we are), capped at MAX_BLEND_WEIGHT.
-            # This guarantees convergence in ≤ 3–5 iterations at any
-            # collapse level.
-            # ─────────────────────────────────────────────────────────────
+            
             _MAX_BLEND_WEIGHT = 0.30
             for _ in range(20):  # safety cap — should converge in < 5
                 _H = self.entropy()
@@ -194,13 +130,7 @@ class BeliefState:
 
         fallback_prob = self.state_probabilities.get("__prior_fallback__", 0.0)
         if 0.0 < fallback_prob <= self._FALLBACK_PRUNE_THRESHOLD:
-            # Fix 14: Only prune __prior_fallback__ if the entropy floor is
-            # already satisfied BEFORE the prune. If entropy enforcement raised
-            # fallback probability to just above PRIOR_ALPHA (= 0.01) and we
-            # prune it immediately, entropy drops back below the floor and the
-            # enforcement/prune cycle repeats indefinitely for up to 20 iterations.
-            # Gate the prune on self.entropy() >= MIN_ENTROPY_FLOOR so the floor
-            # is never undercut by the pruning step that follows it.
+            
             if self.entropy() >= self.MIN_ENTROPY_FLOOR:
                 pruned_dist = {
                     k: v for k, v in self.state_probabilities.items()
@@ -233,19 +163,7 @@ class BeliefState:
         return mean - self.RISK_LAMBDA * variance
 
     def ucb_score(self, action: str) -> float:
-        # FIX-14: Return float('inf') for unvisited actions so UCB1's
-        # "must explore" guarantee is preserved.
-        #
-        # Bug: count = self.action_counts.get(action, 0) + 1 always added 1,
-        # giving unvisited actions an effective count of 1. This suppressed the
-        # log(N)/count → ∞ singularity that UCB1 uses as the "must explore"
-        # signal. Cold-start exploration was degraded — actions seen once were
-        # treated the same as actions never seen. The algorithm could commit to
-        # a suboptimal action after a single trial.
-        #
-        # Fix: return float('inf') for count=0 actions, which is the standard
-        # UCB1 behaviour. This guarantees every action is tried at least once
-        # before any is repeated, preserving the regret bound.
+        
         count = self.action_counts.get(action, 0)
         if count == 0:
             return float('inf')  # Must explore: standard UCB1 guarantee
@@ -349,27 +267,7 @@ class BeliefState:
     # =========================================================
 
     def record_action(self, action: str, reward: float):
-        """
-        Fix 11 (Welford's algorithm): Record an action reward using incremental
-        z-score normalisation.
-
-        Previous implementation re-normalised ALL entries in the deque on every
-        new reward arrival, making historical action utilities non-stationary:
-        a single extreme new reward retroactively changed the perceived history
-        of ALL prior actions. This is not standard bandit normalisation.
-
-        Fix: use Welford's online algorithm to maintain a running mean and
-        variance per action. Only the NEW reward is normalised relative to the
-        running statistics and appended. Existing deque entries are untouched,
-        keeping historical utility estimates stable.
-
-        Welford update for sample n:
-            delta  = reward - mean_{n-1}
-            mean_n = mean_{n-1} + delta / n
-            delta2 = reward - mean_n
-            M2_n   = M2_{n-1} + delta * delta2
-            var_n  = M2_n / n   (population variance)
-        """
+        
         if action not in self.action_rewards:
             self.action_rewards[action] = deque(maxlen=self.REWARD_WINDOW)
         if action not in self._raw_action_rewards:
@@ -399,10 +297,35 @@ class BeliefState:
             std = math.sqrt(max(variance, self.NORMALIZE_EPS))
             normalised = (reward - new_mean) / std
             normalised = max(-self.REWARD_CLAMP, min(self.REWARD_CLAMP, normalised))
+
+            
+            if n == 3 and action in self._raw_action_rewards:
+                raw_deque = self._raw_action_rewards[action]
+                if len(raw_deque) >= 2:
+                    # Renormalize the first 2 raw rewards using the current
+                    # Welford mean/std (which now include all 3 samples).
+                    old_entries = list(raw_deque)[:2]
+                    renormalized = []
+                    for r in old_entries:
+                        z = (r - new_mean) / std
+                        renormalized.append(
+                            max(-self.REWARD_CLAMP, min(self.REWARD_CLAMP, z))
+                        )
+                    # Replace first 2 entries in the normalised deque.
+                    # action_rewards[action] has exactly 2 entries at this point.
+                    existing = self.action_rewards.get(action)
+                    if existing is not None and len(existing) == 2:
+                        existing.clear()
+                        existing.extend(renormalized)
+
         else:
-            # FIX-06 (MS-01): For n < 3, use simple linear clamp. Once n reaches
-            # 3 the Welford branch takes over with stable running statistics.
-            normalised = max(-self.REWARD_CLAMP, min(self.REWARD_CLAMP, reward))
+            
+            _raw_scale = 0.5  # max absolute raw reward (confidence - 0.5)
+            if _raw_scale > 0:
+                normalised = reward / _raw_scale * self.REWARD_CLAMP
+            else:
+                normalised = 0.0
+            normalised = max(-self.REWARD_CLAMP, min(self.REWARD_CLAMP, normalised))
 
         self.action_rewards[action].append(normalised)
         self.action_counts[action] = self.action_counts.get(action, 0) + 1
@@ -412,29 +335,7 @@ class BeliefState:
     # =========================================================
 
     def global_best_reward(self):
-        """
-        HAR-1 (MATH-1): Return the best RAW reward seen across all actions
-        this session, or None if no actions have been recorded yet.
-
-        MATH-1 root cause: the original implementation initialised best=0.0
-        and unconditionally returned 0.0 when no raw rewards had been
-        recorded.  In uniformly failing contexts (all rewards at -0.5),
-        regret = 0.0 - (-0.5) = 0.5 for EVERY action — a constant that
-        provides no discrimination between better and worse actions.  The
-        regret signal was effectively disabled in the most important scenario:
-        when the agent is failing and needs to differentiate actions.
-
-        Fix: return None when no rewards have been recorded, and let callers
-        skip the regret update when best_reward is None.  When rewards exist,
-        return the true maximum over raw rewards (which may be negative).
-        This ensures regret = best - reward correctly discriminates between
-        actions even when all rewards are negative.
-
-        Returns float or None:
-          - None:  no actions recorded yet (caller should skip regret update)
-          - float: true maximum raw reward over all recorded actions
-                   (may be negative if all actions have failed so far)
-        """
+        
         best = None
         for history in self._raw_action_rewards.values():
             if history:
@@ -477,41 +378,12 @@ class BeliefState:
     # =========================================================
 
     def _stable_value_bytes(self, value: Any) -> bytes:
-        # HARD-2 (§3.8): Type-tagged encoding to eliminate None/"None" collision.
-        #
-        # Bug: the fallback branch `return str(value).encode()` produced b"None"
-        # for BOTH value=None AND value="None" (the string). Observation dicts
-        # containing None values (common for missing perception fields, e.g.
-        # `perception_snapshot=None`) produced identical commitment hashes as
-        # dicts containing the string "None". This weakened the cryptographic
-        # commitment chain, making observationally distinct world states
-        # hash-indistinguishable.
-        #
-        # Fix: prefix each type with a 1-byte tag before the value encoding.
-        # Tags are chosen to be unambiguous and cannot appear as a prefix of
-        # any other type's encoding:
-        #   \x00 = None
-        #   \x01 = str
-        #   \x02 = int / bool (stringified)
-        #   \x03 = float (IEEE 754 big-endian double)
-        #   \x04 = dict (handled by recursive branch)
-        #   \x05 = list (handled by recursive branch)
-        #   \xff = unknown fallback (type name + stringified value)
-        #
-        # The dict and list branches use recursion and do not need tags because
-        # their structure is unambiguous from their encoding (sorted keys for
-        # dict, length-prefixed elements for list).
+        
         if value is None:
             # \x00 tag: unambiguously None — cannot be produced by any str value.
             return b"\x00"
         if isinstance(value, float):
-            # FIX SI-5: Quantize to 6 decimal places before packing.
-            # IEEE 754 rounding accumulates platform-specific drift at the 15th
-            # decimal place (e.g. 0.33333333333333337 vs 0.3333333333333333).
-            # Divergent floats produce divergent struct.pack bytes → divergent
-            # commitment hashes even when belief distributions are identical.
-            # Rounding to 6 decimals canonicalises values while preserving all
-            # operationally meaningful precision for probability values in [0,1].
+            
             return b"\x03" + struct.pack("!d", round(value, 6))
         if isinstance(value, (int, bool)):
             return b"\x02" + str(value).encode()
@@ -524,25 +396,7 @@ class BeliefState:
                 parts.append(self._stable_value_bytes(value[k]))
             return b"".join(parts)
         if isinstance(value, list):
-            # HARDEN-1 (M-NEW-01): Replace b"|".join(...) with length-prefixed
-            # encoding to eliminate the delimiter-byte collision risk.
-            #
-            # Bug: The previous delimiter b"|" (byte value 0x7C = 124) can appear
-            # in IEEE 754 struct.pack("!d", v) float encodings. Two distinct lists
-            # [f1, f2] and [f1 + delta] could theoretically produce identical byte
-            # sequences when the boundary byte of an encoded float coincidentally
-            # equals 0x7C — breaking commitment hash uniqueness.
-            #
-            # The code comment claiming b"|" "never appears" in float packing was
-            # false. Many double-precision floats produce byte sequences containing
-            # 0x7C. While exploitation requires adversarially crafted observation
-            # dicts, natural perception data could also trigger this in practice.
-            #
-            # Fix: length-prefix each serialised element with its byte count as a
-            # 4-byte big-endian unsigned integer. This makes the boundary between
-            # elements unambiguous: the decoder always reads 4 bytes for length,
-            # then exactly that many bytes for the payload — no in-band delimiter
-            # needed. Two distinct lists can never produce the same encoding.
+            
             result = b""
             for item in value:
                 item_bytes = self._stable_value_bytes(item)
@@ -608,20 +462,7 @@ class BeliefState:
     # =========================================================
 
     def to_dict(self) -> dict:
-        """
-        Fix 12: Serialise BeliefState to a JSON-safe dict including
-        _iteration_counter and _sample_counter so Thompson sampling seeds
-        are reproducible across process restarts.
-
-        Callers that want replay reproducibility should persist the returned
-        dict (e.g. in the authority state file) and pass it to from_dict()
-        when reconstructing BeliefState after a restart.
-
-        Note: action_rewards and _raw_action_rewards store deques of floats
-        which are serialised as lists. The Welford running-statistics fields
-        (_welford_n, _welford_mean, _welford_M2) are also persisted so that
-        normalisation history survives a restart.
-        """
+        
         return {
             "commitment_hash": self.commitment_hash,
             "iteration_counter": self._iteration_counter,
