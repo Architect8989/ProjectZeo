@@ -87,6 +87,15 @@ class PureLLMWrapper:
 
         EXTENSION: add new cloud models here. The function must be exported
         from operate/models/apis.py.
+
+        NOTE (RB-NEW-02 FIX): "llava" is intentionally absent from this
+        registry. llava is a local Ollama model and must be routed exclusively
+        through QwenOllamaAdapter (the local adapter). Including it here would
+        create a shadow cloud routing path through PureLLMWrapper even when
+        OLLAMA_ONLY=1 enforcement is active. If "llava" reaches this method,
+        it means the factory misconfigured the adapter — raise ValueError
+        immediately so the misconfiguration is visible rather than silently
+        routing through the wrong backend.
         """
         registry: Dict[str, Callable] = {
             "gpt-4":              apis.call_gpt_4o,
@@ -105,7 +114,7 @@ class PureLLMWrapper:
             "claude-3-opus":     apis.call_claude_3_with_ocr,
             "claude-3-sonnet":   apis.call_claude_3_with_ocr,
             "gemini-pro-vision": apis.call_gemini_pro_vision,
-            "llava":             apis.call_ollama_llava,
+            # RB-NEW-02 FIX: "llava" removed — see docstring above.
             "gpt-4o-labeled":    apis.call_gpt_4o_labeled,
             "gpt-4-with-som":    apis.call_gpt_4o_labeled,
             "gpt-4-with-ocr":    apis.call_gpt_4o_with_ocr,
