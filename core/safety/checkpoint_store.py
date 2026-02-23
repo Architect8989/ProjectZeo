@@ -6,7 +6,13 @@ import tempfile
 import hashlib
 from typing import Optional, Dict, Any
 
-CHECKPOINT_DIR = "memory"
+# FIX H-18: Absolute path anchored to project root.
+# Bug: "memory" is CWD-relative. Starting the process from different working
+# directories creates diverging checkpoints. Pattern mirrors _RESTORE_LEDGER_PATH
+# in restore_provider.py (already uses absolute anchor).
+import pathlib as _pathlib
+CHECKPOINT_DIR = str(_pathlib.Path(__file__).resolve().parents[2] / "memory")
+del _pathlib
 CHECKPOINT_FILE = os.path.join(CHECKPOINT_DIR, "kernel_checkpoint.json")
 
 
