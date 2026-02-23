@@ -301,26 +301,36 @@ class RestoreVerifier:
         if geom is not None and hasattr(self._os, "get_window_geometry"):
             try:
                 current = self._os.get_window_geometry(snapshot.focus.window_id)
-                if current != geom:
-                    # Check if the delta is within the tolerance threshold.
-                    within_tolerance = False
-                    try:
-                        if isinstance(current, dict) and isinstance(geom, dict):
-                            deltas = [
-                                abs(current.get(k, 0) - geom.get(k, 0))
-                                for k in ("x", "y", "width", "height")
-                                if k in geom or k in current
-                            ]
-                            within_tolerance = all(
-                                d <= self._GEOMETRY_TOLERANCE_PX for d in deltas
-                            )
-                    except Exception:
-                        within_tolerance = False
+
+                def _to_dict(val):
+                    if isinstance(val, dict):
+                        return val
+                    if isinstance(val, str):
+                        parsed: dict = {}
+                        for line in val.splitlines():
+                            if "=" in line:
+                                k, _, v = line.partition("=")
+                                try:
+                                    parsed[k.strip().lower()] = int(v.strip())
+                                except ValueError:
+                                    pass
+                        return parsed if {"x", "y", "width", "height"}.issubset(parsed) else None
+                    return None
+
+                current_d = _to_dict(current)
+                geom_d = _to_dict(geom)
+
+                if current_d is not None and geom_d is not None and current_d != geom_d:
+                    deltas = [
+                        abs(current_d.get(k, 0) - geom_d.get(k, 0))
+                        for k in ("x", "y", "width", "height")
+                    ]
+                    within_tolerance = all(d <= self._GEOMETRY_TOLERANCE_PX for d in deltas)
 
                     if not within_tolerance:
                         msg = (
                             f"Window geometry changed after restore: "
-                            f"snapshot={geom!r} current={current!r}. "
+                            f"snapshot={geom_d!r} current={current_d!r}. "
                             "This may be a legitimate window manager resize. "
                             "Set RestoreVerifier._GEOMETRY_MISMATCH_IS_HARD_FAILURE=True "
                             "to treat this as a hard failure."
