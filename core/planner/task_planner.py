@@ -13,22 +13,7 @@ class PlanningError(RuntimeError):
 
 
 class TaskPlanner:
-    """
-    Planning authority.
-
-    HAR-2 WARNING: This class is currently DEAD CODE — it is not imported or
-    instantiated anywhere in the production execution path.  It is preserved
-    for potential future use.  The LLM interface bug in _analyze_requirements()
-    has been fixed (see module docstring), but the class has not been
-    integration-tested against the live execution path.
-
-    Flow:
-    intent
-      -> requirement analysis (LLM)
-      -> task decomposition
-      -> execution plan synthesis
-      -> plan validation
-    """
+    
 
     MAX_INTENT_CHARS = 10_000
 
@@ -38,14 +23,7 @@ class TaskPlanner:
         llm_call,
         environment_fingerprint: Optional[Dict[str, Any]] = None,
     ):
-        """
-        llm_call(messages: List[dict], objective: str, session_id: str) -> str
-            Must accept the standard three-argument interface used throughout
-            the production execution path.  A plain string callable
-            (prompt: str) -> str will raise TypeError at runtime.
-
-        environment_fingerprint is informational only.
-        """
+        
         if llm_call is None:
             raise ValueError("llm_call is required")
 
