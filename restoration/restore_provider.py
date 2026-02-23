@@ -4,7 +4,7 @@ import time
 import threading
 import json
 import os
-from typing import Optional, Set
+from typing import Optional
 
 from restoration.snapshot_types import RestorationSnapshot
 from restoration.snapshot_provider import SnapshotProvider
@@ -47,21 +47,7 @@ class RestoreProvider:
         self._snapshot_provider = snapshot_provider
         self._lock = threading.Lock()
 
-        # RB-4 FIX: Wrap os.makedirs() in try/except so a read-only filesystem
-        # (container, NFS mount, CI environment) does not crash the process at
-        # startup before any task has run.
-        #
-        # Previous behaviour: os.makedirs(..., exist_ok=True) raised PermissionError
-        # on read-only deployments, propagating out of __init__ and preventing
-        # main() from starting entirely.
-        #
-        # Fix: catch the error, set _ledger_available=False, and continue.
-        # When False, _persist_ledger() is a no-op (no write attempted) and
-        # _load_ledger() returns an empty set (no read attempted). The only
-        # functional degradation is that duplicate-restore protection is disabled:
-        # a snapshot could theoretically be restored twice if the process
-        # crashes and restarts during the restoration window. This is a safe
-        # trade-off — a double restoration (cursor + focus) is idempotent.
+        
         self._ledger_available: bool = True
         try:
             os.makedirs(os.path.dirname(self._RESTORE_LEDGER_PATH), exist_ok=True)
@@ -77,50 +63,77 @@ class RestoreProvider:
                 file=_sys.stderr,
             )
 
-        self._completed_snapshots: Set[str] = (
-            self._load_ledger() if self._ledger_available else set()
+        
+        self._completed_snapshots: dict = (  # {snapshot_id: float timestamp}
+            self._load_ledger() if self._ledger_available else {}
         )
 
     # =========================================================
     # LEDGER
     # =========================================================
 
-    def _load_ledger(self) -> Set[str]:
+    def _load_ledger(self) -> dict:
+        """
+        Load completed-snapshots ledger from disk.
+
+        SI-4 / H9 FIX: Returns a {snapshot_id: timestamp} dict.
+        Backward-compatible: accepts the old JSON-list format (assigns
+        timestamp=0.0 so legacy entries sort before new ones and are evicted
+        first on trim).
+        """
         if not os.path.exists(self._RESTORE_LEDGER_PATH):
-            return set()
+            return {}
 
         try:
             with open(self._RESTORE_LEDGER_PATH, "r", encoding="utf-8") as f:
                 data = json.load(f)
 
-            if not isinstance(data, list):
-                raise RestorationError("Restore ledger corrupted")
+            if isinstance(data, dict):
+                # New format: {snapshot_id: float_timestamp}
+                return {
+                    str(k): float(v)
+                    for k, v in list(data.items())[: self.MAX_LEDGER_ENTRIES]
+                    if isinstance(v, (int, float))
+                }
 
-            # Enforce deterministic ordering
-            return set(str(x) for x in data[: self.MAX_LEDGER_ENTRIES])
+            if isinstance(data, list):
+                # Old format: ["snapshot_id", ...] — upgrade in memory.
+                # Assign timestamp 0.0 so old entries are evicted first.
+                return {str(x): 0.0 for x in data[: self.MAX_LEDGER_ENTRIES]}
+
+            raise RestorationError("Restore ledger corrupted")
 
         except Exception as e:
             raise RestorationError(f"Restore ledger load failed: {e}") from e
 
     def _persist_ledger(self) -> None:
-        # RB-4 FIX: Skip write entirely when the ledger directory is not writable.
-        # This path is taken on read-only filesystems (see __init__ comment).
+        """
+        Persist completed-snapshots ledger to disk atomically.
+
+        SI-4 / H9 FIX: Trims by OLDEST timestamp (chronological) not by
+        lexicographic sort on SHA-256 hex IDs.
+        """
+        # RB-4 FIX: Skip write when ledger directory is not writable.
         if not self._ledger_available:
             return
 
         tmp_path = self._RESTORE_LEDGER_PATH + ".tmp"
 
         try:
-            # Enforce bounded size
+            # SI-4 / H9 FIX: Sort by timestamp ascending; keep the
+            # MAX_LEDGER_ENTRIES newest (highest timestamps), discard oldest.
             if len(self._completed_snapshots) > self.MAX_LEDGER_ENTRIES:
-                trimmed = sorted(self._completed_snapshots)[
-                    -self.MAX_LEDGER_ENTRIES :
-                ]
-                self._completed_snapshots = set(trimmed)
+                sorted_by_ts = sorted(
+                    self._completed_snapshots.items(),
+                    key=lambda kv: kv[1],  # sort by float timestamp
+                )
+                self._completed_snapshots = dict(
+                    sorted_by_ts[-self.MAX_LEDGER_ENTRIES:]
+                )
 
             with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(
-                    sorted(self._completed_snapshots),
+                    self._completed_snapshots,
                     f,
                     separators=(",", ":"),
                 )
@@ -184,7 +197,9 @@ class RestoreProvider:
 
             self._verify(snapshot)
 
-            self._completed_snapshots.add(snapshot_id)
+            # SI-4 / H9 FIX: Record snapshot_id with current timestamp so
+            # _persist_ledger() can trim by oldest timestamp (not lexicographic).
+            self._completed_snapshots[snapshot_id] = time.time()
             self._persist_ledger()
 
     # =========================================================
@@ -192,21 +207,7 @@ class RestoreProvider:
     # =========================================================
 
     def _restore_application(self, snapshot: RestorationSnapshot) -> None:
-        # SI-NEW-02 FIX: Guard against the bare-desktop sentinel.
-        #
-        # Root cause: when a snapshot is taken while no application window is
-        # focused (bare desktop), snapshot_provider stores the sentinel string
-        # "__bare_desktop__" in application.process_name. The previous code
-        # passed this sentinel directly to os.activate_application(), which
-        # either raises an OSError (application not found) or — worse —
-        # activates any application whose title happens to fuzzy-match the
-        # sentinel. This silently broke the restoration sequence for every
-        # task started from a bare desktop (RB-A1 class of failures).
-        #
-        # Fix: return early when the sentinel is detected, exactly mirroring
-        # the guards already present in _restore_window() and
-        # _validate_application(). When the desktop had no focused application
-        # at snapshot time, no application needs to be restored.
+        
         if snapshot.application.process_name == "__bare_desktop__":
             return
 
@@ -333,18 +334,7 @@ class RestoreProvider:
         return self._levenshtein(expected, actual) <= self.MAX_TITLE_DISTANCE
 
     def _validate_window(self, current_window, snapshot) -> bool:
-        # FIX-01 / SI-01: Symmetric guard matching _validate_application().
-        #
-        # When the snapshot was taken on a bare desktop (no window focused),
-        # focus.window_id is "__bare_desktop__".  No window focus can be
-        # verified; returning True here allows the restoration to complete
-        # without the 5-retry loop that previously always failed and raised
-        # RestorationError("Post-restore verification failed") for every
-        # bare-desktop task (RB-A1 / RB-A3 runtime blockers).
-        #
-        # _restore_window() also guards this sentinel (returns early without
-        # calling focus_window()), so the OS backend is never asked to focus
-        # a non-existent window.
+        
         if snapshot.focus.window_id == "__bare_desktop__":
             return True
 
@@ -360,10 +350,7 @@ class RestoreProvider:
         return self._strict_match(expected, actual)
 
     def _validate_application(self, current_app, snapshot) -> bool:
-        # FIX RTB-02: When the snapshot was taken on a bare desktop (no focused
-        # application), application.process_name is "__bare_desktop__". No
-        # application focus can be verified; skip the fuzzy match and return True
-        # so restoration can complete without a spurious verification failure.
+        
         if snapshot.application.process_name == "__bare_desktop__":
             return True
 
