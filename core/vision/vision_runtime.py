@@ -1,58 +1,6 @@
-"""
-core/vision/vision_runtime.py
-==============================
-PATCHES APPLIED (Audit Fixes):
-
-  ✅  FIX-2 (CRITICAL): NETWORK_READ_TIMEOUT raised from 20s to 120s.
-           MODEL_CALL_TIMEOUT_SECONDS raised from 22s to 130s.
-           MAX_ALLOWED_LATENCY_SECONDS raised from 8s to 120s.
-
-           CPU inference on Qwen2.5-VL 7B takes 40–90s on consumer hardware.
-           The prior 20s read timeout caused VisionUnavailableError on every
-           single observer frame. After 5 consecutive failures the observer
-           marked itself permanently unhealthy — the system never captured a
-           snapshot and never armed for any task. Complete startup failure.
-
-  ✅  FIX-3 (CRITICAL): _call_model() now uses a response compatibility shim
-           that handles BOTH ollama >=0.2 object shape (response.message.content)
-           AND legacy dict shape (response["message"]["content"]).
-
-           The original code used response.get("message", {}).get("content")
-           which is dict-only. ollama >=0.2 returns a Python object — calling
-           .get() on it raises AttributeError → VisionDegradedError on every
-           frame. Combined with FIX-2 timeout issues, this made the observer
-           permanently blind within seconds on any modern Ollama installation.
-
-           The shim is identical to the one already applied in
-           adapters/qwen_ollama_adapter.py (_extract_response_content).
-
-  ✅  FIX-4 (CRITICAL): VisionUnavailableError is now imported from
-           core/mode_controller.py instead of being defined locally.
-
-           main.py imports VisionUnavailableError from core.mode_controller
-           and catches it in the health-retry loop (begin_planning guard).
-           The locally-defined class here was a DIFFERENT Python object —
-           exceptions raised by VisionRuntime were NOT caught by main.py's
-           except block. They fell through to the outer except Exception →
-           _force_safe_shutdown(), bypassing all retry logic entirely.
-
-  ✅  EVO-1: _expand_frame_latency_threshold() — latency guard now uses
-           the same ceiling as MODEL_CALL_TIMEOUT_SECONDS to avoid false
-           VisionDegradedError on legitimately slow (but successful) frames.
-
-All existing correct behaviours preserved:
-  - Daemon thread at CAPTURE_INTERVAL_SECONDS (0.5s)
-  - MAX_CONSECUTIVE_FAILURES=5 health threshold
-  - PIL.ImageGrab capture + JPEG encode
-  - MAX_FRAME_BYTES=4MB cap
-  - Temperature=0 enforcement
-  - _normalize_output() element validation + coordinate clamping
-  - _is_interactable() type-based detection
-  - ThreadPoolExecutor(max_workers=1) bounded model calls
-"""
-
 from __future__ import annotations
 
+import sys
 import time
 import threading
 from typing import Dict, Any, Optional, List
@@ -67,9 +15,7 @@ from PIL import Image, ImageGrab
 import ollama
 import httpx
 
-# FIX-4: Import the canonical VisionUnavailableError from mode_controller so
-# main.py's except (VisionUnavailableError, ...) catches exceptions raised here.
-# The locally-defined class was a different Python object — not caught by main.py.
+# FIX-4: Import the canonical VisionUnavailableError from mode_controller.
 from core.mode_controller import VisionUnavailableError
 
 
@@ -78,16 +24,39 @@ class VisionDegradedError(RuntimeError):
 
 
 # ==================================================
+# PYTHON VERSION COMPAT HELPER  (FIX-C2)
+# ==================================================
+
+def _shutdown_executor_compat(executor, wait: bool = False) -> None:
+    """
+    FIX-C2 (RB-2): Python 3.8 compatible ThreadPoolExecutor shutdown.
+
+    The cancel_futures parameter was added in Python 3.9.  On Python 3.8,
+    passing it raises:
+        TypeError: shutdown() got an unexpected keyword argument 'cancel_futures'
+
+    This helper passes cancel_futures=True only when running Python >= 3.9,
+    and falls back to shutdown(wait=wait) on older versions.
+
+    Previously, vision_runtime.stop() called shutdown directly with
+    cancel_futures=True; the resulting TypeError was silently swallowed
+    by main.py's `except Exception: pass` block, causing the executor to
+    never shut down and daemon threads to leak for the process lifetime.
+    """
+    if sys.version_info >= (3, 9):
+        executor.shutdown(wait=wait, cancel_futures=True)
+    else:
+        executor.shutdown(wait=wait)
+
+
+# ==================================================
 # CONFIG
 # ==================================================
 
-# FIX-2: All timeouts raised to accommodate CPU inference on Qwen2.5-VL 7B.
-# CPU inference takes 40–90s. Prior values (8s / 20s / 22s) caused permanent
-# observer blindness on every consumer-grade machine.
-MAX_ALLOWED_LATENCY_SECONDS  = 120.0   # was 8.0  — must be >= MODEL_CALL_TIMEOUT_SECONDS
+MAX_ALLOWED_LATENCY_SECONDS  = 120.0
 NETWORK_CONNECT_TIMEOUT      = 5.0
-NETWORK_READ_TIMEOUT         = 120.0   # was 20.0 — 40-90s CPU inference + margin
-MODEL_CALL_TIMEOUT_SECONDS   = 130.0   # was 22.0 — outer executor deadline
+NETWORK_READ_TIMEOUT         = 120.0
+MODEL_CALL_TIMEOUT_SECONDS   = 130.0
 
 MAX_FRAME_BYTES = 4 * 1024 * 1024
 MAX_ELEMENTS = 128
@@ -105,12 +74,7 @@ def _extract_vision_content(response: Any) -> str:
 
     ollama >=0.2: object with attribute access  → response.message.content
     ollama  <0.2: dict                          → response["message"]["content"]
-
-    The original code used response.get("message", {}).get("content") which
-    is dict-only and raises AttributeError on every frame with modern Ollama.
-    This shim is identical to the one in adapters/qwen_ollama_adapter.py.
     """
-    # Modern ollama >=0.2: object with attribute access
     if hasattr(response, "message"):
         message = response.message
         if hasattr(message, "content"):
@@ -121,7 +85,6 @@ def _extract_vision_content(response: Any) -> str:
                 f"Unexpected ollama response.message.content type: {type(content)}"
             )
 
-    # Legacy ollama <0.2: dict-style response
     if isinstance(response, dict):
         content = response.get("message", {}).get("content")
         if isinstance(content, str):
@@ -157,11 +120,10 @@ class VisionRuntime:
 
         self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
 
-        # FIX-2: read timeout raised from 20s to 120s for CPU inference compatibility.
         self._ollama_client = ollama.Client(
             timeout=httpx.Timeout(
                 connect=NETWORK_CONNECT_TIMEOUT,
-                read=NETWORK_READ_TIMEOUT,    # was 20.0
+                read=NETWORK_READ_TIMEOUT,
                 write=5.0,
                 pool=5.0,
             )
@@ -201,13 +163,22 @@ class VisionRuntime:
             self._thread.start()
 
     def stop(self) -> None:
+        """
+        FIX-C2 (RB-2): Use _shutdown_executor_compat() instead of calling
+        executor.shutdown(cancel_futures=True) directly.
+
+        Direct use of cancel_futures=True raised TypeError on Python 3.8,
+        which was silently swallowed by the caller, leaking the executor.
+        The compat helper checks sys.version_info before passing the argument.
+        """
         with self._lock:
             self._running = False
 
         if self._thread:
             self._thread.join(timeout=3.0)
 
-        self._executor.shutdown(wait=False, cancel_futures=True)
+        # FIX-C2: Python 3.8-compatible executor shutdown.
+        _shutdown_executor_compat(self._executor, wait=False)
 
     def is_healthy(self) -> bool:
         with self._lock:
@@ -253,7 +224,7 @@ class VisionRuntime:
     # ==================================================
 
     def _process_frame_internal(self) -> Dict[str, Any]:
-        start = time.time()   # wall clock only
+        start = time.time()
 
         frame_ts = time.time()
 
@@ -263,8 +234,6 @@ class VisionRuntime:
 
         latency = time.time() - start
 
-        # FIX-2 / EVO-1: latency guard now uses MAX_ALLOWED_LATENCY_SECONDS (120s)
-        # to avoid false VisionDegradedError on legitimately slow CPU inference.
         if latency > MAX_ALLOWED_LATENCY_SECONDS:
             raise VisionDegradedError(
                 f"Vision latency exceeded: {latency:.2f}s > {MAX_ALLOWED_LATENCY_SECONDS}s"
@@ -314,7 +283,6 @@ class VisionRuntime:
         future = self._executor.submit(_invoke)
 
         try:
-            # FIX-2: timeout raised from 22s to 130s
             return future.result(timeout=MODEL_CALL_TIMEOUT_SECONDS)
         except concurrent.futures.TimeoutError:
             future.cancel()
@@ -356,8 +324,7 @@ class VisionRuntime:
                 f"Vision model call failed: {e}"
             )
 
-        # FIX-3: Use compatibility shim instead of dict-only .get() access.
-        # ollama >=0.2 returns an object; dict-style access raises AttributeError.
+        # FIX-3: Use compatibility shim.
         content = _extract_vision_content(response)
 
         return self._parse_json(content)
