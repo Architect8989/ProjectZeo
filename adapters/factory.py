@@ -16,9 +16,18 @@ from adapters.apis_safety_layer import apply_patches
 # =========================================================
 _LOCAL_REGISTRY: Dict[str, str] = {
     "qwen2.5-vl": "adapters.qwen_ollama_adapter.QwenOllamaAdapter",
+    # FIX RB-7: llava was misclassified in _CLOUD_REGISTRY. LLaVA is served
+    # by local Ollama and never routes through cloud APIs. Moving it here
+    # ensures OLLAMA_ONLY=1 mode can use llava without hitting the cloud-block
+    # guard, and that llava users are not incorrectly denied at runtime.
+    #
+    # QwenOllamaAdapter is provider-agnostic: the model name ("llava") is
+    # passed through directly to ollama.Client().chat(), so no adapter-level
+    # changes are needed. The only requirement is that 'llava' is pulled
+    # locally via `ollama pull llava` before use.
+    "llava": "adapters.qwen_ollama_adapter.QwenOllamaAdapter",
     # Extension point — add new local models here:
     # "llama3.2-vision": "adapters.llama_ollama_adapter.LlamaOllamaAdapter",
-    # "llava":           "adapters.llava_ollama_adapter.LlavaOllamaAdapter",
 }
 
 # =========================================================
@@ -40,7 +49,7 @@ _CLOUD_REGISTRY = {
     "claude-3-sonnet",
     "gemini-pro-vision",
     "qwen-vl",       # Qwen cloud (DashScope) — not local Ollama
-    "llava",          # LLaVA via legacy ollama path in PureLLMWrapper
+    # NOTE: "llava" removed from cloud registry (FIX RB-7 — see LOCAL_REGISTRY above)
     # Extension point — add new cloud model base names here.
 }
 
@@ -137,7 +146,6 @@ def _resolve_base_model(model_name: str) -> str:
 
 
 def _is_cloud_allowed() -> bool:
-    
     return _CLOUD_ACCESS_PERMITTED
 
 
@@ -145,7 +153,7 @@ class AdapterFactory:
 
     @staticmethod
     def build_llm(model_name: str):
-        
+
         model_name = _validate_model_name(model_name)
         _ensure_patches()
 
@@ -176,10 +184,6 @@ class AdapterFactory:
 
             # --- Route 2: Cloud adapter via PureLLMWrapper ---
             if base_model in _CLOUD_REGISTRY:
-                # FIX RB-2 / H-01: Cloud is BLOCKED by default.
-                # _is_cloud_allowed() returns the value frozen at import time.
-                # For this to return True, run.py must have cleared OLLAMA_ONLY
-                # from os.environ BEFORE this module was imported.
                 if not _is_cloud_allowed():
                     raise ModelNotRecognizedException(
                         f"Model '{model_name}' is a cloud model, but OLLAMA_ONLY is "
@@ -214,7 +218,7 @@ class AdapterFactory:
     ):
         """
         Convenience coroutine: resolve adapter and call get_next_action().
-        Reuses the cached adapter — does NOT reconstruct on every call (§R3).
+        Reuses the cached adapter — does NOT reconstruct on every call.
         """
         adapter = AdapterFactory.build_llm(model_name)
         return await adapter.get_next_action(
