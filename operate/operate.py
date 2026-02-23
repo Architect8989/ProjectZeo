@@ -24,11 +24,6 @@ from core.cognition.belief_state import BeliefState
 from core.cognition.action_ranker import ActionRanker
 from core.cognition.reasoning_engine import ReasoningEngine
 
-# SI-01 FIX: Import PolicyEngine so it can be instantiated and called in
-# the execution path. Previously PolicyEngine was defined, unit-tested, and
-# completely unreachable at runtime — the allowlist of permitted applications
-# was dead code. Every application could be launched or clicked regardless
-# of configuration.
 from policy.engine import PolicyEngine, PolicyViolationError
 
 from config.timeouts import MAX_STAGNANT_ITERS_UI, MAX_STAGNANT_ITERS_COMMAND
@@ -62,6 +57,7 @@ def operate_main(
     world_graph=None,
     os_backend: Optional[OperatingSystem] = None,
     max_wallclock_seconds: int = 90 * 60,
+    watchdog=None,                # RB-1 FIX: optional RuntimeWatchdog instance
 ):
 
     if not isinstance(execution_plan, ExecutionPlan):
@@ -72,13 +68,7 @@ def operate_main(
 
     os_backend = os_backend or OperatingSystem()
 
-    # SI-01 FIX: Instantiate PolicyEngine here so it is active for the
-    # entire task execution. The engine is passed into the loop so it can
-    # validate every action before _execute_decision() is called.
-    #
-    # Configuration: load from policy.yaml if it exists, otherwise use
-    # the default conservative allowlist. Operators should extend the
-    # allowlist in policy.yaml rather than modifying source code.
+    
     policy_engine = PolicyEngine()
     try:
         import os as _os_mod, yaml as _yaml  # type: ignore[import]
@@ -153,6 +143,7 @@ def operate_main(
             reasoning_engine=reasoning_engine,
             policy_engine=policy_engine,
             max_wallclock_seconds=max_wallclock_seconds,
+            watchdog=watchdog,     # RB-1 FIX: propagate watchdog into inner loop
         )
     finally:
         input_arbitrator.shutdown()
@@ -174,6 +165,7 @@ def _execute_autonomous_loop(
     reasoning_engine: Optional[ReasoningEngine],
     policy_engine: PolicyEngine,   # SI-01 FIX: required, not optional
     max_wallclock_seconds: int,
+    watchdog=None,                 # RB-1 FIX: RuntimeWatchdog, optional
 ):
 
     start_ts = time.time()
@@ -184,33 +176,10 @@ def _execute_autonomous_loop(
         "objective": execution_plan.objective,
     })
 
-    # FIX M-1 (HAR-06/MS-03): Pass terminal_prompt as intent_hash so Thompson
-    # sampling is seeded uniquely per task intent.
-    #
-    # The bug: _execute_autonomous_loop called BeliefState() with no arguments.
-    # BeliefState.__init__ defaults intent_hash="" → commitment_hash="GENESIS"
-    # for every task. With an identical seed, Thompson samples are identical
-    # across all replans of the same task — the sampler cannot distinguish a
-    # prior failure from an unexplored action, neutralising replan exploration.
-    #
-    # Fix: pass terminal_prompt so commitment_hash = SHA-256(intent) — unique
-    # per user objective, preserving within-session determinism while ensuring
-    # distinct seed sequences across replans and across different tasks.
+    
     belief = BeliefState(intent_hash=terminal_prompt)
 
-    # FIX-C6 (MATH-3): Call set_plan_horizon() after BeliefState construction
-    # so dynamic regret decay is tuned to the actual plan length.
-    #
-    # Root cause: set_plan_horizon() was defined on BeliefState but never called
-    # anywhere in the execution path.  _regret_decay defaulted permanently to
-    # REGRET_DECAY=0.995 regardless of plan length.  For short plans (~5 steps,
-    # ~65 iterations), 0.995^65 ≈ 0.72 — regret persisted at 72% across the
-    # whole plan, skewing the exploration signal.  Dynamic horizon tuning was
-    # dead code.
-    #
-    # Fix: call set_plan_horizon(real_steps) immediately after BeliefState
-    # construction.  real_steps = len(steps) - 1 to exclude the synthetic DONE
-    # sentinel (consistent with the _real_steps computation in the loop below).
+    
     _plan_real_steps = max(len(execution_plan.steps) - 1, 1)
     belief.set_plan_horizon(_plan_real_steps)
 
@@ -237,34 +206,18 @@ def _execute_autonomous_loop(
             journal.record({"event": "execution_timeout"})
             raise RuntimeError("TASK_FAILED:timeout")
 
+        
+        if watchdog is not None:
+            watchdog.check()
+
         if current_step_index >= len(execution_plan.steps):
             journal.record({"event": "execution_complete"})
             return
 
-        # FIX-M6 (RB-2 / SI-2): Signal SOC liveness at the START of each
-        # iteration, not only inside the action execution try-block.
-        #
-        # Bug: soc_action_started() was called once, inside the try block after
-        # all authority/policy checks. During LLM planning (40–90s on CPU), no
-        # heartbeat reached the watchdog between the previous iteration's
-        # soc_action_started() call and the next one. With the old 8-second
-        # timeout, _forced_release was set to True after the first LLM call,
-        # making all subsequent evaluate() calls return RELEASE permanently.
-        # clear_emergency_reclaim() was never called from any production path.
-        #
-        # Fix: call soc_action_started() here (top of loop) so the 180-second
-        # watchdog timer resets on every iteration, even those dominated by
-        # LLM inference time. This is the "heartbeat during planning" option
-        # described in the audit as FIX option (c). The raised timeout (180s,
-        # FIX-M2) provides additional safety margin.
+        
         input_arbitrator.soc_action_started()
 
-        # FIX-M6 (SI-2): Also clear any prior forced release at the start of
-        # each iteration. If the watchdog fired during a previous stalled
-        # iteration and _forced_release was set, it must be cleared before we
-        # can re-evaluate authority for the current iteration. Without this,
-        # a single watchdog fire permanently kills all subsequent actions for
-        # the task (one-way latch behaviour described in the audit).
+        
         input_arbitrator.clear_emergency_reclaim()
 
         iteration += 1
@@ -318,19 +271,7 @@ def _execute_autonomous_loop(
 
             try:
                 if len(json.dumps(bounded)) <= MAX_PERCEPTION_JSON_BYTES:
-                    # FIX H-05: Likelihoods are still heuristic but now
-                    # structured as an observation model with explicit
-                    # conditional semantics rather than bare magic constants.
-                    #
-                    # Interpretation: each value is the approximate probability
-                    # of observing this snapshot feature IF the system is in the
-                    # named state. These are not calibrated empirically, but are
-                    # coherent with the qualitative meaning of each state.
-                    #
-                    # True Bayesian calibration requires a labelled dataset of
-                    # (world_snapshot, ground_truth_state) pairs which does not
-                    # exist for this system. This is documented explicitly so
-                    # future operators understand the approximation.
+                    
                     likelihoods: Dict[str, float] = {}
 
                     focused_app = bounded.get("focused_app")
@@ -376,12 +317,7 @@ def _execute_autonomous_loop(
                 a for a in raw_actions if isinstance(a, dict)
             )
 
-        # FIX H-03 / RB-03: Wire ReasoningEngine as a fallback when the static
-        # plan provides no valid candidate actions. Previously this path raised
-        # TASK_FAILED immediately. Now we ask the ReasoningEngine to propose
-        # alternative actions given the current belief state and perception.
-        # This is only triggered when the static plan is empty/malformed — for
-        # normal execution, static plan actions are used directly.
+        
         if not candidate_actions and reasoning_engine is not None:
             perception_for_reasoning = {}
             if isinstance(perception_snapshot, dict):
@@ -464,19 +400,11 @@ def _execute_autonomous_loop(
             raise RuntimeError("REPLAN_REQUIRED")
 
         try:
-            # NOTE: soc_action_started() was moved to the TOP of the loop
-            # iteration (FIX-M6) to keep the watchdog alive during LLM planning.
-            # The call below is retained as a secondary heartbeat specifically
-            # for the action execution phase, giving the watchdog two refresh
-            # points per iteration: (1) planning start, (2) execution start.
+            
             input_arbitrator.soc_action_started()
             os_backend.heartbeat()
 
-            # SI-01 FIX: Validate action against PolicyEngine BEFORE executing.
-            # This is the enforcement point for the application allowlist.
-            # If accessibility_backend is available, we get the real AT-SPI
-            # node for role/app validation. If not (Windows, non-AT-SPI Linux),
-            # we use a lightweight dict-based node built from perception data.
+            
             _policy_node = None
             if accessibility_backend is not None:
                 try:
@@ -491,25 +419,7 @@ def _execute_autonomous_loop(
                 if isinstance(world_snapshot, dict):
                     _focused_app = str(world_snapshot.get("focused_app", ""))
 
-                # FIX-M5 / HARD-7 (RB-5 / SI-HARD-7): Use a non-empty sentinel
-                # when focused_app is absent rather than returning "".
-                #
-                # Bug: when _focused_app is "" (falsy), PolicyEngine.validate()
-                # produced app = "unknown" via the falsy check:
-                #     app = app_obj.name.lower() if app_obj and app_obj.name else "unknown"
-                # This triggered the hard-deny "Application identity unavailable"
-                # for EVERY action during the observer warmup phase (up to 150s)
-                # and any time the world graph hadn't populated focused_app yet.
-                #
-                # Fix: use "__unknown_app__" as the sentinel. PolicyEngine will
-                # still deny it (it's not in allowed_apps), but:
-                # 1. The deny reason is "Unauthorized application: '__unknown_app__'"
-                #    rather than "Application identity unavailable" — operator-visible.
-                # 2. The app name is non-empty, so the allowlist check path is taken
-                #    rather than the identity-failure path, giving a meaningful reason.
-                # 3. Operators who want to permit actions during warmup can add
-                #    "__unknown_app__" to allowed_apps explicitly, rather than having
-                #    no configuration handle for this case at all.
+                
                 _sentinel_app = _focused_app if _focused_app.strip() else "__unknown_app__"
 
                 class _LightweightNode:
@@ -555,55 +465,17 @@ def _execute_autonomous_loop(
                 # Treat as WAIT — re-evaluate after brief pause
                 raise RuntimeError("REPLAN_REQUIRED")
 
-            # MR-01a FIX: Conservative authority gate.
-            # ─────────────────────────────────────────────────────────────
-            # Bug: soc_confident = belief.environment_stability > 0.7 fires
-            # on a SINGLE observation exceeding the threshold. Because the
-            # stability scalar is derived from uncalibrated Bayesian likelihoods,
-            # a single well-perceived frame can push it above 0.7 and open the
-            # CONTINUE gate for high-risk operations.
-            #
-            # Fix: require 3 consecutive high-stability observations (>0.7)
-            # before asserting soc_confident for high-risk actions. Low-risk
-            # actions retain the single-observation gate for latency reasons.
-            # ─────────────────────────────────────────────────────────────
+            
             if is_high_risk:
                 soc_confident = belief.consecutive_high_stability_count >= 3
             else:
                 soc_confident = belief.environment_stability > 0.7
 
-            # FIX H-09 / RB-02: action_timeout is explicitly non-interrupting for
-            # blocking I/O (the context manager's own docstring states this clearly).
-            # Wrapping command execution and tool installation in it provides a
-            # false guarantee while adding overhead. These operation types have their
-            # own effective timeouts:
-            #   - command_execution: subprocess.run() timeout (os_backend.run_command)
-            #   - tool_installation: AutonomousInstaller.MAX_INSTALL_TIME (15 min)
-            #   - task-level: max_wallclock_seconds checked at the top of the loop
-            #
-            # action_timeout IS retained for UI operations (click, type, hotkey)
-            # which are genuinely short-lived and where 30s is a meaningful bound.
-            #
-            # For command/install operations: the subprocess itself is the timeout
-            # boundary. The outer loop's max_wallclock_seconds is the safety net.
+            
             operation = selected_action.get("operation", "").lower().strip()
             _use_action_timeout = operation not in ("command", "install")
 
-            # AT-01 FIX: Replace plain `with action_timeout(30): result = _execute_decision(...)`
-            # with run_with_timeout(), which UNBLOCKS THE CALLING THREAD if the UI
-            # operation stalls on a frozen display or input queue.
-            #
-            # The action_timeout() context manager alone is advisory-only — it fires
-            # at Python yield points AFTER the guarded code returns. Any blocking
-            # pyautogui/X11 call (e.g. mouse() stalling on a frozen display) would
-            # run indefinitely with only the context manager. The docstring in
-            # action_timeout explicitly states: "operate.py uses run_with_timeout()
-            # inside the action_timeout block to combine both."
-            #
-            # run_with_timeout() submits the callable to _UI_EXECUTOR (single-worker
-            # ThreadPoolExecutor) and calls future.result(timeout=30). The calling
-            # thread is unblocked after 30s regardless of whether the background
-            # thread is still blocked on a native OS call.
+            
             if _use_action_timeout:
                 result = run_with_timeout(
                     lambda: _execute_decision(
@@ -667,23 +539,25 @@ def _execute_autonomous_loop(
                     "stderr_bytes": len(stderr),
                 })
 
+        except PolicyViolationError as pve:
+            
+            journal.record({
+                "event": "policy_blocked",
+                "reason": str(pve),
+                "step": current_step_index,
+                "action": selected_action.get("operation"),
+            })
+            raise RuntimeError("TASK_FAILED:policy_blocked") from pve
+
         except Exception:
             belief.record_action(action_key, reward=-0.5)
 
-            # MATH-04 FIX: Pass raw reward (-0.5 for failure) to update_regret.
-            # HAR-1 (MATH-1): global_best_reward() returns None when no rewards
-            # have been recorded — skip regret update to avoid phantom 0.0 optimum.
+            
             best_reward = belief.global_best_reward()
             if best_reward is not None:
                 belief.update_regret(action_key, -0.5, best_reward)
 
-            # FIX H-1: Commit on EVERY action, including failures.
-            # Bug: belief.commit() was only called in the success path. Repeated
-            # failures kept commitment_hash at its initial value (SHA-256(intent)),
-            # keeping Thompson seeds in a low-diversity regime: the same actions
-            # were re-sampled under nearly identical conditions across failure
-            # iterations. Diversifying the chain on failure ensures subsequent
-            # Thompson samples differ from the failed attempt, improving recovery.
+            
             belief.commit(action_key, {"outcome": "failure", "step": current_step_index})
 
             stagnant_iterations += 1
@@ -736,18 +610,7 @@ def _execute_autonomous_loop(
             journal.record({"event": "execution_complete"})
             return
 
-        # FIX M-5 / H4: Exclude the DONE sentinel step from plan_steps_total.
-        #
-        # Bug: len(execution_plan.steps) included the synthetic DONE step
-        # appended by ExecutionPlanner.create_plan(). At the convergence check,
-        # current_step_index (= steps_completed) was always < len(steps) because
-        # the DONE step is at index len-1 and the DONE branch above returns
-        # before ever reaching this code. converged() therefore always returned
-        # False — the fast-exit was permanently dead code.
-        #
-        # Fix: _real_steps = len(steps) - 1 excludes the DONE sentinel.
-        # When all real work steps are completed (current_step_index == _real_steps),
-        # converged() can now return True and fire the fast-exit path.
+        
         _real_steps = max(len(execution_plan.steps) - 1, 1)
         if belief.converged(
             min_iterations=3,
@@ -769,22 +632,7 @@ def _execute_decision(
     accessibility_backend,
     installer: Optional[AutonomousInstaller],
 ):
-    """
-    Dispatch a single action decision to the OS backend.
-
-    FIX-5: click operations use os_backend.mouse({"x": x, "y": y})
-    which correctly handles LLM-supplied NORMALIZED coordinates (0.0–1.0).
-
-    Operation mapping:
-      click       → os_backend.mouse()       — normalized 0.0–1.0 coords
-      type/write  → os_backend.type_text()
-      hotkey/press→ os_backend.press_keys()
-      command     → os_backend.run_command() — returns CompletedProcess
-      file_create → os_backend.write_file()
-      verify      → os_backend.run_command() or visual no-op
-      install     → AutonomousInstaller.install_tool()
-      done        → no-op
-    """
+    
 
     if not isinstance(decision, dict):
         raise RuntimeError("TASK_FAILED:invalid_decision_payload")
@@ -812,30 +660,9 @@ def _execute_decision(
                 f"TASK_FAILED:click_invalid_coordinates x={x!r} y={y!r}"
             )
 
-        # RB-A7 FIX: Coordinate space guard.
-        #
-        # os_backend.mouse() expects NORMALIZED coordinates in [0.0, 1.0].
-        # QwenOllamaAdapter._resolve_click_coordinates() resolves OCR text
-        # anchors by calling get_text_coordinates() which may return absolute
-        # pixel values (e.g. x=847, y=512 on a 1920×1080 display).
-        #
-        # Heuristic: if either coordinate exceeds 1.0, assume the pair is in
-        # absolute pixel space and normalise using the screen dimensions
-        # reported by os_backend.
+        
         if x_f > 1.0 or y_f > 1.0:
-            # FIX RB-1: If screen_size() is unavailable, raise a hard error
-            # instead of silently clamping to (1.0, 1.0).
-            #
-            # Bug: the original code caught all exceptions from screen_size()
-            # with "except: pass" then let x_f/y_f proceed unchanged into
-            # max(0.0, min(1.0, x_f)) — mapping absolute pixels like x=1200
-            # to 1.0, which is the right edge of the screen. Every text-targeted
-            # click silently fired at the bottom-right corner, burning replan
-            # budget with zero diagnostic output.
-            #
-            # Fix: raise RuntimeError("TASK_FAILED:...") so the stagnation
-            # counter increments, the journal records the failure reason, and
-            # operators see an actionable error instead of mysterious misclicks.
+            
             try:
                 screen_w, screen_h = os_backend.screen_size()
                 if screen_w > 0 and screen_h > 0:
