@@ -398,21 +398,7 @@ def main(llm_callable: Callable, model_name: str):
 
                 _task_succeeded = False
 
-                # MATH-NEW-03 FIX: Cross-replan BeliefState persistence.
-                #
-                # Root cause: each replan called operate_main() fresh, constructing
-                # a new BeliefState from scratch. The bandit forgot all action counts,
-                # regret history, Welford statistics, and Thompson counter state from
-                # prior attempts. On a second replan, low-reward actions already
-                # identified as problematic were re-explored from the uninformative
-                # uniform prior.
-                #
-                # Fix: _belief_state_out is a single-element list that operate_main()
-                # populates (via belief_state_out= parameter) with the serialized
-                # BeliefState after every loop exit — success, REPLAN_REQUIRED, or
-                # TASK_FAILED. On each replan, the prior state is forwarded as
-                # prior_belief_state= so the new run reconstructs the bandit from
-                # the full history of the previous run rather than starting over.
+                
                 _belief_state_out: list = []
                 _prior_belief_state: Optional[dict] = None
 
@@ -561,6 +547,18 @@ def main(llm_callable: Callable, model_name: str):
                                 restore_required=False,
                                 last_snapshot_id=None,
                                 dirty=False,
+                                # H2 FIX: Persist BeliefState Thompson counters so
+                                # Thompson sampling seed chain is reproducible across
+                                # process restarts (crash-recovery replans start from
+                                # the correct counter state rather than counter=0).
+                                thompson_state=(
+                                    {
+                                        "iteration_counter": _belief_state_out[0].get("iteration_counter", 0),
+                                        "sample_counter":    _belief_state_out[0].get("sample_counter", 0),
+                                        "commitment_hash":   _belief_state_out[0].get("commitment_hash", ""),
+                                    }
+                                    if _belief_state_out else None
+                                ),
                             )
 
                         except Exception as cleanup_err:
@@ -578,6 +576,15 @@ def main(llm_callable: Callable, model_name: str):
                                 restore_required=False,
                                 last_snapshot_id=None,
                                 dirty=False,
+                                # H2 FIX: Persist Thompson state on clean exit too.
+                                thompson_state=(
+                                    {
+                                        "iteration_counter": _belief_state_out[0].get("iteration_counter", 0),
+                                        "sample_counter":    _belief_state_out[0].get("sample_counter", 0),
+                                        "commitment_hash":   _belief_state_out[0].get("commitment_hash", ""),
+                                    }
+                                    if _belief_state_out else None
+                                ),
                             )
                         except Exception:
                             pass
