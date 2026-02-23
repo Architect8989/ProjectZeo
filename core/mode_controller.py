@@ -2,6 +2,7 @@ import time
 import threading
 import json
 import os
+import sys
 import pathlib
 from enum import Enum
 from typing import Optional, Deque, Dict, Callable
@@ -42,15 +43,12 @@ class ModeController:
     MAX_PLANNING_SECONDS = 60.0
     MAX_PLAN_ID_LENGTH = 128
 
-    # §R8: ARMED mode timeout — prevents infinite ARMED stall
+    # §R8: ARMED mode timeout — prevents infinite ARMED stall.
     # FIX RB-5 / H-6: Raised from 30.0 to LLM_CALL_TIMEOUT_SECONDS + 60.0 (210.0s).
-    # CPU-only Ollama inference takes 40-90s. With MAX_ARMED_SECONDS=30s the
+    # CPU-only Ollama inference takes 40–90s. With MAX_ARMED_SECONDS=30s the
     # ARMED timeout fired before planning completed, triggering ArmedTimeoutError
     # → OBSERVER revert → replan count not incremented → infinite OBSERVER loop.
-    # Effective replan budget was 0 on CPU hardware.
-    #
     # Formula: LLM_CALL_TIMEOUT_SECONDS (150s) + 60s safety margin = 210s.
-    # Import is deferred to avoid circular import at module top.
     MAX_ARMED_SECONDS: float = 210.0
 
     _MODULE_ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -87,7 +85,33 @@ class ModeController:
             maxlen=self.MAX_TRANSITION_HISTORY
         )
 
-        self.TRANSITION_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        # FIX SI-1 / RB-A1: Guard the log directory creation against read-only
+        # filesystems (containers, NFS mounts, CI environments).
+        #
+        # Previous code: self.TRANSITION_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        # This raised PermissionError unconditionally on any filesystem where the
+        # process does not have write permission to create <project_root>/logs/.
+        # The exception propagated out of __init__, crashing the process before
+        # any task could ever start — observer_loop, vision_runtime, and
+        # intent_listener were never reached.
+        #
+        # Fix: wrap mkdir in try/except. On failure, set _transition_log_available=False
+        # so _commit_transition() skips all file I/O gracefully. In-memory
+        # _transition_history still accumulates entries for forensic inspection
+        # within the session. Operational correctness is unaffected.
+        self._transition_log_available: bool = True
+        try:
+            self.TRANSITION_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        except (PermissionError, OSError) as _mkdir_err:
+            self._transition_log_available = False
+            print(
+                f"[ModeController] WARNING: Cannot create transition log directory "
+                f"({self.TRANSITION_LOG_PATH.parent!r}): {_mkdir_err}. "
+                "Transition logging is DISABLED for this session. "
+                "This is expected on read-only filesystems (containers, NFS, CI). "
+                "In-memory transition history remains available via get_authority_snapshot().",
+                file=sys.stderr,
+            )
 
     # ==================================================
     # READS
@@ -451,6 +475,12 @@ class ModeController:
 
         self._transition_history.append(entry)
 
+        # FIX SI-1 / RB-A1: Skip all file I/O when the log directory could not
+        # be created at startup (read-only filesystem). The in-memory history
+        # above still accumulates entries; only the durable JSONL log is absent.
+        if not self._transition_log_available:
+            return
+
         # FIX F-03 / RB-08: Always close the file descriptor in a finally block.
         # Previously, if os.write() or os.fsync() raised (e.g. disk full), the
         # fd was never closed, leaking a file descriptor on every transition.
@@ -541,4 +571,5 @@ class ModeController:
                 "execution_plan_attached": self._execution_plan_attached,
                 "execution_plan_id": self._execution_plan_id,
                 "transition_history_depth": len(self._transition_history),
+                "transition_log_available": self._transition_log_available,
             }
