@@ -34,17 +34,10 @@ from restoration.restore_verifier import RestoreVerifier, RestorationVerificatio
 
 from core.planner.execution_planner import ExecutionPlanner
 
-# FIX-C3 (RB-4): Import RuntimeWatchdog so it can be instantiated and called
-# in the heartbeat loop.  Previously the class was defined but never imported
-# or instantiated anywhere in the execution path — all runtime safety limits
-# (4 GB RAM, 90% CPU, 1-hour wall-clock) were permanently inactive.
+
 from core.safety.runtime_watchdog import RuntimeWatchdog, WatchdogViolation
 
-# HAR-4: Import uninstall_patches so the global builtins.open monkey-patch
-# is cleaned up on shutdown.  Without this call in the finally block, the
-# patch lives for the entire process lifetime — an undocumented permanent
-# process-wide side effect that interferes with test isolation and subprocess
-# environments.
+
 from adapters.apis_safety_layer import uninstall_patches
 
 
@@ -216,11 +209,7 @@ def main(llm_callable: Callable, model_name: str):
     _install_signal_handlers()
     atexit.register(lambda: _force_safe_shutdown(os_backend, auth_state, "atexit"))
 
-    # FIX-C3 (RB-4): Instantiate RuntimeWatchdog at startup so all runtime
-    # safety limits are active for the process lifetime.
-    # Previously the class was defined but never instantiated — the 4 GB RAM,
-    # 90% sustained CPU, and 1-hour wall-clock limits were completely inactive.
-    # watchdog.check() is called in the heartbeat loop below.
+    
     watchdog = RuntimeWatchdog()
 
     env_fingerprint = collect_environment_fingerprint()
@@ -380,14 +369,19 @@ def main(llm_callable: Callable, model_name: str):
                         mode.update_observer_health(observer.is_healthy())
                         mode.update_vision_status(vision_runtime.is_healthy())
 
-                execution_plan = planner.create_plan(
-                    objective=intent,
-                    requirements={
-                        "environment": env_fingerprint,
-                        "tools": env_fingerprint.get("tools", []),
-                    },
-                    high_level_steps=[{"goal": intent}],
-                )
+                
+                try:
+                    watchdog.pause_cpu()
+                    execution_plan = planner.create_plan(
+                        objective=intent,
+                        requirements={
+                            "environment": env_fingerprint,
+                            "tools": env_fingerprint.get("tools", []),
+                        },
+                        high_level_steps=[{"goal": intent}],
+                    )
+                finally:
+                    watchdog.resume_cpu()
 
                 mode.attach_execution_plan(f"plan_{int(time.time())}")
                 mode.mark_planning_complete()
@@ -416,6 +410,7 @@ def main(llm_callable: Callable, model_name: str):
                                 observer=observer,
                                 world_graph=world_graph,
                                 os_backend=os_backend,
+                                watchdog=watchdog,   # RB-1 FIX: active during execution
                             )
                             _task_succeeded = True
                             break
@@ -427,7 +422,6 @@ def main(llm_callable: Callable, model_name: str):
                             replan_count += 1
                             if replan_count > MAX_REPLANS:
                                 raise RuntimeError("TASK_FAILED:max_replans_exceeded")
-
                             mode.begin_replan_sequence()
 
                             try:
@@ -467,14 +461,19 @@ def main(llm_callable: Callable, model_name: str):
                                 env_fingerprint = collect_environment_fingerprint()
                                 planner.refresh_environment(env_fingerprint)
 
-                                execution_plan = planner.create_plan(
-                                    objective=intent,
-                                    requirements={
-                                        "environment": env_fingerprint,
-                                        "tools": env_fingerprint.get("tools", []),
-                                    },
-                                    high_level_steps=[{"goal": intent}],
-                                )
+                                # RB-1 FIX: Pause CPU monitoring during replan LLM call.
+                                try:
+                                    watchdog.pause_cpu()
+                                    execution_plan = planner.create_plan(
+                                        objective=intent,
+                                        requirements={
+                                            "environment": env_fingerprint,
+                                            "tools": env_fingerprint.get("tools", []),
+                                        },
+                                        high_level_steps=[{"goal": intent}],
+                                    )
+                                finally:
+                                    watchdog.resume_cpu()
 
                                 mode.attach_execution_plan(
                                     f"plan_replan_{replan_count}_{int(time.time())}"
@@ -622,14 +621,7 @@ def main(llm_callable: Callable, model_name: str):
         except Exception:
             pass
 
-        # HAR-4 (Determinism): Restore builtins.open to its original value on
-        # process shutdown.  apply_patches() installs a global monkey-patch on
-        # builtins.open for the process lifetime without cleaning it up.  For
-        # production long-running processes this is usually acceptable, but it
-        # causes false-positive blocks and test isolation failures in environments
-        # that reload modules or share a Python interpreter across test runs.
-        # Calling uninstall_patches() here is cheap (single attribute swap) and
-        # makes the side effect lifecycle explicit and bounded.
+        
         try:
             uninstall_patches()
         except Exception:
