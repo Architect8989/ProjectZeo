@@ -43,7 +43,15 @@ class ModeController:
     MAX_PLAN_ID_LENGTH = 128
 
     # §R8: ARMED mode timeout — prevents infinite ARMED stall
-    MAX_ARMED_SECONDS = 30.0
+    # FIX RB-5 / H-6: Raised from 30.0 to LLM_CALL_TIMEOUT_SECONDS + 60.0 (210.0s).
+    # CPU-only Ollama inference takes 40-90s. With MAX_ARMED_SECONDS=30s the
+    # ARMED timeout fired before planning completed, triggering ArmedTimeoutError
+    # → OBSERVER revert → replan count not incremented → infinite OBSERVER loop.
+    # Effective replan budget was 0 on CPU hardware.
+    #
+    # Formula: LLM_CALL_TIMEOUT_SECONDS (150s) + 60s safety margin = 210s.
+    # Import is deferred to avoid circular import at module top.
+    MAX_ARMED_SECONDS: float = 210.0
 
     _MODULE_ROOT = pathlib.Path(__file__).resolve().parents[1]
     TRANSITION_LOG_PATH = _MODULE_ROOT / "logs" / "mode_transitions.jsonl"
