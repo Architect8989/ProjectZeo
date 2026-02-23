@@ -192,9 +192,32 @@ class RestoreProvider:
     # =========================================================
 
     def _restore_application(self, snapshot: RestorationSnapshot) -> None:
-        self._os.activate_application(
-            {"title": snapshot.application.process_name}
-        )
+        # SI-NEW-02 FIX: Guard against the bare-desktop sentinel.
+        #
+        # Root cause: when a snapshot is taken while no application window is
+        # focused (bare desktop), snapshot_provider stores the sentinel string
+        # "__bare_desktop__" in application.process_name. The previous code
+        # passed this sentinel directly to os.activate_application(), which
+        # either raises an OSError (application not found) or — worse —
+        # activates any application whose title happens to fuzzy-match the
+        # sentinel. This silently broke the restoration sequence for every
+        # task started from a bare desktop (RB-A1 class of failures).
+        #
+        # Fix: return early when the sentinel is detected, exactly mirroring
+        # the guards already present in _restore_window() and
+        # _validate_application(). When the desktop had no focused application
+        # at snapshot time, no application needs to be restored.
+        if snapshot.application.process_name == "__bare_desktop__":
+            return
+
+        try:
+            self._os.activate_application(
+                {"title": snapshot.application.process_name}
+            )
+        except OSError:
+            # Best-effort: if the application is no longer running, skip
+            # rather than failing the entire restoration sequence.
+            pass
         time.sleep(self.POST_ACTION_DELAY)
 
     def _restore_window(self, snapshot: RestorationSnapshot) -> None:
