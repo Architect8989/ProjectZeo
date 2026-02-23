@@ -38,84 +38,22 @@ _OCR_READER = None
 _OCR_LOCK = threading.Lock()
 _OCR_WARMUP_TIMEOUT_SECONDS = 120
 
-# RTB-07 FIX: Replace permanent _OCR_UNAVAILABLE bool with a cooldown-based
-# retry mechanism. Previously, one EasyOCR failure at cold-start permanently
-# disabled OCR for the process lifetime. Any subsequent task that required
-# text-label click resolution failed silently because the flag could never
-# recover within a session.
-#
-# Fix: record the timestamp of the last failure. After _OCR_RETRY_COOLDOWN_SECONDS
-# (300s = 5 min), allow one retry attempt. This lets OCR recover automatically
-# after transient failures (network timeout during model weight download, GPU
-# warm-up delay) without requiring a process restart.
-#
-# FIX RB-A6: Both _OCR_UNAVAILABLE and _OCR_LAST_FAILURE_TS are now ONLY read
-# and written while _OCR_LOCK is held. The previous code read both variables
-# OUTSIDE the lock as a "fast path" optimization:
-#
-#   if _OCR_UNAVAILABLE:                              # ← read outside lock
-#       if time.monotonic() - _OCR_LAST_FAILURE_TS   # ← read outside lock
-#           < _OCR_RETRY_COOLDOWN_SECONDS:
-#           return None
-#
-# This was a data race. Another thread could be inside the lock writing
-# _OCR_LAST_FAILURE_TS = time.monotonic() (after a failure) while this thread
-# read a stale value of 0.0. The comparison `time.monotonic() - 0.0` would be
-# in the millions of seconds, causing the cooldown check to evaluate to False
-# and two threads to simultaneously attempt OCR re-initialization.
-#
-# In the other direction: _OCR_UNAVAILABLE could be read as True by thread A
-# while thread B was concurrently clearing it (setting it to False inside the
-# lock after a successful re-init). Thread A would then return None and skip
-# the perfectly functional OCR reader.
-#
-# Fix: remove the lock-free fast path entirely. All reads and writes of
-# _OCR_UNAVAILABLE and _OCR_LAST_FAILURE_TS go through _OCR_LOCK.
-# The performance cost is negligible: _get_ocr_reader() is called once per
-# action resolution (not in a hot inner loop), and the lock is uncontested
-# once OCR is initialized (_OCR_READER is not None → early return).
+
 _OCR_UNAVAILABLE = False
 _OCR_LAST_FAILURE_TS: float = 0.0
 _OCR_RETRY_COOLDOWN_SECONDS = 300.0
 
 
 def _get_ocr_reader():
-    """
-    EasyOCR initialisation is non-fatal (FIX-5).
-    On a raw OS with no network, the model download (~150 MB) may fail.
-    Falls back to coordinate-only mode when OCR is unavailable.
-
-    RTB-07: After _OCR_RETRY_COOLDOWN_SECONDS from the last failure,
-    clears the unavailable flag and retries initialisation once, allowing
-    recovery from transient cold-start failures.
-
-    FIX RB-A6: All reads/writes of _OCR_UNAVAILABLE and _OCR_LAST_FAILURE_TS
-    are now exclusively inside _OCR_LOCK to eliminate the data race described
-    above. The lock-free fast path has been removed.
-    """
     global _OCR_READER, _OCR_UNAVAILABLE, _OCR_LAST_FAILURE_TS
 
-    # Fast path: reader already initialized. Read _OCR_READER without the lock
-    # because it transitions from None → object exactly once (inside the lock),
-    # and object references are written atomically in CPython. Once non-None,
-    # it is never set back to None, so this read is safe.
-    if _OCR_READER is not None:
-        return _OCR_READER
-
-    # All remaining logic — including reading _OCR_UNAVAILABLE and
-    # _OCR_LAST_FAILURE_TS — happens exclusively inside the lock.
     with _OCR_LOCK:
-        # Re-check under lock (double-checked locking for _OCR_READER).
         if _OCR_READER is not None:
             return _OCR_READER
 
-        # FIX RB-A6: Cooldown check is now fully inside the lock.
-        # Both reads of _OCR_UNAVAILABLE and _OCR_LAST_FAILURE_TS are
-        # serialized with writes — no torn reads possible.
         if _OCR_UNAVAILABLE:
             if time.monotonic() - _OCR_LAST_FAILURE_TS < _OCR_RETRY_COOLDOWN_SECONDS:
                 return None
-            # Cooldown elapsed — reset flag and attempt re-initialization.
             _OCR_UNAVAILABLE = False
             logger.info("[QwenOllamaAdapter] OCR cooldown elapsed — retrying EasyOCR init.")
 
@@ -160,8 +98,6 @@ def _get_ocr_reader():
             return _OCR_READER
 
         except Exception as exc:
-            # FIX RB-A6: Write _OCR_UNAVAILABLE and _OCR_LAST_FAILURE_TS
-            # inside the lock — consistent with the reads above.
             _OCR_UNAVAILABLE = True
             _OCR_LAST_FAILURE_TS = time.monotonic()
             logger.warning(
@@ -353,19 +289,7 @@ class QwenOllamaAdapter:
         if len(history_messages) > self.MAX_HISTORY_TURNS:
             history_messages = history_messages[-self.MAX_HISTORY_TURNS:]
 
-        # --- Capture live screenshot ---
-        # RB-03 FIX: Windows NamedTemporaryFile PermissionError.
-        # ─────────────────────────────────────────────────────────────────
-        # On Windows, NamedTemporaryFile(delete=True) keeps the OS file
-        # handle open until the `with` block exits. A second open() call
-        # on the same path raises PermissionError because Windows does not
-        # allow a second handle while the first is open with exclusive access.
-        #
-        # Fix: create both temp files with delete=False, close each handle
-        # immediately, perform all I/O, then unlink in a finally block.
-        # This is safe on all platforms (Linux/macOS unlink semantics
-        # differ but the explicit cleanup is harmless).
-        # ─────────────────────────────────────────────────────────────────
+        
         raw_tmp_name = None
         jpeg_tmp_name = None
         try:
