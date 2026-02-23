@@ -6,7 +6,7 @@ import sys
 import select
 import os
 import stat
-import tempfile
+import pathlib
 from typing import Optional
 
 
@@ -16,22 +16,12 @@ def atomic_write_intent(intent_text: str, intent_file: str = None) -> None:
 
     RB-06 FIX: The IntentListener polls at 100ms. A non-atomic write (open,
     write, close) creates a race window where the listener can read a partial
-    intent if it polls between the open and the final close. The result is a
-    truncated intent string being silently discarded (UTF-8 strict decode
-    fails on a partial multi-byte sequence) or misinterpreted.
+    intent if it polls between the open and the final close.
 
     Fix: write to a .tmp sibling file, then os.replace() to the target path.
     os.replace() is atomic on POSIX (rename syscall) and atomic on Windows
     (MoveFileExW with MOVEFILE_REPLACE_EXISTING). The listener only ever
     reads complete files.
-
-    Parameters
-    ----------
-    intent_text : str
-        The intent string to write. Must be non-empty and ≤ 4096 bytes
-        when encoded as UTF-8.
-    intent_file : str, optional
-        Destination path. Defaults to IntentListener.INTENT_FILE.
     """
     if intent_file is None:
         intent_file = IntentListener.INTENT_FILE
@@ -63,8 +53,32 @@ class IntentListener:
     POLL_INTERVAL = 0.1
     INTENT_MAX_BYTES = 4096
 
-    # PATCH §1.7: replace hardcoded /tmp with platform-aware temp dir
-    INTENT_FILE: str = os.path.join(tempfile.gettempdir(), "projectzeo.intent")
+    # FIX RB-3: Replace tempfile.gettempdir() path with a project-relative path.
+    #
+    # Bug: INTENT_FILE = os.path.join(tempfile.gettempdir(), "projectzeo.intent")
+    # resolves to /tmp/projectzeo.intent on Linux.  The bundled intent file
+    # lives at temp/arm_system.intent (relative to project root).  The listener
+    # polled /tmp/projectzeo.intent while the file to be read was elsewhere —
+    # the system never entered ARMED state in default deployment.
+    #
+    # Fix: resolve the path relative to this file's location at import time.
+    # This is robust against:
+    #   - Different working directories at process startup
+    #   - Containerised deployments that mount the project at a non-CWD path
+    #   - Operator scripts that write to temp/arm_system.intent expecting it to
+    #     be picked up automatically
+    #
+    # Deployment note: operators can override INTENT_FILE after import by
+    # assigning IntentListener.INTENT_FILE = "/custom/path" before calling
+    # IntentListener.__init__(). This class attribute is mutable.
+    _PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[1]
+    INTENT_FILE: str = str(_PROJECT_ROOT / "temp" / "arm_system.intent")
+
+    # ARM_PREFIX: content starting with this prefix has the prefix stripped
+    # before use as the task objective.  The bundled intent file ships with
+    # "ARM: investigate deployment issue"; the "ARM: " is a human-readable
+    # signal, not part of the actual task description that the LLM receives.
+    _ARM_PREFIX = "ARM:"
 
     def __init__(self, mode_controller, snapshot_provider):
         self.mode = mode_controller
@@ -150,18 +164,6 @@ class IntentListener:
 
             if ready:
                 try:
-                    # FIX-M3 (RB-3): Replace sys.stdin.read(N) with readline().
-                    #
-                    # Bug: sys.stdin.read(N) on a TTY reads until EOF, not until
-                    # newline. Interactive users press Enter after typing — this
-                    # sends '\n', NOT EOF (Ctrl-D). read() blocks indefinitely
-                    # until Ctrl-D, making the interactive UX permanently broken.
-                    # The documented primary UX (type intent + press Enter) never
-                    # worked on any TTY.
-                    #
-                    # Fix: sys.stdin.readline() returns on '\n' (Enter key), which
-                    # is the natural interactive terminator. We still enforce the
-                    # INTENT_MAX_BYTES limit by checking the resulting string length.
                     raw = sys.stdin.readline()
                     if len(raw.encode("utf-8", errors="replace")) > self.INTENT_MAX_BYTES:
                         print(
@@ -178,6 +180,8 @@ class IntentListener:
                     return None
 
                 intent = data.strip()
+                # FIX RB-3: Strip ARM: prefix from stdin input too
+                intent = self._strip_arm_prefix(intent)
                 return intent if intent else None
 
         # ---- Secure file ingestion ----
@@ -199,30 +203,10 @@ class IntentListener:
             if not stat.S_ISREG(st.st_mode):
                 return None
 
-            # PATCH §1.7: uid check is skipped on Windows where getuid() doesn't exist
             current_uid = getattr(os, "getuid", lambda: None)()
             if current_uid is not None and st.st_uid != current_uid:
                 return None
 
-            # FIX F-01 / RB-06: The prior check `(st.st_mode & 0o022) != 0` rejected
-            # files with the GROUP-WRITE bit (0o020) set. On Linux with umask 002
-            # (standard in many multi-user environments), files are created with mode
-            # 0o664 — group-readable AND group-writable — causing every intent file to
-            # be silently discarded with no diagnostic. The system would never arm.
-            #
-            # Corrected policy: reject ONLY genuinely dangerous permissions:
-            #   - World-writable (0o002): any unprivileged user can modify the file,
-            #     enabling privilege escalation via intent injection.
-            #
-            # Group-writable (0o020) is NOT rejected because:
-            #   - It requires group membership to exploit (not arbitrary users).
-            #   - It is the default permission produced by umask 002, which is
-            #     standard on many developer and CI systems.
-            #   - The README documents no requirement to chmod 600 intent files.
-            #
-            # Operators in high-security deployments should enforce umask 027 or
-            # chmod 600 manually; this is not enforced at the code level to avoid
-            # breaking the most common deployment configurations.
             if (st.st_mode & 0o002) != 0:
                 print(
                     f"[IntentListener] Rejected intent file — world-writable: {path}",
@@ -247,12 +231,6 @@ class IntentListener:
                 except Exception:
                     pass
 
-        # RB-A5 FIX: If data was successfully read but is empty or whitespace-only,
-        # emit a diagnostic warning to stderr and do NOT delete the file.
-        # Previously the file was silently consumed and discarded, leaving the
-        # operator with no indication of why the system failed to arm. The operator
-        # must re-write a valid intent to arm; discarding their (possibly accidental)
-        # whitespace-only file without warning creates a silent failure mode.
         if should_delete and data is not None:
             intent = data.strip()
             if not intent:
@@ -262,9 +240,21 @@ class IntentListener:
                     f"string to arm the system. File has NOT been deleted.",
                     file=sys.stderr,
                 )
-                # Do not delete: leave the file in place so the operator can inspect it.
                 return None
-            # Non-empty content — safe to delete and return.
+
+            # FIX RB-3: Strip "ARM: " prefix before using as task objective.
+            # The bundled intent file ships with "ARM: investigate deployment issue".
+            # Without stripping, the literal string "ARM: " becomes the first word
+            # of the LLM prompt, degrading plan quality.
+            intent = self._strip_arm_prefix(intent)
+            if not intent:
+                print(
+                    f"[IntentListener] Discarded intent file — content was only the "
+                    f"ARM: prefix with no task text: {path!r}.",
+                    file=sys.stderr,
+                )
+                return None
+
             try:
                 os.remove(path)
             except Exception:
@@ -275,4 +265,24 @@ class IntentListener:
             return None
 
         intent = data.strip()
+        intent = self._strip_arm_prefix(intent)
         return intent if intent else None
+
+    # ==================================================
+    # Helpers
+    # ==================================================
+
+    def _strip_arm_prefix(self, text: str) -> str:
+        """
+        FIX RB-3: Strip the 'ARM:' prefix if present (case-insensitive).
+
+        The bundled temp/arm_system.intent ships with:
+            ARM: investigate deployment issue
+
+        Without stripping, "ARM: " becomes the first word of the task objective
+        sent to the LLM, degrading plan quality and causing confusing logs.
+        """
+        stripped = text.strip()
+        if stripped.upper().startswith(self._ARM_PREFIX):
+            stripped = stripped[len(self._ARM_PREFIX):].strip()
+        return stripped
