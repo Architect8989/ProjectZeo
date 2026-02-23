@@ -150,20 +150,20 @@ class IntentListener:
 
             if ready:
                 try:
-                    # RB-06 FIX: Bounded readline via read() with a size limit.
-                    # readline() has no built-in size limit — a malicious or
-                    # accidental multi-megabyte line would load it entirely into
-                    # memory before the caller can check. The file-path ingestion
-                    # already enforces INTENT_MAX_BYTES (4096) via os.read(); the
-                    # stdin path must match that guarantee.
+                    # FIX-M3 (RB-3): Replace sys.stdin.read(N) with readline().
                     #
-                    # Strategy: read at most INTENT_MAX_BYTES + 1 bytes. If the
-                    # result exceeds the limit, the line is overlong — discard
-                    # it with a diagnostic and return None. The +1 allows us to
-                    # detect truncation (len == limit+1) vs. a line that happens
-                    # to land exactly on the limit.
-                    raw = sys.stdin.read(self.INTENT_MAX_BYTES + 1)
-                    if len(raw) > self.INTENT_MAX_BYTES:
+                    # Bug: sys.stdin.read(N) on a TTY reads until EOF, not until
+                    # newline. Interactive users press Enter after typing — this
+                    # sends '\n', NOT EOF (Ctrl-D). read() blocks indefinitely
+                    # until Ctrl-D, making the interactive UX permanently broken.
+                    # The documented primary UX (type intent + press Enter) never
+                    # worked on any TTY.
+                    #
+                    # Fix: sys.stdin.readline() returns on '\n' (Enter key), which
+                    # is the natural interactive terminator. We still enforce the
+                    # INTENT_MAX_BYTES limit by checking the resulting string length.
+                    raw = sys.stdin.readline()
+                    if len(raw.encode("utf-8", errors="replace")) > self.INTENT_MAX_BYTES:
                         print(
                             f"[IntentListener] Discarded stdin intent — exceeds "
                             f"{self.INTENT_MAX_BYTES} byte limit.",
