@@ -149,7 +149,14 @@ def compress_screenshot(raw_screenshot_filename, screenshot_filename):
     with Image.open(raw_screenshot_filename) as img:
         # Step 1: Convert palette-mode (P/PA) to RGBA so transparency is
         # represented as a proper alpha channel that split()[3] can access.
-        if img.mode == "P":
+        #
+        # RB-NEW-03 FIX: Also handle "PA" (palette + alpha) mode.
+        # PIL's "PA" mode is distinct from "P" (palette-only). A palette+alpha
+        # PNG opened by PIL remains in "PA" mode; the previous check
+        # `img.mode == "P"` did not match it. PA.split() returns 2 bands
+        # (palette index + alpha), so bands[3] would raise IndexError.
+        # Fix: check for both "P" and "PA" and convert both to "RGBA".
+        if img.mode in ("P", "PA"):
             img = img.convert("RGBA")
 
         # Step 2: Composite any alpha channel over a white background.
