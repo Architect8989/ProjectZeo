@@ -191,10 +191,22 @@ class ModeController:
     # ==================================================
 
     def arm(self, intent: str) -> None:
+        # FIX-M1 (RB-1 / SI-1): The _replan_in_progress guard was REMOVED from
+        # arm(). Previously, begin_replan_sequence() set _replan_in_progress=True
+        # and then the replan path called arm(), which immediately raised
+        # ModeTransitionError("Replan in progress"). The flag was only cleared in
+        # a finally block AFTER the exception propagated — meaning every replan
+        # attempt triggered a shutdown. MAX_REPLANS=3 was unreachable dead code.
+        #
+        # The concurrent-replan guard is still correctly enforced by
+        # begin_replan_sequence(): if _replan_in_progress is already True it
+        # raises ModeTransitionError("Replan already in progress"). arm() itself
+        # does NOT need to reject the replan path — it must be callable from it.
+        #
+        # Use arm_for_replan() when called from an active replan sequence (it
+        # bypasses the OBSERVER mode requirement since the mode controller will
+        # have been reset to OBSERVER by force_observer() before arm() is needed).
         with self._lock:
-            if self._replan_in_progress:
-                raise ModeTransitionError("Replan in progress")
-
             if self._mode is not SystemMode.OBSERVER:
                 raise ModeTransitionError("Cannot arm unless OBSERVER")
 
@@ -212,6 +224,45 @@ class ModeController:
             self._failure_reason = None
 
             self._commit_transition(SystemMode.ARMED, "intent armed", False)
+
+    def arm_for_replan(self, intent: str) -> None:
+        """
+        FIX-M1: Arm the system during an active replan sequence.
+
+        Identical to arm() but does NOT require _replan_in_progress=False.
+        Called exclusively from the replan path in main.py after
+        begin_replan_sequence() has set _replan_in_progress=True and
+        force_observer() has reset the mode to OBSERVER.
+
+        Why a separate method rather than modifying arm():
+        - arm() is the normal arming path; it must fail-closed for all other
+          callers.
+        - arm_for_replan() is the replanning arming path; it is explicitly
+          permitted to run while _replan_in_progress=True.
+        - Keeping them separate makes the call site in main.py self-documenting
+          and avoids adding a boolean 'bypass' parameter to arm() which would be
+          invisible at call sites.
+        """
+        with self._lock:
+            # Replan can only arm from OBSERVER (set by force_observer() earlier
+            # in the replan sequence).
+            if self._mode is not SystemMode.OBSERVER:
+                raise ModeTransitionError(
+                    "arm_for_replan requires OBSERVER mode — "
+                    "call force_observer() before arm_for_replan()"
+                )
+
+            if not intent or not intent.strip():
+                raise ModeTransitionError("Intent must be non-empty")
+
+            self._intent = intent.strip()
+            self._intent_frozen = False
+            self._planning_completed = False
+            self._execution_plan_attached = False
+            self._execution_plan_id = None
+            self._failure_reason = None
+
+            self._commit_transition(SystemMode.ARMED, "intent armed (replan)", False)
 
     def begin_planning(self) -> None:
         with self._lock:
