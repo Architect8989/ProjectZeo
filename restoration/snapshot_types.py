@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import time
+import threading
 from dataclasses import dataclass, field
 from typing import Optional, Dict, Any
 
@@ -109,9 +110,23 @@ class RestorationSnapshot:
         distinct IDs.  Without this, round(captured_at * 1000) could collide
         and trigger SnapshotProviderError("Snapshot id collision").
         """
-        # Atomically advance the nonce (class-level, not instance-level)
-        RestorationSnapshot._nonce_counter += 1
-        nonce = RestorationSnapshot._nonce_counter
+        # HARD-3 (RB-6): Thread-safe nonce increment.
+        #
+        # Bug: RestorationSnapshot._nonce_counter += 1 is a non-atomic
+        # read-modify-write on a class-level integer. Under concurrent snapshot
+        # creation (replan sequences that briefly overlap, or test threads),
+        # two threads could read the same counter value and compute identical
+        # nonces. Two snapshots created within the same millisecond would then
+        # produce identical snapshot_ids, causing SnapshotProviderError("Snapshot
+        # id collision") and blocking replan arming.
+        #
+        # Fix: protect the increment with a class-level threading.Lock.
+        # The lock is a module-level singleton (defined after the class body
+        # alongside the counter initialisation) so it is shared across all
+        # calls to _derive_snapshot_id() regardless of when they occur.
+        with RestorationSnapshot._nonce_lock:
+            RestorationSnapshot._nonce_counter += 1
+            nonce = RestorationSnapshot._nonce_counter
 
         canonical = json.dumps(
             {
@@ -241,3 +256,8 @@ class RestorationSnapshot:
 # (correctly incremented by _derive_snapshot_id) and the per-instance field
 # (always 0 because create() never passed _nonce_counter to __init__).
 RestorationSnapshot._nonce_counter = 0  # type: ignore[attr-defined]
+
+# HARD-3 (RB-6): Class-level lock for thread-safe nonce increment.
+# Must be initialised here (outside the frozen dataclass body) alongside
+# the counter. The lock is shared across all _derive_snapshot_id() calls.
+RestorationSnapshot._nonce_lock = threading.Lock()  # type: ignore[attr-defined]
