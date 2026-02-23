@@ -107,6 +107,16 @@ class BeliefState:
         # execution plan is loaded to tune decay to the actual task length.
         self._regret_decay: float = self.REGRET_DECAY
 
+        # Fix 11 (Welford): per-action running statistics for incremental
+        # z-score normalisation. Using Welford's online algorithm means only
+        # the NEW reward entry is normalised relative to running mean/variance.
+        # Historical entries remain stable (their normalised values do not
+        # change when a new reward arrives). This replaces the previous
+        # bulk re-normalisation that made all historical utilities non-stationary.
+        self._welford_n: Dict[str, int] = {}          # count of rewards seen
+        self._welford_mean: Dict[str, float] = {}     # running mean
+        self._welford_M2: Dict[str, float] = {}       # running sum of squared deviations
+
     # =========================================================
     # BELIEF UPDATE
     # =========================================================
@@ -184,14 +194,22 @@ class BeliefState:
 
         fallback_prob = self.state_probabilities.get("__prior_fallback__", 0.0)
         if 0.0 < fallback_prob <= self._FALLBACK_PRUNE_THRESHOLD:
-            pruned_dist = {
-                k: v for k, v in self.state_probabilities.items()
-                if k != "__prior_fallback__"
-            }
-            if pruned_dist:
-                total = sum(pruned_dist.values())
-                if total > 0:
-                    self.state_probabilities = {k: v / total for k, v in pruned_dist.items()}
+            # Fix 14: Only prune __prior_fallback__ if the entropy floor is
+            # already satisfied BEFORE the prune. If entropy enforcement raised
+            # fallback probability to just above PRIOR_ALPHA (= 0.01) and we
+            # prune it immediately, entropy drops back below the floor and the
+            # enforcement/prune cycle repeats indefinitely for up to 20 iterations.
+            # Gate the prune on self.entropy() >= MIN_ENTROPY_FLOOR so the floor
+            # is never undercut by the pruning step that follows it.
+            if self.entropy() >= self.MIN_ENTROPY_FLOOR:
+                pruned_dist = {
+                    k: v for k, v in self.state_probabilities.items()
+                    if k != "__prior_fallback__"
+                }
+                if pruned_dist:
+                    total = sum(pruned_dist.values())
+                    if total > 0:
+                        self.state_probabilities = {k: v / total for k, v in pruned_dist.items()}
 
     def entropy(self) -> float:
         return -sum(
@@ -331,50 +349,62 @@ class BeliefState:
     # =========================================================
 
     def record_action(self, action: str, reward: float):
-        
+        """
+        Fix 11 (Welford's algorithm): Record an action reward using incremental
+        z-score normalisation.
+
+        Previous implementation re-normalised ALL entries in the deque on every
+        new reward arrival, making historical action utilities non-stationary:
+        a single extreme new reward retroactively changed the perceived history
+        of ALL prior actions. This is not standard bandit normalisation.
+
+        Fix: use Welford's online algorithm to maintain a running mean and
+        variance per action. Only the NEW reward is normalised relative to the
+        running statistics and appended. Existing deque entries are untouched,
+        keeping historical utility estimates stable.
+
+        Welford update for sample n:
+            delta  = reward - mean_{n-1}
+            mean_n = mean_{n-1} + delta / n
+            delta2 = reward - mean_n
+            M2_n   = M2_{n-1} + delta * delta2
+            var_n  = M2_n / n   (population variance)
+        """
         if action not in self.action_rewards:
             self.action_rewards[action] = deque(maxlen=self.REWARD_WINDOW)
         if action not in self._raw_action_rewards:
-            # MATH-04 FIX: parallel raw reward window
             self._raw_action_rewards[action] = deque(maxlen=self.REWARD_WINDOW)
 
         # Always store the unmodified raw reward for regret / global best.
         self._raw_action_rewards[action].append(reward)
 
-        history = self.action_rewards[action]
+        # ---- Welford incremental update ----
+        n = self._welford_n.get(action, 0) + 1
+        self._welford_n[action] = n
 
-        if len(history) >= 3:
-            # z-score normalisation: append raw, compute stats over full
-            # inclusive window (MATH-03 FIX: lag-free inclusive statistics),
-            # then re-normalise ALL entries.
-            history.append(reward)
-            mean = sum(history) / len(history)
-            variance = sum((r - mean) ** 2 for r in history) / len(history)
+        prev_mean = self._welford_mean.get(action, 0.0)
+        delta = reward - prev_mean
+        new_mean = prev_mean + delta / n
+        self._welford_mean[action] = new_mean
+
+        prev_M2 = self._welford_M2.get(action, 0.0)
+        delta2 = reward - new_mean
+        new_M2 = prev_M2 + delta * delta2
+        self._welford_M2[action] = new_M2
+
+        if n >= 3:
+            # Sufficient history for z-score normalisation.
+            # Population variance = M2 / n; add NORMALIZE_EPS for stability.
+            variance = new_M2 / n
             std = math.sqrt(max(variance, self.NORMALIZE_EPS))
-
-            # FIX H6/M-2: Re-normalise EVERY entry in the window, not just the
-            # latest. On the transition at n==3, entries 0 and 1 are clamped
-            # linear values; without this re-normalisation they contaminate the
-            # z-score window. For n > 3, existing entries are already z-scored
-            # and re-normalise coherently (no statistical regression for mature
-            # windows).
-            new_history = []
-            for raw_val in history:
-                nv = (raw_val - mean) / std
-                new_history.append(max(-self.REWARD_CLAMP, min(self.REWARD_CLAMP, nv)))
-            history.clear()
-            history.extend(new_history)
+            normalised = (reward - new_mean) / std
+            normalised = max(-self.REWARD_CLAMP, min(self.REWARD_CLAMP, normalised))
         else:
-            # FIX-06 (MS-01): For n < 3, use simple linear clamp instead of
-            # storing raw values.  This keeps the deque in a consistent unit
-            # space [-REWARD_CLAMP, +REWARD_CLAMP] for all window sizes,
-            # eliminating the mixed-unit contamination of early-session stats.
-            # When n reaches 3, the z-score branch re-normalises all entries
-            # over the full inclusive window — including these clamped entries —
-            # eliminating the boundary contamination identified in H6/M-2.
-            clamped = max(-self.REWARD_CLAMP, min(self.REWARD_CLAMP, reward))
-            history.append(clamped)
+            # FIX-06 (MS-01): For n < 3, use simple linear clamp. Once n reaches
+            # 3 the Welford branch takes over with stable running statistics.
+            normalised = max(-self.REWARD_CLAMP, min(self.REWARD_CLAMP, reward))
 
+        self.action_rewards[action].append(normalised)
         self.action_counts[action] = self.action_counts.get(action, 0) + 1
 
     # =========================================================
@@ -560,6 +590,104 @@ class BeliefState:
             return False
 
         return True
+
+    # =========================================================
+    # SERIALIZATION — Fix 12 (Thompson counter persistence)
+    # =========================================================
+
+    def to_dict(self) -> dict:
+        """
+        Fix 12: Serialise BeliefState to a JSON-safe dict including
+        _iteration_counter and _sample_counter so Thompson sampling seeds
+        are reproducible across process restarts.
+
+        Callers that want replay reproducibility should persist the returned
+        dict (e.g. in the authority state file) and pass it to from_dict()
+        when reconstructing BeliefState after a restart.
+
+        Note: action_rewards and _raw_action_rewards store deques of floats
+        which are serialised as lists. The Welford running-statistics fields
+        (_welford_n, _welford_mean, _welford_M2) are also persisted so that
+        normalisation history survives a restart.
+        """
+        return {
+            "commitment_hash": self.commitment_hash,
+            "iteration_counter": self._iteration_counter,
+            "sample_counter": self._sample_counter,
+            "state_probabilities": dict(self.state_probabilities),
+            "action_counts": dict(self.action_counts),
+            "action_rewards": {
+                k: list(v) for k, v in self.action_rewards.items()
+            },
+            "raw_action_rewards": {
+                k: list(v) for k, v in self._raw_action_rewards.items()
+            },
+            "regret": {
+                k: list(v) for k, v in self.regret.items()
+            },
+            "progress_score": self.progress_score,
+            "environment_stability": self.environment_stability,
+            "consecutive_high_stability_count": self.consecutive_high_stability_count,
+            "regret_decay": self._regret_decay,
+            "welford_n": dict(self._welford_n),
+            "welford_mean": dict(self._welford_mean),
+            "welford_M2": dict(self._welford_M2),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict, intent_hash: str = "") -> "BeliefState":
+        """
+        Fix 12: Reconstruct a BeliefState from a previously serialised dict.
+
+        The reconstructed instance has the same commitment_hash,
+        _iteration_counter, and _sample_counter as when to_dict() was called,
+        so Thompson sampling seeds continue the same sequence as before the
+        restart — making post-restart replay reproducible.
+        """
+        obj = cls(intent_hash=intent_hash)
+
+        # Restore commitment chain state (overrides the intent-derived genesis)
+        if isinstance(data.get("commitment_hash"), str):
+            obj.commitment_hash = data["commitment_hash"]
+        if isinstance(data.get("iteration_counter"), int):
+            obj._iteration_counter = data["iteration_counter"]
+        if isinstance(data.get("sample_counter"), int):
+            obj._sample_counter = data["sample_counter"]
+
+        if isinstance(data.get("state_probabilities"), dict):
+            obj.state_probabilities = dict(data["state_probabilities"])
+        if isinstance(data.get("action_counts"), dict):
+            obj.action_counts = dict(data["action_counts"])
+
+        for key, vals in (data.get("action_rewards") or {}).items():
+            if isinstance(vals, list):
+                obj.action_rewards[key] = deque(vals, maxlen=cls.REWARD_WINDOW)
+        for key, vals in (data.get("raw_action_rewards") or {}).items():
+            if isinstance(vals, list):
+                obj._raw_action_rewards[key] = deque(vals, maxlen=cls.REWARD_WINDOW)
+
+        for key, val in (data.get("regret") or {}).items():
+            if isinstance(val, list) and len(val) == 2:
+                obj.regret[key] = tuple(val)
+
+        if isinstance(data.get("progress_score"), (int, float)):
+            obj.progress_score = float(data["progress_score"])
+        if isinstance(data.get("environment_stability"), (int, float)):
+            obj.environment_stability = float(data["environment_stability"])
+        if isinstance(data.get("consecutive_high_stability_count"), int):
+            obj.consecutive_high_stability_count = data["consecutive_high_stability_count"]
+        if isinstance(data.get("regret_decay"), (int, float)):
+            obj._regret_decay = float(data["regret_decay"])
+
+        # Restore Welford running statistics
+        if isinstance(data.get("welford_n"), dict):
+            obj._welford_n = {k: int(v) for k, v in data["welford_n"].items()}
+        if isinstance(data.get("welford_mean"), dict):
+            obj._welford_mean = {k: float(v) for k, v in data["welford_mean"].items()}
+        if isinstance(data.get("welford_M2"), dict):
+            obj._welford_M2 = {k: float(v) for k, v in data["welford_M2"].items()}
+
+        return obj
 
     # =========================================================
     # SUMMARY
