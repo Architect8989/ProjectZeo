@@ -1,6 +1,12 @@
 from typing import Dict, Any, List
 import json
 
+# FIX H4: Import shared injection marker set instead of defining it inline.
+# Both ReasoningEngine and ExecutionPlanner now use INJECTION_MARKERS from
+# core.security.injection_markers, so adding a new marker in one place
+# covers both components automatically.
+from core.security.injection_markers import INJECTION_MARKERS
+
 
 class ReasoningEngine:
     """
@@ -12,77 +18,11 @@ class ReasoningEngine:
     MAX_TEXT_CHARS = 400
     MAX_JSON_CHARS = 8000
 
-    # HAR-5 (MATH-9): Comprehensive injection marker set.
-    #
-    # Each string is lowercased; _truncate_text() lowercases the input before
-    # checking so the comparison is case-insensitive.
-    #
-    # Markers cover:
-    #   - Classic direct override phrases
-    #   - Common LLM template delimiters used in fine-tuned models
-    #   - Structural injections (new system prompt, role override)
-    #   - Common paraphrases found in adversarial prompt research
-    #
-    # Operators who deploy this system against richer adversarial environments
-    # should extend this frozenset or replace _truncate_text() with a
-    # dedicated classifier.
-    _INJECTION_MARKERS = frozenset({
-        # Classic override phrases
-        "ignore previous instructions",
-        "ignore all previous",
-        "ignore prior instructions",
-        "disregard previous",
-        "disregard all previous",
-        "disregard prior instructions",
-        "disregard the above",
-        "forget previous instructions",
-        "forget all previous",
-        "override previous instructions",
-        "override the above",
-
-        # "New instruction" injection patterns
-        "new instruction:",
-        "new instructions:",
-        "updated instruction:",
-        "revised instruction:",
-        "important instruction:",
-
-        # System prompt / role injection
-        "system:",
-        "system prompt:",
-        "new system prompt:",
-        "<|system|>",
-        "[system]",
-        "###system",
-        "### system",
-
-        # LLM template delimiters used in fine-tuned / instruction-tuned models
-        "</s>",
-        "[inst]",
-        "</inst>",
-        "[/inst]",
-        "<s>[inst]",
-        "<|im_start|>",
-        "<|im_end|>",
-        "<|endoftext|>",
-        "assistant:",
-        "human:",
-        "user:",
-
-        # Jailbreak prefix patterns
-        "act as",
-        "pretend you are",
-        "pretend to be",
-        "you are now",
-        "from now on",
-        "your new role",
-        "your task is now",
-
-        # Escaping / structural attacks
-        "```system",
-        "---system",
-        "=== system",
-    })
+    # FIX H4: Reference shared authoritative marker set.
+    # Previously 35 markers were defined inline here; ExecutionPlanner only
+    # had 7 (a subset). The asymmetry left 28 known injection patterns
+    # undetected in planning prompts. Now both classes use the same source.
+    _INJECTION_MARKERS = INJECTION_MARKERS
 
     def __init__(self, llm_callable):
         self._llm = llm_callable
@@ -191,13 +131,10 @@ class ReasoningEngine:
         """
         HAR-5 (MATH-9): Truncate and sanitize entity text.
 
-        Checks against a comprehensive set of injection markers
-        (_INJECTION_MARKERS) instead of the original single-marker check
-        for "ignore previous instructions".
-
-        The original single-marker check was trivially bypassed by any
-        alternative phrasing.  ExecutionPlanner already used 7 markers;
-        this method now uses an aligned and extended set for consistency.
+        Checks against the shared INJECTION_MARKERS set (35 markers) imported
+        from core.security.injection_markers. Both ReasoningEngine and
+        ExecutionPlanner now use the same set, closing the asymmetry where
+        28 markers were caught here but silently passed in planning prompts.
 
         Returns "" (empty string) if any injection marker is found,
         suppressing the hostile text from the LLM prompt entirely.
