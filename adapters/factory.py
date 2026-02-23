@@ -65,10 +65,54 @@ _PATCH_LOCK = threading.Lock()
 _MODEL_PATTERN = re.compile(r"^[a-zA-Z0-9.\-_:/]+$")
 
 
-_ADAPTER_CACHE: Dict[str, Any] = {}
+# SI-8 / H8 FIX: Bound the adapter cache with LRU eviction.
+#
+# Bug: _ADAPTER_CACHE was an unbounded plain dict. Different version tags
+# (e.g. "qwen2.5-vl:7b-instruct" vs "qwen2.5-vl:latest") created separate
+# cache entries, each with its own ThreadPoolExecutor. In long-running
+# processes with many model variants the cache grew without bound, leaking
+# thread-pool resources proportional to distinct model name strings seen.
+#
+# Fix: use an OrderedDict capped at _ADAPTER_CACHE_MAX_SIZE entries. On
+# insertion beyond the cap, the least-recently-used entry (first in dict
+# order) is evicted. The build-lock design is preserved; eviction uses
+# _ADAPTER_CACHE_LOCK for thread safety.
+_ADAPTER_CACHE_MAX_SIZE: int = 10
+
+from collections import OrderedDict as _OrderedDict
+_ADAPTER_CACHE: "_OrderedDict[str, Any]" = _OrderedDict()
 _ADAPTER_CACHE_LOCK = threading.Lock()           # guards _ADAPTER_CACHE reads/writes
 _ADAPTER_BUILD_LOCKS: Dict[str, threading.Lock] = {}  # per-model construction mutex
 _BUILD_LOCKS_LOCK = threading.Lock()             # guards _ADAPTER_BUILD_LOCKS itself
+
+
+def _cache_put(model_name: str, instance: Any) -> None:
+    """
+    SI-8 / H8 FIX: Insert into the LRU adapter cache, evicting the oldest
+    entry when the cache exceeds _ADAPTER_CACHE_MAX_SIZE.
+
+    Must be called with _ADAPTER_CACHE_LOCK already held.
+    """
+    _ADAPTER_CACHE[model_name] = instance
+    # Move to end (most-recently-used position in OrderedDict)
+    _ADAPTER_CACHE.move_to_end(model_name)
+    # Evict oldest (least-recently-used) entries beyond the cap
+    while len(_ADAPTER_CACHE) > _ADAPTER_CACHE_MAX_SIZE:
+        _ADAPTER_CACHE.popitem(last=False)
+
+
+def _cache_get(model_name: str) -> "Any | None":
+    """
+    SI-8 / H8 FIX: Retrieve from the LRU adapter cache, promoting the entry
+    to most-recently-used position.
+
+    Must be called with _ADAPTER_CACHE_LOCK already held.
+    Returns None if not present.
+    """
+    instance = _ADAPTER_CACHE.get(model_name)
+    if instance is not None:
+        _ADAPTER_CACHE.move_to_end(model_name)
+    return instance
 
 
 import os as _os_module
@@ -158,9 +202,11 @@ class AdapterFactory:
         _ensure_patches()
 
         # Fast path: return cached adapter without acquiring build lock.
+        # SI-8 / H8 FIX: Use _cache_get() which also updates LRU order.
         with _ADAPTER_CACHE_LOCK:
-            if model_name in _ADAPTER_CACHE:
-                return _ADAPTER_CACHE[model_name]
+            cached = _cache_get(model_name)
+            if cached is not None:
+                return cached
 
         # Slow path: acquire per-model build lock.
         build_lock = _get_model_build_lock(model_name)
@@ -168,8 +214,9 @@ class AdapterFactory:
             # Double-checked locking: another thread may have completed
             # construction while we waited for the build lock.
             with _ADAPTER_CACHE_LOCK:
-                if model_name in _ADAPTER_CACHE:
-                    return _ADAPTER_CACHE[model_name]
+                cached = _cache_get(model_name)
+                if cached is not None:
+                    return cached
 
             base_model = _resolve_base_model(model_name)
 
@@ -179,7 +226,7 @@ class AdapterFactory:
                 AdapterClass = _import_class(local_path)
                 instance = AdapterClass(model_name=model_name)
                 with _ADAPTER_CACHE_LOCK:
-                    _ADAPTER_CACHE[model_name] = instance
+                    _cache_put(model_name, instance)
                 return instance
 
             # --- Route 2: Cloud adapter via PureLLMWrapper ---
@@ -198,7 +245,7 @@ class AdapterFactory:
 
                 instance = PureLLMWrapper(model_name=base_model)
                 with _ADAPTER_CACHE_LOCK:
-                    _ADAPTER_CACHE[model_name] = instance
+                    _cache_put(model_name, instance)
                 return instance
 
             # --- Route 3: Unknown ---
