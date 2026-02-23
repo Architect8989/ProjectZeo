@@ -316,16 +316,28 @@ class SnapshotProvider:
             if _wid_result.returncode == 0:
                 _wid = _wid_result.stdout.strip().decode("utf-8", errors="replace")
                 _geo_result = _sp.run(
-                    ["xdotool", "getwindowgeometry", _wid],
+                    ["xdotool", "getwindowgeometry", "--shell", _wid],
                     capture_output=True,
                     timeout=2,
                 )
                 if _geo_result.returncode == 0:
-                    extended["window_geometry"] = _geo_result.stdout.decode(
-                        "utf-8", errors="replace"
-                    ).strip()
+                    _geo_dict: dict = {}
+                    for _line in _geo_result.stdout.decode("utf-8", errors="replace").splitlines():
+                        if "=" in _line:
+                            _k, _, _v = _line.partition("=")
+                            try:
+                                _geo_dict[_k.strip().lower()] = int(_v.strip())
+                            except ValueError:
+                                pass
+                    if {"x", "y", "width", "height"}.issubset(_geo_dict):
+                        extended["window_geometry"] = {
+                            "x": _geo_dict["x"],
+                            "y": _geo_dict["y"],
+                            "width": _geo_dict["width"],
+                            "height": _geo_dict["height"],
+                        }
         except Exception:
-            pass  # xdotool absent or failed — non-fatal
+            pass
 
         # Active process snapshot (psutil — cross-platform)
         try:
