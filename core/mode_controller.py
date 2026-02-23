@@ -40,7 +40,7 @@ class ArmedTimeoutError(ModeTransitionError):
 class ModeController:
 
     MAX_TRANSITION_HISTORY = 2000
-    MAX_PLANNING_SECONDS = 60.0
+    MAX_PLANNING_SECONDS = 180.0
     MAX_PLAN_ID_LENGTH = 128
 
     # §R8: ARMED mode timeout — prevents infinite ARMED stall.
