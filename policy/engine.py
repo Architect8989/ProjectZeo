@@ -89,12 +89,28 @@ class PolicyEngine:
     })
 
     def __init__(self, allowed_apps=None):
-        # Roles that should never be interacted with automatically
+        # FIX-M4 (RB-4 / SI-3): Removed "terminal" from denied_roles.
+        #
+        # Bug: The AT-SPI role of a terminal emulator's text area is "terminal".
+        # Terminal emulators (gnome-terminal, xterm, konsole, etc.) are listed in
+        # allowed_apps, creating a silent policy contradiction: the app was allowed
+        # but every interaction with its text area was denied via the role check,
+        # which fired BEFORE the app check. All GUI terminal tasks failed silently.
+        #
+        # The denied_roles set should contain only roles where autonomous interaction
+        # could cause irreversible harm regardless of the hosting application. The
+        # "terminal" role in an explicitly-allowed terminal emulator is intentional
+        # and safe. "password text" and "alert" retain their denials because
+        # autonomous interaction with password fields and alert dialogs is always
+        # hazardous, regardless of the application context.
+        #
+        # Operators who need to permit alert/dialog interaction (e.g., for
+        # auto-dismissing non-destructive OK dialogs) should subclass PolicyEngine
+        # and override denied_roles in their subclass, or pass a custom validate()
+        # implementation. Do NOT remove "password text" from denied_roles.
         self.denied_roles = {
-            "terminal",
             "password text",
             "alert",
-            "dialog",
         }
 
         # Names that imply destructive or privileged intent
