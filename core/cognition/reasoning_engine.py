@@ -1,5 +1,3 @@
-# core/cognition/reasoning_engine.py
-
 from typing import Dict, Any, List
 import json
 
@@ -13,6 +11,78 @@ class ReasoningEngine:
     MAX_ENTITIES = 20
     MAX_TEXT_CHARS = 400
     MAX_JSON_CHARS = 8000
+
+    # HAR-5 (MATH-9): Comprehensive injection marker set.
+    #
+    # Each string is lowercased; _truncate_text() lowercases the input before
+    # checking so the comparison is case-insensitive.
+    #
+    # Markers cover:
+    #   - Classic direct override phrases
+    #   - Common LLM template delimiters used in fine-tuned models
+    #   - Structural injections (new system prompt, role override)
+    #   - Common paraphrases found in adversarial prompt research
+    #
+    # Operators who deploy this system against richer adversarial environments
+    # should extend this frozenset or replace _truncate_text() with a
+    # dedicated classifier.
+    _INJECTION_MARKERS = frozenset({
+        # Classic override phrases
+        "ignore previous instructions",
+        "ignore all previous",
+        "ignore prior instructions",
+        "disregard previous",
+        "disregard all previous",
+        "disregard prior instructions",
+        "disregard the above",
+        "forget previous instructions",
+        "forget all previous",
+        "override previous instructions",
+        "override the above",
+
+        # "New instruction" injection patterns
+        "new instruction:",
+        "new instructions:",
+        "updated instruction:",
+        "revised instruction:",
+        "important instruction:",
+
+        # System prompt / role injection
+        "system:",
+        "system prompt:",
+        "new system prompt:",
+        "<|system|>",
+        "[system]",
+        "###system",
+        "### system",
+
+        # LLM template delimiters used in fine-tuned / instruction-tuned models
+        "</s>",
+        "[inst]",
+        "</inst>",
+        "[/inst]",
+        "<s>[inst]",
+        "<|im_start|>",
+        "<|im_end|>",
+        "<|endoftext|>",
+        "assistant:",
+        "human:",
+        "user:",
+
+        # Jailbreak prefix patterns
+        "act as",
+        "pretend you are",
+        "pretend to be",
+        "you are now",
+        "from now on",
+        "your new role",
+        "your task is now",
+
+        # Escaping / structural attacks
+        "```system",
+        "---system",
+        "=== system",
+    })
 
     def __init__(self, llm_callable):
         self._llm = llm_callable
@@ -74,12 +144,10 @@ class ReasoningEngine:
 
         safe: Dict[str, Any] = {}
 
-        # Basic scalar fields
         for key in ["focused_app", "entity_count"]:
             if key in perception:
                 safe[key] = perception.get(key)
 
-        # Entities (bounded + truncated)
         entities = perception.get("entities", [])
         if isinstance(entities, list):
 
@@ -101,7 +169,6 @@ class ReasoningEngine:
                         safe_ent[k] = v
 
                     elif isinstance(v, dict):
-                        # shallow sanitize nested dict
                         nested = {}
                         for nk, nv in v.items():
                             if isinstance(nv, str):
@@ -117,17 +184,32 @@ class ReasoningEngine:
         return safe
 
     # ==================================================
-    # TEXT TRUNCATION + BASIC INJECTION DAMPENING
+    # TEXT TRUNCATION + INJECTION DAMPENING  (HAR-5 FIX)
     # ==================================================
 
     def _truncate_text(self, text: str) -> str:
+        """
+        HAR-5 (MATH-9): Truncate and sanitize entity text.
+
+        Checks against a comprehensive set of injection markers
+        (_INJECTION_MARKERS) instead of the original single-marker check
+        for "ignore previous instructions".
+
+        The original single-marker check was trivially bypassed by any
+        alternative phrasing.  ExecutionPlanner already used 7 markers;
+        this method now uses an aligned and extended set for consistency.
+
+        Returns "" (empty string) if any injection marker is found,
+        suppressing the hostile text from the LLM prompt entirely.
+        Returns text[:MAX_TEXT_CHARS] otherwise.
+        """
         if not isinstance(text, str):
             return ""
 
-        # Remove obvious instruction-like markers
         lowered = text.lower()
-        if "ignore previous instructions" in lowered:
-            return ""
+        for marker in self._INJECTION_MARKERS:
+            if marker in lowered:
+                return ""
 
         return text[: self.MAX_TEXT_CHARS]
 
