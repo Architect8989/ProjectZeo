@@ -242,6 +242,7 @@ def _execute_autonomous_loop(
     if prior_belief_state is not None:
         try:
             belief = BeliefState.from_dict(prior_belief_state, intent_hash=terminal_prompt)
+            belief.consecutive_high_stability_count = 0
             journal.record({"event": "belief_state_restored", "from_prior": True})
         except Exception as _bs_err:
             belief = BeliefState(intent_hash=terminal_prompt)
