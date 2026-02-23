@@ -505,7 +505,14 @@ class BeliefState:
             # \x00 tag: unambiguously None — cannot be produced by any str value.
             return b"\x00"
         if isinstance(value, float):
-            return b"\x03" + struct.pack("!d", value)
+            # FIX SI-5: Quantize to 6 decimal places before packing.
+            # IEEE 754 rounding accumulates platform-specific drift at the 15th
+            # decimal place (e.g. 0.33333333333333337 vs 0.3333333333333333).
+            # Divergent floats produce divergent struct.pack bytes → divergent
+            # commitment hashes even when belief distributions are identical.
+            # Rounding to 6 decimals canonicalises values while preserving all
+            # operationally meaningful precision for probability values in [0,1].
+            return b"\x03" + struct.pack("!d", round(value, 6))
         if isinstance(value, (int, bool)):
             return b"\x02" + str(value).encode()
         if isinstance(value, str):
@@ -553,8 +560,13 @@ class BeliefState:
 
         obs_bytes = self._stable_value_bytes(observation)
 
+        # FIX SI-5: Quantize probability floats to 6 decimal places before
+        # packing. Mirrors the _stable_value_bytes float fix — state_probabilities
+        # are normalised floats susceptible to the same platform drift. Without
+        # quantization, commit() produces platform-divergent hashes for identical
+        # belief distributions.
         prob_bytes = b"".join(
-            k.encode() + struct.pack("!d", v)
+            k.encode() + struct.pack("!d", round(v, 6))
             for k, v in sorted(self.state_probabilities.items())
         )
 
