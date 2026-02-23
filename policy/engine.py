@@ -5,12 +5,10 @@ _logger = logging.getLogger(__name__)
 
 
 class PolicyViolationError(RuntimeError):
-    
     pass
 
 
 class PolicyEngine:
-    
 
     ALLOW = "ALLOW"
     DENY = "DENY"
@@ -19,26 +17,34 @@ class PolicyEngine:
     # HAR-04 / FIX-4 (SI-NEW-02): Default allowlist expanded to include common
     # terminal emulators, code editors, and file managers.
     #
-    # Bug: The previous allowlist contained only {"google-chrome", "firefox",
-    # "libreoffice", "gedit"}. Any task requiring gnome-terminal, code, kate,
-    # nautilus, or any other unlisted application would receive DENY on every
-    # action, burning all MAX_REPLANS=3 on consecutive DENY cycles and failing
-    # with TASK_FAILED:max_replans_exceeded — with no operator-visible signal
-    # unless policy logging was enabled.
+    # FIX-C1 (RB-1 CRITICAL): Added "__unknown_app__" to the allowlist.
     #
-    # Fix: add the most commonly needed categories:
-    #   - Terminal emulators: gnome-terminal, xterm, konsole, xfce4-terminal,
-    #                         mate-terminal, tilix, alacritty, Terminal, iTerm
-    #   - Code editors:       code (VSCode), kate, sublime_text, atom, gedit
-    #   - File managers:      nautilus, thunar, nemo, dolphin, Finder
-    #   - Office suite:       libreoffice (and sub-apps: writer, calc, impress)
-    #   - Browsers:           google-chrome, firefox, chromium, brave-browser
+    # Root cause: during world-graph warmup (up to 150s), world_graph.focused_app
+    # has not yet been populated. operate.py uses "__unknown_app__" as the sentinel
+    # when focused_app is empty. Because "__unknown_app__" was not in
+    # _DEFAULT_ALLOWED_APPS, PolicyEngine.validate() returned DENY for EVERY action
+    # during warmup — consuming all MAX_REPLANS=3 within seconds and producing
+    # TASK_FAILED:max_replans_exceeded before a single action was ever executed.
     #
-    # Operators who need a stricter allowlist should pass allowed_apps= at
-    # construction or update policy.yaml (preferred — avoids source changes).
-    # Operators who need additional apps should do the same rather than
-    # modifying this constant directly.
+    # Fix: add "__unknown_app__" to the allowlist.
+    #   - The DENY reason becomes "Unauthorized application: '__unknown_app__'" for
+    #     non-empty focused_app sentinels, giving operators a meaningful error.
+    #   - Operators who need a STRICTER policy (deny actions when app is unknown)
+    #     can construct PolicyEngine(allowed_apps=...) excluding "__unknown_app__".
+    #   - The warmup window is bounded: once world_graph.focused_app populates with
+    #     a real app, the normal allowlist rules apply.
+    #
+    # NOTE: allowing "__unknown_app__" means autonomous actions CAN execute when
+    # the active application is not yet known.  This is the less-safe default but
+    # it matches the practical requirement: the system is useless if no action can
+    # ever fire.  Operators running in higher-assurance environments should replace
+    # this with an explicit app name or delay task arming until warmup completes.
     _DEFAULT_ALLOWED_APPS = frozenset({
+        # Warmup / identity-unknown sentinel — permits actions before world-graph
+        # has observed the first application focus event.  Remove from allowed_apps
+        # at construction if you need strict deny-when-unknown behaviour.
+        "__unknown_app__",
+
         # Browsers
         "google-chrome",
         "firefox",
@@ -80,7 +86,7 @@ class PolicyEngine:
         "dolphin",
         "finder",         # macOS Finder
         "pcmanfm",
-        # System utilities (commonly needed by autonomous tasks)
+        # System utilities
         "evince",         # PDF viewer
         "eog",            # Image viewer
         "gpicview",
@@ -90,30 +96,11 @@ class PolicyEngine:
 
     def __init__(self, allowed_apps=None):
         # FIX-M4 (RB-4 / SI-3): Removed "terminal" from denied_roles.
-        #
-        # Bug: The AT-SPI role of a terminal emulator's text area is "terminal".
-        # Terminal emulators (gnome-terminal, xterm, konsole, etc.) are listed in
-        # allowed_apps, creating a silent policy contradiction: the app was allowed
-        # but every interaction with its text area was denied via the role check,
-        # which fired BEFORE the app check. All GUI terminal tasks failed silently.
-        #
-        # The denied_roles set should contain only roles where autonomous interaction
-        # could cause irreversible harm regardless of the hosting application. The
-        # "terminal" role in an explicitly-allowed terminal emulator is intentional
-        # and safe. "password text" and "alert" retain their denials because
-        # autonomous interaction with password fields and alert dialogs is always
-        # hazardous, regardless of the application context.
-        #
-        # Operators who need to permit alert/dialog interaction (e.g., for
-        # auto-dismissing non-destructive OK dialogs) should subclass PolicyEngine
-        # and override denied_roles in their subclass, or pass a custom validate()
-        # implementation. Do NOT remove "password text" from denied_roles.
         self.denied_roles = {
             "password text",
             "alert",
         }
 
-        # Names that imply destructive or privileged intent
         self.high_risk_name_patterns = [
             re.compile(r"delete", re.IGNORECASE),
             re.compile(r"remove", re.IGNORECASE),
@@ -122,17 +109,11 @@ class PolicyEngine:
             re.compile(r"erase", re.IGNORECASE),
         ]
 
-        # HAR-04: Apps allowed for autonomous interaction.
-        # Accepts a custom set for operator extensibility; falls back to the
-        # conservative default when not provided.
         if allowed_apps is not None:
             self.allowed_apps = frozenset(str(a).lower() for a in allowed_apps)
         else:
             self.allowed_apps = self._DEFAULT_ALLOWED_APPS
 
-        # HAR-04: Emit a startup warning so operators know the allowlist is
-        # active.  Called once at construction rather than per validate() call
-        # to avoid log spam during task execution.
         _logger.info(
             "PolicyEngine initialized. Autonomous interaction allowed for: %s. "
             "Applications outside this set will receive DENY. "
@@ -140,10 +121,6 @@ class PolicyEngine:
             "PolicyEngine._DEFAULT_ALLOWED_APPS.",
             sorted(self.allowed_apps),
         )
-
-    # -------------------------------------------------
-    # HAR-04: Operator utility — emit structured warning for unlisted app.
-    # -------------------------------------------------
 
     def warn_if_unlisted(self, app_name: str) -> None:
         """
@@ -153,10 +130,6 @@ class PolicyEngine:
         silent DENY cases to operators who have not extended the allowlist.
         Without this, the system silently denies all actions on unlisted apps
         and the only signal is the DENY return value from validate().
-
-        Example::
-
-            policy.warn_if_unlisted(current_app_name)
         """
         if app_name and app_name.lower() not in self.allowed_apps:
             _logger.warning(
@@ -166,8 +139,6 @@ class PolicyEngine:
                 app_name,
                 sorted(self.allowed_apps),
             )
-
-    # -------------------------------------------------
 
     def validate(self, node, action: str):
         """
@@ -207,9 +178,6 @@ class PolicyEngine:
             return self.DENY, "Application identity unavailable"
 
         # Hard deny: app not allow-listed
-        # HAR-04: This is the enforcement point for the allowlist.
-        # An unlisted application causes DENY for every action, including
-        # read-only ones. Operators must explicitly add apps to allowed_apps.
         if app not in self.allowed_apps:
             return self.DENY, (
                 f"Unauthorized application: {app!r}. "
