@@ -670,18 +670,21 @@ def _execute_autonomous_loop(
         except Exception:
             belief.record_action(action_key, reward=-0.5)
 
-            # MATH-04 FIX: Pass raw reward (-0.5 for failure) to update_regret,
-            # not the normalised value from the history deque. Regret must be
-            # in raw (confidence delta) units so it is meaningful across sessions
-            # and comparable between actions with different sample-count histories.
-            # HAR-1 (MATH-1): global_best_reward() now returns None when no
-            # rewards have been recorded.  Skip regret update when None so
-            # regret is not computed against a phantom 0.0 optimum — which
-            # would make regret a constant (0.5) in uniformly failing contexts,
-            # eliminating its discriminative function.
+            # MATH-04 FIX: Pass raw reward (-0.5 for failure) to update_regret.
+            # HAR-1 (MATH-1): global_best_reward() returns None when no rewards
+            # have been recorded — skip regret update to avoid phantom 0.0 optimum.
             best_reward = belief.global_best_reward()
             if best_reward is not None:
                 belief.update_regret(action_key, -0.5, best_reward)
+
+            # FIX H-1: Commit on EVERY action, including failures.
+            # Bug: belief.commit() was only called in the success path. Repeated
+            # failures kept commitment_hash at its initial value (SHA-256(intent)),
+            # keeping Thompson seeds in a low-diversity regime: the same actions
+            # were re-sampled under nearly identical conditions across failure
+            # iterations. Diversifying the chain on failure ensures subsequent
+            # Thompson samples differ from the failed attempt, improving recovery.
+            belief.commit(action_key, {"outcome": "failure", "step": current_step_index})
 
             stagnant_iterations += 1
             if stagnant_iterations >= stagnant_limit:
@@ -910,7 +913,12 @@ def _execute_decision(
         if isinstance(command, str) and command.strip():
             result = os_backend.run_command(command.strip())
             return result
-        return {"operation": "verify", "result": "visual_check", "success": True}
+        # FIX-8: Return success=None (inconclusive) instead of success=True.
+        # With success=True all visual verify steps auto-passed without any
+        # actual check. StepVerifier.verify_step() interprets success=None
+        # as "inconclusive — rely on world-graph delta for confidence scoring"
+        # rather than auto-passing. This prevents spurious progress accounting.
+        return {"operation": "verify", "result": "visual_check", "success": None}
 
     # ----------------------------------------------------------
     # TOOL INSTALLATION
