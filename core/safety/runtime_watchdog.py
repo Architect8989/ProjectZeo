@@ -1,6 +1,7 @@
 import psutil
 import time
 import os
+import threading
 from collections import deque
 
 
@@ -31,6 +32,25 @@ class RuntimeWatchdog:
     - No false positives on short CPU spikes
     - Best-effort only (cannot interrupt blocking ops)
     - Deterministic violation semantics
+
+    FIX RB-4: CPU checking can be paused during LLM inference.
+
+    On CPU-only Ollama inference (40-90s per call), sustained CPU usage above
+    90% is expected and legitimate — the model is actively computing. Without
+    pausing, the 3-second sustained CPU window triggers WatchdogViolation mid-
+    inference and forces _force_safe_shutdown(), aborting every task on CPU-only
+    hardware.
+
+    Usage pattern in main.py / run.py:
+        watchdog.pause_cpu()
+        try:
+            result = llm_adapter.get_next_action(...)
+        finally:
+            watchdog.resume_cpu()
+
+    This preserves CPU monitoring for all non-inference phases (UI operations,
+    command execution, restoration) while suppressing false positives during
+    legitimate heavy computation.
     """
 
     def __init__(self):
@@ -40,11 +60,51 @@ class RuntimeWatchdog:
         # Sliding window of CPU samples
         self._cpu_samples = deque(maxlen=CPU_MIN_SAMPLES)
 
+        # FIX RB-4: CPU pause flag — thread-safe.
+        # When True, cpu_percent() is NOT called and samples accumulated during
+        # the paused window are discarded on resume.
+        self._cpu_paused: bool = False
+        self._cpu_pause_lock = threading.Lock()
+
         # Prime cpu_percent so first real read is meaningful
         try:
             self.process.cpu_percent(interval=None)
         except Exception:
             pass
+
+    # =================================================
+    # CPU PAUSE / RESUME  [FIX RB-4]
+    # =================================================
+
+    def pause_cpu(self) -> None:
+        """
+        FIX RB-4: Pause CPU monitoring for the duration of an LLM inference call.
+
+        Call before submitting to the LLM adapter. Must be paired with resume_cpu()
+        in a try/finally block. Nested pause_cpu() calls are idempotent.
+        """
+        with self._cpu_pause_lock:
+            self._cpu_paused = True
+
+    def resume_cpu(self) -> None:
+        """
+        FIX RB-4: Resume CPU monitoring after LLM inference completes.
+
+        Clears accumulated samples from the paused window so a legitimate CPU
+        spike during inference does not poison the next monitoring window.
+        """
+        with self._cpu_pause_lock:
+            self._cpu_paused = False
+            self._cpu_samples.clear()  # discard samples from paused window
+
+    def is_cpu_paused(self) -> bool:
+        """Return True if CPU monitoring is currently paused."""
+        with self._cpu_pause_lock:
+            return self._cpu_paused
+
+    # =================================================
+    # MAIN CHECK
+    # =================================================
 
     def check(self):
         now = time.time()
@@ -64,22 +124,30 @@ class RuntimeWatchdog:
             pass
 
         # --- CPU LIMIT (SUSTAINED) ---
-        try:
-            cpu = self.process.cpu_percent(interval=CPU_SAMPLE_INTERVAL)
-            self._cpu_samples.append(cpu)
+        # FIX RB-4: Skip entirely when paused. cpu_percent(interval=0.1) is a
+        # blocking syscall — calling it during LLM inference adds 100ms to every
+        # 250ms heartbeat iteration and accumulates samples that would immediately
+        # trigger WatchdogViolation on resume (90% CPU from inference).
+        with self._cpu_pause_lock:
+            _paused = self._cpu_paused
 
-            # Only evaluate after window is populated
-            if len(self._cpu_samples) >= CPU_MIN_SAMPLES:
-                avg_cpu = sum(self._cpu_samples) / len(self._cpu_samples)
+        if not _paused:
+            try:
+                cpu = self.process.cpu_percent(interval=CPU_SAMPLE_INTERVAL)
+                self._cpu_samples.append(cpu)
 
-                if avg_cpu > MAX_CPU_PERCENT:
-                    self._violate(
-                        f"CPU_LIMIT(avg={avg_cpu:.1f}%)"
-                    )
+                # Only evaluate after window is populated
+                if len(self._cpu_samples) >= CPU_MIN_SAMPLES:
+                    avg_cpu = sum(self._cpu_samples) / len(self._cpu_samples)
 
-        except Exception:
-            # Telemetry failure must never abort execution
-            pass
+                    if avg_cpu > MAX_CPU_PERCENT:
+                        self._violate(
+                            f"CPU_LIMIT(avg={avg_cpu:.1f}%)"
+                        )
+
+            except Exception:
+                # Telemetry failure must never abort execution
+                pass
 
     def _violate(self, reason: str):
         msg = f"WATCHDOG_LIMIT_EXCEEDED:{reason}"
