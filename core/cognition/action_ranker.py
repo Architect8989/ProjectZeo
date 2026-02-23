@@ -7,12 +7,47 @@ import json
 
 
 class ActionRanker:
-    
+
 
     MIN_TAU = 0.15
     MAX_TAU = 1.5
     MAX_EXPLORATION_BONUS = 1.0  # prevent UCB domination
     MIN_EXPLORATION_BONUS = 0.0  # FIX MATH-05: prevent exploitation suppression
+
+    # MATH-NEW-02 FIX: Default saturation; tuned by set_plan_horizon().
+    # See set_plan_horizon() docstring for rationale.
+    _DEFAULT_EXPLOIT_SATURATION_N = 50
+
+    def __init__(self) -> None:
+        # MATH-NEW-02 FIX: _exploit_saturation_n is an instance attribute so
+        # set_plan_horizon() can tune it per-task without affecting other
+        # ActionRanker instances (e.g. concurrent replan scenarios).
+        self._exploit_saturation_n: int = self._DEFAULT_EXPLOIT_SATURATION_N
+
+    def set_plan_horizon(self, total_steps: int) -> None:
+        """
+        MATH-NEW-02 / HARDEN-03 FIX: Tune EXPLOIT_SATURATION_N to the plan horizon.
+
+        Root cause: the fixed _EXPLOIT_SATURATION_N = 50 local constant meant
+        that for a 3-step plan the agent ran in exploration-heavy weighting mode
+        (EU weight ≈ 0.50, Thompson ≈ 0.25) for the entire plan execution, since
+        no single action ever accumulated 50 visits in a 3-step plan. The intended
+        effect — gradually shifting weight from exploration to exploitation as the
+        agent gains confidence — never engaged for short plans.
+
+        Fix: set saturation to max(10, total_steps * 2). This means:
+          - A 3-step plan saturates at 6 visits (≥ min 10 → effective 10).
+            After 10 visits, EU weight ≈ 0.90 — full exploit mode.
+          - A 25-step plan saturates at 50 visits (matches old fixed value).
+          - A 50-step plan saturates at 100 visits — proportionally later.
+
+        The minimum of 10 prevents premature saturation on single-step plans where
+        even a handful of stagnant iterations should remain exploration-leaning.
+
+        Call this method once per operate_main() invocation, after the execution
+        plan is loaded and plan step count is known. operate.py already does this.
+        """
+        self._exploit_saturation_n = max(10, total_steps * 2)
 
     # ==================================================
     # ACTION SELECTION (DETERMINISTIC except for tie-breaking)
@@ -56,7 +91,7 @@ class ActionRanker:
             # Delegated Thompson (single coherent implementation)
             thompson = belief_state.thompson_sample(key)
 
-            # Fix 13: Adaptive scoring weights.
+            # Fix 13 / MATH-NEW-02 FIX: Adaptive scoring weights tuned to plan horizon.
             # Fixed weights (0.6 EU, 0.2 explore, 0.2 Thompson) are problematic
             # because as an action matures (high visit count), Thompson and UCB
             # both converge toward their means — the exploration components
@@ -64,13 +99,14 @@ class ActionRanker:
             # less room for EU (exploitation) when it is most informative.
             #
             # Fix: shift weight from Thompson toward EU linearly as visit count
-            # grows, saturating at EXPLOIT_SATURATION_N visits.
-            # At n=0:   EU=0.50, explore=0.25, Thompson=0.25
-            # At n=50:  EU=0.75, explore=0.20, Thompson=0.05
+            # grows, saturating at _exploit_saturation_n visits (tuned by
+            # set_plan_horizon() to max(10, plan_steps * 2) — short plans
+            # reach exploit-weighted mode proportionally earlier).
+            # At n=0:          EU=0.50, explore=0.25, Thompson=0.25
+            # At n=saturation: EU≈0.90, explore≈0.20, Thompson≈0.05
             # Weights always sum to 1.0 (verified by construction below).
             n = belief_state.action_counts.get(key, 0)
-            _EXPLOIT_SATURATION_N = 50
-            _t = min(1.0, n / _EXPLOIT_SATURATION_N)  # 0.0 (new) → 1.0 (mature)
+            _t = min(1.0, n / self._exploit_saturation_n)  # 0.0 (new) → 1.0 (mature)
 
             # Thompson shifts from 0.25 → 0.05 as action matures
             w_thompson = 0.25 - 0.20 * _t
