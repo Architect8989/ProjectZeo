@@ -30,30 +30,32 @@ from operate.operate import operate_main
 
 from restoration.snapshot_provider import SnapshotProvider, SnapshotProviderError
 from restoration.restore_provider import RestoreProvider
-# FIX RB-04 / F-04: Import and wire RestoreVerifier so post-restore assertions
-# are actually executed. Previously the class was imported nowhere and its
-# contract (mode check, input-lock check, cursor, focus) was never enforced.
 from restoration.restore_verifier import RestoreVerifier, RestorationVerificationError
 
 from core.planner.execution_planner import ExecutionPlanner
+
+# FIX-C3 (RB-4): Import RuntimeWatchdog so it can be instantiated and called
+# in the heartbeat loop.  Previously the class was defined but never imported
+# or instantiated anywhere in the execution path — all runtime safety limits
+# (4 GB RAM, 90% CPU, 1-hour wall-clock) were permanently inactive.
+from core.safety.runtime_watchdog import RuntimeWatchdog, WatchdogViolation
+
+# HAR-4: Import uninstall_patches so the global builtins.open monkey-patch
+# is cleaned up on shutdown.  Without this call in the finally block, the
+# patch lives for the entire process lifetime — an undocumented permanent
+# process-wide side effect that interferes with test isolation and subprocess
+# environments.
+from adapters.apis_safety_layer import uninstall_patches
 
 
 def _shutdown_executor(executor, wait: bool = False) -> None:
     """
     RB-08 FIX: Python 3.8 compatibility for ThreadPoolExecutor.shutdown().
-
-    The cancel_futures parameter was added in Python 3.9. Calling
-    executor.shutdown(wait=False, cancel_futures=True) on Python 3.8 raises
-    TypeError: shutdown() got an unexpected keyword argument 'cancel_futures'.
-
-    This helper calls shutdown() with cancel_futures only when the runtime
-    supports it (Python >= 3.9); falls back to shutdown(wait=wait) on 3.8.
     """
     if sys.version_info >= (3, 9):
         executor.shutdown(wait=wait, cancel_futures=True)
     else:
         executor.shutdown(wait=wait)
-
 
 
 # PATCH §1.5: reduced from 2.0s to 0.25s for lower intent-to-task latency
@@ -62,8 +64,7 @@ HEARTBEAT_INTERVAL = 0.25
 MAX_TASK_SECONDS = 90 * 60
 MAX_REPLANS = 3
 
-# FIX-4: Extended from 8s to 150s to accommodate CPU inference latency
-# (Qwen2.5-VL: 40–90s per frame on CPU-only hardware).
+# FIX-4: Extended from 8s to 150s
 WARMUP_TIMEOUT_SECONDS = 150.0
 WARMUP_STABLE_FRAMES = 3
 
@@ -159,7 +160,6 @@ def _enforce_task_timeout():
 def _safe_begin_restoration(mode: ModeController) -> bool:
     """
     PATCH §1.5: begin_restoration() only accepts EXECUTING mode.
-    Handles all mode states gracefully in the finally block.
     Returns True if restoration should proceed, False if it should be skipped.
     """
     current = mode.mode
@@ -216,7 +216,13 @@ def main(llm_callable: Callable, model_name: str):
     _install_signal_handlers()
     atexit.register(lambda: _force_safe_shutdown(os_backend, auth_state, "atexit"))
 
-    # Mutable fingerprint — refreshed after each task and each replan
+    # FIX-C3 (RB-4): Instantiate RuntimeWatchdog at startup so all runtime
+    # safety limits are active for the process lifetime.
+    # Previously the class was defined but never instantiated — the 4 GB RAM,
+    # 90% sustained CPU, and 1-hour wall-clock limits were completely inactive.
+    # watchdog.check() is called in the heartbeat loop below.
+    watchdog = RuntimeWatchdog()
+
     env_fingerprint = collect_environment_fingerprint()
 
     persisted = auth_state.load()
@@ -232,14 +238,7 @@ def main(llm_callable: Callable, model_name: str):
     observer_loop.start()
 
     # --------------------------------------------------------
-    # FIX-4: Extended warmup — 150s for CPU inference compat.
-    # RB-A8 FIX: Track whether warmup fully stabilised and emit a structured
-    # warning if it did not. On bare/near-empty desktops, entity_count() may
-    # stay at 0 for the entire warmup window. The loop silently exits and
-    # take_snapshot() is called on an empty world model, yielding a plan with
-    # zero screen context. The fix surfaces this condition to operators via a
-    # structured stderr warning with actionable guidance, and records a
-    # degraded-warmup flag on auth_state for post-hoc audit review.
+    # Warmup — extended to 150s for CPU inference compat.
     # --------------------------------------------------------
     stable_frames = 0
     warmup_deadline = time.time() + WARMUP_TIMEOUT_SECONDS
@@ -262,7 +261,7 @@ def main(llm_callable: Callable, model_name: str):
             f"[WARMUP] WARNING: warmup did not reach {WARMUP_STABLE_FRAMES} stable frames "
             f"within {WARMUP_TIMEOUT_SECONDS:.0f}s. "
             f"entity_count={world_graph.entity_count()}, stable_frames={stable_frames}. "
-            f"Proceeding with degraded world model — plan quality may be reduced. "
+            f"Proceeding with degraded world model. "
             f"If running on a bare desktop, ensure at least one application window is "
             f"visible before arming, or increase WARMUP_TIMEOUT_SECONDS.",
             file=sys.stderr,
@@ -276,7 +275,7 @@ def main(llm_callable: Callable, model_name: str):
                 "timeout_seconds": WARMUP_TIMEOUT_SECONDS,
             })
         except Exception:
-            pass  # auth_state record failure must not block startup
+            pass
 
     snapshot_provider = SnapshotProvider(
         observer=observer,
@@ -290,10 +289,6 @@ def main(llm_callable: Callable, model_name: str):
         snapshot_provider=snapshot_provider,
     )
 
-    # FIX RB-04 / F-04: Instantiate RestoreVerifier with the OS backend and
-    # mode controller so its verification contract is actually enforced after
-    # each restoration. cursor_tolerance_px=5 matches RestoreProvider's own
-    # CURSOR_TOLERANCE_PX constant.
     restore_verifier = RestoreVerifier(
         os_backend=os_backend,
         mode_controller=mode,
@@ -313,13 +308,23 @@ def main(llm_callable: Callable, model_name: str):
             try:
                 _enforce_task_timeout()
 
+                # FIX-C3 (RB-4): Call watchdog.check() on every heartbeat so
+                # runtime safety limits are enforced.  WatchdogViolation is a
+                # subclass of RuntimeError and is caught by the outer
+                # `except Exception` block, which calls _force_safe_shutdown().
+                try:
+                    watchdog.check()
+                except WatchdogViolation as wv:
+                    print(f"[MAIN] WatchdogViolation: {wv}", file=sys.stderr)
+                    _force_safe_shutdown(os_backend, auth_state, f"watchdog:{wv}")
+                    break
+
                 mode.update_observer_health(observer.is_healthy())
                 mode.update_vision_status(vision_runtime.is_healthy())
 
                 if mode.mode == SystemMode.PLANNING:
                     mode.check_planning_timeout()
 
-                # §R8: guard ARMED mode stall
                 if mode.mode == SystemMode.ARMED:
                     mode.check_armed_timeout()
 
@@ -328,6 +333,9 @@ def main(llm_callable: Callable, model_name: str):
                     continue
 
                 _set_task_start(time.time())
+                # FIX-C3: Reset watchdog start time when a new task begins so the
+                # 1-hour wall-clock limit applies per-task, not per-process.
+                watchdog.start_time = time.time()
                 replan_count = 0
 
                 snapshot_id = mode.consume_snapshot()
@@ -340,7 +348,6 @@ def main(llm_callable: Callable, model_name: str):
                 if not intent or not intent.strip():
                     raise RuntimeError("Invalid intent")
 
-                # GAP-3 FIX: shutdown previous planner executor before replacing
                 if _current_planner is not None:
                     try:
                         _shutdown_executor(_current_planner._executor, wait=False)
@@ -354,7 +361,6 @@ def main(llm_callable: Callable, model_name: str):
                 )
                 _current_planner = planner
 
-                # PATCH §main-7: retry transient health failures before begin_planning
                 for _health_attempt in range(HEALTH_RETRY_MAX):
                     try:
                         mode.begin_planning()
@@ -434,16 +440,30 @@ def main(llm_callable: Callable, model_name: str):
                                         f"[MAIN] Replan snapshot failed (using prior): {snap_err}",
                                         file=sys.stderr,
                                     )
-                                    new_snapshot_id = snapshot_id  # reuse prior snapshot
+                                    new_snapshot_id = snapshot_id
+
                                 mode.attach_snapshot(new_snapshot_id)
-                                mode.arm(intent)
+
+                                # FIX-C5 (RB-6): Use mode.arm_for_replan(intent) instead
+                                # of mode.arm(intent) in the replan sequence.
+                                #
+                                # arm_for_replan() was added specifically as the
+                                # self-documenting, safe-by-construction path for
+                                # replanning.  Using arm() here is structurally
+                                # incorrect: if the arm() guard is ever reinstated
+                                # (e.g. to prevent concurrent arming), all replan
+                                # sequences will raise ModeTransitionError silently
+                                # and arm_for_replan() will remain unreachable dead code.
+                                #
+                                # Using the purpose-built method makes the contract
+                                # explicit and future-proof against arm() guard changes.
+                                mode.arm_for_replan(intent)
 
                                 _ingest_latest_perception(observer, world_graph)
                                 planner.update_world_snapshot(world_graph.snapshot())
 
                                 mode.begin_planning()
 
-                                # §R5: refresh fingerprint before replan
                                 env_fingerprint = collect_environment_fingerprint()
                                 planner.refresh_environment(env_fingerprint)
 
@@ -472,7 +492,6 @@ def main(llm_callable: Callable, model_name: str):
 
                     if should_restore:
                         try:
-                            # DEF-4: daemon-thread timeout guard on restoration
                             _restore_exc: list = []
 
                             def _do_restore():
@@ -497,13 +516,6 @@ def main(llm_callable: Callable, model_name: str):
                             if _restore_exc:
                                 raise _restore_exc[0]
 
-                            # FIX RTB-03: complete_execution() must be called
-                            # BEFORE restore_verifier.verify() so the mode is
-                            # already OBSERVER when _verify_execution_mode()
-                            # checks it. Previously verify() was called while
-                            # the mode was still RESTORING, causing the mode
-                            # assertion to always fail silently and masking any
-                            # genuine post-restore mode anomalies.
                             mode.complete_execution()
 
                             snap_obj = snapshot_provider.get_snapshot(snapshot_id)
@@ -511,28 +523,6 @@ def main(llm_callable: Callable, model_name: str):
                                 try:
                                     restore_verifier.verify(snap_obj)
                                 except RestorationVerificationError as rve:
-                                    # FIX H1: Restoration verification failure is
-                                    # now a HARD FAILURE, not a warning.
-                                    #
-                                    # The system claimed "deterministic verification
-                                    # (fail-closed)" but the original code caught
-                                    # RestorationVerificationError, printed a warning,
-                                    # and continued execution — silently ignoring that
-                                    # the post-restore workspace state does not match
-                                    # the pre-task snapshot.
-                                    #
-                                    # Fix: print a HARD FAILURE message and re-raise.
-                                    # The re-raised exception propagates to the outer
-                                    # "except Exception as cleanup_err" block, which
-                                    # calls _force_safe_shutdown() — the same path as
-                                    # any other restoration failure. The system is now
-                                    # actually fail-closed.
-                                    #
-                                    # Note: restoration itself already completed
-                                    # (cursor moved, window focused). Verification
-                                    # failure means the post-restore state does not
-                                    # match expectations — a genuine anomaly that must
-                                    # not be swallowed.
                                     print(
                                         f"[MAIN] RestoreVerifier HARD FAILURE: {rve}",
                                         file=sys.stderr,
@@ -568,19 +558,17 @@ def main(llm_callable: Callable, model_name: str):
                         except Exception:
                             pass
 
-                    # §R5: refresh fingerprint after successful task
                     if _task_succeeded:
                         try:
                             env_fingerprint = collect_environment_fingerprint()
                         except Exception:
-                            pass  # non-fatal
+                            pass
 
                     observer.reset_for_new_task()
                     world_graph.reset()
                     _clear_task_start()
 
             except ArmedTimeoutError as ate:
-                # §R8: ARMED timeout is recoverable
                 print(f"[MAIN] {ate}", file=sys.stderr)
                 mode.force_observer()
                 _clear_task_start()
@@ -588,7 +576,6 @@ def main(llm_callable: Callable, model_name: str):
                 continue
 
             except ObserverBlindnessError as obe:
-                # EVO-4: attempt one vision restart before breaking
                 print(
                     f"[MAIN] Observer blind: {obe} — attempting vision restart",
                     file=sys.stderr,
@@ -634,5 +621,18 @@ def main(llm_callable: Callable, model_name: str):
             vision_runtime.stop()
         except Exception:
             pass
+
+        # HAR-4 (Determinism): Restore builtins.open to its original value on
+        # process shutdown.  apply_patches() installs a global monkey-patch on
+        # builtins.open for the process lifetime without cleaning it up.  For
+        # production long-running processes this is usually acceptable, but it
+        # causes false-positive blocks and test isolation failures in environments
+        # that reload modules or share a Python interpreter across test runs.
+        # Calling uninstall_patches() here is cheap (single attribute swap) and
+        # makes the side effect lifecycle explicit and bounded.
+        try:
+            uninstall_patches()
+        except Exception:
+            pass  # Non-fatal — shutdown path must not raise
 
         _force_safe_shutdown(os_backend, auth_state, "shutdown")
