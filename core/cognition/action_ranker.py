@@ -2,7 +2,6 @@
 
 from typing import List, Dict, Any
 import math
-import random
 import hashlib
 import json
 
@@ -12,10 +11,18 @@ class ActionRanker:
     Deterministic action selector.
 
     Guarantees:
-    - No randomness
+    - No randomness: tie-breaking is derived from belief_state.commitment_hash
+      (a SHA-256 chain seeded per intent), not from Python's process-level RNG.
     - Stable action identity
     - Single Thompson source (delegated to BeliefState)
     - Bounded exploration bonus (both above AND below zero)
+
+    FIX HARD-1 (SI-4 / §3.2): The previous implementation used random.choice()
+    for tie-breaking, which was non-deterministic across runs. The docstring
+    claimed "No randomness" while the code comments admitted "Uniform random
+    tie-breaking" — a direct contradiction. Tie-breaking is now derived from
+    commitment_hash bytes, making action selection fully reproducible for
+    identical inputs.
 
     FIX MATH-05: exploration_bonus was previously only clamped at the top
     (min(bonus, MAX_EXPLORATION_BONUS)). When ucb_full < mean_reward (which
@@ -111,25 +118,43 @@ class ActionRanker:
 
         probabilities = [s / total for s in exp_scores]
 
-        # MR-03 FIX: Uniform random tie-breaking among equally-scoring actions.
-        # ─────────────────────────────────────────────────────────────────
-        # Bug: max(range(len(actions)), key=lambda i: probabilities[i]) uses
-        # Python's max() which returns the LAST maximum when multiple actions
-        # share the highest probability. In the common case where all actions
-        # are unseen (probabilities are equal), this always picks the last
-        # action in the list — biasing exploration toward the end of whatever
-        # ordering the planner happened to produce.
+        # HARD-1 (SI-4 / §3.2): Deterministic tie-breaking among equally-scoring
+        # actions, derived from belief_state.commitment_hash.
         #
-        # Fix: collect all maximally-scoring actions and choose uniformly at
-        # random. This gives true uniform exploration when no history exists
-        # and preserves correct exploitation when one action is clearly better.
-        # ─────────────────────────────────────────────────────────────────
+        # Bug: random.choice(candidates) uses Python's process-level random module,
+        # which is NOT seeded deterministically. The class docstring claims "No
+        # randomness" and prior code comments stated "Uniform random tie-breaking"
+        # — a direct contradiction. Across runs with identical belief state and
+        # action set, different action selections were produced whenever multiple
+        # candidates tied for maximum softmax probability (common at task start
+        # when all actions are unseen). This made the commitment chain diverge
+        # from run to run, breaking post-hoc replay.
+        #
+        # Fix: derive the tie-breaking index from commitment_hash, which is itself
+        # a deterministic SHA-256 chain seeded per intent. For identical inputs
+        # (same intent, same action sequence, same world state), commitment_hash
+        # is identical, and therefore the same candidate is selected. The selection
+        # rotates predictably as the chain advances — no process-level RNG needed.
+        #
+        # Implementation: take the first 8 bytes of commitment_hash as a big-endian
+        # uint64, then index into candidates via modulo. This preserves uniform
+        # coverage over candidates (no modulo bias for candidate lists ≤ 2^32).
         max_prob = max(probabilities)
         candidates = [
             i for i, p in enumerate(probabilities)
             if abs(p - max_prob) < 1e-9
         ]
-        selected_index = random.choice(candidates)
+        if len(candidates) == 1:
+            selected_index = candidates[0]
+        else:
+            # Deterministic index derived from commitment_hash.
+            # Falls back to index 0 if commitment_hash is unavailable or malformed.
+            try:
+                _hash_bytes = bytes.fromhex(belief_state.commitment_hash[:16])
+                _hash_int = int.from_bytes(_hash_bytes, "big")
+                selected_index = candidates[_hash_int % len(candidates)]
+            except Exception:
+                selected_index = candidates[0]
 
         return actions[selected_index]
 
