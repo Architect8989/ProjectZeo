@@ -47,8 +47,39 @@ class RestoreProvider:
         self._snapshot_provider = snapshot_provider
         self._lock = threading.Lock()
 
-        os.makedirs(os.path.dirname(self._RESTORE_LEDGER_PATH), exist_ok=True)
-        self._completed_snapshots: Set[str] = self._load_ledger()
+        # RB-4 FIX: Wrap os.makedirs() in try/except so a read-only filesystem
+        # (container, NFS mount, CI environment) does not crash the process at
+        # startup before any task has run.
+        #
+        # Previous behaviour: os.makedirs(..., exist_ok=True) raised PermissionError
+        # on read-only deployments, propagating out of __init__ and preventing
+        # main() from starting entirely.
+        #
+        # Fix: catch the error, set _ledger_available=False, and continue.
+        # When False, _persist_ledger() is a no-op (no write attempted) and
+        # _load_ledger() returns an empty set (no read attempted). The only
+        # functional degradation is that duplicate-restore protection is disabled:
+        # a snapshot could theoretically be restored twice if the process
+        # crashes and restarts during the restoration window. This is a safe
+        # trade-off — a double restoration (cursor + focus) is idempotent.
+        self._ledger_available: bool = True
+        try:
+            os.makedirs(os.path.dirname(self._RESTORE_LEDGER_PATH), exist_ok=True)
+        except (PermissionError, OSError) as _ledger_dir_err:
+            self._ledger_available = False
+            import sys as _sys
+            print(
+                f"[RestoreProvider] WARNING: Cannot create ledger directory "
+                f"({os.path.dirname(self._RESTORE_LEDGER_PATH)!r}): "
+                f"{_ledger_dir_err}. "
+                "Duplicate-restore protection is DISABLED for this session. "
+                "This is expected on read-only filesystems (containers, NFS, CI).",
+                file=_sys.stderr,
+            )
+
+        self._completed_snapshots: Set[str] = (
+            self._load_ledger() if self._ledger_available else set()
+        )
 
     # =========================================================
     # LEDGER
@@ -72,6 +103,11 @@ class RestoreProvider:
             raise RestorationError(f"Restore ledger load failed: {e}") from e
 
     def _persist_ledger(self) -> None:
+        # RB-4 FIX: Skip write entirely when the ledger directory is not writable.
+        # This path is taken on read-only filesystems (see __init__ comment).
+        if not self._ledger_available:
+            return
+
         tmp_path = self._RESTORE_LEDGER_PATH + ".tmp"
 
         try:
