@@ -79,6 +79,24 @@ class OperatingSystem:
                 self.force_release_all(reason="heartbeat_timeout")
 
     # =================================================
+    # SCREEN SIZE  [FIX RB-1]
+    # =================================================
+
+    def screen_size(self) -> tuple:
+        """
+        FIX RB-1: Return (width, height) in pixels.
+
+        operate.py:_execute_decision() calls this whenever an OCR-resolved
+        click has absolute pixel coordinates (x > 1.0 or y > 1.0).
+        Without this method every OCR text-targeted click raised
+        AttributeError → TASK_FAILED → replan consumed → task failed.
+
+        pyautogui.size() is authoritative and cross-platform.
+        """
+        w, h = pyautogui.size()
+        return int(w), int(h)
+
+    # =================================================
     # COMMANDS / FILES
     # =================================================
 
@@ -90,10 +108,6 @@ class OperatingSystem:
         if sudo and hasattr(os, "geteuid") and os.geteuid() != 0:
             full_cmd = f"sudo {cmd}"
 
-        # FIX RTB-04: Pass timeout to subprocess.run() so hung installs
-        # (apt-get, npm install, curl) do not block the execute thread
-        # indefinitely. Default is None (no limit) for general commands;
-        # callers may pass INSTALL_COMMAND_TIMEOUT_SECONDS explicitly.
         try:
             result = subprocess.run(
                 full_cmd,
@@ -244,6 +258,79 @@ class OperatingSystem:
         return self.get_focused_window()
 
     # =================================================
+    # WINDOW GEOMETRY  [FIX H-2]
+    # =================================================
+
+    def get_window_geometry(self, window_id: str) -> Dict[str, int]:
+        """
+        FIX H-2: Return geometry dict for a window identified by title.
+
+        RestoreVerifier._verify_window_geometry() calls this when
+        snapshot.metadata["extended"]["window_geometry"] is present.
+        Previously absent → hasattr() guard silently skipped the check,
+        making geometry verification permanently dead code.
+
+        Linux: queries xdotool. macOS/Windows: raises OSError (best-effort).
+        Callers (RestoreVerifier) swallow OSError and continue.
+        """
+        if not isinstance(window_id, str) or not window_id.strip():
+            raise OSError("get_window_geometry(): window_id must be a non-empty string")
+
+        system = platform.system()
+
+        if system == "Linux":
+            try:
+                # Find window by title substring
+                search = subprocess.run(
+                    ["xdotool", "search", "--name", window_id.strip()],
+                    capture_output=True,
+                    text=True,
+                    timeout=3,
+                )
+                if search.returncode != 0 or not search.stdout.strip():
+                    raise OSError(f"Window not found: {window_id!r}")
+
+                wid = search.stdout.strip().split()[0]
+
+                geo = subprocess.run(
+                    ["xdotool", "getwindowgeometry", "--shell", wid],
+                    capture_output=True,
+                    text=True,
+                    timeout=3,
+                )
+                if geo.returncode != 0:
+                    raise OSError(f"Could not get geometry for wid {wid}")
+
+                result: Dict[str, int] = {}
+                for line in geo.stdout.splitlines():
+                    if "=" not in line:
+                        continue
+                    key, _, val = line.partition("=")
+                    key = key.strip().lower()
+                    if key in ("x", "y", "width", "height"):
+                        try:
+                            result[key] = int(val.strip())
+                        except ValueError:
+                            pass
+
+                if len(result) < 4:
+                    raise OSError("Incomplete geometry data from xdotool")
+
+                return result
+
+            except subprocess.TimeoutExpired:
+                raise OSError("get_window_geometry(): xdotool timed out")
+            except OSError:
+                raise
+            except Exception as e:
+                raise OSError(f"get_window_geometry() failed: {e}") from e
+
+        raise OSError(
+            f"get_window_geometry() not implemented on {system}. "
+            "RestoreVerifier will treat this as best-effort (soft failure)."
+        )
+
+    # =================================================
     # APPLICATION ACTIVATION
     # =================================================
 
@@ -324,19 +411,14 @@ class OperatingSystem:
         if title.lower() not in focused.get("title", "").lower():
             raise OSError("activate_application(): verification failed")
 
-
     # =================================================
     # ALIASED / MISSING API SHIMS
-    # (required by operate.py and autonomous_installer.py)
     # =================================================
 
     def click(self, x: float, y: float) -> None:
         """
         Click at pixel-absolute coordinates.
-
-        operate.py resolves OCR coordinates to absolute pixels.
-        We convert to percentages and delegate to mouse() so the
-        coordinate validation and pyautogui plumbing is reused.
+        Converts to percentages and delegates to mouse() for validation reuse.
         """
         screen_w, screen_h = pyautogui.size()
         if screen_w <= 0 or screen_h <= 0:
@@ -364,24 +446,12 @@ class OperatingSystem:
     def run_command(self, command: str, *, timeout: Optional[int] = _INSTALL_TIMEOUT) -> subprocess.CompletedProcess:
         """
         Alias for exec() — required by operate.py and autonomous_installer.py.
-
-        FIX RTB-04: Passes INSTALL_COMMAND_TIMEOUT_SECONDS as the default
-        timeout so install commands (apt-get, npm, curl) cannot hang indefinitely.
-        Pass timeout=None explicitly if no limit is desired for short commands.
-
-        Returns the CompletedProcess so callers can inspect stdout/stderr/returncode.
+        Returns CompletedProcess so callers can inspect stdout/stderr/returncode.
         """
         return self.exec(command, timeout=timeout)
 
     def open_browser(self) -> None:
-        """
-        Open the system default web browser.
-
-        Uses platform-appropriate mechanism:
-          - macOS  : open -a Safari (falls back to generic open)
-          - Linux  : xdg-open (falls back to $BROWSER env var)
-          - Windows: start shell built-in
-        """
+        """Open the system default web browser."""
         system = platform.system()
 
         try:
@@ -420,11 +490,7 @@ class OperatingSystem:
         time.sleep(1.5)
 
     def focus_address_bar(self) -> None:
-        """
-        Focus the browser address bar (Ctrl+L / Cmd+L).
-
-        Works on Chrome, Firefox, Safari, Edge on all platforms.
-        """
+        """Focus the browser address bar (Ctrl+L / Cmd+L)."""
         system = platform.system()
         if system == "Darwin":
             self.press(["command", "l"])
@@ -435,10 +501,6 @@ class OperatingSystem:
     def focus_window(self, spec: dict) -> None:
         """
         Bring a window to the foreground by title substring.
-
-        Delegates to activate_application() which handles all platforms
-        and performs post-condition verification.
-
         Required by restore_provider.py during the RESTORING phase.
         """
         if not isinstance(spec, dict):
@@ -453,6 +515,19 @@ class OperatingSystem:
     # =================================================
     # RESTORATION / SAFETY
     # =================================================
+
+    def is_automation_active(self) -> bool:
+        """
+        FIX H-2: Expose automation state for RestoreVerifier._verify_input_released().
+
+        Previously absent. RestoreVerifier checks hasattr(self._os, 'is_automation_active')
+        and silently skips the check when the method is missing — making the
+        'fail-closed verification' claim false. This method makes the check active.
+
+        Thread-safe: reads under _automation_lock.
+        """
+        with self._automation_lock:
+            return self._automation_active
 
     def mark_automation_inactive(self) -> None:
         with self._automation_lock:
