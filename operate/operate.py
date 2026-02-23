@@ -120,10 +120,15 @@ def operate_main(
 
     installer = None
     if observer is not None:
+        # HAR-6 (RB-5): Pass shared_ollama_client from the planner so
+        # AutonomousInstaller reuses the same httpx connection pool instead of
+        # creating a new ollama.Client() (with its own pool) on every call.
+        _shared_client = getattr(planner, "_ollama_client", None)
         installer = AutonomousInstaller(
             observer=observer,
             os_backend=os_backend,
             llm_callable=llm_callable,
+            shared_ollama_client=_shared_client,
         )
 
     # FIX H-03: Instantiate ReasoningEngine with the same llm_callable so it
@@ -192,6 +197,23 @@ def _execute_autonomous_loop(
     # per user objective, preserving within-session determinism while ensuring
     # distinct seed sequences across replans and across different tasks.
     belief = BeliefState(intent_hash=terminal_prompt)
+
+    # FIX-C6 (MATH-3): Call set_plan_horizon() after BeliefState construction
+    # so dynamic regret decay is tuned to the actual plan length.
+    #
+    # Root cause: set_plan_horizon() was defined on BeliefState but never called
+    # anywhere in the execution path.  _regret_decay defaulted permanently to
+    # REGRET_DECAY=0.995 regardless of plan length.  For short plans (~5 steps,
+    # ~65 iterations), 0.995^65 ≈ 0.72 — regret persisted at 72% across the
+    # whole plan, skewing the exploration signal.  Dynamic horizon tuning was
+    # dead code.
+    #
+    # Fix: call set_plan_horizon(real_steps) immediately after BeliefState
+    # construction.  real_steps = len(steps) - 1 to exclude the synthetic DONE
+    # sentinel (consistent with the _real_steps computation in the loop below).
+    _plan_real_steps = max(len(execution_plan.steps) - 1, 1)
+    belief.set_plan_horizon(_plan_real_steps)
+
     action_ranker = ActionRanker()
 
     # PATCH §1.11: bounded command output log fed into world_graph
@@ -652,8 +674,14 @@ def _execute_autonomous_loop(
             # not the normalised value from the history deque. Regret must be
             # in raw (confidence delta) units so it is meaningful across sessions
             # and comparable between actions with different sample-count histories.
+            # HAR-1 (MATH-1): global_best_reward() now returns None when no
+            # rewards have been recorded.  Skip regret update when None so
+            # regret is not computed against a phantom 0.0 optimum — which
+            # would make regret a constant (0.5) in uniformly failing contexts,
+            # eliminating its discriminative function.
             best_reward = belief.global_best_reward()
-            belief.update_regret(action_key, -0.5, best_reward)
+            if best_reward is not None:
+                belief.update_regret(action_key, -0.5, best_reward)
 
             stagnant_iterations += 1
             if stagnant_iterations >= stagnant_limit:
@@ -675,8 +703,10 @@ def _execute_autonomous_loop(
         # MATH-04 FIX: Pass raw_reward directly to update_regret so regret is
         # tracked in interpretable confidence-delta units, not session-relative
         # z-scores. global_best_reward() now reads from _raw_action_rewards.
+        # HAR-1 (MATH-1): Skip regret update when global_best_reward() is None.
         best_reward = belief.global_best_reward()
-        belief.update_regret(action_key, raw_reward, best_reward)
+        if best_reward is not None:
+            belief.update_regret(action_key, raw_reward, best_reward)
 
         if not verification.success:
             stagnant_iterations += 1
