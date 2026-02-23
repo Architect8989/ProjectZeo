@@ -11,7 +11,19 @@ from typing import Optional
 
 
 def atomic_write_intent(intent_text: str, intent_file: str = None) -> None:
-   
+    """
+    Write intent text atomically to the intent file.
+
+    RB-4 / H5 FIX: Explicitly set the temp file mode to 0o644 before rename.
+    Under umask 0000 (Docker --privileged default), files created without an
+    explicit chmod inherit mode 0666 (world-writable). _peek_intent() rejects
+    world-writable (bit 0o002) and group-writable (bit 0o020) files. Without
+    this chmod, every intent file written inside a privileged container was
+    permanently rejected, leaving the system in OBSERVER indefinitely.
+
+    os.chmod() is called BEFORE os.replace() so the file is never visible on
+    the filesystem with the wrong mode — os.replace() is atomic on POSIX.
+    """
     if intent_file is None:
         intent_file = IntentListener.INTENT_FILE
 
@@ -28,6 +40,12 @@ def atomic_write_intent(intent_text: str, intent_file: str = None) -> None:
     try:
         with open(tmp_path, "wb") as f:
             f.write(encoded)
+        # RB-4 FIX: Force mode 0o644 before atomic rename so the intent file
+        # is never world-writable (0o002) or group-writable (0o020) at rest.
+        try:
+            os.chmod(tmp_path, 0o644)
+        except OSError:
+            pass  # Best-effort — chmod may not be supported on some filesystems
         os.replace(tmp_path, intent_file)
     except Exception:
         try:
@@ -210,6 +228,21 @@ class IntentListener:
             if (st.st_mode & 0o002) != 0:
                 print(
                     f"[IntentListener] Rejected intent file — world-writable: {path}",
+                    file=sys.stderr,
+                )
+                return None, None
+
+            # RB-4 / H5 FIX: Also reject group-writable files (bit 0o020).
+            # The original check only blocked world-writable (0o002). Under
+            # umask 0022 (standard Linux) files are 0644 — accepted. But
+            # under non-standard group-write umasks (e.g. 0o002) files can be
+            # 0664 (group-writable) and should be treated as potentially unsafe:
+            # any member of the file's group can overwrite the intent and inject
+            # an arbitrary task objective. atomic_write_intent() now always
+            # chmods to 0o644 so this is defence-in-depth for external writers.
+            if (st.st_mode & 0o020) != 0:
+                print(
+                    f"[IntentListener] Rejected intent file — group-writable: {path}",
                     file=sys.stderr,
                 )
                 return None, None
