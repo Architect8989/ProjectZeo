@@ -8,27 +8,7 @@ import numpy as np
 
 
 class BeliefState:
-    """
-    Probabilistic belief state tracking for autonomous execution.
-
-    CALIBRATION DISCLAIMER (Audit Finding H3 / M-4):
-    -------------------------------------------------
-    The Bayesian likelihoods used in operate.py (0.9, 0.8, 0.7, 0.5) are
-    heuristic constants, NOT empirically calibrated probabilities.
-
-    True calibration requires a labelled dataset of (world_snapshot,
-    ground_truth_state) pairs which does not exist for this system.
-
-    IMPLICATION: self.state_probabilities values are RELATIVE SCORES used
-    for exploration decisions, not absolute probability estimates. Code that
-    treats them as calibrated probabilities (e.g. P(in_state_X) > 0.95) will
-    produce results that are statistically meaningless in an absolute sense,
-    though the relative ordering of states remains useful for action selection.
-
-    The environment_stability scalar (used by authority arbitration) is derived
-    from the "significant_change" boolean in perception deltas and is NOT
-    affected by the uncalibrated likelihoods.
-    """
+    
 
     EXPLORATION_C = 1.4
     RISK_LAMBDA = 0.3
@@ -311,55 +291,14 @@ class BeliefState:
         return decayed
 
     def set_plan_horizon(self, total_steps: int, iters_per_step: int = 13) -> None:
-        """
-        MR-05 FIX: Compute regret decay dynamically based on the plan horizon.
-
-        The goal: regret on early actions decays to ≤5% of its original value
-        by the end of the plan. At REGRET_DECAY=0.995 (legacy constant), regret
-        at iteration 1 decays to only ~19.7% by task end (325 iterations for a
-        25-step plan) — still heavily distorting action selection near the end.
-
-        Formula:
-            target_fraction = 0.05  (5% of original)
-            total_iters = total_steps * iters_per_step
-            decay = target_fraction^(1 / total_iters)
-
-        For a 25-step plan: decay = 0.05^(1/325) ≈ 0.9909
-        For a 10-step plan: decay = 0.05^(1/130) ≈ 0.9773
-
-        Call this once after the execution plan is loaded, before the first
-        iteration of the execution loop.
-
-        Parameters
-        ----------
-        total_steps : int
-            Number of real plan steps (excluding the DONE sentinel).
-        iters_per_step : int
-            Expected iterations per step (default 13, matching
-            MAX_STAGNANT_ITERS_COMMAND + slack).
-        """
+        
         total_iters = max(total_steps * iters_per_step, 1)
         target_fraction = 0.05  # regret decays to 5% by plan end
         self._regret_decay = target_fraction ** (1.0 / total_iters)
 
 
     def update_regret(self, action: str, reward: float, best_reward: float):
-        """
-        Update regret for this action.
-
-        Parameters
-        ----------
-        action : str
-        reward : float
-            MATH-04 FIX: Must be a RAW reward (confidence delta, not z-score).
-            Callers (operate.py) should pass `raw_reward` directly, not the
-            normalised value from `action_rewards`. This makes regret meaningful
-            across sessions and comparable between actions with different
-            sample-count histories.
-        best_reward : float
-            The best RAW reward observed across all actions this session.
-            Use `global_best_reward()` which now reads from `_raw_action_rewards`.
-        """
+       
         self._iteration_counter += 1
 
         regret_value = best_reward - reward
@@ -376,34 +315,7 @@ class BeliefState:
     # =========================================================
 
     def record_action(self, action: str, reward: float):
-        """
-        Record a reward observation for an action, storing a uniformly
-        normalised value in action_rewards.
-
-        FIX-06 (MS-01): The original code stored raw-clamped values for
-        n < 3 and z-scores for n ≥ 3, producing a mixed-unit deque. The
-        first two entries were in raw space [-3, 3]; subsequent entries
-        were z-scores relative to the window at each observation time.
-        expected_utility(), ucb_score(), and thompson_sample() operated
-        over this mixed deque, producing biased means and inflated variances
-        during the first 100 actions of every new BeliefState (the entire
-        task window for most tasks).
-
-        FIX H6/M-2 (n=3 deque boundary contamination):
-        At the transition when len(history) first reaches 3 (after append),
-        entries 0 and 1 are linearly-clamped values while entry 2 is the
-        raw reward being z-scored for the first time. Computing z-score stats
-        over this mixed window biases mean and std, contaminating the score.
-
-        Fix: on the n==3 transition, re-normalise ALL entries in the window
-        using the same z-score parameters. This ensures all three entries share
-        the same unit space. For n > 3, prior entries are already z-scored from
-        previous calls and re-normalisation is effectively a no-op (they rescale
-        coherently about the same mean).
-
-        The parallel _raw_action_rewards deque is always populated with the
-        unmodified raw reward for regret and global_best_reward() calculations.
-        """
+        
         if action not in self.action_rewards:
             self.action_rewards[action] = deque(maxlen=self.REWARD_WINDOW)
         if action not in self._raw_action_rewards:
@@ -502,12 +414,39 @@ class BeliefState:
     # =========================================================
 
     def _stable_value_bytes(self, value: Any) -> bytes:
+        # HARD-2 (§3.8): Type-tagged encoding to eliminate None/"None" collision.
+        #
+        # Bug: the fallback branch `return str(value).encode()` produced b"None"
+        # for BOTH value=None AND value="None" (the string). Observation dicts
+        # containing None values (common for missing perception fields, e.g.
+        # `perception_snapshot=None`) produced identical commitment hashes as
+        # dicts containing the string "None". This weakened the cryptographic
+        # commitment chain, making observationally distinct world states
+        # hash-indistinguishable.
+        #
+        # Fix: prefix each type with a 1-byte tag before the value encoding.
+        # Tags are chosen to be unambiguous and cannot appear as a prefix of
+        # any other type's encoding:
+        #   \x00 = None
+        #   \x01 = str
+        #   \x02 = int / bool (stringified)
+        #   \x03 = float (IEEE 754 big-endian double)
+        #   \x04 = dict (handled by recursive branch)
+        #   \x05 = list (handled by recursive branch)
+        #   \xff = unknown fallback (type name + stringified value)
+        #
+        # The dict and list branches use recursion and do not need tags because
+        # their structure is unambiguous from their encoding (sorted keys for
+        # dict, length-prefixed elements for list).
+        if value is None:
+            # \x00 tag: unambiguously None — cannot be produced by any str value.
+            return b"\x00"
         if isinstance(value, float):
-            return struct.pack("!d", value)
+            return b"\x03" + struct.pack("!d", value)
         if isinstance(value, (int, bool)):
-            return str(value).encode()
+            return b"\x02" + str(value).encode()
         if isinstance(value, str):
-            return value.encode()
+            return b"\x01" + value.encode()
         if isinstance(value, dict):
             parts = []
             for k in sorted(value):
@@ -539,7 +478,13 @@ class BeliefState:
                 item_bytes = self._stable_value_bytes(item)
                 result += struct.pack("!I", len(item_bytes)) + item_bytes
             return result
-        return str(value).encode()
+        # Unknown type: tag \xff + type name + stringified value.
+        # This ensures distinct Python types that happen to have the same str()
+        # representation (e.g. a custom object whose __str__ returns "None")
+        # still produce distinct byte sequences.
+        type_name = type(value).__name__.encode()
+        value_bytes = str(value).encode()
+        return b"\xff" + struct.pack("!H", len(type_name)) + type_name + value_bytes
 
     def commit(self, action: str, observation: Dict[str, Any]) -> None:
 
@@ -571,17 +516,7 @@ class BeliefState:
         plan_steps_total: int = 0,
         steps_completed: int = 0,
     ) -> bool:
-        """
-        Return True when all real plan steps are completed.
-
-        FIX M-5 / H4: The caller (operate.py) is now responsible for passing
-        plan_steps_total = len(execution_plan.steps) - 1 to exclude the DONE
-        sentinel step. This method itself is unchanged — the fix is in how
-        operate.py computes _real_steps before calling converged().
-
-        When plan_steps_total excludes the sentinel, steps_completed ==
-        plan_steps_total correctly signals completion of all real work steps.
-        """
+        
         if current_iteration < min_iterations:
             return False
 
