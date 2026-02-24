@@ -187,6 +187,109 @@ def _make_llm_callable(adapter):
 
 
 # ---------------------------------------------------------------------------
+# STARTUP DEPENDENCY VALIDATOR
+# ---------------------------------------------------------------------------
+
+def _validate_runtime_dependencies(model_name: str) -> None:
+    """
+    FIX P0-1 / P0-2 / P0-4 / H-9:
+    Validate all hard runtime dependencies before entering the main loop.
+    Emits a clear, actionable error and exits with code 1 on failure.
+
+    Checks:
+      1. psutil importable                 (process watchdog)
+      2. xdotool present on Linux          (snapshot capture — HARD)
+      3. wmctrl present on Linux           (window restoration — WARNING)
+      4. Ollama daemon reachable           (LLM planning + execution)
+      5. Requested model available locally (prevents silent planning failure)
+    """
+    import shutil as _shutil
+    import platform as _platform
+
+    errors = []
+    warnings = []
+
+    # 1. psutil
+    try:
+        import psutil as _  # noqa: F401
+    except ImportError:
+        errors.append(
+            "  [MISSING] psutil is not installed.\n"
+            "    Fix: pip install psutil"
+        )
+
+    # 2. xdotool (Linux, required)
+    if _platform.system() == "Linux":
+        if _shutil.which("xdotool") is None:
+            errors.append(
+                "  [MISSING] xdotool is not installed (required for snapshot capture on Linux).\n"
+                "    Fix (Debian/Ubuntu): sudo apt-get install xdotool\n"
+                "    Fix (Fedora/RHEL):   sudo dnf install xdotool\n"
+                "    Fix (Arch):          sudo pacman -S xdotool"
+            )
+
+    # 3. wmctrl (Linux, recommended)
+    if _platform.system() == "Linux":
+        if _shutil.which("wmctrl") is None:
+            warnings.append(
+                "  [WARNING] wmctrl is not installed. "
+                "Window-focus restoration will be best-effort only.\n"
+                "    Fix: sudo apt-get install wmctrl"
+            )
+
+    # 4. Ollama daemon reachability
+    _ollama_ok = False
+    try:
+        import ollama as _ollama
+        _ollama.Client().list()
+        _ollama_ok = True
+    except Exception as _ollama_err:
+        errors.append(
+            "  [UNREACHABLE] Ollama daemon is not running or not installed: "
+            + str(_ollama_err) + "\n"
+            "    Fix: install Ollama from https://ollama.com "
+            "and ensure the daemon is running.\n"
+            "    On Linux/macOS: ollama serve"
+        )
+
+    # 5. Model availability (only when Ollama is reachable)
+    if _ollama_ok:
+        try:
+            import ollama as _ollama  # noqa: F811
+            _existing_models = {m.model for m in _ollama.Client().list().models}
+            _base = model_name.split(":")[0]
+            _found = any(
+                model_name in m or _base in m
+                for m in _existing_models
+            )
+            if not _found:
+                errors.append(
+                    "  [NOT PULLED] Model '" + model_name + "' is not available locally.\n"
+                    "    Fix: ollama pull " + model_name
+                )
+        except Exception:
+            pass  # Daemon check already covered above
+
+    # Emit warnings
+    if warnings:
+        print("\n[STARTUP] Dependency warnings (non-fatal):", file=sys.stderr)
+        for w in warnings:
+            print(w, file=sys.stderr)
+
+    # Emit errors and exit
+    if errors:
+        print(
+            "\n[STARTUP] FATAL: Required dependencies are missing or unreachable.\n"
+            "ProjectZeo cannot start until these are resolved:\n",
+            file=sys.stderr,
+        )
+        for e in errors:
+            print(e, file=sys.stderr)
+        print("", file=sys.stderr)
+        sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
 # ENTRY POINT
 # ---------------------------------------------------------------------------
 
@@ -196,6 +299,10 @@ if __name__ == "__main__":
     # FIX F-02: Persist the resolved model name so all downstream text-only
     # Ollama calls see the operator-specified model.
     os.environ["LLM_MODEL"] = model_name
+
+    # FIX P0-1/P0-2/P0-3/P0-4: Validate all hard runtime dependencies before
+    # importing any project code that would crash on missing system tools.
+    _validate_runtime_dependencies(model_name)
 
     # OLLAMA_ONLY was already set/cleared above before factory import.
     # The factory freeze has already captured the correct value.
