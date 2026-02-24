@@ -1,9 +1,13 @@
 import os
 import time
 import json
+import pathlib
 from typing import Optional
 
-RESTART_DIR = "memory"
+# FIX: Use absolute path anchored to project root, not CWD.
+# CWD-relative paths diverge when the process is launched from different directories.
+_PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[2]
+RESTART_DIR = str(_PROJECT_ROOT / "memory")
 RESTART_FILE = os.path.join(RESTART_DIR, "restart_guard.json")
 
 MAX_RESTARTS = 5
