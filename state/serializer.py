@@ -172,36 +172,17 @@ class AuthorityStateSerializer:
         last_snapshot_id: Optional[str],
         dirty: bool,
         thompson_state: Optional[Dict[str, Any]] = None,
+        belief_state_full: Optional[Dict[str, Any]] = None,
     ) -> None:
         """
         Persist authority state atomically.
 
-        FIX H-17: Optional thompson_state persists BeliefState counters so
-        Thompson sampling is reproducible across process restarts.
+        thompson_state: slim 3-field stub kept for backward compatibility.
 
-        thompson_state dict schema:
-          {
-            "iteration_counter": int,   # belief._iteration_counter
-            "sample_counter":    int,   # belief._sample_counter
-            "commitment_hash":   str,   # belief.commitment_hash (hex)
-          }
-
-        Usage in main.py (before the operate_main call):
-          auth_state.persist(
-              ...,
-              thompson_state={
-                  "iteration_counter": belief._iteration_counter,
-                  "sample_counter":    belief._sample_counter,
-                  "commitment_hash":   belief.commitment_hash,
-              },
-          )
-
-        On restore (after auth_state.load()):
-          ts = persisted.get("thompson_state") or {}
-          belief._iteration_counter = ts.get("iteration_counter", 0)
-          belief._sample_counter    = ts.get("sample_counter", 0)
-          if "commitment_hash" in ts:
-              belief.commitment_hash = ts["commitment_hash"]
+        belief_state_full (FIX SI-4): Full BeliefState.to_dict() payload.
+        When present after a crash, main.py calls BeliefState.from_dict() and
+        passes the result as prior_belief_state to the first operate_main(),
+        restoring full bandit continuity across crash-recovery restarts.
         """
         state = {
             "version": _AUTH_STATE_VERSION,
@@ -218,6 +199,9 @@ class AuthorityStateSerializer:
                 "sample_counter":    int(thompson_state.get("sample_counter", 0)),
                 "commitment_hash":   str(thompson_state.get("commitment_hash", "")),
             }
+        # FIX SI-4: Persist full BeliefState for crash-recovery bandit continuity.
+        if belief_state_full is not None and isinstance(belief_state_full, dict):
+            state["belief_state_full"] = belief_state_full
 
         with self._lock:
             self._atomic_write(state)
