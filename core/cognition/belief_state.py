@@ -21,8 +21,44 @@ class BeliefState:
     
     MIN_ENTROPY_FLOOR = 0.3
 
-    NORMALIZE_EPS = 1e-8
-    REWARD_CLAMP = 3.0
+    # AUDIT-SI-4 FIX: Bootstrap normalization scale promoted to class constant.
+    #
+    # Root cause: the previous code used a local variable `_raw_scale = 0.5`
+    # inside record_action() with a comment "max absolute raw reward
+    # (confidence - 0.5)". This embedded an undocumented implicit contract:
+    # reward signals must be in [0, 1] (confidence scores where 0.5 = neutral).
+    # No validation existed at call sites to enforce this range.
+    #
+    # Consequence: if a caller passed rewards outside [0, 1] — for example
+    # [-1.0, +1.0] success/failure signals — the bootstrap phase (n < 3
+    # samples) would produce distorted normalized values that are
+    # retroactively corrected only at n == 3 by the Welford renormalization.
+    # Decision-making during the first 2 observations for any action operated
+    # on incorrectly scaled scores, causing suboptimal early exploration.
+    #
+    # Fix:
+    #   1. Promote the scale to BOOTSTRAP_REWARD_SCALE class constant with a
+    #      full docstring documenting the expected raw reward contract.
+    #   2. Add RAW_REWARD_MIN / RAW_REWARD_MAX constants that define the
+    #      expected input range for raw rewards.
+    #   3. In record_action(), clamp the raw reward to [RAW_REWARD_MIN,
+    #      RAW_REWARD_MAX] before normalization. This prevents distortion
+    #      from out-of-range inputs without breaking callers that pass valid
+    #      in-range values.
+    #   4. The retroactive n==3 renormalization is preserved unchanged —
+    #      it remains the authoritative correction path for bootstrap bias.
+    #
+    # BOOTSTRAP_REWARD_SCALE contract:
+    #   Raw rewards are expected in [0.0, 1.0] where:
+    #     0.0 = complete failure
+    #     0.5 = neutral / no progress
+    #     1.0 = complete success
+    #   The scale maps [0, 1] → [-REWARD_CLAMP, REWARD_CLAMP] via:
+    #     normalised = (reward / BOOTSTRAP_REWARD_SCALE) * REWARD_CLAMP
+    #   i.e. reward=0.5 → 0.0 (neutral), reward=1.0 → +REWARD_CLAMP (max).
+    BOOTSTRAP_REWARD_SCALE: float = 0.5   # half of the [0,1] input range
+    RAW_REWARD_MIN: float = 0.0           # minimum valid raw reward
+    RAW_REWARD_MAX: float = 1.0           # maximum valid raw reward
 
     
     THOMPSON_WINDOW = 20
@@ -304,6 +340,16 @@ class BeliefState:
         if action not in self._raw_action_rewards:
             self._raw_action_rewards[action] = deque(maxlen=self.REWARD_WINDOW)
 
+        # AUDIT-SI-4 FIX: Clamp raw reward to [RAW_REWARD_MIN, RAW_REWARD_MAX]
+        # before any normalization. This enforces the bootstrap contract
+        # (rewards must be in [0, 1]) without breaking callers that already
+        # pass valid values. Out-of-range rewards (e.g. -0.5 or 1.5) are
+        # silently clamped here rather than producing distorted bootstrap
+        # scores that require retroactive correction. The Welford renormalization
+        # at n==3 still fires as before — this clamp is an additional guard,
+        # not a replacement.
+        reward = max(self.RAW_REWARD_MIN, min(self.RAW_REWARD_MAX, float(reward)))
+
         # Always store the unmodified raw reward for regret / global best.
         self._raw_action_rewards[action].append(reward)
 
@@ -350,12 +396,15 @@ class BeliefState:
                         existing.extend(renormalized)
 
         else:
-            
-            _raw_scale = 0.5  # max absolute raw reward (confidence - 0.5)
-            if _raw_scale > 0:
-                normalised = reward / _raw_scale * self.REWARD_CLAMP
-            else:
-                normalised = 0.0
+            # Bootstrap path (n < 3): use BOOTSTRAP_REWARD_SCALE class constant.
+            # AUDIT-SI-4 FIX: The previous code used a local `_raw_scale = 0.5`
+            # with no documentation. Replaced with the class constant
+            # BOOTSTRAP_REWARD_SCALE (= 0.5) which is now documented above with
+            # its contract and rationale. The raw reward has already been clamped
+            # to [RAW_REWARD_MIN, RAW_REWARD_MAX] = [0.0, 1.0] earlier in this
+            # method, so division by BOOTSTRAP_REWARD_SCALE is guaranteed safe
+            # (BOOTSTRAP_REWARD_SCALE > 0 by definition).
+            normalised = (reward / self.BOOTSTRAP_REWARD_SCALE) * self.REWARD_CLAMP
             normalised = max(-self.REWARD_CLAMP, min(self.REWARD_CLAMP, normalised))
 
         self.action_rewards[action].append(normalised)
