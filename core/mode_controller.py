@@ -8,6 +8,11 @@ from enum import Enum
 from typing import Optional, Deque, Dict, Callable
 from collections import deque
 
+try:
+    from config.timeouts import LLM_CALL_TIMEOUT_SECONDS as _LLM_CALL_TIMEOUT_SECONDS
+except ImportError:
+    _LLM_CALL_TIMEOUT_SECONDS = 150.0
+
 
 class SystemMode(str, Enum):
     OBSERVER = "OBSERVER"
@@ -43,13 +48,10 @@ class ModeController:
     MAX_PLANNING_SECONDS = 180.0
     MAX_PLAN_ID_LENGTH = 128
 
-    # §R8: ARMED mode timeout — prevents infinite ARMED stall.
-    # FIX RB-5 / H-6: Raised from 30.0 to LLM_CALL_TIMEOUT_SECONDS + 60.0 (210.0s).
-    # CPU-only Ollama inference takes 40–90s. With MAX_ARMED_SECONDS=30s the
-    # ARMED timeout fired before planning completed, triggering ArmedTimeoutError
-    # → OBSERVER revert → replan count not incremented → infinite OBSERVER loop.
-    # Formula: LLM_CALL_TIMEOUT_SECONDS (150s) + 60s safety margin = 210s.
-    MAX_ARMED_SECONDS: float = 210.0
+    # §R8 / SI-7 FIX: ARMED mode timeout derived from config at class definition
+    # time so it stays aligned when LLM_CALL_TIMEOUT_SECONDS is tuned.
+    # Formula: LLM_CALL_TIMEOUT_SECONDS + 60s safety margin.
+    MAX_ARMED_SECONDS: float = _LLM_CALL_TIMEOUT_SECONDS + 60.0
 
     _MODULE_ROOT = pathlib.Path(__file__).resolve().parents[1]
     TRANSITION_LOG_PATH = _MODULE_ROOT / "logs" / "mode_transitions.jsonl"
