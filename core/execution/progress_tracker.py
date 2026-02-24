@@ -52,8 +52,27 @@ class ProgressTracker:
 
     @staticmethod
     def _hash_plan(plan: ExecutionPlan) -> str:
+        # FIX: ExecutionPlan is a plain Python dataclass, not a Pydantic model.
+        # It has no .json() method. The previous plan.json() raised:
+        #   AttributeError: 'ExecutionPlan' object has no attribute 'json'
+        # on the first call to ProgressTracker(), crashing progress persistence
+        # for every task before any step could be tracked.
+        #
+        # Fix: build a deterministic canonical string from the plan's public
+        # fields using json.dumps. Sort keys for stability across Python runs.
+        import json as _json
+        canonical = _json.dumps(
+            {
+                "objective": plan.objective,
+                "step_ids": [s.id for s in plan.steps],
+                "step_types": [s.type.value for s in plan.steps],
+                "step_descriptions": [s.description for s in plan.steps],
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
         h = hashlib.sha256()
-        h.update(plan.json().encode("utf-8"))
+        h.update(canonical.encode("utf-8"))
         return h.hexdigest()[:16]
 
     # ==================================================
@@ -200,3 +219,4 @@ class ProgressTracker:
             else time.time()
         )
         return round(end - self._execution_start_ts, 2)
+    
