@@ -81,15 +81,35 @@ def _headless_capture(file_path: str) -> None:
     """
     Attempt headless screenshot capture using available CLI tools.
 
-    Tries in order: scrot, ImageMagick import, gnome-screenshot.
-    Raises VisionUnavailableError if none succeed.
+    AUDIT-RD-1 / H-5 FIX: Reduced per-backend timeout and added environment
+    probing to avoid blocking on misconfigured partial X11 tooling.
+
+    Root cause: under a system where Xvfb is installed but not running,
+    ImageMagick's `import -window root png:-` blocks waiting for an X display
+    connection for the full 5-second timeout. With 3 backends × 5s each the
+    total capture latency reached 15s, far exceeding ATOMIC_WINDOW_SECONDS=0.5
+    in SnapshotProvider and causing SnapshotProviderError → task abort.
+
+    Fixes:
+      1. Per-backend timeout reduced from 5s → 1.5s. Any functional backend
+         (scrot stdout pipe, gnome-screenshot file write) responds well within
+         1.5s. Only genuinely hung processes (X display blocked) take longer —
+         exactly the case we want to skip fast.
+      2. ImageMagick backend is now gated on a lightweight X display probe:
+         `xdpyinfo -display <display>` with a 0.5s timeout. If the display is
+         not reachable, we skip ImageMagick entirely rather than blocking.
+         This eliminates the primary source of the 5-second stall.
+      3. scrot empty-stdout guard preserved (HARDEN-5 FIX).
+
+    Tries in order: scrot, ImageMagick import (if display probe passes),
+    gnome-screenshot. Raises VisionUnavailableError if none succeed.
     """
     # Backend 1: scrot (lightweight X11-free capable on some distros)
     try:
         result = subprocess.run(
             ["scrot", "-"],
             capture_output=True,
-            timeout=5,
+            timeout=1.5,  # AUDIT-RD-1: reduced from 5s → 1.5s
         )
         # HARDEN-5 FIX: Check len(result.stdout) > 0 before writing.
         # Older scrot versions (< 1.0) do not support the "-" (stdout) flag.
@@ -105,25 +125,49 @@ def _headless_capture(file_path: str) -> None:
         pass
 
     # Backend 2: ImageMagick import (requires virtual framebuffer or Xvfb)
-    try:
-        result = subprocess.run(
-            ["import", "-window", "root", "png:-"],
-            capture_output=True,
-            timeout=5,
-        )
-        if result.returncode == 0 and result.stdout:
-            with open(file_path, "wb") as f:
-                f.write(result.stdout)
-            return
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        pass
+    #
+    # AUDIT-RD-1 / H-5 FIX: Probe the X display before attempting `import`.
+    # If DISPLAY is set but the display server is not actually reachable
+    # (Xvfb installed but not running, stale DISPLAY env var, etc.), `import`
+    # blocks indefinitely waiting for an X connection. The 1.5s timeout alone
+    # is insufficient because the socket connection attempt itself can hang
+    # longer than the subprocess.run() timeout on some Linux kernels.
+    #
+    # Guard: run `xdpyinfo` with a 0.5s hard timeout. If it fails or times
+    # out, the X server is not reachable — skip ImageMagick entirely.
+    _display = os.environ.get("DISPLAY", "").strip()
+    _imagemagick_allowed = False
+    if _display:
+        try:
+            _probe = subprocess.run(
+                ["xdpyinfo", "-display", _display],
+                capture_output=True,
+                timeout=0.5,
+            )
+            _imagemagick_allowed = (_probe.returncode == 0)
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            _imagemagick_allowed = False
+
+    if _imagemagick_allowed:
+        try:
+            result = subprocess.run(
+                ["import", "-window", "root", "png:-"],
+                capture_output=True,
+                timeout=1.5,  # AUDIT-RD-1: reduced from 5s → 1.5s
+            )
+            if result.returncode == 0 and result.stdout:
+                with open(file_path, "wb") as f:
+                    f.write(result.stdout)
+                return
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass
 
     # Backend 3: gnome-screenshot (Wayland / GNOME environments)
     try:
         result = subprocess.run(
             ["gnome-screenshot", "-f", file_path],
             capture_output=True,
-            timeout=5,
+            timeout=1.5,  # AUDIT-RD-1: reduced from 5s → 1.5s
         )
         if result.returncode == 0 and os.path.exists(file_path):
             return
@@ -132,7 +176,8 @@ def _headless_capture(file_path: str) -> None:
 
     raise VisionUnavailableError(
         "No screenshot backend available in headless environment. "
-        "Set DISPLAY or install one of: scrot, imagemagick (import), gnome-screenshot."
+        "Set DISPLAY to a reachable X server, or install one of: "
+        "scrot, imagemagick (import), gnome-screenshot."
     )
 
 
