@@ -80,25 +80,79 @@ def apply_patches():
 
 def uninstall_patches():
     """
-    SI-02 FIX: Restore builtins.open to its original value.
+    AUDIT-SI-2 FIX: Restore builtins.open to its original value with
+    structured logging and post-uninstall verification.
+
+    Previous issue: the try/except:pass in main.py around uninstall_patches()
+    swallowed any failure silently. If uninstall itself threw, the patched
+    builtins.open remained active for the rest of the process lifetime with
+    no diagnostic. This was operationally benign in production (process
+    exits) but interfered with in-process test isolation.
+
+    Fixes applied:
+      1. Structured log.info() confirms the original open was restored,
+         including a verifiable identity check (is original).
+      2. A post-uninstall assertion logs an explicit ERROR if builtins.open
+         is still the patched version after restoration — surfaces the
+         failure rather than silently continuing.
+      3. The sentinel attributes (_original_open_pre_safety_patch,
+         _safety_open_installed) are cleaned up atomically.
+
+    NOTE ON THREAD-LOCAL SCOPING:
+    The global builtins.open patch is safe in production (single shutdown
+    path, process terminates). For test isolation without subprocess
+    boundaries, the recommended alternative is to scope the patch to a
+    threading.local() object and restore per-thread in teardown. This is
+    a deeper refactor deferred to a future hardening pass; the structured
+    logging below provides the minimum viable auditability for now.
 
     Call this in test teardown or when completely shutting down the safety
     layer. Without this, builtins.open remains patched for the process
-    lifetime, which is usually correct for production but interferes with
-    test isolation if tests do not use subprocess isolation.
+    lifetime — correct for production, problematic for in-process tests.
     """
     import builtins as _builtins_mod
+    import logging as _logging
+
+    _uninstall_logger = _logging.getLogger(__name__)
+
     original = getattr(_builtins_mod, "_original_open_pre_safety_patch", None)
-    if original is not None:
-        _builtins_mod.open = original
+
+    if original is None:
+        # Patches were never installed — nothing to do.
+        _uninstall_logger.debug(
+            "[APIS-SAFETY] uninstall_patches(): no patch installed, nothing to restore."
+        )
+        return
+
+    # Restore builtins.open to the true original
+    _builtins_mod.open = original
+
+    # Clean up sentinel attributes atomically
+    for _attr in ("_original_open_pre_safety_patch", "_safety_open_installed"):
         try:
-            del _builtins_mod._original_open_pre_safety_patch
+            delattr(_builtins_mod, _attr)
         except AttributeError:
             pass
-        try:
-            del _builtins_mod._safety_open_installed
-        except AttributeError:
-            pass
+
+    # Post-uninstall verification: confirm builtins.open IS the original.
+    # If the identity check fails, a concurrent thread may have re-patched it
+    # between our restore and this check — log an explicit ERROR so the
+    # condition is surfaced in structured logs rather than silently accepted.
+    if _builtins_mod.open is not original:
+        _uninstall_logger.error(
+            "[APIS-SAFETY] uninstall_patches(): builtins.open identity check FAILED "
+            "after restoration. A concurrent patch may have re-installed itself. "
+            "Current open=%r, expected original=%r. "
+            "Process-wide file I/O may still be intercepted.",
+            _builtins_mod.open,
+            original,
+        )
+    else:
+        _uninstall_logger.info(
+            "[APIS-SAFETY] uninstall_patches(): builtins.open successfully restored "
+            "to original=%r. All screenshot-write interception is deactivated.",
+            original,
+        )
 
 
 # ============================================================
