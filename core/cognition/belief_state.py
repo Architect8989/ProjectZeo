@@ -153,6 +153,18 @@ class BeliefState:
     # =========================================================
 
     def expected_utility(self, action: str) -> float:
+        """
+        Risk-adjusted expected utility with bounded penalty.
+
+        FIX B-MATH-3: Without a penalty cap, RISK_LAMBDA * variance can reach
+        0.3 * 9.0 = 2.7 (when rewards alternate between ±3.0), causing a
+        high-mean-high-variance action (mean=+2.0) to score EU = 2.0 - 2.7 = -0.7
+        — worse than an untried action (EU = 0.0).  The risk penalty should
+        reduce reward, not invert the sign of a clearly positive action.
+
+        Fix: cap the penalty at |mean| so the worst-case EU for a positive-mean
+        action is 0.0 (neutral), never negative.
+        """
         rewards = self.action_rewards.get(action)
         if not rewards:
             return 0.0
@@ -160,10 +172,25 @@ class BeliefState:
         n = len(rewards)
         mean = sum(rewards) / n
         variance = sum((r - mean) ** 2 for r in rewards) / n
-        return mean - self.RISK_LAMBDA * variance
+        raw_penalty = self.RISK_LAMBDA * variance
+        # Penalty capped at |mean| to prevent sign inversion.
+        bounded_penalty = min(raw_penalty, abs(mean))
+        return mean - bounded_penalty
 
     def ucb_score(self, action: str) -> float:
-        
+        """
+        UCB1 score with scale-corrected exploitation term.
+
+        FIX B-MATH-1: action_rewards stores Welford z-scores on [-REWARD_CLAMP,
+        REWARD_CLAMP] = [-3, 3], while the UCB1 exploration bonus is unscaled
+        (bounded by EXPLORATION_C * sqrt(log T)).  Mixing these two incompatible
+        scales invalidates UCB1's O(sqrt(K T log T)) regret bound and can cause
+        visited failing actions (mean ≈ -3) to dominate unvisited actions.
+
+        Fix: map mean_reward from [-REWARD_CLAMP, REWARD_CLAMP] → [0, 1] before
+        adding the exploration bonus.  This restores the [0,1] assumption that
+        UCB1 requires for both exploitation and exploration terms.
+        """
         count = self.action_counts.get(action, 0)
         if count == 0:
             return float('inf')  # Must explore: standard UCB1 guarantee
@@ -171,13 +198,17 @@ class BeliefState:
         total_actions = max(sum(self.action_counts.values()) + 1, 2)
         rewards = self.action_rewards.get(action)
 
-        mean_reward = sum(rewards) / len(rewards) if rewards else 0.0
+        mean_reward_raw = sum(rewards) / len(rewards) if rewards else 0.0
+
+        # Normalize to [0, 1] so both terms share the same scale.
+        mean_reward_01 = (mean_reward_raw + self.REWARD_CLAMP) / (2.0 * self.REWARD_CLAMP)
+        mean_reward_01 = max(0.0, min(1.0, mean_reward_01))
 
         exploration = self.EXPLORATION_C * math.sqrt(
             math.log(total_actions) / count
         )
 
-        return mean_reward + exploration
+        return mean_reward_01 + exploration
 
     # =========================================================
     # THOMPSON SAMPLING — MATH-08 FIX
