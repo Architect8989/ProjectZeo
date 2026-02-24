@@ -2,7 +2,11 @@ import json
 import time
 import hashlib
 import os
+import pathlib
 from typing import Any
+
+_PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[1]
+_DEFAULT_JOURNAL_PATH = str(_PROJECT_ROOT / "logs" / "action_audit.jsonl")
 
 
 class ActionJournal:
@@ -16,10 +20,16 @@ class ActionJournal:
     - Never terminates host process on I/O failure
     """
 
-    def __init__(self, path="action_audit.jsonl"):
+    def __init__(self, path: str = _DEFAULT_JOURNAL_PATH):
         self.path = path
         self.last_hash = "0" * 64
         self.last_intent_hash = None
+
+        # Ensure the log directory exists before _initialize_session() writes.
+        try:
+            os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        except (PermissionError, OSError):
+            pass  # Read-only filesystem: write will fail gracefully in record().
 
         try:
             self._initialize_session()
