@@ -67,8 +67,7 @@ def _get_ocr_reader():
 
     if easyocr is None:
         raise ImportError(
-            "easyocr is not installed. Install it with: pip install easyocr
-"
+            "easyocr is not installed. Install it with: pip install easyocr. "
             "On Ollama-only deployments, text-based click resolution via the "
             "legacy APIs module is unavailable. Use QwenOllamaAdapter instead, "
             "which has its own fault-tolerant OCR initialisation."
