@@ -39,6 +39,7 @@ from core.safety.runtime_watchdog import RuntimeWatchdog, WatchdogViolation
 
 
 from adapters.apis_safety_layer import uninstall_patches
+from core.cognition.belief_state import BeliefState
 
 
 def _shutdown_executor(executor, wait: bool = False) -> None:
@@ -215,6 +216,12 @@ def main(llm_callable: Callable, model_name: str):
     env_fingerprint = collect_environment_fingerprint()
 
     persisted = auth_state.load()
+
+    # FIX SI-4: On crash recovery, try to restore the full BeliefState so that
+    # the first post-crash task continues learning from where it left off rather
+    # than re-exploring all actions from a virgin uniform prior.
+    _crash_recovery_belief_state: "dict | None" = persisted.get("belief_state_full")
+
     if persisted.get("dirty") or persisted.get("restore_required"):
         try:
             os_backend.force_release_all(reason="crash_recovery")
@@ -400,7 +407,11 @@ def main(llm_callable: Callable, model_name: str):
 
                 
                 _belief_state_out: list = []
-                _prior_belief_state: Optional[dict] = None
+                # FIX SI-4: Seed first task with crash-recovery BeliefState
+                # when available; clear after first use so subsequent tasks
+                # start fresh (normal behavior for non-crash runs).
+                _prior_belief_state: Optional[dict] = _crash_recovery_belief_state
+                _crash_recovery_belief_state = None  # consume once
 
                 try:
                     while not _SHUTDOWN_EVENT.is_set():
@@ -547,10 +558,6 @@ def main(llm_callable: Callable, model_name: str):
                                 restore_required=False,
                                 last_snapshot_id=None,
                                 dirty=False,
-                                # H2 FIX: Persist BeliefState Thompson counters so
-                                # Thompson sampling seed chain is reproducible across
-                                # process restarts (crash-recovery replans start from
-                                # the correct counter state rather than counter=0).
                                 thompson_state=(
                                     {
                                         "iteration_counter": _belief_state_out[0].get("iteration_counter", 0),
@@ -558,6 +565,11 @@ def main(llm_callable: Callable, model_name: str):
                                         "commitment_hash":   _belief_state_out[0].get("commitment_hash", ""),
                                     }
                                     if _belief_state_out else None
+                                ),
+                                # FIX SI-4: Persist full BeliefState for
+                                # crash-recovery bandit continuity.
+                                belief_state_full=(
+                                    _belief_state_out[0] if _belief_state_out else None
                                 ),
                             )
 
@@ -576,7 +588,6 @@ def main(llm_callable: Callable, model_name: str):
                                 restore_required=False,
                                 last_snapshot_id=None,
                                 dirty=False,
-                                # H2 FIX: Persist Thompson state on clean exit too.
                                 thompson_state=(
                                     {
                                         "iteration_counter": _belief_state_out[0].get("iteration_counter", 0),
@@ -584,6 +595,10 @@ def main(llm_callable: Callable, model_name: str):
                                         "commitment_hash":   _belief_state_out[0].get("commitment_hash", ""),
                                     }
                                     if _belief_state_out else None
+                                ),
+                                # FIX SI-4: Persist full BeliefState.
+                                belief_state_full=(
+                                    _belief_state_out[0] if _belief_state_out else None
                                 ),
                             )
                         except Exception:
