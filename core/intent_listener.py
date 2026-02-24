@@ -60,9 +60,27 @@ class IntentListener:
     POLL_INTERVAL = 0.1
     INTENT_MAX_BYTES = 4096
 
-    
+    # RB-CRIT-3 FIX: INTENT_FILE was hardcoded to
+    #   <project_root>/temp/arm_system.intent
+    # but the shipped intent file lives at:
+    #   <project_root>/arm_system.intent  (project root, no subdirectory)
+    #
+    # Runtime verification:
+    #   $ ls ProjectZeo-main/arm_system.intent      → exists (29 bytes)
+    #   $ ls ProjectZeo-main/temp/arm_system.intent → no such file
+    #
+    # _listen_loop() called os.path.exists(self.INTENT_FILE) on every poll
+    # tick. With the wrong path this always returned False, leaving the system
+    # in OBSERVER mode indefinitely. Arming via the file mechanism was
+    # permanently blocked regardless of the file content or permissions.
+    #
+    # Fix: point INTENT_FILE at the project root (no temp/ subdirectory).
+    # The atomic_write_intent() helper and sidecar writers use os.path.dirname()
+    # on INTENT_FILE to locate the sidecar directory — they are automatically
+    # correct after this change (they now write sidecars to the project root,
+    # which is acceptable; the temp/ subdirectory serves no operational purpose).
     _PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[1]
-    INTENT_FILE: str = str(_PROJECT_ROOT / "temp" / "arm_system.intent")
+    INTENT_FILE: str = str(_PROJECT_ROOT / "arm_system.intent")
 
     # ARM_PREFIX: content starting with this prefix has the prefix stripped
     # before use as the task objective.  The bundled intent file ships with
@@ -355,3 +373,4 @@ class IntentListener:
         if stripped.upper().startswith(self._ARM_PREFIX):
             stripped = stripped[len(self._ARM_PREFIX):].strip()
         return stripped
+    
