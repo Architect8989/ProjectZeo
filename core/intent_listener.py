@@ -373,4 +373,4 @@ class IntentListener:
         if stripped.upper().startswith(self._ARM_PREFIX):
             stripped = stripped[len(self._ARM_PREFIX):].strip()
         return stripped
-    
+                
