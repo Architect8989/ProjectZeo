@@ -4,7 +4,10 @@ import hashlib
 import tempfile
 from typing import List, Dict, Optional
 
-PLAYBOOK_DIR = "memory/playbooks"
+import pathlib as _pathlib
+_PROJECT_ROOT = _pathlib.Path(__file__).resolve().parents[2]
+PLAYBOOK_DIR = str(_PROJECT_ROOT / "memory" / "playbooks")
+del _pathlib
 
 
 # -------------------------------------------------
