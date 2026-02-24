@@ -9,10 +9,9 @@ import sys
 import threading
 import time
 import asyncio
-import copy
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
-from typing import List, Tuple, Optional, Any, Dict
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 import ollama
@@ -38,7 +37,6 @@ _OCR_READER = None
 _OCR_LOCK = threading.Lock()
 _OCR_WARMUP_TIMEOUT_SECONDS = 120
 
-
 _OCR_UNAVAILABLE = False
 _OCR_LAST_FAILURE_TS: float = 0.0
 _OCR_RETRY_COOLDOWN_SECONDS = 300.0
@@ -55,14 +53,14 @@ def _get_ocr_reader():
             if time.monotonic() - _OCR_LAST_FAILURE_TS < _OCR_RETRY_COOLDOWN_SECONDS:
                 return None
             _OCR_UNAVAILABLE = False
-            logger.info("[QwenOllamaAdapter] OCR cooldown elapsed — retrying EasyOCR init.")
+            logger.info("[QwenOllamaAdapter] OCR cooldown elapsed -- retrying EasyOCR init.")
 
         logger.warning(
             "[QwenOllamaAdapter] Initialising EasyOCR reader. "
-            "This may take up to 90 seconds on CPU-only hardware …"
+            "This may take up to 90 seconds on CPU-only hardware."
         )
         print(
-            "[QwenOllamaAdapter] Initialising EasyOCR (first-time, may be slow) …",
+            "[QwenOllamaAdapter] Initialising EasyOCR (first-time, may be slow)...",
             file=sys.stderr,
             flush=True,
         )
@@ -85,12 +83,13 @@ def _get_ocr_reader():
 
             if t.is_alive():
                 raise RuntimeError(
-                    f"EasyOCR initialisation timed out after {_OCR_WARMUP_TIMEOUT_SECONDS}s"
+                    "EasyOCR initialisation timed out after "
+                    + str(_OCR_WARMUP_TIMEOUT_SECONDS) + "s"
                 )
 
             if "err" in error_holder:
                 raise RuntimeError(
-                    f"EasyOCR initialisation failed: {error_holder['err']}"
+                    "EasyOCR initialisation failed: " + str(error_holder["err"])
                 ) from error_holder["err"]
 
             _OCR_READER = result_holder["reader"]
@@ -101,13 +100,16 @@ def _get_ocr_reader():
             _OCR_UNAVAILABLE = True
             _OCR_LAST_FAILURE_TS = time.monotonic()
             logger.warning(
-                f"[QwenOllamaAdapter] EasyOCR unavailable: {exc}. "
-                f"Will retry after {_OCR_RETRY_COOLDOWN_SECONDS}s. "
-                "Falling back to coordinate-only click resolution."
+                "[QwenOllamaAdapter] EasyOCR unavailable: %s. "
+                "Will retry after %.0fs. "
+                "Falling back to coordinate-only click resolution.",
+                exc,
+                _OCR_RETRY_COOLDOWN_SECONDS,
             )
             print(
-                f"[QwenOllamaAdapter] WARNING: EasyOCR unavailable ({exc}). "
-                f"Coordinate-only mode active. Retry in {_OCR_RETRY_COOLDOWN_SECONDS}s.",
+                "[QwenOllamaAdapter] WARNING: EasyOCR unavailable (" + str(exc) + "). "
+                "Coordinate-only mode active. "
+                "Retry in " + str(int(_OCR_RETRY_COOLDOWN_SECONDS)) + "s.",
                 file=sys.stderr,
                 flush=True,
             )
@@ -120,7 +122,7 @@ def _get_ocr_reader():
 
 def _extract_response_content(response: Any) -> str:
     """
-    Handles BOTH ollama ≥0.2 object shape (response.message.content)
+    Handles BOTH ollama >=0.2 object shape (response.message.content)
     and legacy dict shape (response['message']['content']).
     """
     if hasattr(response, "message"):
@@ -130,7 +132,8 @@ def _extract_response_content(response: Any) -> str:
             if isinstance(content, str):
                 return content
             raise RuntimeError(
-                f"Unexpected ollama response.message.content type: {type(content)}"
+                "Unexpected ollama response.message.content type: "
+                + str(type(content))
             )
 
     if isinstance(response, dict):
@@ -138,11 +141,11 @@ def _extract_response_content(response: Any) -> str:
         if isinstance(content, str):
             return content
         raise RuntimeError(
-            f"Unexpected ollama dict response shape: {response!r}"
+            "Unexpected ollama dict response shape: " + repr(response)
         )
 
     raise RuntimeError(
-        f"Cannot extract content from ollama response type: {type(response)}"
+        "Cannot extract content from ollama response type: " + str(type(response))
     )
 
 
@@ -155,9 +158,8 @@ def _build_text_summary_of_message(msg: dict) -> Optional[dict]:
     Convert an older message that may contain image data into a text-only
     summary suitable for inclusion in the multi-turn history sent to Ollama.
 
-    Keeps the role and extracts text content. Images from older turns are
-    dropped to keep the context window bounded — the current turn always
-    carries the live screenshot.
+    Images from older turns are dropped to keep the context window bounded.
+    The current turn always carries the live screenshot.
 
     Returns None if the message should be skipped entirely.
     """
@@ -168,11 +170,9 @@ def _build_text_summary_of_message(msg: dict) -> Optional[dict]:
     content = msg.get("content")
 
     if isinstance(content, str):
-        # Plain text — include as-is
         return {"role": role, "content": content}
 
     if isinstance(content, list):
-        # Multimodal content — extract only text parts
         text_parts = []
         for part in content:
             if isinstance(part, dict) and part.get("type") == "text":
@@ -206,8 +206,19 @@ class QwenOllamaAdapter:
 
     # Maximum number of prior conversation turns to include in each call.
     # Each turn is text-only (images stripped from older turns).
-    # Keeps context window bounded on long tasks.
     MAX_HISTORY_TURNS = 10
+
+    # Coordinate mandate injected into the system prompt when OCR is unavailable.
+    # Prevents text-based clicks from being emitted in coordinate-only mode,
+    # which would cause silent drops and task stagnation.
+    # FIX RB-5: Without this, stagnation occurs after MAX_STAGNANT_ITERS_UI=12.
+    _COORD_MANDATE = (
+        "\n\nCRITICAL CONSTRAINT: OCR text-recognition is unavailable on this system. "
+        "You MUST use coordinate-based clicks ONLY. "
+        "NEVER emit a click operation with a 'text' field. "
+        "EVERY click MUST include numeric x and y values in the 0.0 to 1.0 range. "
+        "Correct format: {\"operation\": \"click\", \"x\": \"0.50\", \"y\": \"0.30\"}"
+    )
 
     def __init__(self, model_name: str = "qwen2.5-vl:7b-instruct"):
         if not isinstance(model_name, str) or not model_name.strip():
@@ -215,8 +226,8 @@ class QwenOllamaAdapter:
 
         self.model_name = model_name.strip()
 
-        # §R4: read timeout raised to 120s for CPU inference compatibility.
-        # CPU inference on Qwen2.5-VL 7B: 40–90s on consumer hardware.
+        # Read timeout raised to 120s for CPU inference compatibility.
+        # CPU inference on Qwen2.5-VL 7B: 40-90s on consumer hardware.
         self._client = ollama.Client(
             timeout=httpx.Timeout(
                 connect=10.0,
@@ -226,11 +237,11 @@ class QwenOllamaAdapter:
             )
         )
 
-        # Bounded executor — prevents unbounded thread spawn under async callers
+        # Bounded executor prevents unbounded thread spawn under async callers.
         self._executor = ThreadPoolExecutor(max_workers=1)
 
     # ==========================================================
-    # PUBLIC ENTRY — adapter interface contract
+    # PUBLIC ENTRY -- adapter interface contract
     # ==========================================================
 
     async def get_next_action(
@@ -250,7 +261,7 @@ class QwenOllamaAdapter:
             return None, exc
 
     # ==========================================================
-    # CORE VISION INFERENCE — FIX-3: full history forwarded
+    # CORE VISION INFERENCE
     # ==========================================================
 
     async def _call_qwen_with_history(
@@ -262,44 +273,42 @@ class QwenOllamaAdapter:
         Capture current screen, build multi-turn message list, call Ollama,
         parse JSON operations.
 
-        FIX-3: Prior conversation turns are included as text-only history
-        so the LLM knows what has already been done. Only the current
-        (latest) user turn carries the live screenshot image.
+        Prior conversation turns are included as text-only history so the LLM
+        knows what has already been done. Only the current (latest) user turn
+        carries the live screenshot image.
         """
-
         # --- Build system prompt ---
         system_content = get_system_prompt(self.model_name, objective)
 
+        # FIX RB-5: When OCR is unavailable mandate coordinate-based clicks.
+        # Text-based click ops are silently dropped by _resolve_click_coordinates
+        # in coordinate-only fallback mode, causing stagnation after 12 iters.
+        if _OCR_UNAVAILABLE:
+            system_content = system_content + self._COORD_MANDATE
+
         # --- Build historical context (text-only, no old images) ---
         history_messages: List[dict] = []
-
-        # Walk all prior messages, convert to text summaries
         for msg in messages:
             role = msg.get("role")
-
-            # Skip the system message — we'll inject our own below
             if role == "system":
                 continue
-
             summary = _build_text_summary_of_message(msg)
             if summary is not None:
                 history_messages.append(summary)
 
-        # Trim to MAX_HISTORY_TURNS (keep the most recent turns)
         if len(history_messages) > self.MAX_HISTORY_TURNS:
             history_messages = history_messages[-self.MAX_HISTORY_TURNS:]
 
-        
         raw_tmp_name = None
         jpeg_tmp_name = None
         try:
             _rtf = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
             raw_tmp_name = _rtf.name
-            _rtf.close()  # release handle so capture can write it
+            _rtf.close()
 
             _jtf = tempfile.NamedTemporaryFile(suffix=".jpeg", delete=False)
             jpeg_tmp_name = _jtf.name
-            _jtf.close()  # release handle before compress writes it
+            _jtf.close()
 
             capture_screen_with_cursor(raw_tmp_name)
             compress_screenshot(raw_tmp_name, jpeg_tmp_name)
@@ -308,7 +317,6 @@ class QwenOllamaAdapter:
                 img_base64 = base64.b64encode(f.read()).decode("utf-8")
 
             # --- Build per-action user prompt ---
-            # §R9: inject current objective to prevent LLM drift on long tasks
             is_first_message = len(history_messages) == 0
             base_prompt = (
                 get_user_first_message_prompt()
@@ -318,13 +326,12 @@ class QwenOllamaAdapter:
 
             if objective and objective.strip():
                 user_prompt_text = (
-                    f"Current objective: {objective.strip()}\n\n{base_prompt}"
+                    "Current objective: " + objective.strip() + "\n\n" + base_prompt
                 )
             else:
                 user_prompt_text = base_prompt
 
             # --- Assemble full message list for ollama.chat() ---
-            # Structure: [system] + [text-only history] + [current user turn with screenshot]
             ollama_messages: List[Dict[str, Any]] = [
                 {"role": "system", "content": system_content}
             ]
@@ -354,16 +361,12 @@ class QwenOllamaAdapter:
 
             response = await loop.run_in_executor(self._executor, _blocking_call)
 
-            # All post-processing that references jpeg_tmp_name MUST happen
-            # inside this try block while the file still exists on disk.
-            # The finally clause below deletes it.
             content = _extract_response_content(response)
             operations = self._parse_and_normalize_json(content)
 
             if not isinstance(operations, list):
                 raise RuntimeError("LLM output must be a JSON array")
 
-            # Filter to valid operation dicts only
             operations = [
                 op for op in operations
                 if isinstance(op, dict) and "operation" in op
@@ -374,7 +377,6 @@ class QwenOllamaAdapter:
             return operations
 
         finally:
-            # RB-03 FIX: Explicit cleanup — safe on all platforms.
             for _tmp_path in (raw_tmp_name, jpeg_tmp_name):
                 if _tmp_path is not None:
                     try:
@@ -399,7 +401,7 @@ class QwenOllamaAdapter:
         reader = _get_ocr_reader()
 
         if reader is None:
-            # Coordinate-only fallback
+            # Coordinate-only fallback: keep only ops with explicit x, y.
             filtered: List[dict] = []
             for op in operations:
                 if op.get("operation") != "click":
@@ -411,7 +413,7 @@ class QwenOllamaAdapter:
                     op["x"] = float(x)
                     op["y"] = float(y)
                     filtered.append(op)
-                # else: no coords and no OCR → drop (fail-closed)
+                # No coords and no OCR: drop (fail-closed).
             operations.clear()
             operations.extend(filtered)
             return
@@ -419,7 +421,7 @@ class QwenOllamaAdapter:
         try:
             ocr_result = reader.readtext(screenshot_path)
         except Exception as exc:
-            logger.warning(f"[QwenOllamaAdapter] OCR readtext failed: {exc}")
+            logger.warning("[QwenOllamaAdapter] OCR readtext failed: %s", exc)
             ocr_result = []
 
         filtered = []
@@ -429,14 +431,14 @@ class QwenOllamaAdapter:
                 continue
 
             if "text" not in op:
-                # DEF-2 FIX: honour explicit x/y coordinates
+                # Honour explicit x/y coordinates when no text target is given.
                 x = op.get("x")
                 y = op.get("y")
                 if isinstance(x, (int, float)) and isinstance(y, (int, float)):
                     op["x"] = float(x)
                     op["y"] = float(y)
                     filtered.append(op)
-                # else: no text, no coords → fail-closed, drop
+                # No text, no coords: fail-closed, drop.
                 continue
 
             try:
@@ -451,7 +453,7 @@ class QwenOllamaAdapter:
                         op["y"] = float(y)
                         filtered.append(op)
             except Exception:
-                # Unresolvable text click → drop silently (fail-closed)
+                # Unresolvable text click: drop silently (fail-closed).
                 continue
 
         operations.clear()
@@ -464,11 +466,12 @@ class QwenOllamaAdapter:
     def _parse_and_normalize_json(self, text: str) -> List[dict]:
         """
         Parse LLM text output into a list of operation dicts.
-        GAP-1 FIX: greedy regex captures full JSON arrays (was non-greedy,
-        truncated multi-operation arrays to first element).
+
+        Greedy regex captures full JSON arrays (a non-greedy pattern would
+        truncate multi-operation arrays to only the first element).
         """
         text = text.strip()
-        # Strip markdown fences
+        # Strip markdown fences.
         text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.MULTILINE)
         text = re.sub(r"\s*```$", "", text, flags=re.MULTILINE).strip()
 
@@ -481,7 +484,7 @@ class QwenOllamaAdapter:
         except Exception:
             pass
 
-        # Greedy fallback — try outermost array, then outermost object
+        # Greedy fallback: try outermost array, then outermost object.
         for pattern in (r"(\[.*\])", r"(\{.*\})"):
             match = re.search(pattern, text, re.DOTALL)
             if match:
@@ -495,5 +498,6 @@ class QwenOllamaAdapter:
                     pass
 
         raise RuntimeError(
-            f"No valid JSON structure found in ollama response: {text[:200]!r}"
+            "No valid JSON structure found in ollama response: "
+            + repr(text[:200])
         )
