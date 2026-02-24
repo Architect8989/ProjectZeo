@@ -37,7 +37,12 @@ class SnapshotProvider:
     SNAPSHOT_SCHEMA_VERSION = "2.2"
 
     MAX_SNAPSHOTS = 128
-    MAX_SNAPSHOT_AGE_SECONDS = 3600
+    # FIX RB-3: Raised from 3600s (1h) to 6300s (105min) so snapshots survive
+    # the full MAX_TASK_SECONDS=5400s window plus a 15min restoration buffer.
+    # The previous value of 3600s guaranteed restoration failure for any task
+    # running longer than 60 minutes because get_snapshot() enforced TTL at
+    # retrieval time, returning None and triggering _force_safe_shutdown().
+    MAX_SNAPSHOT_AGE_SECONDS = 6300
     # RTB-04: Increased from 0.25s to 0.5s. Under OS load, three consecutive
     # syscalls (cursor + focused_window + active_app) frequently exceeded 250ms,
     # causing permanent denial-of-service on task arming under adversarial load.
