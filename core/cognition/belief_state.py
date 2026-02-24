@@ -57,8 +57,43 @@ class BeliefState:
     #     normalised = (reward / BOOTSTRAP_REWARD_SCALE) * REWARD_CLAMP
     #   i.e. reward=0.5 → 0.0 (neutral), reward=1.0 → +REWARD_CLAMP (max).
     BOOTSTRAP_REWARD_SCALE: float = 0.5   # half of the [0,1] input range
-    RAW_REWARD_MIN: float = 0.0           # minimum valid raw reward
-    RAW_REWARD_MAX: float = 1.0           # maximum valid raw reward
+
+    # RB-CRIT-1 FIX: REWARD_CLAMP and NORMALIZE_EPS were used throughout this
+    # class (ucb_score, thompson_sample, record_action) but were never defined
+    # anywhere in the codebase (grep -rn "REWARD_CLAMP\s*=" returned zero
+    # results). Every call to record_action(), ucb_score(), thompson_sample(),
+    # or expected_utility() raised:
+    #   AttributeError: 'BeliefState' object has no attribute 'REWARD_CLAMP'
+    # This made the entire probabilistic cognition subsystem non-functional.
+    # No task could complete more than one iteration.
+    #
+    # Fix: define both constants here as class-level attributes with the values
+    # implied by the rest of the code:
+    #   REWARD_CLAMP = 3.0  (z-score ceiling used in all normalization paths)
+    #   NORMALIZE_EPS = 1e-8  (numeric stability guard in Welford variance)
+    REWARD_CLAMP: float = 3.0             # z-score ceiling for normalized rewards
+    NORMALIZE_EPS: float = 1e-8          # variance floor for Welford normalization
+
+    # RB-CRIT-2 FIX: Expand reward range to [-1.0, 1.0] to preserve negative
+    # learning signal. The previous RAW_REWARD_MIN = 0.0 silently clamped
+    # reward=-0.5 (policy-denied, authority-abort, low-confidence) to 0.0
+    # (neutral), making failures indistinguishable from untried actions.
+    # The bandit re-explored destructive actions with equal probability as
+    # novel ones. Regret underflowed (failure → neutral → 0 regret delta).
+    #
+    # With RAW_REWARD_MIN = -1.0:
+    #   reward=-0.5 (failure) → normalized = (-0.5/0.5)*3.0 = -3.0 (floor)
+    #   reward=0.0  (neutral) → normalized = (0.0/0.5)*3.0  =  0.0 (center)
+    #   reward=1.0  (success) → normalized = (1.0/0.5)*3.0  = +3.0 (ceiling)
+    # Failures are now distinguishable from untried actions, regret accumulates
+    # correctly, and the bandit avoids re-exploring known-bad actions.
+    RAW_REWARD_MIN: float = -1.0          # minimum valid raw reward (failures)
+    RAW_REWARD_MAX: float = 1.0           # maximum valid raw reward (successes)
+
+    # P2: Maximum entropy allowed for convergence declaration.
+    # If entropy is still high, the belief distribution has not consolidated —
+    # declaring convergence while uncertain risks false success.
+    MAX_ENTROPY_CONVERGENCE: float = 2.0  # nats; uniform over 8 states ≈ 2.08
 
     
     THOMPSON_WINDOW = 20
@@ -435,208 +470,4 @@ class BeliefState:
         significant = delta.get("significant_change", False)
 
         if significant:
-            self.environment_stability *= 0.8
-            # MR-01a FIX: Reset the consecutive high-stability counter on
-            # any significant change so the 3-obs gate cannot be satisfied
-            # across a stability boundary.
-            self.consecutive_high_stability_count = 0
-        else:
-            self.environment_stability = min(
-                1.0,
-                self.environment_stability + 0.05,
-            )
-            # MR-01a FIX: Increment consecutive counter when stable.
-            if self.environment_stability > 0.7:
-                self.consecutive_high_stability_count += 1
-            else:
-                self.consecutive_high_stability_count = 0
-
-        self.environment_stability = max(0.0, min(1.0, self.environment_stability))
-
-    # =========================================================
-    # STABLE COMMITMENT HASH
-    # =========================================================
-
-    def _stable_value_bytes(self, value: Any) -> bytes:
-        
-        if value is None:
-            # \x00 tag: unambiguously None — cannot be produced by any str value.
-            return b"\x00"
-        if isinstance(value, float):
-            
-            return b"\x03" + struct.pack("!d", round(value, 6))
-        if isinstance(value, (int, bool)):
-            return b"\x02" + str(value).encode()
-        if isinstance(value, str):
-            return b"\x01" + value.encode()
-        if isinstance(value, dict):
-            parts = []
-            for k in sorted(value):
-                parts.append(k.encode())
-                parts.append(self._stable_value_bytes(value[k]))
-            return b"".join(parts)
-        if isinstance(value, list):
-            
-            result = b""
-            for item in value:
-                item_bytes = self._stable_value_bytes(item)
-                result += struct.pack("!I", len(item_bytes)) + item_bytes
-            return result
-        # Unknown type: tag \xff + type name + stringified value.
-        # This ensures distinct Python types that happen to have the same str()
-        # representation (e.g. a custom object whose __str__ returns "None")
-        # still produce distinct byte sequences.
-        type_name = type(value).__name__.encode()
-        value_bytes = str(value).encode()
-        return b"\xff" + struct.pack("!H", len(type_name)) + type_name + value_bytes
-
-    def commit(self, action: str, observation: Dict[str, Any]) -> None:
-
-        obs_bytes = self._stable_value_bytes(observation)
-
-        # FIX SI-5: Quantize probability floats to 6 decimal places before
-        # packing. Mirrors the _stable_value_bytes float fix — state_probabilities
-        # are normalised floats susceptible to the same platform drift. Without
-        # quantization, commit() produces platform-divergent hashes for identical
-        # belief distributions.
-        prob_bytes = b"".join(
-            k.encode() + struct.pack("!d", round(v, 6))
-            for k, v in sorted(self.state_probabilities.items())
-        )
-
-        payload = (
-            self.commitment_hash.encode()
-            + action.encode()
-            + obs_bytes
-            + prob_bytes
-        )
-
-        self.commitment_hash = hashlib.sha256(payload).hexdigest()
-
-    # =========================================================
-    # CONVERGENCE — FIX M-5 / H4
-    # =========================================================
-
-    def converged(
-        self,
-        *,
-        min_iterations: int = 0,
-        current_iteration: int = 0,
-        plan_steps_total: int = 0,
-        steps_completed: int = 0,
-    ) -> bool:
-        
-        if current_iteration < min_iterations:
-            return False
-
-        if plan_steps_total <= 0:
-            return False
-
-        if steps_completed < plan_steps_total:
-            return False
-
-        return True
-
-    # =========================================================
-    # SERIALIZATION — Fix 12 (Thompson counter persistence)
-    # =========================================================
-
-    def to_dict(self) -> dict:
-        
-        return {
-            "commitment_hash": self.commitment_hash,
-            "iteration_counter": self._iteration_counter,
-            "sample_counter": self._sample_counter,
-            "state_probabilities": dict(self.state_probabilities),
-            "action_counts": dict(self.action_counts),
-            "action_rewards": {
-                k: list(v) for k, v in self.action_rewards.items()
-            },
-            "raw_action_rewards": {
-                k: list(v) for k, v in self._raw_action_rewards.items()
-            },
-            "regret": {
-                k: list(v) for k, v in self.regret.items()
-            },
-            "progress_score": self.progress_score,
-            "environment_stability": self.environment_stability,
-            "consecutive_high_stability_count": self.consecutive_high_stability_count,
-            "regret_decay": self._regret_decay,
-            "welford_n": dict(self._welford_n),
-            "welford_mean": dict(self._welford_mean),
-            "welford_M2": dict(self._welford_M2),
-        }
-
-    @classmethod
-    def from_dict(cls, data: dict, intent_hash: str = "") -> "BeliefState":
-        """
-        Fix 12: Reconstruct a BeliefState from a previously serialised dict.
-
-        The reconstructed instance has the same commitment_hash,
-        _iteration_counter, and _sample_counter as when to_dict() was called,
-        so Thompson sampling seeds continue the same sequence as before the
-        restart — making post-restart replay reproducible.
-        """
-        obj = cls(intent_hash=intent_hash)
-
-        # Restore commitment chain state (overrides the intent-derived genesis)
-        if isinstance(data.get("commitment_hash"), str):
-            obj.commitment_hash = data["commitment_hash"]
-        if isinstance(data.get("iteration_counter"), int):
-            obj._iteration_counter = data["iteration_counter"]
-        if isinstance(data.get("sample_counter"), int):
-            obj._sample_counter = data["sample_counter"]
-
-        if isinstance(data.get("state_probabilities"), dict):
-            obj.state_probabilities = dict(data["state_probabilities"])
-        if isinstance(data.get("action_counts"), dict):
-            obj.action_counts = dict(data["action_counts"])
-
-        for key, vals in (data.get("action_rewards") or {}).items():
-            if isinstance(vals, list):
-                obj.action_rewards[key] = deque(vals, maxlen=cls.REWARD_WINDOW)
-        for key, vals in (data.get("raw_action_rewards") or {}).items():
-            if isinstance(vals, list):
-                obj._raw_action_rewards[key] = deque(vals, maxlen=cls.REWARD_WINDOW)
-
-        for key, val in (data.get("regret") or {}).items():
-            if isinstance(val, list) and len(val) == 2:
-                obj.regret[key] = tuple(val)
-
-        if isinstance(data.get("progress_score"), (int, float)):
-            obj.progress_score = float(data["progress_score"])
-        if isinstance(data.get("environment_stability"), (int, float)):
-            obj.environment_stability = float(data["environment_stability"])
-        if isinstance(data.get("consecutive_high_stability_count"), int):
-            obj.consecutive_high_stability_count = data["consecutive_high_stability_count"]
-        if isinstance(data.get("regret_decay"), (int, float)):
-            obj._regret_decay = float(data["regret_decay"])
-
-        # Restore Welford running statistics
-        if isinstance(data.get("welford_n"), dict):
-            obj._welford_n = {k: int(v) for k, v in data["welford_n"].items()}
-        if isinstance(data.get("welford_mean"), dict):
-            obj._welford_mean = {k: float(v) for k, v in data["welford_mean"].items()}
-        if isinstance(data.get("welford_M2"), dict):
-            obj._welford_M2 = {k: float(v) for k, v in data["welford_M2"].items()}
-
-        return obj
-
-    # =========================================================
-    # SUMMARY
-    # =========================================================
-
-    def summary(self) -> Dict[str, Any]:
-        return {
-            "entropy": self.entropy(),
-            "state_distribution": self.state_probabilities,
-            "action_counts": self.action_counts,
-            "regret": {
-                k: self._get_effective_regret(k)
-                for k in self.regret
-            },
-            "progress_score": self.progress_score,
-            "environment_stability": self.environment_stability,
-            "commitment_hash": self.commitment_hash,
-            "global_best_reward": self.global_best_reward(),
-        }
+            self.enviro
