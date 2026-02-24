@@ -1,8 +1,14 @@
-import psutil
 import time
 import os
 import threading
 from collections import deque
+
+try:
+    import psutil as _psutil_module
+    _PSUTIL_AVAILABLE = True
+except ImportError:
+    _psutil_module = None
+    _PSUTIL_AVAILABLE = False
 
 
 MAX_RUNTIME_SECONDS = 3600          # 1 hour per task
@@ -57,28 +63,25 @@ class RuntimeWatchdog:
     """
 
     def __init__(self):
-        # FIX SI-2 / RB-A2: Dedicated lock for start_time access.
-        # Separate from _cpu_pause_lock so CPU pause/resume does not block
-        # time-limit checks and vice versa.
+        # FIX RB-2 / SI-2: Dedicated lock for start_time access.
         self._start_time_lock = threading.Lock()
         self._start_time: float = time.time()
 
-        self.process = psutil.Process(os.getpid())
+        # FIX RB-2: Guard psutil instantiation. When psutil is absent,
+        # memory and CPU checks are skipped; the time-limit check still fires.
+        self.process = None
+        if _PSUTIL_AVAILABLE:
+            try:
+                self.process = _psutil_module.Process(os.getpid())
+                self.process.cpu_percent(interval=None)
+            except Exception:
+                self.process = None
 
         # Sliding window of CPU samples
         self._cpu_samples = deque(maxlen=CPU_MIN_SAMPLES)
 
-        # FIX RB-4: CPU pause flag — thread-safe.
-        # When True, cpu_percent() is NOT called and samples accumulated during
-        # the paused window are discarded on resume.
         self._cpu_paused: bool = False
         self._cpu_pause_lock = threading.Lock()
-
-        # Prime cpu_percent so first real read is meaningful
-        try:
-            self.process.cpu_percent(interval=None)
-        except Exception:
-            pass
 
     # =================================================
     # START TIME PROPERTY (FIX SI-2 / RB-A2)
@@ -154,29 +157,25 @@ class RuntimeWatchdog:
         if elapsed > MAX_RUNTIME_SECONDS:
             self._violate("TIME_LIMIT")
 
-        # --- MEMORY LIMIT ---
-        try:
-            mem_mb = self.process.memory_info().rss / (1024 * 1024)
-            if mem_mb > MAX_MEMORY_MB:
-                self._violate("MEMORY_LIMIT")
-        except Exception:
-            # Fail-open on telemetry failure
-            pass
+        # --- MEMORY LIMIT (only when psutil is available) ---
+        if self.process is not None:
+            try:
+                mem_mb = self.process.memory_info().rss / (1024 * 1024)
+                if mem_mb > MAX_MEMORY_MB:
+                    self._violate("MEMORY_LIMIT")
+            except Exception:
+                pass
 
-        # --- CPU LIMIT (SUSTAINED) ---
-        # FIX RB-4: Skip entirely when paused. cpu_percent(interval=0.1) is a
-        # blocking syscall — calling it during LLM inference adds 100ms to every
-        # 250ms heartbeat iteration and accumulates samples that would immediately
-        # trigger WatchdogViolation on resume (90% CPU from inference).
+        # --- CPU LIMIT (SUSTAINED, only when psutil is available) ---
+        # FIX RB-4: Skip entirely when paused.
         with self._cpu_pause_lock:
             _paused = self._cpu_paused
 
-        if not _paused:
+        if not _paused and self.process is not None:
             try:
                 cpu = self.process.cpu_percent(interval=CPU_SAMPLE_INTERVAL)
                 self._cpu_samples.append(cpu)
 
-                # Only evaluate after window is populated
                 if len(self._cpu_samples) >= CPU_MIN_SAMPLES:
                     avg_cpu = sum(self._cpu_samples) / len(self._cpu_samples)
 
@@ -186,7 +185,6 @@ class RuntimeWatchdog:
                         )
 
             except Exception:
-                # Telemetry failure must never abort execution
                 pass
 
     def _violate(self, reason: str):
