@@ -206,6 +206,28 @@ class VisionRuntime:
                     if not self._running:
                         return
 
+                    # P0-E FIX (RT-07): Guard against stale frames when CPU
+                    # inference is slow (40-90 s per frame).  The executor
+                    # serialises frames; a new capture is already queued while
+                    # inference for the previous one is still running.  Without
+                    # this check the world graph is updated with minutes-old
+                    # perception data, causing actions to target stale UI state.
+                    #
+                    # If the frame timestamp is older than MAX_ALLOWED_LATENCY_SECONDS
+                    # from NOW (not from inference start), treat this loop iteration
+                    # as a transient failure: increment the failure counter but do
+                    # NOT update last_output.  This forces the consumer to use the
+                    # most recent non-stale frame and marks vision unhealthy after
+                    # MAX_CONSECUTIVE_FAILURES consecutive stale frames.
+                    frame_age = time.time() - output.get("frame_ts", 0.0)
+                    if frame_age > MAX_ALLOWED_LATENCY_SECONDS:
+                        self._consecutive_failures += 1
+                        if self._consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                            self._healthy = False
+                        # Do not update last_output with stale data.
+                        time.sleep(CAPTURE_INTERVAL_SECONDS)
+                        continue
+
                     self._last_output = output
                     self._last_frame_ts = output["frame_ts"]
                     self._consecutive_failures = 0
