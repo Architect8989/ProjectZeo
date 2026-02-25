@@ -21,14 +21,72 @@ class BeliefState:
     
     MIN_ENTROPY_FLOOR = 0.3
 
-    
+    # AUDIT-SI-4 FIX: Bootstrap normalization scale promoted to class constant.
+    #
+    # Root cause: the previous code used a local variable `_raw_scale = 0.5`
+    # inside record_action() with a comment "max absolute raw reward
+    # (confidence - 0.5)". This embedded an undocumented implicit contract:
+    # reward signals must be in [0, 1] (confidence scores where 0.5 = neutral).
+    # No validation existed at call sites to enforce this range.
+    #
+    # Consequence: if a caller passed rewards outside [0, 1] — for example
+    # [-1.0, +1.0] success/failure signals — the bootstrap phase (n < 3
+    # samples) would produce distorted normalized values that are
+    # retroactively corrected only at n == 3 by the Welford renormalization.
+    # Decision-making during the first 2 observations for any action operated
+    # on incorrectly scaled scores, causing suboptimal early exploration.
+    #
+    # Fix:
+    #   1. Promote the scale to BOOTSTRAP_REWARD_SCALE class constant with a
+    #      full docstring documenting the expected raw reward contract.
+    #   2. Add RAW_REWARD_MIN / RAW_REWARD_MAX constants that define the
+    #      expected input range for raw rewards.
+    #   3. In record_action(), clamp the raw reward to [RAW_REWARD_MIN,
+    #      RAW_REWARD_MAX] before normalization. This prevents distortion
+    #      from out-of-range inputs without breaking callers that pass valid
+    #      in-range values.
+    #   4. The retroactive n==3 renormalization is preserved unchanged —
+    #      it remains the authoritative correction path for bootstrap bias.
+    #
+    # BOOTSTRAP_REWARD_SCALE contract:
+    #   Raw rewards are expected in [0.0, 1.0] where:
+    #     0.0 = complete failure
+    #     0.5 = neutral / no progress
+    #     1.0 = complete success
+    #   The scale maps [0, 1] → [-REWARD_CLAMP, REWARD_CLAMP] via:
+    #     normalised = (reward / BOOTSTRAP_REWARD_SCALE) * REWARD_CLAMP
+    #   i.e. reward=0.5 → 0.0 (neutral), reward=1.0 → +REWARD_CLAMP (max).
     BOOTSTRAP_REWARD_SCALE: float = 0.5   # half of the [0,1] input range
 
-    
+    # RB-CRIT-1 FIX: REWARD_CLAMP and NORMALIZE_EPS were used throughout this
+    # class (ucb_score, thompson_sample, record_action) but were never defined
+    # anywhere in the codebase (grep -rn "REWARD_CLAMP\s*=" returned zero
+    # results). Every call to record_action(), ucb_score(), thompson_sample(),
+    # or expected_utility() raised:
+    #   AttributeError: 'BeliefState' object has no attribute 'REWARD_CLAMP'
+    # This made the entire probabilistic cognition subsystem non-functional.
+    # No task could complete more than one iteration.
+    #
+    # Fix: define both constants here as class-level attributes with the values
+    # implied by the rest of the code:
+    #   REWARD_CLAMP = 3.0  (z-score ceiling used in all normalization paths)
+    #   NORMALIZE_EPS = 1e-8  (numeric stability guard in Welford variance)
     REWARD_CLAMP: float = 3.0             # z-score ceiling for normalized rewards
     NORMALIZE_EPS: float = 1e-8          # variance floor for Welford normalization
 
-    
+    # RB-CRIT-2 FIX: Expand reward range to [-1.0, 1.0] to preserve negative
+    # learning signal. The previous RAW_REWARD_MIN = 0.0 silently clamped
+    # reward=-0.5 (policy-denied, authority-abort, low-confidence) to 0.0
+    # (neutral), making failures indistinguishable from untried actions.
+    # The bandit re-explored destructive actions with equal probability as
+    # novel ones. Regret underflowed (failure → neutral → 0 regret delta).
+    #
+    # With RAW_REWARD_MIN = -1.0:
+    #   reward=-0.5 (failure) → normalized = (-0.5/0.5)*3.0 = -3.0 (floor)
+    #   reward=0.0  (neutral) → normalized = (0.0/0.5)*3.0  =  0.0 (center)
+    #   reward=1.0  (success) → normalized = (1.0/0.5)*3.0  = +3.0 (ceiling)
+    # Failures are now distinguishable from untried actions, regret accumulates
+    # correctly, and the bandit avoids re-exploring known-bad actions.
     RAW_REWARD_MIN: float = -1.0          # minimum valid raw reward (failures)
     RAW_REWARD_MAX: float = 1.0           # maximum valid raw reward (successes)
 
@@ -587,3 +645,4 @@ class BeliefState:
         except Exception:
             # Any reconstruction error → safe fallback with fresh state.
             return cls(intent_hash=intent_hash)
+
