@@ -187,6 +187,53 @@ class SnapshotProvider:
                         data = json.load(f)
                     snap = RestorationSnapshot.from_dict(data)
                     captured = float(snap.metadata.get("captured_at_wallclock", 0))
+
+                    # H-4 FIX: Dual-direction timestamp sanity check.
+                    #
+                    # Two NTP-related failure modes that the original code missed:
+                    #
+                    # 1. FAR PAST: Snapshots older than 2 * MAX_SNAPSHOT_AGE_SECONDS
+                    #    (12600s / ~3.5h) should never appear after a clean shutdown
+                    #    because normal expiry removes them.  If one appears it was
+                    #    written during a previous process run under a severely skewed
+                    #    clock or survived an unexpected filesystem restore.  Accepting
+                    #    it risks restoring workspace state that is hours stale.
+                    #
+                    # 2. FAR FUTURE: captured_at > now + 60s means the snapshot was
+                    #    written by a process whose system clock was ahead by more than
+                    #    60 seconds. After an NTP correction that steps the clock
+                    #    backward, the snapshot would appear to never expire (now < captured_at
+                    #    always) and would survive indefinitely in memory and on disk.
+                    #    This could chain into a restoration from arbitrarily old state.
+                    #
+                    # Fix: reject snapshots in either anomalous category, delete the
+                    # file, and log a diagnostic. The 60s grace window for future
+                    # timestamps tolerates minor clock skew without false positives.
+                    _max_age = self.MAX_SNAPSHOT_AGE_SECONDS * 2  # 12600s hard reject
+                    _future_grace = 60.0  # tolerate up to 60s clock skew
+
+                    if captured > 0 and (now - captured) > _max_age:
+                        import sys as _sys
+                        print(
+                            f"[SnapshotProvider] Reload: snapshot {snap.snapshot_id[:12]}… "
+                            f"is FAR PAST ({round((now - captured)/3600, 1)}h old, "
+                            f"hard limit {_max_age/3600:.1f}h). Discarding.",
+                            file=_sys.stderr,
+                        )
+                        os.remove(fpath)
+                        continue
+
+                    if captured > now + _future_grace:
+                        import sys as _sys
+                        print(
+                            f"[SnapshotProvider] Reload: snapshot {snap.snapshot_id[:12]}… "
+                            f"has a FUTURE timestamp ({round(captured - now, 1)}s ahead). "
+                            "Possible NTP forward-step. Discarding to prevent stale restoration.",
+                            file=_sys.stderr,
+                        )
+                        os.remove(fpath)
+                        continue
+
                     if (now - captured) > self.MAX_SNAPSHOT_AGE_SECONDS:
                         os.remove(fpath)  # expired — discard
                         continue
@@ -304,7 +351,35 @@ class SnapshotProvider:
         if not self._observer.is_healthy():
             raise SnapshotProviderError("Observer unhealthy")
 
-        observer_state = self._observer.snapshot()
+        # RB-5 FIX: Wrap observer.snapshot() in try/except SnapshotProviderError.
+        #
+        # Root cause: is_healthy() checked the observer thread's health flag, but
+        # the flag was set by the observer thread on its OWN schedule. Between
+        # is_healthy()==True and observer.snapshot(), the observer thread could:
+        #   - Lose its display connection (X11 disconnect, Wayland compositor restart)
+        #   - Hit an internal exception in the perception pipeline
+        #   - Be interrupted by the OS scheduler and leave snapshot() in a partial state
+        #
+        # Any exception from observer.snapshot() propagated as a bare exception
+        # through IntentListener._listen_loop(), which swallowed it in except:pass
+        # and immediately re-polled. The intent file was NOT consumed, so the system
+        # attempted arming again on the next poll tick. This created a tight retry
+        # loop (every POLL_INTERVAL=0.1s) that generated noisy logs and burned CPU.
+        #
+        # Fix: catch any exception from observer.snapshot() and re-raise as
+        # SnapshotProviderError so the caller (IntentListener._listen_loop) sees a
+        # typed, expected exception with a diagnostic message, logs it properly as
+        # arm_failure_reason, and backs off before retrying.
+        try:
+            observer_state = self._observer.snapshot()
+        except SnapshotProviderError:
+            raise  # Already typed — propagate unchanged
+        except Exception as _obs_exc:
+            raise SnapshotProviderError(
+                f"Observer.snapshot() raised during capture — observer may be "
+                f"flapping (health check passed but snapshot failed): {_obs_exc}"
+            ) from _obs_exc
+
         if not isinstance(observer_state, dict):
             raise SnapshotProviderError("Observer snapshot malformed")
 
