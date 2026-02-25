@@ -474,4 +474,222 @@ class ExecutionPlanner:
             # The previous getattr(self, "_decompose_model", None) was permanently
             # None — the attribute was never set — causing repeated closure
             # introspection on every planning call.
-            _model = self._mod
+            _model = self._model_name
+
+            # FIX-07: Use shared Ollama client from __init__.
+            client = self._ollama_client
+            if client is None:
+                raise PlanningError("Ollama client unavailable for text-only planning call")
+
+            response = client.chat(
+                model=_model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a step-expansion planning engine. "
+                            "Return ONLY valid JSON. No prose. No markdown fences."
+                        ),
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                options={"temperature": 0},
+            )
+
+            # Extract plain text from Ollama response (compat with >=0.2 and legacy).
+            if hasattr(response, "message") and hasattr(response.message, "content"):
+                return response.message.content
+            if isinstance(response, dict):
+                return response.get("message", {}).get("content", "")
+            return str(response)
+
+        except PlanningError:
+            raise
+        except Exception as exc:
+            raise PlanningError(f"_call_llm_text failed: {exc}") from exc
+
+    # ==================================================
+    # GOAL EXPANSION — P0 FIX: _expand_goal() was entirely absent.
+    # Every create_plan() call raised:
+    #   AttributeError: 'ExecutionPlanner' object has no attribute '_expand_goal'
+    # making planning impossible. This method is the core of the planner.
+    # ==================================================
+
+    def _expand_goal(
+        self, goal: str, *, include_screen_context: bool = False
+    ) -> "List[Dict[str, Any]]":
+        """
+        Expand a single high-level goal string into a list of ExecutionStep
+        spec dicts by calling the LLM with a structured planning prompt.
+
+        Returns a List of dicts, each matching _STEP_SCHEMA_BLOCK, with keys:
+          type, description, estimated_duration, retryable, verification, action.
+
+        Raises PlanningError if the LLM response cannot be parsed into valid steps.
+        """
+        import json as _json
+        import re as _re
+
+        # Build environment context block (safe fields only).
+        env_lines = []
+        for key in self.SAFE_ENV_FIELDS:
+            val = self._environment.get(key)
+            if val is not None:
+                env_lines.append(f"  {key}: {val}")
+        env_block = "\n".join(env_lines) if env_lines else "  (unavailable)"
+
+        # Optionally include world/screen context for UI-facing goals.
+        screen_block = ""
+        if include_screen_context and self._world_snapshot:
+            try:
+                entities = self._world_snapshot.get("entities", [])[:10]
+                focused = self._world_snapshot.get("focused_app", "unknown")
+                entity_labels = ", ".join(
+                    str(e.get("label") or e.get("text") or e)
+                    for e in entities
+                )
+                screen_block = (
+                    f"\nCURRENT SCREEN STATE:\n"
+                    f"  focused_app: {focused}\n"
+                    f"  visible_entities ({len(entities)}): {entity_labels}"
+                )
+            except Exception:
+                screen_block = ""
+
+        prompt = (
+            f"GOAL: {goal}\n\n"
+            f"ENVIRONMENT:\n{env_block}"
+            f"{screen_block}\n\n"
+            f"{_STEP_SCHEMA_BLOCK}\n"
+            "Expand the GOAL into the minimal ordered sequence of steps needed "
+            "to achieve it. Return ONLY a JSON array of step objects. "
+            "No prose. No markdown. No extra keys."
+        )
+
+        raw_text = self._call_llm_text(prompt)
+        steps = self._parse_step_array(raw_text)
+
+        validated = []
+        for raw_step in steps:
+            step = self._validate_and_normalise_step(raw_step)
+            if step is not None:
+                validated.append(step)
+
+        if not validated:
+            raise PlanningError(f"LLM returned no valid steps for goal: {goal!r}")
+
+        return validated
+
+    # --------------------------------------------------
+    # JSON PARSING HELPERS
+    # --------------------------------------------------
+
+    def _parse_step_array(self, raw_text: str) -> "List[Dict[str, Any]]":
+        """
+        Extract a JSON array from LLM output. Uses greedy bracket matching
+        as a fallback when the model wraps output in prose or markdown fences.
+        """
+        import json as _json
+        import re as _re
+
+        if not isinstance(raw_text, str) or not raw_text.strip():
+            raise PlanningError("LLM returned empty response for step expansion")
+
+        text = _re.sub(r"```(?:json)?", "", raw_text).strip()
+
+        try:
+            result = _json.loads(text)
+            if isinstance(result, list):
+                return result
+            if isinstance(result, dict) and "steps" in result:
+                return result["steps"]
+        except _json.JSONDecodeError:
+            pass
+
+        bracket_match = _re.search(r"\[.*\]", text, _re.DOTALL)
+        if bracket_match:
+            try:
+                result = _json.loads(bracket_match.group(0))
+                if isinstance(result, list):
+                    return result
+            except _json.JSONDecodeError:
+                pass
+
+        raise PlanningError(
+            f"Could not parse JSON step array from LLM response: {raw_text[:200]!r}"
+        )
+
+    def _validate_and_normalise_step(
+        self, raw: "Dict[str, Any]"
+    ) -> "Optional[Dict[str, Any]]":
+        """
+        Validate one raw step dict from the LLM and normalise to the expected
+        schema. Returns None for invalid steps so one bad step does not abort
+        the whole plan.
+        """
+        if not isinstance(raw, dict):
+            return None
+
+        raw_type = raw.get("type", "")
+        valid_types = {
+            "ui_interaction", "command_execution", "file_creation",
+            "verification", "tool_installation",
+        }
+        if raw_type not in valid_types:
+            return None
+
+        description = raw.get("description", "")
+        if not isinstance(description, str) or not description.strip():
+            description = f"Execute {raw_type} step"
+
+        try:
+            duration = float(raw.get("estimated_duration", 5.0))
+            duration = max(0.0, min(duration, self.MAX_ESTIMATED_DURATION))
+        except (TypeError, ValueError):
+            duration = 5.0
+
+        retryable = bool(raw.get("retryable", True))
+        verification = raw.get("verification", {})
+        if not isinstance(verification, dict):
+            verification = {}
+
+        action = raw.get("action", {})
+        if not isinstance(action, dict):
+            action = {"operation": raw_type}
+
+        # Safety: reject steps with dangerous shell commands.
+        command_text = action.get("command", "") + " " + action.get("content", "")
+        for pattern in self._compiled_patterns:
+            if pattern.search(command_text):
+                return None
+
+        # Injection check on action field values.
+        for v in action.values():
+            if isinstance(v, str):
+                for marker in INJECTION_MARKERS:
+                    if marker.lower() in v.lower():
+                        return None
+
+        # Truncate excessively long commands.
+        if "command" in action and isinstance(action["command"], str):
+            if len(action["command"]) > self.MAX_COMMAND_LENGTH:
+                action["command"] = action["command"][: self.MAX_COMMAND_LENGTH]
+
+        return {
+            "type": raw_type,
+            "description": description.strip(),
+            "estimated_duration": duration,
+            "retryable": retryable,
+            "verification": verification,
+            "action": action,
+        }
+
+    # --------------------------------------------------
+    # UTILITIES
+    # --------------------------------------------------
+
+    def _extract_required_tools(self, requirements: "Dict[str, Any]") -> "List[str]":
+        tools = requirements.get("tools", [])
+        if isinstance(tools, list):
+            return [str(t) for t in tools if t]
+        return []
