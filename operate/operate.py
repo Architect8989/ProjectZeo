@@ -29,6 +29,35 @@ from policy.engine import PolicyEngine, PolicyViolationError
 
 from config.timeouts import MAX_STAGNANT_ITERS_UI, MAX_STAGNANT_ITERS_COMMAND
 
+# RT-05 FIX: Move pyautogui import to module top-level with availability flag.
+#
+# Root cause: the previous code deferred `import pyautogui` inside the
+# `elif op == "scroll":` branch of _execute_decision().  On headless CI
+# environments or systems without pyautogui installed, the ImportError was
+# caught by the outer `except Exception` handler which returned
+# {"success": False, "reward": -0.5} with no diagnostic.  The operator saw
+# scroll silently failing with a generic failure reward and no indication
+# that the dependency was missing.  The startup validator
+# (_validate_runtime_dependencies in run.py) did not check for pyautogui,
+# so the system would happily start, run for an arbitrary number of steps,
+# and then produce inexplicable -0.5 rewards on every scroll action.
+#
+# Fix (two parts):
+#   1. Import pyautogui here at module load time inside a try/except so that
+#      import failure is detected once at startup, not on every scroll call.
+#   2. Set _PYAUTOGUI_AVAILABLE = True/False based on the import outcome.
+#      The scroll branch now checks this flag and returns a structured error
+#      with a clear "pyautogui_unavailable" reason rather than a silent -0.5.
+#
+# Part 2 of the fix (in run.py's _validate_runtime_dependencies) emits a
+# FATAL startup error if pyautogui is missing and scrolling is needed, so
+# operators see the dependency gap before any task runs.
+try:
+    import pyautogui as _pyautogui
+    _PYAUTOGUI_AVAILABLE: bool = True
+except ImportError:
+    _pyautogui = None  # type: ignore[assignment]
+    _PYAUTOGUI_AVAILABLE: bool = False
 
 MAX_PERCEPTION_ENTITIES = 20
 MAX_PERCEPTION_JSON_BYTES = 10_000
@@ -793,12 +822,28 @@ def _execute_decision(
             return {"success": True, "reward": 0.8}
 
         elif op == "scroll":
-            import pyautogui
+            # RT-05 FIX: Use the module-level _pyautogui alias (imported at the
+            # top of this file) and the _PYAUTOGUI_AVAILABLE flag instead of
+            # deferring `import pyautogui` here.
+            #
+            # If pyautogui is unavailable, return a structured failure with a
+            # clear reason so operators can diagnose the dependency gap.  The
+            # failure reward (-0.5) is identical to other hard failures and
+            # feeds correctly into the Welford normaliser and Thompson sampler.
+            if not _PYAUTOGUI_AVAILABLE:
+                return {
+                    "success": False,
+                    "reward": -0.5,
+                    "reason": (
+                        "pyautogui_unavailable: scroll operation requires pyautogui. "
+                        "Install with: pip install pyautogui"
+                    ),
+                }
             direction = str(action.get("direction", "down")).lower()
             clicks = int(action.get("clicks", 3))
             amount = clicks if direction == "up" else -clicks
             run_with_timeout(
-                lambda: pyautogui.scroll(amount),
+                lambda: _pyautogui.scroll(amount),
                 seconds=10.0,
                 operation_hint="scroll",
                 executor=task_ui_executor,
