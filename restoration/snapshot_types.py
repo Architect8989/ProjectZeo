@@ -241,8 +241,64 @@ class RestorationSnapshot:
                 "process_name": self.application.process_name,
                 "pid": self.application.pid,
             },
-            "metadata": dict(self.metadata),
+            \"metadata\": dict(self.metadata),
         }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "RestorationSnapshot":
+        """
+        H-01 FIX: Reconstruct a RestorationSnapshot from a to_dict() payload.
+
+        Used by SnapshotProvider._reload_from_disk() to restore persisted
+        snapshots across process restarts.  Raises ValueError on malformed input.
+        """
+        if not isinstance(data, dict):
+            raise ValueError("from_dict(): data must be a dict")
+
+        snapshot_id = str(data.get("snapshot_id", "")).strip()
+        if not snapshot_id:
+            raise ValueError("from_dict(): missing snapshot_id")
+
+        try:
+            captured_at = float(data["captured_at"])
+        except (KeyError, TypeError, ValueError) as e:
+            raise ValueError(f"from_dict(): invalid captured_at — {e}") from e
+
+        execution_mode = str(data.get("execution_mode", "observer"))
+
+        cursor_d = data.get("cursor", {})
+        if not isinstance(cursor_d, dict):
+            raise ValueError("from_dict(): invalid cursor block")
+        cursor = CursorState(x=int(cursor_d["x"]), y=int(cursor_d["y"]))
+
+        focus_d = data.get("focus", {})
+        if not isinstance(focus_d, dict):
+            raise ValueError("from_dict(): invalid focus block")
+        focus = FocusState(
+            window_id=str(focus_d.get("window_id", "")),
+            title=focus_d.get("title"),
+        )
+
+        app_d = data.get("application", {})
+        if not isinstance(app_d, dict):
+            raise ValueError("from_dict(): invalid application block")
+        application = ApplicationState(
+            process_name=str(app_d.get("process_name", "__bare_desktop__")),
+            pid=app_d.get("pid"),
+        )
+
+        metadata = dict(data.get("metadata", {}))
+
+        # Reconstruct with the ORIGINAL snapshot_id (do not re-derive).
+        return cls(
+            snapshot_id=snapshot_id,
+            captured_at=captured_at,
+            execution_mode=execution_mode,
+            cursor=cursor,
+            focus=focus,
+            application=application,
+            metadata=metadata,
+        )
 
 
 # FIX-04 (SI-02): Declare the nonce counter as a TRUE class-level attribute
