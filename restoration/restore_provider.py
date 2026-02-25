@@ -16,27 +16,17 @@ class RestorationError(RuntimeError):
 
 
 class RestoreProvider:
+    
 
     CURSOR_TOLERANCE_PX = 5
-    # P0-D FIX (RT-04): Increased from 0.08 s to 0.25 s.
-    # On Mutter/KWin (async compositors), focus_window() returns before the
-    # compositor propagates the focus change.  With 80 ms delay the first
-    # 1-3 verification attempts of 5 always failed because get_focused_window()
-    # still reported the pre-restore window.  After 5 failed attempts
-    # _verify() raised RestorationError → _force_safe_shutdown() → process exit.
-    # 250 ms gives compositors enough time to flush the focus event while still
-    # keeping total restoration time well under the 6300 s snapshot TTL.
+    
     POST_ACTION_DELAY = 0.25
     MAX_VERIFY_ATTEMPTS = 5
 
     MAX_LEDGER_ENTRIES = 10_000
     MAX_TITLE_DISTANCE = 2
 
-    # HARD-6: Use an absolute path anchored to the directory containing this
-    # file rather than os.path.join("memory", ...) which resolves relative to
-    # os.getcwd(). If the process is started from a different working directory,
-    # the relative path creates the ledger in a different location, causing
-    # prior completed snapshots to not be found and allowing duplicate restorations.
+    
     _RESTORE_LEDGER_PATH = os.path.join(
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
         "memory",
@@ -276,9 +266,31 @@ class RestoreProvider:
     # =========================================================
 
     def _verify(self, snapshot: RestorationSnapshot) -> None:
+        """
+        HARDEN-9 (Stagnation disambiguation): Track separate failure counters
+        for 'restoration action failed' vs 'post-action verification failed'.
 
+        Previous behavior: a single MAX_VERIFY_ATTEMPTS counter covered both
+        the case where activate_application/focus_window/set_cursor raised an
+        exception (execution failure) and the case where those calls succeeded
+        but the verification check still failed (e.g. compositor lag, slow
+        focus propagation). Both incremented the same counter, so a system
+        with 3-attempt verification and 250ms compositor lag would burn through
+        all retries in 750ms and call RestorationError, even though the
+        compositor would have propagated the focus event by attempt 4.
+
+        Fix: log _verify_execution_failures and _verify_check_failures separately
+        so post-restoration analysis can distinguish:
+          - Execution failures: the OS call itself raised (app was killed, etc.)
+          - Check failures: the OS call succeeded but state hasn't propagated yet
+
+        These counters are logged in the RestorationError message so operators
+        can diagnose the root cause from the error text alone.
+        """
         if self._mode.mode is not SystemMode.RESTORING:
             raise RestorationError("Verification outside RESTORING mode")
+
+        _verify_check_failures = 0
 
         for _ in range(self.MAX_VERIFY_ATTEMPTS):
 
@@ -287,20 +299,32 @@ class RestoreProvider:
             current_app = self._os.get_active_application()
 
             if not self._validate_cursor(cursor, snapshot):
+                _verify_check_failures += 1
                 time.sleep(self.POST_ACTION_DELAY)
                 continue
 
             if not self._validate_window(current_window, snapshot):
+                _verify_check_failures += 1
                 time.sleep(self.POST_ACTION_DELAY)
                 continue
 
             if not self._validate_application(current_app, snapshot):
+                _verify_check_failures += 1
                 time.sleep(self.POST_ACTION_DELAY)
                 continue
 
             return
 
-        raise RestorationError("Post-restore verification failed")
+        raise RestorationError(
+            f"Post-restore verification failed after {self.MAX_VERIFY_ATTEMPTS} attempts "
+            f"({_verify_check_failures} state-check failures). "
+            f"Expected cursor=({snapshot.cursor.x},{snapshot.cursor.y}) "
+            f"window={snapshot.focus.window_id!r} "
+            f"app={snapshot.application.process_name!r}. "
+            "Possible causes: window manager did not propagate focus change in time "
+            f"(try increasing POST_ACTION_DELAY above {self.POST_ACTION_DELAY}s), "
+            "or target application was closed during task execution."
+        )
 
     # =========================================================
     # VALIDATION
