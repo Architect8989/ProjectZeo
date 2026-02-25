@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import time
 import threading
 import json
@@ -63,6 +64,25 @@ class SnapshotProvider:
         self._observer = observer
         self._os = os_backend
         self._mode = mode_controller
+
+        # FIX-4 (MEDIUM): ATOMIC_WINDOW_SECONDS is now runtime-configurable via
+        # the PROJECTZEO_ATOMIC_WINDOW_SECONDS environment variable so that slow
+        # VMs and disk-saturated hosts can relax the capture deadline without
+        # requiring a code change.  The class constant (0.5s) remains as the
+        # default.  Valid range is clamped to [0.1, 10.0] seconds to prevent
+        # misconfiguration from masking genuine OS hangs.
+        #
+        # Usage:
+        #   export PROJECTZEO_ATOMIC_WINDOW_SECONDS=2.0   # e.g. for slow VMs
+        _env_val = os.environ.get("PROJECTZEO_ATOMIC_WINDOW_SECONDS")
+        if _env_val is not None:
+            try:
+                _configured = float(_env_val)
+                self._atomic_window_seconds: float = max(0.1, min(10.0, _configured))
+            except ValueError:
+                self._atomic_window_seconds = self.ATOMIC_WINDOW_SECONDS
+        else:
+            self._atomic_window_seconds = self.ATOMIC_WINDOW_SECONDS
 
         # instance-local registry
         self._snapshots: "OrderedDict[str, RestorationSnapshot]" = OrderedDict()
@@ -218,7 +238,7 @@ class SnapshotProvider:
 
         capture_duration = t_end - t_start
 
-        if capture_duration > self.ATOMIC_WINDOW_SECONDS:
+        if capture_duration > self._atomic_window_seconds:
             raise SnapshotProviderError(
                 f"Atomic capture window exceeded ({round(capture_duration,4)}s)"
             )
