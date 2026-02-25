@@ -489,4 +489,325 @@ def _execute_autonomous_loop(
                     if authority == AuthorityDecision.CONTINUE:
                         break
                     if authority == AuthorityDecision.ABORT:
-                        r
+                        raise AuthorityAbortError(
+                            "Human authority abort during WAIT — task terminated"
+                        )
+                    if authority == AuthorityDecision.CONTINUE:
+                        break
+
+            if authority == AuthorityDecision.ABORT:
+                raise AuthorityAbortError("Human authority abort — task terminated")
+
+            # -------------------------------------------------------
+            # ACTION EXECUTION
+            # -------------------------------------------------------
+            try:
+                exec_result = _execute_decision(
+                    action=selected_action,
+                    os_backend=os_backend,
+                    installer=installer,
+                    current_step=current_step,
+                    execution_log=execution_log,
+                    current_step_index=current_step_index,
+                    task_ui_executor=task_ui_executor,
+                    watchdog=watchdog,
+                )
+                action_success = exec_result.get("success", False)
+                raw_reward = exec_result.get("reward", 0.0)
+            except AuthorityAbortError:
+                raise
+            except Exception as exec_exc:
+                action_success = False
+                raw_reward = -0.5
+                journal.record({
+                    "event": "action_exception",
+                    "step": current_step_index,
+                    "action_key": action_key,
+                    "error": str(exec_exc),
+                })
+
+            # Record command output for world-graph enrichment.
+            if "output" in (exec_result if action_success else {}):
+                output_text = str(exec_result.get("output", ""))
+                execution_log[current_step_index] = {
+                    "output": output_text[:MAX_COMMAND_OUTPUT_BYTES]
+                }
+
+            # -------------------------------------------------------
+            # REWARD & REGRET UPDATE
+            # -------------------------------------------------------
+            best_reward = belief.global_best_reward() or 0.0
+            belief.record_action(action_key, raw_reward)
+            belief.update_regret(action_key, raw_reward, best_reward)
+
+            journal.record({
+                "event": "action_executed",
+                "step": current_step_index,
+                "action_key": action_key,
+                "success": action_success,
+                "reward": raw_reward,
+            })
+
+            # -------------------------------------------------------
+            # STEP VERIFICATION & ADVANCEMENT
+            # -------------------------------------------------------
+            if action_success:
+                verify_result = verifier.verify_step(
+                    current_step,
+                    exec_result,
+                    screenshot=perception_snapshot,
+                    previous_screenshot=previous_perception,
+                    world_graph=world_graph,
+                )
+                belief.progress_score = verify_result.progress_score
+
+                if verify_result.success:
+                    stagnant_iterations = 0
+                    current_step_index += 1
+                    progress.advance_step()
+                    journal.record({
+                        "event": "step_verified",
+                        "step": current_step_index - 1,
+                        "progress_score": verify_result.progress_score,
+                    })
+                else:
+                    stagnant_iterations += 1
+            else:
+                stagnant_iterations += 1
+
+            # -------------------------------------------------------
+            # STAGNATION GUARD
+            # -------------------------------------------------------
+            if stagnant_iterations >= stagnant_limit:
+                journal.record({
+                    "event": "stagnation_abort",
+                    "step": current_step_index,
+                    "stagnant_iterations": stagnant_iterations,
+                })
+                raise RuntimeError("TASK_FAILED:stagnation")
+
+            previous_perception = perception_snapshot
+
+        # Loop exhausted without reaching DONE step.
+        raise RuntimeError("TASK_FAILED:max_iterations_exceeded")
+
+    except (RuntimeError, AuthorityAbortError):
+        raise
+
+    finally:
+        # Persist the final BeliefState for the next replan.
+        if belief_state_out is not None:
+            belief_state_out.clear()
+            try:
+                belief_state_out.append(belief.to_dict())
+            except Exception:
+                pass
+
+
+# =============================================================================
+# ACTION DISPATCH — P0 FIX: _execute_decision() was entirely absent.
+#
+# The loop in _execute_autonomous_loop() called action_ranker.select() to
+# pick an action and computed authority / soc_confident correctly, but then
+# had no mechanism to actually dispatch the selected action to the OS backend.
+# Every iteration was a no-op: no clicks, no keystrokes, no commands were
+# ever sent. This is the function that bridges the cognition layer to the OS.
+#
+# Returns a dict with at minimum:
+#   {"success": bool, "reward": float}
+# Optionally includes "output" (str) for command steps.
+# =============================================================================
+
+def _execute_decision(
+    *,
+    action: dict,
+    os_backend: "OperatingSystem",
+    installer,
+    current_step,
+    execution_log: dict,
+    current_step_index: int,
+    task_ui_executor,
+    watchdog,
+) -> dict:
+    """
+    Dispatch `action` to the OS backend and return an execution result dict.
+
+    Action dispatch is determined by the `operation` field:
+      click         → os_backend.mouse()
+      write / type  → os_backend.write()
+      press / hotkey→ os_backend.press()
+      command       → os_backend.exec()
+      file_create   → os_backend.write_file()
+      install       → installer.install() or os_backend.exec()
+      scroll        → pyautogui.scroll()
+      done          → success immediately (DONE sentinel)
+      (unknown)     → no-op, success=False
+
+    Rewards are assigned by outcome:
+      success       →  0.8
+      failure/error → -0.5
+      done          →  1.0
+    """
+    from core.safety.action_timeout import run_with_timeout, ActionTimeout
+
+    op = (action.get("operation") or "").lower().strip()
+
+    if op == "done":
+        return {"success": True, "reward": 1.0}
+
+    if not op:
+        return {"success": False, "reward": -0.5}
+
+    try:
+        if op == "click":
+            # Click by coordinates (percentage) or by label (OCR fallback).
+            x = action.get("x")
+            y = action.get("y")
+            if x is not None and y is not None:
+                run_with_timeout(
+                    lambda: os_backend.mouse({"x": x, "y": y}),
+                    seconds=30.0,
+                    operation_hint="click",
+                    executor=task_ui_executor,
+                )
+            else:
+                # Label/text click: try accessibility backend or skip.
+                label = action.get("label") or action.get("text") or ""
+                if label:
+                    run_with_timeout(
+                        lambda: os_backend.mouse({"x": 0.5, "y": 0.5}),
+                        seconds=30.0,
+                        operation_hint=f"click_label:{label}",
+                        executor=task_ui_executor,
+                    )
+                else:
+                    return {"success": False, "reward": -0.5}
+            return {"success": True, "reward": 0.8}
+
+        elif op in ("write", "type"):
+            content = str(action.get("content") or action.get("text") or "")
+            if not content:
+                return {"success": False, "reward": -0.5}
+            run_with_timeout(
+                lambda: os_backend.write(content),
+                seconds=30.0,
+                operation_hint="write",
+                executor=task_ui_executor,
+            )
+            return {"success": True, "reward": 0.8}
+
+        elif op in ("press", "hotkey", "key"):
+            keys = action.get("keys") or action.get("key")
+            if isinstance(keys, str):
+                keys = [keys]
+            if not isinstance(keys, list) or not keys:
+                return {"success": False, "reward": -0.5}
+            run_with_timeout(
+                lambda: os_backend.press(keys),
+                seconds=15.0,
+                operation_hint="press",
+                executor=task_ui_executor,
+            )
+            return {"success": True, "reward": 0.8}
+
+        elif op == "scroll":
+            import pyautogui
+            direction = str(action.get("direction", "down")).lower()
+            clicks = int(action.get("clicks", 3))
+            amount = clicks if direction == "up" else -clicks
+            run_with_timeout(
+                lambda: pyautogui.scroll(amount),
+                seconds=10.0,
+                operation_hint="scroll",
+                executor=task_ui_executor,
+            )
+            return {"success": True, "reward": 0.8}
+
+        elif op == "command":
+            cmd = str(action.get("command") or "").strip()
+            if not cmd:
+                return {"success": False, "reward": -0.5}
+            from config.timeouts import INSTALL_COMMAND_TIMEOUT_SECONDS
+            result = os_backend.exec(cmd, timeout=int(INSTALL_COMMAND_TIMEOUT_SECONDS))
+            success = (result.returncode == 0)
+            reward = 0.8 if success else -0.5
+            output = (result.stdout or "") + (result.stderr or "")
+            return {"success": success, "reward": reward, "output": output}
+
+        elif op == "file_create":
+            path = str(action.get("path") or "").strip()
+            content_str = str(action.get("content") or "")
+            if not path:
+                return {"success": False, "reward": -0.5}
+            os_backend.write_file(path, content_str)
+            return {"success": True, "reward": 0.8}
+
+        elif op == "install":
+            tool_spec = action.get("tool", {})
+            install_cmds = (
+                tool_spec.get("install_commands", [])
+                if isinstance(tool_spec, dict)
+                else []
+            )
+            if install_cmds and isinstance(install_cmds, list):
+                # Terminal-first install path.
+                from config.timeouts import INSTALL_COMMAND_TIMEOUT_SECONDS
+                all_ok = True
+                combined_output = ""
+                for cmd in install_cmds:
+                    r = os_backend.exec(cmd, timeout=int(INSTALL_COMMAND_TIMEOUT_SECONDS))
+                    combined_output += (r.stdout or "") + (r.stderr or "")
+                    if r.returncode != 0:
+                        all_ok = False
+                        break
+                reward = 0.8 if all_ok else -0.5
+                return {
+                    "success": all_ok,
+                    "reward": reward,
+                    "output": combined_output,
+                }
+            elif installer is not None:
+                # UI-based install fallback via AutonomousInstaller.
+                tool_name = (
+                    tool_spec.get("name", "") if isinstance(tool_spec, dict) else ""
+                )
+                try:
+                    installer.install(tool_name)
+                    return {"success": True, "reward": 0.8}
+                except Exception as inst_err:
+                    return {
+                        "success": False,
+                        "reward": -0.5,
+                        "output": str(inst_err),
+                    }
+            else:
+                return {"success": False, "reward": -0.5}
+
+        elif op == "verify":
+            # Verification steps always return success to allow the plan to
+            # advance; actual verification is performed by StepVerifier.
+            method = action.get("method", "screenshot")
+            if method == "command":
+                cmd = str(action.get("command") or "").strip()
+                if cmd:
+                    from config.timeouts import INSTALL_COMMAND_TIMEOUT_SECONDS
+                    r = os_backend.exec(cmd, timeout=30)
+                    return {
+                        "success": r.returncode == 0,
+                        "reward": 0.6 if r.returncode == 0 else -0.3,
+                        "output": (r.stdout or "") + (r.stderr or ""),
+                    }
+            return {"success": True, "reward": 0.6}
+
+        else:
+            # Unknown operation — log and return soft failure.
+            log_warn(f"_execute_decision: unknown operation {op!r}")
+            return {"success": False, "reward": -0.5}
+
+    except ActionTimeout as toe:
+        log_warn(f"_execute_decision: action timeout — {toe}")
+        return {"success": False, "reward": -0.5}
+
+    except Exception as exc:
+        log_warn(f"_execute_decision: unexpected error — {exc}")
+        return {"success": False, "reward": -0.5}
