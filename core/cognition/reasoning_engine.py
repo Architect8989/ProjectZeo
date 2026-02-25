@@ -1,11 +1,8 @@
 from typing import Dict, Any, List
 import json
 
-# FIX H4: Import shared injection marker set instead of defining it inline.
-# Both ReasoningEngine and ExecutionPlanner now use INJECTION_MARKERS from
-# core.security.injection_markers, so adding a new marker in one place
-# covers both components automatically.
-from core.security.injection_markers import INJECTION_MARKERS
+
+from core.security.injection_markers import INJECTION_MARKERS, normalize_for_injection_check
 
 
 class ReasoningEngine:
@@ -143,7 +140,10 @@ class ReasoningEngine:
         if not isinstance(text, str):
             return ""
 
-        lowered = text.lower()
+        # HAR-6: Apply NFKD + ASCII normalization before matching to defeat
+        # Unicode homoglyph injection bypasses (e.g. using U+03B9 GREEK IOTA
+        # in place of ASCII 'i' in "ιgnore previous instructions").
+        lowered = normalize_for_injection_check(text)
         for marker in self._INJECTION_MARKERS:
             if marker in lowered:
                 return ""
