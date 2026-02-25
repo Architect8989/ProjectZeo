@@ -21,72 +21,14 @@ class BeliefState:
     
     MIN_ENTROPY_FLOOR = 0.3
 
-    # AUDIT-SI-4 FIX: Bootstrap normalization scale promoted to class constant.
-    #
-    # Root cause: the previous code used a local variable `_raw_scale = 0.5`
-    # inside record_action() with a comment "max absolute raw reward
-    # (confidence - 0.5)". This embedded an undocumented implicit contract:
-    # reward signals must be in [0, 1] (confidence scores where 0.5 = neutral).
-    # No validation existed at call sites to enforce this range.
-    #
-    # Consequence: if a caller passed rewards outside [0, 1] — for example
-    # [-1.0, +1.0] success/failure signals — the bootstrap phase (n < 3
-    # samples) would produce distorted normalized values that are
-    # retroactively corrected only at n == 3 by the Welford renormalization.
-    # Decision-making during the first 2 observations for any action operated
-    # on incorrectly scaled scores, causing suboptimal early exploration.
-    #
-    # Fix:
-    #   1. Promote the scale to BOOTSTRAP_REWARD_SCALE class constant with a
-    #      full docstring documenting the expected raw reward contract.
-    #   2. Add RAW_REWARD_MIN / RAW_REWARD_MAX constants that define the
-    #      expected input range for raw rewards.
-    #   3. In record_action(), clamp the raw reward to [RAW_REWARD_MIN,
-    #      RAW_REWARD_MAX] before normalization. This prevents distortion
-    #      from out-of-range inputs without breaking callers that pass valid
-    #      in-range values.
-    #   4. The retroactive n==3 renormalization is preserved unchanged —
-    #      it remains the authoritative correction path for bootstrap bias.
-    #
-    # BOOTSTRAP_REWARD_SCALE contract:
-    #   Raw rewards are expected in [0.0, 1.0] where:
-    #     0.0 = complete failure
-    #     0.5 = neutral / no progress
-    #     1.0 = complete success
-    #   The scale maps [0, 1] → [-REWARD_CLAMP, REWARD_CLAMP] via:
-    #     normalised = (reward / BOOTSTRAP_REWARD_SCALE) * REWARD_CLAMP
-    #   i.e. reward=0.5 → 0.0 (neutral), reward=1.0 → +REWARD_CLAMP (max).
+    
     BOOTSTRAP_REWARD_SCALE: float = 0.5   # half of the [0,1] input range
 
-    # RB-CRIT-1 FIX: REWARD_CLAMP and NORMALIZE_EPS were used throughout this
-    # class (ucb_score, thompson_sample, record_action) but were never defined
-    # anywhere in the codebase (grep -rn "REWARD_CLAMP\s*=" returned zero
-    # results). Every call to record_action(), ucb_score(), thompson_sample(),
-    # or expected_utility() raised:
-    #   AttributeError: 'BeliefState' object has no attribute 'REWARD_CLAMP'
-    # This made the entire probabilistic cognition subsystem non-functional.
-    # No task could complete more than one iteration.
-    #
-    # Fix: define both constants here as class-level attributes with the values
-    # implied by the rest of the code:
-    #   REWARD_CLAMP = 3.0  (z-score ceiling used in all normalization paths)
-    #   NORMALIZE_EPS = 1e-8  (numeric stability guard in Welford variance)
+    
     REWARD_CLAMP: float = 3.0             # z-score ceiling for normalized rewards
     NORMALIZE_EPS: float = 1e-8          # variance floor for Welford normalization
 
-    # RB-CRIT-2 FIX: Expand reward range to [-1.0, 1.0] to preserve negative
-    # learning signal. The previous RAW_REWARD_MIN = 0.0 silently clamped
-    # reward=-0.5 (policy-denied, authority-abort, low-confidence) to 0.0
-    # (neutral), making failures indistinguishable from untried actions.
-    # The bandit re-explored destructive actions with equal probability as
-    # novel ones. Regret underflowed (failure → neutral → 0 regret delta).
-    #
-    # With RAW_REWARD_MIN = -1.0:
-    #   reward=-0.5 (failure) → normalized = (-0.5/0.5)*3.0 = -3.0 (floor)
-    #   reward=0.0  (neutral) → normalized = (0.0/0.5)*3.0  =  0.0 (center)
-    #   reward=1.0  (success) → normalized = (1.0/0.5)*3.0  = +3.0 (ceiling)
-    # Failures are now distinguishable from untried actions, regret accumulates
-    # correctly, and the bandit avoids re-exploring known-bad actions.
+    
     RAW_REWARD_MIN: float = -1.0          # minimum valid raw reward (failures)
     RAW_REWARD_MAX: float = 1.0           # maximum valid raw reward (successes)
 
@@ -470,4 +412,178 @@ class BeliefState:
         significant = delta.get("significant_change", False)
 
         if significant:
-            self.enviro
+            # Significant UI change: reduce stability score and reset streak.
+            self.environment_stability = max(
+                0.0, self.environment_stability - 0.2
+            )
+            self.consecutive_high_stability_count = 0
+        else:
+            # No significant change: nudge stability upward, cap at 1.0.
+            self.environment_stability = min(
+                1.0, self.environment_stability + 0.05
+            )
+            if self.environment_stability >= 0.8:
+                self.consecutive_high_stability_count += 1
+            else:
+                self.consecutive_high_stability_count = 0
+
+    # =========================================================
+    # SERIALIZATION  — P0 FIX: to_dict / from_dict / summary
+    #
+    # These three methods were entirely absent from the file.
+    # operate.py calls:
+    #   belief.summary()        at line 399 (ReasoningEngine fallback)
+    #   BeliefState.from_dict() at line 244 (replan state restoration)
+    #   belief.to_dict()        (populates belief_state_out for next replan)
+    # All three raised AttributeError, making reasoning fallback and
+    # cross-replan continuity completely non-functional.
+    # =========================================================
+
+    def summary(self) -> dict:
+        """
+        Return a lightweight snapshot of the current belief state suitable
+        for passing to ReasoningEngine.propose_actions() and for logging.
+        All values are JSON-serializable primitives.
+        """
+        # Top-5 most probable world states (keep summary small).
+        top_states = dict(
+            sorted(self.state_probabilities.items(), key=lambda x: x[1], reverse=True)[:5]
+        )
+        return {
+            "entropy": round(self.entropy(), 4),
+            "state_probabilities": {k: round(v, 4) for k, v in top_states.items()},
+            "progress_score": round(self.progress_score, 4),
+            "environment_stability": round(self.environment_stability, 4),
+            "consecutive_high_stability_count": self.consecutive_high_stability_count,
+            "iteration": self._iteration_counter,
+            "total_actions_tried": len(self.action_counts),
+        }
+
+    def to_dict(self) -> dict:
+        """
+        Serialize the full BeliefState to a JSON-safe dict.
+
+        All deque objects are converted to lists. Welford running statistics
+        (mean, M2, n) are preserved so that normalization is consistent when
+        the state is reconstructed via from_dict().
+
+        Called by operate.py to persist state across replans via belief_state_out.
+        """
+        return {
+            # Belief distribution
+            "state_probabilities": dict(self.state_probabilities),
+            "progress_score": self.progress_score,
+            "environment_stability": self.environment_stability,
+            "consecutive_high_stability_count": self.consecutive_high_stability_count,
+
+            # Commitment / iteration tracking
+            "commitment_hash": self.commitment_hash,
+            "_iteration_counter": self._iteration_counter,
+            "_sample_counter": self._sample_counter,
+            "_regret_decay": self._regret_decay,
+
+            # Action statistics
+            "action_counts": dict(self.action_counts),
+            "action_rewards": {
+                k: list(v) for k, v in self.action_rewards.items()
+            },
+            "_raw_action_rewards": {
+                k: list(v) for k, v in self._raw_action_rewards.items()
+            },
+            "regret": {k: list(v) for k, v in self.regret.items()},
+
+            # Welford running statistics (required for consistent renormalization)
+            "_welford_n": dict(self._welford_n),
+            "_welford_mean": dict(self._welford_mean),
+            "_welford_M2": dict(self._welford_M2),
+
+            # Metadata
+            "created_at": self.created_at,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict, *, intent_hash: str = "") -> "BeliefState":
+        """
+        Reconstruct a BeliefState from a dict produced by to_dict().
+
+        Preserves action counts, reward history, Welford statistics,
+        regret, commitment_hash, and Thompson counters so that cross-replan
+        learning is not lost. A fresh BeliefState seeded only with
+        intent_hash is returned as a safe fallback if data is invalid.
+
+        Parameters
+        ----------
+        data : dict
+            Serialized state from BeliefState.to_dict().
+        intent_hash : str
+            The intent string for the current task (used only when creating
+            a fallback instance; the commitment_hash in data takes precedence).
+        """
+        if not isinstance(data, dict):
+            return cls(intent_hash=intent_hash)
+
+        try:
+            instance = cls.__new__(cls)
+
+            # Timestamps
+            instance.created_at = float(data.get("created_at", 0.0) or 0.0)
+
+            # Belief distribution
+            raw_probs = data.get("state_probabilities", {"neutral": 1.0})
+            instance.state_probabilities = (
+                dict(raw_probs) if isinstance(raw_probs, dict) else {"neutral": 1.0}
+            )
+            instance.progress_score = float(data.get("progress_score", 0.0))
+            instance.environment_stability = float(
+                data.get("environment_stability", 1.0)
+            )
+            instance.consecutive_high_stability_count = int(
+                data.get("consecutive_high_stability_count", 0)
+            )
+
+            # Commitment / iteration
+            instance.commitment_hash = str(
+                data.get("commitment_hash", "GENESIS")
+            )
+            instance._iteration_counter = int(
+                data.get("_iteration_counter", 0)
+            )
+            instance._sample_counter = int(data.get("_sample_counter", 0))
+            instance._regret_decay = float(
+                data.get("_regret_decay", cls.REGRET_DECAY)
+            )
+
+            # Action statistics — restore as deques with correct maxlen.
+            instance.action_counts = dict(data.get("action_counts", {}))
+
+            instance.action_rewards = {}
+            for k, v in data.get("action_rewards", {}).items():
+                d = deque(v, maxlen=cls.REWARD_WINDOW)
+                instance.action_rewards[k] = d
+
+            instance._raw_action_rewards = {}
+            for k, v in data.get("_raw_action_rewards", {}).items():
+                d = deque(v, maxlen=cls.REWARD_WINDOW)
+                instance._raw_action_rewards[k] = d
+
+            instance.regret = {}
+            for k, v in data.get("regret", {}).items():
+                if isinstance(v, (list, tuple)) and len(v) == 2:
+                    instance.regret[k] = (float(v[0]), int(v[1]))
+
+            # Welford running statistics
+            instance._welford_n = {
+                k: int(v) for k, v in data.get("_welford_n", {}).items()
+            }
+            instance._welford_mean = {
+                k: float(v) for k, v in data.get("_welford_mean", {}).items()
+            }
+            instance._welford_M2 = {
+                k: float(v) for k, v in data.get("_welford_M2", {}).items()
+            }
+
+            return instance
+
+        except Exception:
+            # Any reconstruction error → safe fallback with fresh state.
+            return cls(intent_hash=intent_hash)
