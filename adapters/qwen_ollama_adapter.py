@@ -452,8 +452,33 @@ class QwenOllamaAdapter:
                         op["x"] = float(x)
                         op["y"] = float(y)
                         filtered.append(op)
-            except Exception:
-                # Unresolvable text click: drop silently (fail-closed).
+                    else:
+                        # H-03 FIX (RT-06): Log when a click is dropped due to
+                        # bad coordinate data so operators can diagnose stagnation.
+                        logger.warning(
+                            "[QwenOllamaAdapter] OCR click DROPPED — text=%r: "
+                            "resolved coords missing x/y (got %r). "
+                            "Stagnation counter will increment.",
+                            op.get("text", ""),
+                            coords,
+                        )
+                else:
+                    logger.warning(
+                        "[QwenOllamaAdapter] OCR click DROPPED — text=%r: "
+                        "get_text_coordinates returned non-dict (%r). "
+                        "Stagnation counter will increment.",
+                        op.get("text", ""),
+                        coords,
+                    )
+            except Exception as _ocr_exc:
+                # H-03 FIX: Log instead of silently continuing (fail-closed).
+                logger.warning(
+                    "[QwenOllamaAdapter] OCR click DROPPED — text=%r: "
+                    "exception during coordinate resolution: %s. "
+                    "Stagnation counter will increment.",
+                    op.get("text", ""),
+                    _ocr_exc,
+                )
                 continue
 
         operations.clear()
