@@ -18,7 +18,15 @@ class RestorationError(RuntimeError):
 class RestoreProvider:
 
     CURSOR_TOLERANCE_PX = 5
-    POST_ACTION_DELAY = 0.08
+    # P0-D FIX (RT-04): Increased from 0.08 s to 0.25 s.
+    # On Mutter/KWin (async compositors), focus_window() returns before the
+    # compositor propagates the focus change.  With 80 ms delay the first
+    # 1-3 verification attempts of 5 always failed because get_focused_window()
+    # still reported the pre-restore window.  After 5 failed attempts
+    # _verify() raised RestorationError → _force_safe_shutdown() → process exit.
+    # 250 ms gives compositors enough time to flush the focus event while still
+    # keeping total restoration time well under the 6300 s snapshot TTL.
+    POST_ACTION_DELAY = 0.25
     MAX_VERIFY_ATTEMPTS = 5
 
     MAX_LEDGER_ENTRIES = 10_000
@@ -215,10 +223,21 @@ class RestoreProvider:
             self._os.activate_application(
                 {"title": snapshot.application.process_name}
             )
-        except OSError:
+        except OSError as _app_err:
+            # GAP-02 FIX: Log explicitly before swallowing so operators see
+            # "application was killed during task" instead of the opaque
+            # "Post-restore verification failed" that previously appeared.
+            import sys as _sys
+            print(
+                f"[RestoreProvider] WARNING: _restore_application() — "
+                f"activate_application({snapshot.application.process_name!r}) "
+                f"raised OSError: {_app_err}. "
+                "Target application may have been closed during task execution. "
+                "Continuing with best-effort restoration.",
+                file=_sys.stderr,
+            )
             # Best-effort: if the application is no longer running, skip
             # rather than failing the entire restoration sequence.
-            pass
         time.sleep(self.POST_ACTION_DELAY)
 
     def _restore_window(self, snapshot: RestorationSnapshot) -> None:
