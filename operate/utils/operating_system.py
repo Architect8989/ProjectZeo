@@ -149,6 +149,15 @@ class OperatingSystem:
 
         pyautogui.write(content, interval=0.01)
 
+        # P0-C FIX (RT-05): Clear the automation-active flag on the success path.
+        # Previously the flag was set True on entry but never cleared on success —
+        # only force_release_all() or mark_automation_inactive() reset it.
+        # RestoreVerifier._verify_input_released() saw is_automation_active()==True
+        # after every successful write/press/mouse call, raising
+        # RestorationVerificationError("Input still locked after restoration").
+        with self._automation_lock:
+            self._automation_active = False
+
     def press(self, keys) -> None:
         if not isinstance(keys, list) or not keys:
             raise RuntimeError("press(): keys must be non-empty list")
@@ -157,6 +166,10 @@ class OperatingSystem:
             self._automation_active = True
 
         pyautogui.hotkey(*keys)
+
+        # P0-C FIX (RT-05): Clear flag on success path (see write() comment).
+        with self._automation_lock:
+            self._automation_active = False
 
     def mouse(self, click_detail: dict) -> None:
         if not isinstance(click_detail, dict):
@@ -189,6 +202,10 @@ class OperatingSystem:
             raise RuntimeError("Cursor failed to reach target")
 
         pyautogui.click()
+
+        # P0-C FIX (RT-05): Clear flag on success path (see write() comment).
+        with self._automation_lock:
+            self._automation_active = False
 
     # =================================================
     # CURSOR STATE
