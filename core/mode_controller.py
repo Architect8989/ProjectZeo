@@ -132,6 +132,16 @@ class ModeController:
         with self._lock:
             return self._intent
 
+    def get_snapshot_id(self) -> Optional[str]:
+        """
+        Return the currently attached snapshot_id, or None if none is attached.
+
+        Used by callers that need to verify a snapshot was attached before
+        calling arm() or arm_for_replan(). Also useful for forensic logging.
+        """
+        with self._lock:
+            return self._snapshot_id
+
     # ==================================================
     # REPLAN CONTROL
     # ==================================================
@@ -288,6 +298,23 @@ class ModeController:
 
             if not intent or not intent.strip():
                 raise ModeTransitionError("Intent must be non-empty")
+
+            # HARDEN-MC: Verify that a snapshot was attached between force_observer()
+            # and arm_for_replan(). In the replan sequence (main.py), the sequence is:
+            #   1. force_observer()         — clears _snapshot_id to None
+            #   2. attach_snapshot(new_id)  — sets _snapshot_id
+            #   3. arm_for_replan(intent)   — must find _snapshot_id set
+            #
+            # If step 2 was skipped (snapshot_provider.take_snapshot() failed and
+            # the caller forgot to attach the prior snapshot_id as fallback), this
+            # guard surfaces the error explicitly rather than allowing the system
+            # to arm into EXECUTING mode with no restoration target.
+            if not self._snapshot_id:
+                raise ModeTransitionError(
+                    "arm_for_replan requires a snapshot to be attached first. "
+                    "Call attach_snapshot(snapshot_id) after force_observer() "
+                    "and before arm_for_replan()."
+                )
 
             self._intent = intent.strip()
             self._intent_frozen = False
