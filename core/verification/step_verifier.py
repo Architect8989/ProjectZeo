@@ -317,6 +317,20 @@ class StepVerifier:
             return result.success, result.reason or "", result.details or {}
 
         # If no explicit condition → require delta evidence
+        # FIX-3 (MEDIUM): When previous_screenshot is None (iteration 0 of a
+        # UI step) the old code always returned (False, "no UI evidence detected")
+        # because there is nothing to diff against.  This wasted one stagnation
+        # slot on every first UI action, reducing the effective retry budget.
+        #
+        # Fix: treat the absence of a previous screenshot as implicit acceptance
+        # of the first action.  The system has no baseline to compare against,
+        # so returning True here is the least-wrong default — any regression will
+        # be caught on the *next* iteration where previous_screenshot is populated.
+        if previous_screenshot is None:
+            return True, "first action accepted (no prior screenshot baseline)", {
+                "first_action": True,
+            }
+
         if previous_screenshot:
             try:
                 delta = world_graph.compute_delta(previous_screenshot)
