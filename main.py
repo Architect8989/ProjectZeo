@@ -560,9 +560,23 @@ def main(llm_callable: Callable, model_name: str):
                                 dirty=False,
                                 thompson_state=(
                                     {
-                                        "iteration_counter": _belief_state_out[0].get("iteration_counter", 0),
-                                        "sample_counter":    _belief_state_out[0].get("sample_counter", 0),
-                                        "commitment_hash":   _belief_state_out[0].get("commitment_hash", ""),
+                                        # RT-02 FIX: BeliefState.to_dict() serializes these
+                                        # counters with underscore-prefix keys ("_iteration_counter",
+                                        # "_sample_counter").  The previous code used the no-underscore
+                                        # form, so .get() always returned the default 0, causing the
+                                        # persisted thompson_state stub to be all-zeros on every task
+                                        # completion.  After a crash, the Thompson stub was always
+                                        # zero — losing per-session uniqueness.
+                                        #
+                                        # Fix: use the canonical underscore-prefixed key names that
+                                        # match BeliefState.to_dict().  AuthorityStateSerializer.persist()
+                                        # accepts both forms and normalizes them internally.
+                                        "_iteration_counter": _belief_state_out[0].get("_iteration_counter", 0),
+                                        "_sample_counter":    _belief_state_out[0].get("_sample_counter", 0),
+                                        "commitment_chain_hash": _belief_state_out[0].get(
+                                            "commitment_chain_hash",
+                                            _belief_state_out[0].get("commitment_hash", ""),
+                                        ),
                                     }
                                     if _belief_state_out else None
                                 ),
@@ -590,9 +604,13 @@ def main(llm_callable: Callable, model_name: str):
                                 dirty=False,
                                 thompson_state=(
                                     {
-                                        "iteration_counter": _belief_state_out[0].get("iteration_counter", 0),
-                                        "sample_counter":    _belief_state_out[0].get("sample_counter", 0),
-                                        "commitment_hash":   _belief_state_out[0].get("commitment_hash", ""),
+                                        # RT-02 FIX (second site): same correction as above.
+                                        "_iteration_counter": _belief_state_out[0].get("_iteration_counter", 0),
+                                        "_sample_counter":    _belief_state_out[0].get("_sample_counter", 0),
+                                        "commitment_chain_hash": _belief_state_out[0].get(
+                                            "commitment_chain_hash",
+                                            _belief_state_out[0].get("commitment_hash", ""),
+                                        ),
                                     }
                                     if _belief_state_out else None
                                 ),
