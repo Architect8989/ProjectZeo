@@ -270,6 +270,31 @@ def _validate_runtime_dependencies(model_name: str) -> None:
         except Exception:
             pass  # Daemon check already covered above
 
+    # 6. pyautogui (required for scroll operations)
+    #
+    # H-07 FIX: The previous validator did not check for pyautogui.
+    # operate.py deferred `import pyautogui` inside the scroll branch so
+    # a missing pyautogui was only discovered at runtime when a scroll action
+    # was attempted, returning a silent {"success": False, "reward": -0.5}
+    # with no indication that the dependency was absent.  Tasks that rely on
+    # scroll would stagnate for up to MAX_STAGNANT_ITERS_UI=12 iterations
+    # before replanning, consuming 12×(planning + execution) cycles for a
+    # dependency that could have been caught at startup.
+    #
+    # Fix: check for pyautogui at startup.  A missing pyautogui is a WARNING
+    # (not a fatal error) because many tasks do not use scroll; the operator
+    # may intentionally run without it.  If scroll actions appear during
+    # execution, the structured error in operate.py now surfaces the reason
+    # clearly in the journal rather than a bare -0.5.
+    try:
+        import pyautogui as _  # noqa: F401
+    except ImportError:
+        warnings.append(
+            "  [WARNING] pyautogui is not installed. "
+            "Scroll operations will fail with a structured error.\n"
+            "    Fix: pip install pyautogui"
+        )
+
     # Emit warnings
     if warnings:
         print("\n[STARTUP] Dependency warnings (non-fatal):", file=sys.stderr)
