@@ -147,16 +147,17 @@ class OperatingSystem:
         with self._automation_lock:
             self._automation_active = True
 
-        pyautogui.write(content, interval=0.01)
-
-        # P0-C FIX (RT-05): Clear the automation-active flag on the success path.
-        # Previously the flag was set True on entry but never cleared on success —
-        # only force_release_all() or mark_automation_inactive() reset it.
-        # RestoreVerifier._verify_input_released() saw is_automation_active()==True
-        # after every successful write/press/mouse call, raising
-        # RestorationVerificationError("Input still locked after restoration").
-        with self._automation_lock:
-            self._automation_active = False
+        # RB-2 FIX: try/finally guarantees _automation_active is ALWAYS cleared,
+        # even when pyautogui raises (FailSafeException, X11 queue timeout, display
+        # disconnection). Previously the flag was set True on entry but only cleared
+        # on the success path — any exception left it permanently True, creating a
+        # race where RestoreVerifier saw an active lock and raised
+        # RestorationVerificationError even though no input was being generated.
+        try:
+            pyautogui.write(content, interval=0.01)
+        finally:
+            with self._automation_lock:
+                self._automation_active = False
 
     def press(self, keys) -> None:
         if not isinstance(keys, list) or not keys:
@@ -165,11 +166,12 @@ class OperatingSystem:
         with self._automation_lock:
             self._automation_active = True
 
-        pyautogui.hotkey(*keys)
-
-        # P0-C FIX (RT-05): Clear flag on success path (see write() comment).
-        with self._automation_lock:
-            self._automation_active = False
+        # RB-2 FIX: try/finally — see write() for full explanation.
+        try:
+            pyautogui.hotkey(*keys)
+        finally:
+            with self._automation_lock:
+                self._automation_active = False
 
     def mouse(self, click_detail: dict) -> None:
         if not isinstance(click_detail, dict):
@@ -195,17 +197,23 @@ class OperatingSystem:
         with self._automation_lock:
             self._automation_active = True
 
-        pyautogui.moveTo(x_px, y_px, duration=0.05)
+        # RB-2 FIX: try/finally — see write() for full explanation.
+        # NOTE: The cursor-position verification (abs(cur_x - x_px) > 3) now
+        # runs INSIDE the try block, so a RuntimeError("Cursor failed to reach
+        # target") still clears the flag via finally before propagating. The
+        # previous code raised RuntimeError after the flag-set but before the
+        # first flag-clear, leaving _automation_active=True permanently.
+        try:
+            pyautogui.moveTo(x_px, y_px, duration=0.05)
 
-        cur_x, cur_y = pyautogui.position()
-        if abs(cur_x - x_px) > 3 or abs(cur_y - y_px) > 3:
-            raise RuntimeError("Cursor failed to reach target")
+            cur_x, cur_y = pyautogui.position()
+            if abs(cur_x - x_px) > 3 or abs(cur_y - y_px) > 3:
+                raise RuntimeError("Cursor failed to reach target")
 
-        pyautogui.click()
-
-        # P0-C FIX (RT-05): Clear flag on success path (see write() comment).
-        with self._automation_lock:
-            self._automation_active = False
+            pyautogui.click()
+        finally:
+            with self._automation_lock:
+                self._automation_active = False
 
     # =================================================
     # CURSOR STATE
