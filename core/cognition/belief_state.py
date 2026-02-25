@@ -49,13 +49,20 @@ class BeliefState:
     #      it remains the authoritative correction path for bootstrap bias.
     #
     # BOOTSTRAP_REWARD_SCALE contract:
-    #   Raw rewards are expected in [0.0, 1.0] where:
-    #     0.0 = complete failure
-    #     0.5 = neutral / no progress
-    #     1.0 = complete success
-    #   The scale maps [0, 1] → [-REWARD_CLAMP, REWARD_CLAMP] via:
+    #   Raw rewards are expected in [-1.0, 1.0] where:
+    #     -1.0 = complete failure / policy abort
+    #      0.0 = neutral / no progress (TRUE NEUTRAL POINT)
+    #     +1.0 = complete success
+    #   The scale maps [-1, 1] → [-REWARD_CLAMP, REWARD_CLAMP] via:
     #     normalised = (reward / BOOTSTRAP_REWARD_SCALE) * REWARD_CLAMP
-    #   i.e. reward=0.5 → 0.0 (neutral), reward=1.0 → +REWARD_CLAMP (max).
+    #
+    # MATH-1 FIX: Previous docstring stated "reward=0.5 → 0.0 (neutral)".
+    # This was WRONG and referred to an obsolete [0, 1] reward convention.
+    # With RAW_REWARD_MIN = -1.0 (current contract), the formula gives:
+    #   reward=0.5: (0.5/0.5)*3.0 = 3.0  → MAX positive (not neutral!)
+    #   reward=0.0: (0.0/0.5)*3.0 = 0.0  → neutral (CORRECT)
+    #   reward=-1.0: (-1.0/0.5)*3.0 = -6.0 → clamped to -REWARD_CLAMP=-3.0
+    # The docstring is now corrected to match the actual [-1, 1] contract.
     #
     # HAR-3 (Math): Bootstrap resolution loss — accepted by design.
     #   During the bootstrap phase (n < 3), rewards outside the range
@@ -160,6 +167,25 @@ class BeliefState:
         )
         # commitment_chain_hash starts as task_identity_hash and is extended
         # by SHA-256(prev_chain_hash + ":" + action_key) in record_action().
+        #
+        # H-7 FIX: Trust-boundary documentation for commitment_chain_hash.
+        #
+        # The chain IS a genuine cryptographic SHA-256 Merkle-style audit trail —
+        # each action appends an immutable link, making it impossible to insert,
+        # delete, or reorder actions without invalidating all subsequent hashes.
+        # Within a single uncompromised process this provides strong integrity.
+        #
+        # The chain IS NOT tamper-proof against a compromised or patched process:
+        #   - The hash state is held entirely in process memory with no external
+        #     root of trust (no HSM, no append-only log, no external verifier).
+        #   - A compromised process can call self.commitment_chain_hash = "..."
+        #     directly and forge any chain value (frozen dataclass is not used here).
+        #   - There is no out-of-band verifier that can detect an in-process forgery.
+        #
+        # Intended use: post-hoc audit of an uncompromised session (compare the
+        # persisted chain hash in .authority_state.json against a replay of the
+        # journal to detect accidental corruption or crash-recovery truncation).
+        # NOT intended use: tamper detection against a hostile or compromised process.
         self.commitment_chain_hash: str = self.task_identity_hash
         self._iteration_counter: int = 0
 
