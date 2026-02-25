@@ -4,6 +4,7 @@ import asyncio
 import inspect
 import copy
 import json
+import threading
 from typing import Callable, List, Dict, Any, Optional
 from concurrent.futures import ThreadPoolExecutor
 
@@ -19,6 +20,26 @@ class PureLLMWrapper:
     """
 
     _patch_applied = False
+
+    # P1-1 FIX: Protect _patch_applied with a class-level threading.Lock.
+    #
+    # Root cause: _patch_applied is a class-level boolean shared by all
+    # instances. The check-and-set sequence:
+    #   if not PureLLMWrapper._patch_applied:
+    #       apply_patches()
+    #       PureLLMWrapper._patch_applied = True
+    # is a non-atomic read-modify-write. Under concurrent instantiation (two
+    # threads both calling AdapterFactory.build_llm() for cloud models at
+    # the same time), both threads can read _patch_applied=False, both call
+    # apply_patches(), and both set _patch_applied=True. The double-apply is
+    # functionally safe (apply_patches() is idempotent via _apis_safety_wrapped
+    # guards on individual functions) but creates noisy redundant work and
+    # masks potential future non-idempotency bugs in apply_patches().
+    #
+    # Fix: add _patch_lock class-level Lock (same pattern as factory.py's
+    # _PATCH_LOCK). The __init__ check now holds the lock for the entire
+    # check-and-set, making it atomic.
+    _patch_lock: "threading.Lock"
 
     # RB-07 FIX: _executor is now an INSTANCE attribute (created in __init__),
     # not a class attribute.
@@ -36,10 +57,13 @@ class PureLLMWrapper:
     # lifecycle management.
 
     def __init__(self, model_name: str):
-        if not PureLLMWrapper._patch_applied:
-            from adapters.apis_safety_layer import apply_patches  # noqa: PLC0415
-            apply_patches()
-            PureLLMWrapper._patch_applied = True
+        # P1-1 FIX: Atomic check-and-set under _patch_lock.
+        # See class body comment for the full rationale.
+        with PureLLMWrapper._patch_lock:
+            if not PureLLMWrapper._patch_applied:
+                from adapters.apis_safety_layer import apply_patches  # noqa: PLC0415
+                apply_patches()
+                PureLLMWrapper._patch_applied = True
 
         self.model_name = model_name
 
@@ -267,3 +291,9 @@ class PureLLMWrapper:
         raise RuntimeError(
             f"Model '{self.model_name}' returned unsupported type: {type(result)}"
         )
+
+# P1-1 FIX: Initialize the class-level lock OUTSIDE the frozen dataclass body
+# (same pattern as RestoreSnapshot._nonce_lock and factory.py's _PATCH_LOCK).
+# Must be done after the class is defined so Python sees it as a plain class
+# attribute, not a dataclass field.
+PureLLMWrapper._patch_lock = threading.Lock()  # type: ignore[attr-defined]
