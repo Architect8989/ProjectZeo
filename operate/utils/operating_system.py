@@ -1,4 +1,14 @@
-import pyautogui
+try:
+    import pyautogui as _pyautogui_mod
+    _pyautogui_mod.FAILSAFE = True
+    _PYAUTOGUI_AVAILABLE: bool = True
+except Exception as _pyautogui_import_err:
+    _pyautogui_mod = None  # type: ignore[assignment]
+    _PYAUTOGUI_AVAILABLE: bool = False
+    _PYAUTOGUI_IMPORT_ERROR: str = str(_pyautogui_import_err)
+else:
+    _PYAUTOGUI_IMPORT_ERROR: str = ""
+
 import platform
 import time
 import math
@@ -14,20 +24,34 @@ try:
 except ImportError:
     _INSTALL_TIMEOUT = 300
 
-pyautogui.FAILSAFE = True
+
+class OperatingSystemUnavailableError(RuntimeError):
+    """Raised when a pyautogui operation is requested but pyautogui is
+    unavailable (not installed or no X11 display)."""
+
+
+def _require_pyautogui() -> object:
+    """
+    P0-1 FIX: Fail fast with a clear error when pyautogui is unavailable.
+
+    Call this at the top of every method that delegates to pyautogui.
+    Returns the pyautogui module on success. Raises OperatingSystemUnavailableError
+    on failure.
+    """
+    if not _PYAUTOGUI_AVAILABLE:
+        raise OperatingSystemUnavailableError(
+            "pyautogui is not available. "
+            f"Import error: {_PYAUTOGUI_IMPORT_ERROR!r}. "
+            "Install with: pip install pyautogui\n"
+            "On headless systems also install: pip install Pillow\n"
+            "On Linux ensure DISPLAY is set or use a virtual framebuffer: "
+            "Xvfb :99 & DISPLAY=:99 python main.py"
+        )
+    return _pyautogui_mod
 
 
 class OperatingSystem:
-    """
-    Deterministic OS boundary.
-
-    CONTRACT:
-    - Cursor schema: {"x": int, "y": int}
-    - Window schema: {"title": str}
-    - Explicit failures only
-    - No silent success
-    - Post-condition verification required
-    """
+    
 
     def __init__(self):
         self._automation_active = False
@@ -79,21 +103,18 @@ class OperatingSystem:
                 self.force_release_all(reason="heartbeat_timeout")
 
     # =================================================
-    # SCREEN SIZE  [FIX RB-1]
+    # SCREEN SIZE
     # =================================================
 
     def screen_size(self) -> tuple:
         """
-        FIX RB-1: Return (width, height) in pixels.
+        Return (width, height) in pixels.
 
         operate.py:_execute_decision() calls this whenever an OCR-resolved
         click has absolute pixel coordinates (x > 1.0 or y > 1.0).
-        Without this method every OCR text-targeted click raised
-        AttributeError → TASK_FAILED → replan consumed → task failed.
-
-        pyautogui.size() is authoritative and cross-platform.
         """
-        w, h = pyautogui.size()
+        pya = _require_pyautogui()
+        w, h = pya.size()
         return int(w), int(h)
 
     # =================================================
@@ -142,19 +163,14 @@ class OperatingSystem:
         if not isinstance(content, str):
             raise RuntimeError("write(): content must be string")
 
+        pya = _require_pyautogui()
         content = content.replace("\\n", "\n")
 
         with self._automation_lock:
             self._automation_active = True
 
-        # RB-2 FIX: try/finally guarantees _automation_active is ALWAYS cleared,
-        # even when pyautogui raises (FailSafeException, X11 queue timeout, display
-        # disconnection). Previously the flag was set True on entry but only cleared
-        # on the success path — any exception left it permanently True, creating a
-        # race where RestoreVerifier saw an active lock and raised
-        # RestorationVerificationError even though no input was being generated.
         try:
-            pyautogui.write(content, interval=0.01)
+            pya.write(content, interval=0.01)
         finally:
             with self._automation_lock:
                 self._automation_active = False
@@ -163,12 +179,13 @@ class OperatingSystem:
         if not isinstance(keys, list) or not keys:
             raise RuntimeError("press(): keys must be non-empty list")
 
+        pya = _require_pyautogui()
+
         with self._automation_lock:
             self._automation_active = True
 
-        # RB-2 FIX: try/finally — see write() for full explanation.
         try:
-            pyautogui.hotkey(*keys)
+            pya.hotkey(*keys)
         finally:
             with self._automation_lock:
                 self._automation_active = False
@@ -189,7 +206,9 @@ class OperatingSystem:
         self._click_at_percentage(float(x), float(y))
 
     def _click_at_percentage(self, x_pct: float, y_pct: float) -> None:
-        screen_w, screen_h = pyautogui.size()
+        pya = _require_pyautogui()
+
+        screen_w, screen_h = pya.size()
 
         x_px = int(screen_w * x_pct)
         y_px = int(screen_h * y_pct)
@@ -197,20 +216,14 @@ class OperatingSystem:
         with self._automation_lock:
             self._automation_active = True
 
-        # RB-2 FIX: try/finally — see write() for full explanation.
-        # NOTE: The cursor-position verification (abs(cur_x - x_px) > 3) now
-        # runs INSIDE the try block, so a RuntimeError("Cursor failed to reach
-        # target") still clears the flag via finally before propagating. The
-        # previous code raised RuntimeError after the flag-set but before the
-        # first flag-clear, leaving _automation_active=True permanently.
         try:
-            pyautogui.moveTo(x_px, y_px, duration=0.05)
+            pya.moveTo(x_px, y_px, duration=0.05)
 
-            cur_x, cur_y = pyautogui.position()
+            cur_x, cur_y = pya.position()
             if abs(cur_x - x_px) > 3 or abs(cur_y - y_px) > 3:
                 raise RuntimeError("Cursor failed to reach target")
 
-            pyautogui.click()
+            pya.click()
         finally:
             with self._automation_lock:
                 self._automation_active = False
@@ -220,7 +233,8 @@ class OperatingSystem:
     # =================================================
 
     def get_cursor_position(self) -> Dict[str, int]:
-        x, y = pyautogui.position()
+        pya = _require_pyautogui()
+        x, y = pya.position()
         return {"x": int(x), "y": int(y)}
 
     def set_cursor_position(self, position: Dict[str, int]) -> None:
@@ -233,7 +247,8 @@ class OperatingSystem:
         if not isinstance(x, int) or not isinstance(y, int):
             raise RuntimeError("set_cursor_position(): invalid coordinates")
 
-        pyautogui.moveTo(x, y, duration=0.05)
+        pya = _require_pyautogui()
+        pya.moveTo(x, y, duration=0.05)
 
     # =================================================
     # WINDOW / APPLICATION
@@ -283,17 +298,15 @@ class OperatingSystem:
         return self.get_focused_window()
 
     # =================================================
-    # WINDOW GEOMETRY  [FIX H-2]
+    # WINDOW GEOMETRY
     # =================================================
 
     def get_window_geometry(self, window_id: str) -> Dict[str, int]:
         """
-        FIX H-2: Return geometry dict for a window identified by title.
+        Return geometry dict for a window identified by title.
 
         RestoreVerifier._verify_window_geometry() calls this when
         snapshot.metadata["extended"]["window_geometry"] is present.
-        Previously absent → hasattr() guard silently skipped the check,
-        making geometry verification permanently dead code.
 
         Linux: queries xdotool. macOS/Windows: raises OSError (best-effort).
         Callers (RestoreVerifier) swallow OSError and continue.
@@ -305,7 +318,6 @@ class OperatingSystem:
 
         if system == "Linux":
             try:
-                # Find window by title substring
                 search = subprocess.run(
                     ["xdotool", "search", "--name", window_id.strip()],
                     capture_output=True,
@@ -441,11 +453,9 @@ class OperatingSystem:
     # =================================================
 
     def click(self, x: float, y: float) -> None:
-        """
-        Click at pixel-absolute coordinates.
-        Converts to percentages and delegates to mouse() for validation reuse.
-        """
-        screen_w, screen_h = pyautogui.size()
+        """Click at pixel-absolute coordinates."""
+        pya = _require_pyautogui()
+        screen_w, screen_h = pya.size()
         if screen_w <= 0 or screen_h <= 0:
             raise RuntimeError("click(): unable to determine screen size")
 
@@ -543,7 +553,7 @@ class OperatingSystem:
 
     def is_automation_active(self) -> bool:
         """
-        FIX H-2: Expose automation state for RestoreVerifier._verify_input_released().
+        P0-2 FIX: Expose automation state for RestoreVerifier._verify_input_released().
 
         Previously absent. RestoreVerifier checks hasattr(self._os, 'is_automation_active')
         and silently skips the check when the method is missing — making the
@@ -564,62 +574,22 @@ class OperatingSystem:
     def force_release_all(self, *, reason: str) -> None:
         self.mark_automation_inactive()
 
-        try:
-            pyautogui.mouseUp()
-        except Exception:
-            pass
-
-        for key in ("shift", "ctrl", "alt", "cmd"):
+        if _PYAUTOGUI_AVAILABLE and _pyautogui_mod is not None:
             try:
-                pyautogui.keyUp(key)
+                _pyautogui_mod.mouseUp()
             except Exception:
                 pass
 
-    # =================================================
-    # EXTENDED STATE — AUDIT-SI-3 FIX
-    # =================================================
-    # The audit identified that RestoreVerifier._verify_window_z_order(),
-    # _verify_browser_state(), and _verify_media_position() were permanently
-    # dead code because OperatingSystem did not implement the three required
-    # interface methods. The hasattr() guards in RestoreVerifier silently
-    # skipped those checks, making the "extended restoration verification"
-    # claim architecturally false.
-    #
-    # Fix: implement all three methods as explicit stubs that raise
-    # NotImplementedError with actionable documentation. The stub approach:
-    #   - Makes hasattr() return True → activates the verification code paths
-    #     that were previously dead.
-    #   - RestoreVerifier wraps each extended check in try/except Exception
-    #     and silently continues on non-RestorationVerificationError exceptions,
-    #     so NotImplementedError causes a soft-skip — the same effective
-    #     behaviour as before, but now with an explicit code path rather than
-    #     a silent structural hole.
-    #   - Any operator who implements these methods in a subclass or future
-    #     OperatingSystem version gets full extended verification for free,
-    #     without changes to RestoreVerifier.
-    #   - The docstrings document exactly what a real implementation must
-    #     return, closing the gap between claimed and actual verification scope.
+            for key in ("shift", "ctrl", "alt", "cmd"):
+                try:
+                    _pyautogui_mod.keyUp(key)
+                except Exception:
+                    pass
+
+    
 
     def get_window_z_order(self, window_id: str) -> int:
-        """
-        AUDIT-SI-3 STUB: Return the Z-order (stacking index) of the window
-        identified by window_id (title substring).
-
-        A real implementation should return an integer where 0 is the
-        bottommost window and higher values indicate windows closer to the
-        foreground. RestoreVerifier._verify_window_z_order() compares this
-        value against the snapshot value and raises RestorationVerificationError
-        on mismatch.
-
-        Platform implementation notes:
-          Linux:   xdotool get_desktop / wmctrl -l  can approximate Z-order.
-          macOS:   CGWindowListCopyWindowInfo with kCGWindowLayer.
-          Windows: GetWindow(hwnd, GW_HWNDPREV/GW_HWNDNEXT) traversal.
-
-        Raises NotImplementedError until a platform-specific implementation
-        is provided. RestoreVerifier's extended check silently skips on
-        NotImplementedError (soft-fail), preserving backward compatibility.
-        """
+        
         raise NotImplementedError(
             "get_window_z_order() is not yet implemented for this platform. "
             "RestoreVerifier will treat this as a soft-fail (verification skipped). "
@@ -628,56 +598,28 @@ class OperatingSystem:
 
     def get_browser_state(self) -> dict:
         """
-        AUDIT-SI-3 STUB: Return the current browser state as a dict.
+        AUDIT-SI-3 STUB: Return current browser state as {"url": str, "title": str}.
 
-        A real implementation should return a dict containing at minimum:
-          {
-            "url":   str,   # current tab URL
-            "title": str,   # current tab title
-          }
-        RestoreVerifier._verify_browser_state() compares this dict against
-        the snapshot value and raises RestorationVerificationError on mismatch.
+        RestoreVerifier compares against the snapshot value. Raises
+        NotImplementedError until a CDP/Marionette integration is provided
+        (soft-fail in verifier).
 
-        Platform implementation notes:
-          Chrome/Chromium: Chrome DevTools Protocol (CDP) via websocket on
-            port 9222 (requires --remote-debugging-port=9222 at launch).
+        Platform notes:
+          Chrome/Chromium: CDP via websocket on port 9222 (--remote-debugging-port).
           Firefox:         Marionette protocol.
-          General:         xdotool getactivewindow getwindowname as fallback.
-
-        Raises NotImplementedError until a CDP/browser-protocol integration is
-        provided. RestoreVerifier's extended check silently skips on
-        NotImplementedError (soft-fail), preserving backward compatibility.
         """
         raise NotImplementedError(
             "get_browser_state() is not yet implemented. "
-            "A CDP integration (Chrome DevTools Protocol) is required for this check. "
-            "RestoreVerifier will treat this as a soft-fail (verification skipped). "
-            "Implement this method to activate browser-state restoration verification."
+            "A CDP integration (Chrome DevTools Protocol) is required. "
+            "RestoreVerifier will treat this as a soft-fail (verification skipped)."
         )
 
     def get_media_playback_position(self) -> float:
-        """
-        AUDIT-SI-3 STUB: Return the current media playback position in seconds.
-
-        A real implementation should return a float representing the current
-        playback position of any active media player (video/audio). Returns
-        0.0 if no media is playing. RestoreVerifier._verify_media_position()
-        checks that abs(current - snapshot_position) <= 1.0 second.
-
-        Platform implementation notes:
-          Linux:   playerctl position (MPRIS D-Bus interface).
-          macOS:   osascript with application "QuickTime Player" / "Music".
-          Windows: Windows Media Player COM interface.
-
-        Raises NotImplementedError until a media-control integration is
-        provided. RestoreVerifier's extended check silently skips on
-        NotImplementedError (soft-fail), preserving backward compatibility.
-        """
+        
         raise NotImplementedError(
             "get_media_playback_position() is not yet implemented. "
-            "A media player control interface (MPRIS, osascript, etc.) is required. "
-            "RestoreVerifier will treat this as a soft-fail (verification skipped). "
-            "Implement this method to activate media-position restoration verification."
+            "An MPRIS/osascript/COM integration is required. "
+            "RestoreVerifier will treat this as a soft-fail (verification skipped)."
         )
 
     # =================================================
