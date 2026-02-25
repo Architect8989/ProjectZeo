@@ -671,15 +671,29 @@ def _execute_decision(
                     executor=task_ui_executor,
                 )
             else:
-                # Label/text click: try accessibility backend or skip.
+                # Label/text click: x/y coordinates are required.
+                # FIX-2 (HIGH): The previous implementation silently fell back
+                # to clicking screen centre (0.5, 0.5) when a label was present
+                # but OCR/coordinate resolution had failed.  That behaviour:
+                #   - Clicked the wrong target on every non-centre UI element
+                #   - Returned success=True / reward=0.8 despite doing nothing useful
+                #   - Caused stagnation loops because the task never progressed
+                #
+                # Fix: return failure immediately so the planner is forced to
+                # replan and either acquire real coordinates or choose a different
+                # action.  The reward of -0.5 is identical to other hard failures
+                # (missing content, missing keys) and feeds correctly into the
+                # Welford normaliser and Thompson sampler.
                 label = action.get("label") or action.get("text") or ""
                 if label:
-                    run_with_timeout(
-                        lambda: os_backend.mouse({"x": 0.5, "y": 0.5}),
-                        seconds=30.0,
-                        operation_hint=f"click_label:{label}",
-                        executor=task_ui_executor,
-                    )
+                    return {
+                        "success": False,
+                        "reward": -0.5,
+                        "reason": (
+                            f"click_label '{label}' has no resolved coordinates — "
+                            "OCR unavailable or label not found; replanning required"
+                        ),
+                    }
                 else:
                     return {"success": False, "reward": -0.5}
             return {"success": True, "reward": 0.8}
@@ -811,3 +825,4 @@ def _execute_decision(
     except Exception as exc:
         log_warn(f"_execute_decision: unexpected error — {exc}")
         return {"success": False, "reward": -0.5}
+
