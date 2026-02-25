@@ -44,11 +44,14 @@ class SnapshotProvider:
     # running longer than 60 minutes because get_snapshot() enforced TTL at
     # retrieval time, returning None and triggering _force_safe_shutdown().
     MAX_SNAPSHOT_AGE_SECONDS = 6300
-    # RTB-04: Increased from 0.25s to 0.5s. Under OS load, three consecutive
-    # syscalls (cursor + focused_window + active_app) frequently exceeded 250ms,
-    # causing permanent denial-of-service on task arming under adversarial load.
-    # 500ms is still conservative enough to catch genuine OS hangs.
-    ATOMIC_WINDOW_SECONDS = 0.5
+    # P0-A FIX (RT-01): Raised from 0.5s to 2.0s.  Under OS load, the three
+    # sequential syscalls (cursor + focused_window + active_app) can each take
+    # 200 ms+, totalling >600 ms even without genuine OS hangs.  The previous
+    # 0.5 s window caused SnapshotProviderError → arm_failure.json → infinite
+    # loop, permanently preventing task arming on loaded hosts.  2.0 s remains
+    # conservative enough to detect true OS hangs (kernel freeze, X11 lockup).
+    # Still overridable via PROJECTZEO_ATOMIC_WINDOW_SECONDS env var.
+    ATOMIC_WINDOW_SECONDS = 2.0
 
     # =========================================================
     # INIT
@@ -88,6 +91,25 @@ class SnapshotProvider:
         self._snapshots: "OrderedDict[str, RestorationSnapshot]" = OrderedDict()
         self._lock = threading.Lock()
 
+        # H-01 FIX (SI-01): Persist snapshots to disk so post-crash restoration
+        # is possible.  On startup we reload all non-expired snapshots from
+        # memory/snapshot_<id>.json files.  Each store_snapshot() call writes a
+        # new file; each eviction or expiry removes the corresponding file.
+        self._snapshot_dir = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "memory",
+            "snapshots",
+        )
+        try:
+            os.makedirs(self._snapshot_dir, exist_ok=True)
+            self._disk_persistence_available = True
+        except (PermissionError, OSError):
+            self._disk_persistence_available = False
+
+        # Reload surviving snapshots from disk (skip expired ones).
+        if self._disk_persistence_available:
+            self._reload_from_disk()
+
     # =========================================================
     # SNAPSHOT REGISTRY (LRU + TTL)
     # =========================================================
@@ -110,7 +132,74 @@ class SnapshotProvider:
 
     def _enforce_capacity(self) -> None:
         while len(self._snapshots) > self.MAX_SNAPSHOTS:
-            self._snapshots.popitem(last=False)
+            evicted_id, _ = self._snapshots.popitem(last=False)
+            self._remove_snapshot_file(evicted_id)
+
+    # =========================================================
+    # DISK PERSISTENCE  (H-01 / SI-01 FIX)
+    # =========================================================
+
+    def _snapshot_path(self, snapshot_id: str) -> str:
+        # Use only the first 64 chars of the hex ID as the filename to stay
+        # well within filesystem path-length limits.
+        safe_id = snapshot_id[:64].replace("/", "_").replace("\\", "_")
+        return os.path.join(self._snapshot_dir, f"snapshot_{safe_id}.json")
+
+    def _write_snapshot_file(self, snapshot: "RestorationSnapshot") -> None:
+        """Persist snapshot to disk as JSON.  Non-fatal on failure."""
+        if not self._disk_persistence_available:
+            return
+        try:
+            path = self._snapshot_path(snapshot.snapshot_id)
+            tmp = path + ".tmp"
+            data = snapshot.to_dict()
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, separators=(",", ":"))
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, path)
+        except Exception:
+            pass  # Non-fatal; in-memory copy still valid
+
+    def _remove_snapshot_file(self, snapshot_id: str) -> None:
+        """Delete the on-disk snapshot file for the given ID.  Non-fatal."""
+        if not self._disk_persistence_available:
+            return
+        try:
+            os.remove(self._snapshot_path(snapshot_id))
+        except FileNotFoundError:
+            pass
+        except Exception:
+            pass
+
+    def _reload_from_disk(self) -> None:
+        """On startup, reload non-expired snapshots from disk into memory."""
+        if not self._disk_persistence_available:
+            return
+        now = time.time()
+        try:
+            for fname in os.listdir(self._snapshot_dir):
+                if not (fname.startswith("snapshot_") and fname.endswith(".json")):
+                    continue
+                fpath = os.path.join(self._snapshot_dir, fname)
+                try:
+                    with open(fpath, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    snap = RestorationSnapshot.from_dict(data)
+                    captured = float(snap.metadata.get("captured_at_wallclock", 0))
+                    if (now - captured) > self.MAX_SNAPSHOT_AGE_SECONDS:
+                        os.remove(fpath)  # expired — discard
+                        continue
+                    if snap.snapshot_id not in self._snapshots:
+                        self._snapshots[snap.snapshot_id] = snap
+                except Exception:
+                    # Corrupted or unreadable file — remove it
+                    try:
+                        os.remove(fpath)
+                    except Exception:
+                        pass
+        except Exception:
+            pass  # Best-effort reload; failures are non-fatal
 
     def store_snapshot(self, snapshot: RestorationSnapshot) -> str:
         if not isinstance(snapshot, RestorationSnapshot):
@@ -128,6 +217,8 @@ class SnapshotProvider:
 
             self._snapshots[snapshot.snapshot_id] = snapshot
             self._enforce_capacity()
+            # H-01: Persist to disk so post-crash restoration is possible.
+            self._write_snapshot_file(snapshot)
 
         return snapshot.snapshot_id
 
@@ -173,8 +264,9 @@ class SnapshotProvider:
 
             age_seconds = now - captured
             if age_seconds > self.MAX_SNAPSHOT_AGE_SECONDS:
-                # Snapshot is stale — evict and return None.
+                # Snapshot is stale — evict from memory and disk, return None.
                 self._snapshots.pop(snapshot_id, None)
+                self._remove_snapshot_file(snapshot_id)
                 import sys as _sys
                 print(
                     f"[SnapshotProvider] Snapshot {snapshot_id[:12]}… expired "
