@@ -51,15 +51,50 @@ def capture_screen_with_cursor(file_path):
                 import Xlib.display  # noqa: PLC0415
                 import Xlib.X        # noqa: PLC0415
             except ImportError:
-                # Headless / no python-xlib: fall back to pyautogui
+                # python-xlib absent → fall through to pyautogui, then headless.
+                pass
+            else:
+                # Xlib present — attempt X11 capture.
+                try:
+                    screen = Xlib.display.Display().screen()
+                    size = screen.width_in_pixels, screen.height_in_pixels
+                    screenshot = ImageGrab.grab(bbox=(0, 0, size[0], size[1]))
+                    screenshot.save(file_path)
+                    return
+                except Exception:
+                    # X11 reachable but capture failed (race on display close,
+                    # compositor restart, etc.) — fall through to pyautogui.
+                    pass
+
+            # RB-4 FIX: pyautogui fallback when Xlib unavailable OR X11 capture
+            # raised an exception (display set but unreachable at the moment of
+            # capture — e.g. Xvfb crashed mid-session, stale DISPLAY env var).
+            #
+            # Previous code: on ImportError, pyautogui.screenshot() was called
+            # directly. If pyautogui also needed a display (which it does via
+            # scrot/ImageMagick on some distros), it raised a bare Exception that
+            # propagated upward as an unclassified error, preventing
+            # VisionUnavailableError from being raised and making the failure
+            # invisible to the observer.
+            #
+            # Fix: wrap pyautogui.screenshot() in try/except. On failure, fall
+            # through to _headless_capture() (the same backend used when DISPLAY
+            # is absent entirely). If _headless_capture() also fails it raises
+            # VisionUnavailableError — a clean, typed signal the observer can
+            # surface rather than a raw Exception.
+            try:
                 screenshot = pyautogui.screenshot()
                 screenshot.save(file_path)
                 return
+            except Exception:
+                # pyautogui failed — X11 is configured but not actually reachable.
+                # Fall through to headless backends.
+                pass
 
-            screen = Xlib.display.Display().screen()
-            size = screen.width_in_pixels, screen.height_in_pixels
-            screenshot = ImageGrab.grab(bbox=(0, 0, size[0], size[1]))
-            screenshot.save(file_path)
+            # Last resort: headless CLI backends (scrot, import, gnome-screenshot).
+            # _headless_capture() raises VisionUnavailableError if none succeed,
+            # giving the caller a clean typed signal rather than a raw exception.
+            _headless_capture(file_path)
 
         else:
             # ── Headless fallback path ────────────────────────────────────
