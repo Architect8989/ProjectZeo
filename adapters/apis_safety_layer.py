@@ -287,6 +287,17 @@ def _patch_all_providers():
     except Exception:
         pass  # Legacy module absent — acceptable on Ollama-only installs
 
+    # H-07 FIX (BOUNDARY-02): Also patch operate.models.apis_openrouter.
+    # The previous implementation only patched operate.models.apis and
+    # operate.legacy.apis.  Any future import of apis_openrouter bypassed the
+    # safety layer entirely — its cloud calls received no immutability
+    # enforcement, no temperature injection, and no validation.
+    try:
+        openrouter = importlib.import_module("operate.models.apis_openrouter")
+        modules_to_patch.append(openrouter)
+    except Exception:
+        pass  # Module absent on Ollama-only installs — acceptable
+
     for _m in modules_to_patch:
         for name in dir(_m):
             if not name.startswith("call_"):
