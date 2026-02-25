@@ -189,6 +189,70 @@ def _is_cloud_allowed() -> bool:
     return _CLOUD_ACCESS_PERMITTED
 
 
+def reconfigure_cloud_access(allow: bool) -> bool:
+    """
+    HARDEN-10: Runtime cloud access reconfiguration.
+
+    Root cause of audit finding (MEDIUM):
+      _CLOUD_ACCESS_PERMITTED is frozen at import time by reading os.environ at
+      module load. Any post-import mutation of os.environ["OLLAMA_ONLY"] is
+      silently ignored. Code that attempts runtime reconfiguration (e.g. test
+      fixtures, orchestrators that need to enable/disable cloud access per task)
+      operates on stale state with no indication that the change had no effect.
+
+    Fix: provide reconfigure_cloud_access() as the ONLY safe way to change
+    cloud access after process start. It:
+      1. Updates the module-level _CLOUD_ACCESS_PERMITTED flag atomically under
+         _ADAPTER_CACHE_LOCK (same lock that guards all cache reads/writes).
+      2. Clears the _ADAPTER_CACHE so that newly constructed adapters use the
+         updated permission. Stale cached adapters built under the old permission
+         would otherwise continue to function — creating a window where a cloud
+         adapter might be returned after cloud was disabled (or vice versa).
+      3. Returns the previous value so callers can restore the original state in
+         finally blocks or teardown.
+
+    Thread safety:
+      The flag write and cache clear are both performed under _ADAPTER_CACHE_LOCK.
+      Concurrent build operations that acquired a build_lock before this call
+      may complete and insert their adapter into the cache; however, their
+      adapter will have been constructed under the OLD permission and will be
+      evicted on the next _cache_put() call under the new permission. This is
+      an acceptable transient race because:
+        - In production (OLLAMA_ONLY=1), cloud is never permitted and this
+          function is never called.
+        - In test environments, test isolation between cloud/non-cloud tests
+          must be enforced at a higher level (subprocess boundaries are ideal).
+
+    Parameters
+    ----------
+    allow : bool
+        True → permit cloud model access (equivalent to OLLAMA_ONLY=0).
+        False → deny cloud model access (equivalent to OLLAMA_ONLY=1).
+
+    Returns
+    -------
+    bool
+        The PREVIOUS value of _CLOUD_ACCESS_PERMITTED, so callers can restore
+        the original state in a finally block:
+
+            prev = reconfigure_cloud_access(True)
+            try:
+                ... cloud operations ...
+            finally:
+                reconfigure_cloud_access(prev)
+    """
+    global _CLOUD_ACCESS_PERMITTED
+
+    with _ADAPTER_CACHE_LOCK:
+        previous = _CLOUD_ACCESS_PERMITTED
+        _CLOUD_ACCESS_PERMITTED = bool(allow)
+        # Invalidate the adapter cache: adapters built under the old permission
+        # must not be returned under the new permission.
+        _ADAPTER_CACHE.clear()
+
+    return previous
+
+
 class AdapterFactory:
 
     @staticmethod
@@ -273,3 +337,5 @@ class AdapterFactory:
 # Module-level aliases for backward compatibility
 build_llm = AdapterFactory.build_llm
 get_action = AdapterFactory.get_action
+# reconfigure_cloud_access is already module-level (not an AdapterFactory method)
+# so it is directly importable: from adapters.factory import reconfigure_cloud_access
