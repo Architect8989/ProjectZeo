@@ -20,7 +20,7 @@ from core.schemas.execution_plan import (
 # The planning prompt has at least as wide an attack surface as the reasoning
 # prompt, so the asymmetry left 28 known injection patterns passing sanitisation
 # undetected here. Importing from the shared module keeps both aligned.
-from core.security.injection_markers import INJECTION_MARKERS
+from core.security.injection_markers import INJECTION_MARKERS, normalize_for_injection_check
 
 
 class PlanningError(RuntimeError):
@@ -664,10 +664,13 @@ class ExecutionPlanner:
                 return None
 
         # Injection check on action field values.
+        # HAR-6: Use normalize_for_injection_check() to defeat Unicode homoglyph
+        # bypasses before marker matching.
         for v in action.values():
             if isinstance(v, str):
+                _normalized_v = normalize_for_injection_check(v)
                 for marker in INJECTION_MARKERS:
-                    if marker.lower() in v.lower():
+                    if marker in _normalized_v:
                         return None
 
         # Truncate excessively long commands.
