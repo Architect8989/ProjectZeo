@@ -127,6 +127,75 @@ def _install_signal_handlers():
 
 
 # ============================================================
+# STARTUP VALIDATION (HARDEN-10 / P0-1 FIX)
+# ============================================================
+
+def _validate_runtime_dependencies() -> list:
+    
+    issues = []
+
+    # 1. pyautogui (P0-1 FIX)
+    try:
+        import pyautogui as _pya
+        # Also verify X11/display is accessible by testing size()
+        _pya.size()
+    except ImportError:
+        issues.append((
+            "FATAL",
+            "pyautogui is not installed. Install with: pip install pyautogui. "
+            "All UI actions (click, type, press, scroll) will fail."
+        ))
+    except Exception as e:
+        issues.append((
+            "FATAL",
+            f"pyautogui cannot access display: {e}. "
+            "On headless systems set DISPLAY=:99 and start Xvfb: "
+            "Xvfb :99 -screen 0 1920x1080x24 &"
+        ))
+
+    # 2. AT-SPI (policy validation)
+    try:
+        import pyatspi  # noqa: F401
+    except ImportError:
+        issues.append((
+            "WARNING",
+            "pyatspi is not available. AT-SPI-based policy validation is disabled. "
+            "validate_action_dict() (non-AT-SPI path) is active as fallback. "
+            "Install with: pip install pyatspi (Linux only)."
+        ))
+
+    # 3. xdotool on Linux
+    import platform as _platform
+    if _platform.system() == "Linux":
+        import shutil
+        if not shutil.which("xdotool"):
+            issues.append((
+                "WARNING",
+                "xdotool not found. Window focus and geometry operations will fail. "
+                "Install with: sudo apt-get install xdotool (Debian/Ubuntu)"
+            ))
+        if not shutil.which("wmctrl"):
+            issues.append((
+                "WARNING",
+                "wmctrl not found. Application activation (focus) will fail on Linux. "
+                "Install with: sudo apt-get install wmctrl"
+            ))
+
+    # 4. DISPLAY on Linux
+    if _platform.system() == "Linux":
+        import os as _os
+        if not _os.environ.get("DISPLAY") and not _os.environ.get("WAYLAND_DISPLAY"):
+            issues.append((
+                "WARNING",
+                "DISPLAY and WAYLAND_DISPLAY are both unset. "
+                "UI operations will fail unless a virtual framebuffer is running. "
+                "Set DISPLAY=:99 or start with Xvfb."
+            ))
+
+    return issues
+
+
+# ============================================================
 # UTILITIES
 # ============================================================
 
@@ -190,6 +259,23 @@ def main(llm_callable: Callable, model_name: str):
     if not isinstance(model_name, str) or not model_name.strip():
         raise RuntimeError("model_name must be a non-empty string")
 
+    
+    _dep_issues = _validate_runtime_dependencies()
+    _has_fatal = False
+    for _severity, _msg in _dep_issues:
+        _log_fn = print  # use print since logging may not be configured yet
+        if _severity == "FATAL":
+            _has_fatal = True
+            _log_fn(f"[STARTUP] FATAL: {_msg}", file=sys.stderr)
+        else:
+            _log_fn(f"[STARTUP] WARNING: {_msg}", file=sys.stderr)
+
+    if _has_fatal:
+        raise RuntimeError(
+            "Fatal startup dependency missing — see FATAL messages above. "
+            "Fix the listed dependencies before starting ProjectZeo."
+        )
+
     os_backend = OperatingSystem()
     state_path = os.path.join(os.getcwd(), ".authority_state.json")
     auth_state = AuthorityStateSerializer(state_path)
@@ -217,9 +303,7 @@ def main(llm_callable: Callable, model_name: str):
 
     persisted = auth_state.load()
 
-    # FIX SI-4: On crash recovery, try to restore the full BeliefState so that
-    # the first post-crash task continues learning from where it left off rather
-    # than re-exploring all actions from a virgin uniform prior.
+    
     _crash_recovery_belief_state: "dict | None" = persisted.get("belief_state_full")
 
     if persisted.get("dirty") or persisted.get("restore_required"):
@@ -304,10 +388,7 @@ def main(llm_callable: Callable, model_name: str):
             try:
                 _enforce_task_timeout()
 
-                # FIX-C3 (RB-4): Call watchdog.check() on every heartbeat so
-                # runtime safety limits are enforced.  WatchdogViolation is a
-                # subclass of RuntimeError and is caught by the outer
-                # `except Exception` block, which calls _force_safe_shutdown().
+                
                 try:
                     watchdog.check()
                 except WatchdogViolation as wv:
@@ -407,9 +488,7 @@ def main(llm_callable: Callable, model_name: str):
 
                 
                 _belief_state_out: list = []
-                # FIX SI-4: Seed first task with crash-recovery BeliefState
-                # when available; clear after first use so subsequent tasks
-                # start fresh (normal behavior for non-crash runs).
+                
                 _prior_belief_state: Optional[dict] = _crash_recovery_belief_state
                 _crash_recovery_belief_state = None  # consume once
 
@@ -460,19 +539,7 @@ def main(llm_callable: Callable, model_name: str):
 
                                 mode.attach_snapshot(new_snapshot_id)
 
-                                # FIX-C5 (RB-6): Use mode.arm_for_replan(intent) instead
-                                # of mode.arm(intent) in the replan sequence.
-                                #
-                                # arm_for_replan() was added specifically as the
-                                # self-documenting, safe-by-construction path for
-                                # replanning.  Using arm() here is structurally
-                                # incorrect: if the arm() guard is ever reinstated
-                                # (e.g. to prevent concurrent arming), all replan
-                                # sequences will raise ModeTransitionError silently
-                                # and arm_for_replan() will remain unreachable dead code.
-                                #
-                                # Using the purpose-built method makes the contract
-                                # explicit and future-proof against arm() guard changes.
+                                
                                 mode.arm_for_replan(intent)
 
                                 _ingest_latest_perception(observer, world_graph)
@@ -560,17 +627,7 @@ def main(llm_callable: Callable, model_name: str):
                                 dirty=False,
                                 thompson_state=(
                                     {
-                                        # RT-02 FIX: BeliefState.to_dict() serializes these
-                                        # counters with underscore-prefix keys ("_iteration_counter",
-                                        # "_sample_counter").  The previous code used the no-underscore
-                                        # form, so .get() always returned the default 0, causing the
-                                        # persisted thompson_state stub to be all-zeros on every task
-                                        # completion.  After a crash, the Thompson stub was always
-                                        # zero — losing per-session uniqueness.
-                                        #
-                                        # Fix: use the canonical underscore-prefixed key names that
-                                        # match BeliefState.to_dict().  AuthorityStateSerializer.persist()
-                                        # accepts both forms and normalizes them internally.
+                                        
                                         "_iteration_counter": _belief_state_out[0].get("_iteration_counter", 0),
                                         "_sample_counter":    _belief_state_out[0].get("_sample_counter", 0),
                                         "commitment_chain_hash": _belief_state_out[0].get(
