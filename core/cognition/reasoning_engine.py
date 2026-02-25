@@ -1,8 +1,11 @@
 from typing import Dict, Any, List
 import json
+import logging
 
 
 from core.security.injection_markers import INJECTION_MARKERS, normalize_for_injection_check
+
+_logger = logging.getLogger(__name__)
 
 
 class ReasoningEngine:
@@ -146,6 +149,17 @@ class ReasoningEngine:
         lowered = normalize_for_injection_check(text)
         for marker in self._INJECTION_MARKERS:
             if marker in lowered:
+                # H-08 FIX (BOUNDARY-04): Emit a warning instead of silently
+                # returning "".  False positives (e.g. "ignore previous approaches"
+                # matching "ignore previous") previously caused legitimate UI text
+                # to vanish from LLM prompts with no operator visibility, making
+                # stagnation loops impossible to diagnose.
+                _logger.warning(
+                    "[ReasoningEngine] Injection marker %r detected in entity text "
+                    "(first 80 chars: %r) — text suppressed from LLM prompt.",
+                    marker,
+                    text[:80],
+                )
                 return ""
 
         return text[: self.MAX_TEXT_CHARS]
