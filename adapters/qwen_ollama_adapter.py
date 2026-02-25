@@ -37,22 +37,50 @@ _OCR_READER = None
 _OCR_LOCK = threading.Lock()
 _OCR_WARMUP_TIMEOUT_SECONDS = 120
 
-_OCR_UNAVAILABLE = False
+# H-02 / D-02 FIX: Replace bare bool _OCR_UNAVAILABLE with threading.Event.
+#
+# Root cause of H-02:
+#   The previous code used a module-level boolean:
+#       _OCR_UNAVAILABLE = False
+#   _get_ocr_reader() wrote this flag under _OCR_LOCK:
+#       _OCR_UNAVAILABLE = True
+#   But _call_qwen_with_history() READ it OUTSIDE any lock:
+#       if _OCR_UNAVAILABLE:
+#   This is a data race: CPython's GIL makes bool reads atomic, but the
+#   read-check-act sequence is not atomic.  On non-CPython runtimes (PyPy,
+#   GraalPy, future no-GIL CPython) a torn read is possible.
+#
+# Fix: replace the bare bool with threading.Event.
+#   - _OCR_UNAVAILABLE_EVENT.set()   replaces  _OCR_UNAVAILABLE = True
+#   - _OCR_UNAVAILABLE_EVENT.clear() replaces  _OCR_UNAVAILABLE = False
+#   - _OCR_UNAVAILABLE_EVENT.is_set() replaces  if _OCR_UNAVAILABLE:
+#
+# threading.Event.is_set() is internally synchronized (uses a Condition /
+# RLock) and is safe to call from any thread without holding an external
+# lock.  This eliminates the data race without requiring callers to acquire
+# _OCR_LOCK for every read.
+#
+# A separate _OCR_LAST_FAILURE_TS float is still needed for the cooldown
+# logic.  It is only written under _OCR_LOCK (inside _get_ocr_reader()), so
+# reads outside the lock are safe on CPython (float assignment is atomic via
+# GIL) and acceptable on other runtimes (worst case: stale read causes one
+# extra retry attempt, not a correctness failure).
+_OCR_UNAVAILABLE_EVENT = threading.Event()    # H-02 FIX: was `_OCR_UNAVAILABLE = False`
 _OCR_LAST_FAILURE_TS: float = 0.0
 _OCR_RETRY_COOLDOWN_SECONDS = 300.0
 
 
 def _get_ocr_reader():
-    global _OCR_READER, _OCR_UNAVAILABLE, _OCR_LAST_FAILURE_TS
+    global _OCR_READER, _OCR_LAST_FAILURE_TS
 
     with _OCR_LOCK:
         if _OCR_READER is not None:
             return _OCR_READER
 
-        if _OCR_UNAVAILABLE:
+        if _OCR_UNAVAILABLE_EVENT.is_set():          # H-02 FIX: was  if _OCR_UNAVAILABLE:
             if time.monotonic() - _OCR_LAST_FAILURE_TS < _OCR_RETRY_COOLDOWN_SECONDS:
                 return None
-            _OCR_UNAVAILABLE = False
+            _OCR_UNAVAILABLE_EVENT.clear()           # H-02 FIX: was  _OCR_UNAVAILABLE = False
             logger.info("[QwenOllamaAdapter] OCR cooldown elapsed -- retrying EasyOCR init.")
 
         logger.warning(
@@ -97,7 +125,7 @@ def _get_ocr_reader():
             return _OCR_READER
 
         except Exception as exc:
-            _OCR_UNAVAILABLE = True
+            _OCR_UNAVAILABLE_EVENT.set()             # H-02 FIX: was  _OCR_UNAVAILABLE = True
             _OCR_LAST_FAILURE_TS = time.monotonic()
             logger.warning(
                 "[QwenOllamaAdapter] EasyOCR unavailable: %s. "
@@ -197,21 +225,10 @@ class QwenOllamaAdapter:
 
     Provider-agnostic design: the only Ollama-specific call is self._client.chat().
     The adapter interface (get_next_action) is shared across all adapters.
-
-    To support a different local model (llama3.2-vision, llava, etc.):
-      - Create a sibling adapter file
-      - Register it in adapters/factory.py _LOCAL_REGISTRY
-      - No changes needed here
     """
 
-    # Maximum number of prior conversation turns to include in each call.
-    # Each turn is text-only (images stripped from older turns).
     MAX_HISTORY_TURNS = 10
 
-    # Coordinate mandate injected into the system prompt when OCR is unavailable.
-    # Prevents text-based clicks from being emitted in coordinate-only mode,
-    # which would cause silent drops and task stagnation.
-    # FIX RB-5: Without this, stagnation occurs after MAX_STAGNANT_ITERS_UI=12.
     _COORD_MANDATE = (
         "\n\nCRITICAL CONSTRAINT: OCR text-recognition is unavailable on this system. "
         "You MUST use coordinate-based clicks ONLY. "
@@ -226,8 +243,6 @@ class QwenOllamaAdapter:
 
         self.model_name = model_name.strip()
 
-        # Read timeout raised to 120s for CPU inference compatibility.
-        # CPU inference on Qwen2.5-VL 7B: 40-90s on consumer hardware.
         self._client = ollama.Client(
             timeout=httpx.Timeout(
                 connect=10.0,
@@ -237,7 +252,6 @@ class QwenOllamaAdapter:
             )
         )
 
-        # Bounded executor prevents unbounded thread spawn under async callers.
         self._executor = ThreadPoolExecutor(max_workers=1)
 
     # ==========================================================
@@ -273,20 +287,16 @@ class QwenOllamaAdapter:
         Capture current screen, build multi-turn message list, call Ollama,
         parse JSON operations.
 
-        Prior conversation turns are included as text-only history so the LLM
-        knows what has already been done. Only the current (latest) user turn
-        carries the live screenshot image.
+        H-02 FIX: _OCR_UNAVAILABLE_EVENT.is_set() is used instead of the bare
+        bool read.  threading.Event.is_set() is internally synchronized and safe
+        to call from any thread without an external lock.
         """
-        # --- Build system prompt ---
         system_content = get_system_prompt(self.model_name, objective)
 
-        # FIX RB-5: When OCR is unavailable mandate coordinate-based clicks.
-        # Text-based click ops are silently dropped by _resolve_click_coordinates
-        # in coordinate-only fallback mode, causing stagnation after 12 iters.
-        if _OCR_UNAVAILABLE:
+        # H-02 FIX: Use .is_set() on the Event rather than reading the bare bool.
+        if _OCR_UNAVAILABLE_EVENT.is_set():           # H-02 FIX: was  if _OCR_UNAVAILABLE:
             system_content = system_content + self._COORD_MANDATE
 
-        # --- Build historical context (text-only, no old images) ---
         history_messages: List[dict] = []
         for msg in messages:
             role = msg.get("role")
@@ -316,7 +326,6 @@ class QwenOllamaAdapter:
             with open(jpeg_tmp_name, "rb") as f:
                 img_base64 = base64.b64encode(f.read()).decode("utf-8")
 
-            # --- Build per-action user prompt ---
             is_first_message = len(history_messages) == 0
             base_prompt = (
                 get_user_first_message_prompt()
@@ -331,7 +340,6 @@ class QwenOllamaAdapter:
             else:
                 user_prompt_text = base_prompt
 
-            # --- Assemble full message list for ollama.chat() ---
             ollama_messages: List[Dict[str, Any]] = [
                 {"role": "system", "content": system_content}
             ]
@@ -401,7 +409,6 @@ class QwenOllamaAdapter:
         reader = _get_ocr_reader()
 
         if reader is None:
-            # Coordinate-only fallback: keep only ops with explicit x, y.
             filtered: List[dict] = []
             for op in operations:
                 if op.get("operation") != "click":
@@ -413,7 +420,6 @@ class QwenOllamaAdapter:
                     op["x"] = float(x)
                     op["y"] = float(y)
                     filtered.append(op)
-                # No coords and no OCR: drop (fail-closed).
             operations.clear()
             operations.extend(filtered)
             return
@@ -431,14 +437,12 @@ class QwenOllamaAdapter:
                 continue
 
             if "text" not in op:
-                # Honour explicit x/y coordinates when no text target is given.
                 x = op.get("x")
                 y = op.get("y")
                 if isinstance(x, (int, float)) and isinstance(y, (int, float)):
                     op["x"] = float(x)
                     op["y"] = float(y)
                     filtered.append(op)
-                # No text, no coords: fail-closed, drop.
                 continue
 
             try:
@@ -453,8 +457,6 @@ class QwenOllamaAdapter:
                         op["y"] = float(y)
                         filtered.append(op)
                     else:
-                        # H-03 FIX (RT-06): Log when a click is dropped due to
-                        # bad coordinate data so operators can diagnose stagnation.
                         logger.warning(
                             "[QwenOllamaAdapter] OCR click DROPPED — text=%r: "
                             "resolved coords missing x/y (got %r). "
@@ -471,7 +473,6 @@ class QwenOllamaAdapter:
                         coords,
                     )
             except Exception as _ocr_exc:
-                # H-03 FIX: Log instead of silently continuing (fail-closed).
                 logger.warning(
                     "[QwenOllamaAdapter] OCR click DROPPED — text=%r: "
                     "exception during coordinate resolution: %s. "
@@ -496,7 +497,6 @@ class QwenOllamaAdapter:
         truncate multi-operation arrays to only the first element).
         """
         text = text.strip()
-        # Strip markdown fences.
         text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.MULTILINE)
         text = re.sub(r"\s*```$", "", text, flags=re.MULTILINE).strip()
 
@@ -509,7 +509,6 @@ class QwenOllamaAdapter:
         except Exception:
             pass
 
-        # Greedy fallback: try outermost array, then outermost object.
         for pattern in (r"(\[.*\])", r"(\{.*\})"):
             match = re.search(pattern, text, re.DOTALL)
             if match:
