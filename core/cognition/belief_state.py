@@ -56,6 +56,19 @@ class BeliefState:
     #   The scale maps [0, 1] → [-REWARD_CLAMP, REWARD_CLAMP] via:
     #     normalised = (reward / BOOTSTRAP_REWARD_SCALE) * REWARD_CLAMP
     #   i.e. reward=0.5 → 0.0 (neutral), reward=1.0 → +REWARD_CLAMP (max).
+    #
+    # HAR-3 (Math): Bootstrap resolution loss — accepted by design.
+    #   During the bootstrap phase (n < 3), rewards outside the range
+    #   (-BOOTSTRAP_REWARD_SCALE, BOOTSTRAP_REWARD_SCALE) i.e. outside
+    #   (-0.5, 0.5) saturate at ±REWARD_CLAMP.  Concretely:
+    #     reward = -0.3  →  normalised = -1.8  (clamped to -REWARD_CLAMP=-3.0)
+    #     reward = -1.0  →  normalised = -6.0  (clamped to -REWARD_CLAMP=-3.0)
+    #   Both a mild partial failure (-0.3) and a total failure (-1.0) produce
+    #   the same normalised value for the first 2 samples.  This is a known
+    #   limitation: the Welford renormalization at n==3 corrects retroactively
+    #   once enough samples exist to estimate true variance.  The 2-sample
+    #   blind period is acceptable because no action selection depends on
+    #   distinguishing failure severity that early.
     BOOTSTRAP_REWARD_SCALE: float = 0.5   # half of the [0,1] input range
 
     # RB-CRIT-1 FIX: REWARD_CLAMP and NORMALIZE_EPS were used throughout this
@@ -95,7 +108,22 @@ class BeliefState:
     # declaring convergence while uncertain risks false success.
     MAX_ENTROPY_CONVERGENCE: float = 2.0  # nats; uniform over 8 states ≈ 2.08
 
-    
+    # HAR-4 (Math): THOMPSON_WINDOW (20) vs REWARD_WINDOW (100) — deliberate
+    # temporal horizon split.
+    #
+    # Thompson sampling uses only the most recent THOMPSON_WINDOW=20 z-scores
+    # for Beta parameter estimation.  This makes it *responsive*: it reacts
+    # quickly to recent environment changes and does not get anchored by stale
+    # reward history.
+    #
+    # UCB1 and Expected Utility scoring use all REWARD_WINDOW=100 samples for
+    # mean and confidence-interval calculation.  This gives them *stability*:
+    # a longer memory prevents thrashing on noisy single-sample events.
+    #
+    # The split is intentional and documented here to prevent "fixing" it.
+    # If you want both algorithms on the same horizon, change THOMPSON_WINDOW
+    # to match REWARD_WINDOW=100 — but expect more Thompson thrashing on
+    # reward-volatile tasks.
     THOMPSON_WINDOW = 20
 
     _FALLBACK_PRUNE_THRESHOLD = PRIOR_ALPHA * 2.0
@@ -113,11 +141,26 @@ class BeliefState:
         self.environment_stability: float = 1.0
 
         
-        self.commitment_hash: str = (
+        # HAR-1 (Determinism): commitment_hash is a *static* SHA-256 of the
+        # task intent computed once at construction time.  It does NOT update on
+        # each action, so calling it a "chain" is misleading.  We rename the
+        # semantic role:
+        #
+        #   task_identity_hash  — static, identifies the task (= old commitment_hash)
+        #   commitment_chain_hash — mutable, updated per record_action() call by
+        #                          SHA-256(prev_chain || action_key), creating a
+        #                          genuine cryptographic audit chain of actions.
+        #
+        # commitment_hash is kept as a property alias for backward compatibility
+        # with serializer.py, main.py, and action_ranker.py which read it.
+        self.task_identity_hash: str = (
             hashlib.sha256(intent_hash.encode("utf-8")).hexdigest()
             if intent_hash
             else "GENESIS"
         )
+        # commitment_chain_hash starts as task_identity_hash and is extended
+        # by SHA-256(prev_chain_hash + ":" + action_key) in record_action().
+        self.commitment_chain_hash: str = self.task_identity_hash
         self._iteration_counter: int = 0
 
         
@@ -137,6 +180,29 @@ class BeliefState:
 
     # =========================================================
     # BELIEF UPDATE
+    # =========================================================
+    # BACKWARD COMPATIBILITY PROPERTY
+    # =========================================================
+
+    @property
+    def commitment_hash(self) -> str:
+        """Backward-compatible alias for task_identity_hash.
+
+        HAR-1: The field was renamed to task_identity_hash to make clear it is
+        a static task-level identifier, not a mutable chain.  External callers
+        (serializer.py, main.py, action_ranker.py) continue to work unchanged
+        via this property.  New code should prefer task_identity_hash directly.
+        """
+        return self.task_identity_hash
+
+    @commitment_hash.setter
+    def commitment_hash(self, value: str) -> None:
+        """Allow from_dict() to set task_identity_hash via the old field name."""
+        self.task_identity_hash = value
+        # Re-synchronise chain hash to new identity if chain is still at genesis
+        if self.commitment_chain_hash == "GENESIS" or not self.commitment_chain_hash:
+            self.commitment_chain_hash = value
+
     # =========================================================
 
     def bayesian_update(self, likelihoods: Dict[str, float]) -> None:
@@ -369,7 +435,13 @@ class BeliefState:
     # =========================================================
 
     def record_action(self, action: str, reward: float):
-        
+        # HAR-1: Advance the commitment chain hash so that each recorded action
+        # extends the cryptographic audit trail.  chain_n = SHA-256(chain_{n-1}
+        # || ":" || action_key).  This makes commitment_chain_hash a genuine
+        # per-action chain rather than a static task-level identifier.
+        _chain_input = f"{self.commitment_chain_hash}:{action}".encode("utf-8")
+        self.commitment_chain_hash = hashlib.sha256(_chain_input).hexdigest()
+
         if action not in self.action_rewards:
             self.action_rewards[action] = deque(maxlen=self.REWARD_WINDOW)
         if action not in self._raw_action_rewards:
@@ -536,6 +608,7 @@ class BeliefState:
 
             # Commitment / iteration tracking
             "commitment_hash": self.commitment_hash,
+            "commitment_chain_hash": self.commitment_chain_hash,  # HAR-1: true per-action chain
             "_iteration_counter": self._iteration_counter,
             "_sample_counter": self._sample_counter,
             "_regret_decay": self._regret_decay,
@@ -602,6 +675,12 @@ class BeliefState:
             # Commitment / iteration
             instance.commitment_hash = str(
                 data.get("commitment_hash", "GENESIS")
+            )
+            # HAR-1: Restore the per-action chain hash; fall back to the
+            # task_identity_hash (== commitment_hash) for states serialized
+            # before this field was introduced.
+            instance.commitment_chain_hash = str(
+                data.get("commitment_chain_hash", instance.task_identity_hash)
             )
             instance._iteration_counter = int(
                 data.get("_iteration_counter", 0)
