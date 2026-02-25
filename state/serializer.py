@@ -135,6 +135,16 @@ class AuthorityStateSerializer:
         self._state_path = state_path
         self._lock = threading.Lock()
 
+        # RT-01 FIX: event_log is an in-memory append-only list that survives
+        # within a single process lifetime.  Callers (main.py warmup diagnostics)
+        # use record_event() to register structured events.  The log is capped at
+        # _MAX_EVENTS to prevent unbounded memory growth across long-running
+        # sessions and is NOT persisted to disk (events are diagnostic only —
+        # the persistent crash-recovery payload lives in belief_state_full).
+        self._event_log: List[Dict[str, Any]] = []
+        self._event_lock = threading.Lock()
+        self._MAX_EVENTS = 1000  # hard cap; oldest events dropped on overflow
+
     # --------------------------------------------------
     # Public API
     # --------------------------------------------------
@@ -178,11 +188,15 @@ class AuthorityStateSerializer:
         Persist authority state atomically.
 
         thompson_state: slim 3-field stub kept for backward compatibility.
+          Keys are accepted with BOTH the leading-underscore prefix used by
+          BeliefState.to_dict() ("_iteration_counter", "_sample_counter") AND
+          the legacy no-underscore form ("iteration_counter", "sample_counter").
+          This makes the caller in main.py resilient to either naming convention.
 
         belief_state_full (FIX SI-4): Full BeliefState.to_dict() payload.
-        When present after a crash, main.py calls BeliefState.from_dict() and
-        passes the result as prior_belief_state to the first operate_main(),
-        restoring full bandit continuity across crash-recovery restarts.
+          When present after a crash, main.py calls BeliefState.from_dict() and
+          passes the result as prior_belief_state to the first operate_main(),
+          restoring full bandit continuity across crash-recovery restarts.
         """
         state = {
             "version": _AUTH_STATE_VERSION,
@@ -193,18 +207,94 @@ class AuthorityStateSerializer:
             "dirty": bool(dirty),
             "updated_at": time.time(),
         }
+
         if thompson_state is not None:
+            # RT-02 FIX: Accept both underscore-prefixed keys (from
+            # BeliefState.to_dict()) and legacy no-underscore keys so the
+            # stub is populated correctly regardless of which form the caller
+            # passes.  Priority: underscore-prefix keys win when present.
+            _iter = thompson_state.get(
+                "_iteration_counter",
+                thompson_state.get("iteration_counter", 0),
+            )
+            _samp = thompson_state.get(
+                "_sample_counter",
+                thompson_state.get("sample_counter", 0),
+            )
+            _comm = thompson_state.get(
+                "commitment_chain_hash",
+                thompson_state.get("commitment_hash", ""),
+            )
             state["thompson_state"] = {
-                "iteration_counter": int(thompson_state.get("iteration_counter", 0)),
-                "sample_counter":    int(thompson_state.get("sample_counter", 0)),
-                "commitment_hash":   str(thompson_state.get("commitment_hash", "")),
+                # Store under canonical underscore-prefixed names so load()
+                # callers that read the raw JSON get unambiguous keys.
+                "_iteration_counter": int(_iter),
+                "_sample_counter":    int(_samp),
+                "commitment_chain_hash": str(_comm),
             }
+
         # FIX SI-4: Persist full BeliefState for crash-recovery bandit continuity.
         if belief_state_full is not None and isinstance(belief_state_full, dict):
             state["belief_state_full"] = belief_state_full
 
         with self._lock:
             self._atomic_write(state)
+
+    def record_event(self, event: Dict[str, Any]) -> None:
+        """
+        RT-01 FIX: Record a structured diagnostic event in the in-memory log.
+
+        Previously absent, causing main.py:266 to call
+            auth_state.record_event({...})
+        which raised AttributeError (caught by the outer try/except Exception:
+        pass), silently discarding warmup-degradation diagnostics.
+
+        This method is intentionally in-memory only:
+        - Events are non-critical diagnostic data; losing them on crash is
+          acceptable and avoids a write-per-event I/O penalty.
+        - The persistent crash-recovery channel is belief_state_full in
+          persist(), not the event log.
+
+        Events are stamped with "recorded_at" if not already present and
+        appended in a thread-safe manner.  The log is capped at _MAX_EVENTS;
+        when full, the oldest half is discarded (bulk trim is cheaper than
+        popping one entry at a time under contention).
+
+        Parameters
+        ----------
+        event : dict
+            Arbitrary structured payload.  Must be JSON-serializable so callers
+            can safely pass it to json.dumps() for export.
+
+        Raises
+        ------
+        Nothing — this method is fail-safe.  Any internal error is swallowed
+        to ensure that a diagnostic helper never disrupts the main loop.
+        """
+        try:
+            if not isinstance(event, dict):
+                return
+            # Deep-copy to prevent accidental external mutation of stored events.
+            stamped = dict(event)
+            stamped.setdefault("recorded_at", time.time())
+
+            with self._event_lock:
+                self._event_log.append(stamped)
+                if len(self._event_log) > self._MAX_EVENTS:
+                    # Discard oldest half — O(n/2) but infrequent (once per 1000 events).
+                    self._event_log = self._event_log[self._MAX_EVENTS // 2:]
+        except Exception:
+            pass  # record_event must never raise
+
+    def get_event_log(self) -> List[Dict[str, Any]]:
+        """
+        Return a snapshot of the in-memory event log.
+
+        Thread-safe: returns a copy so the caller can iterate without holding
+        the lock.  Intended for diagnostics, health-checks, and tests.
+        """
+        with self._event_lock:
+            return list(self._event_log)
 
     def force_safe_state(self) -> None:
         """
