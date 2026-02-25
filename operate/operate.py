@@ -33,6 +33,29 @@ from config.timeouts import MAX_STAGNANT_ITERS_UI, MAX_STAGNANT_ITERS_COMMAND
 MAX_PERCEPTION_ENTITIES = 20
 MAX_PERCEPTION_JSON_BYTES = 10_000
 
+# -----------------------------------------------------------------------
+# P2-2 / RB-1 FIX: Canonical replan signal constant.
+#
+# Root cause (PRODUCTION-DISQUALIFYING):
+#   operate.py raised RuntimeError("TASK_FAILED:stagnation") on stagnation.
+#   main.py's replan handler checked: if str(e) != "REPLAN_REQUIRED": raise
+#   These two strings NEVER matched. Every stagnated task triggered
+#   _force_safe_shutdown() instead of replanning. MAX_REPLANS=3,
+#   begin_replan_sequence(), arm_for_replan(), and all cross-replan belief
+#   continuity were unreachable dead code.
+#
+# Fix: define REPLAN_SIGNAL here as the single source of truth for the
+# signal string. Both the raise site (stagnation abort below) and the
+# caller (main.py) must use this constant — not inline literals — so that
+# any future rename is a one-line change, not a grep-and-pray operation.
+#
+# Recovery classification:
+#   REPLAN_SIGNAL        → recoverable; replan and retry (stagnation)
+#   TASK_FAILED:timeout  → terminal; replan won't help (wall-clock exceeded)
+#   TASK_FAILED:*        → terminal; propagate to outer handler
+# -----------------------------------------------------------------------
+REPLAN_SIGNAL: str = "REPLAN_REQUIRED"
+
 # PATCH §1.11: WAIT should pause and retry, not immediately replan
 WAIT_RETRY_SECONDS = 0.5
 MAX_WAIT_RETRIES = 10  # 5s total wait before replanning
@@ -593,12 +616,43 @@ def _execute_autonomous_loop(
             # STAGNATION GUARD
             # -------------------------------------------------------
             if stagnant_iterations >= stagnant_limit:
+                # H-9 FIX: Emit a structured telemetry event BEFORE raising
+                # so that post-hoc analysis can determine replan frequency,
+                # belief entropy at the trigger point, and which step stalled.
+                #
+                # Fields:
+                #   stagnant_iterations  — how many failed/unverified iterations
+                #   stagnant_limit       — threshold that was reached
+                #   step                 — plan step index that stalled
+                #   belief_entropy       — Shannon entropy of belief distribution
+                #                         at the trigger moment (nats); high
+                #                         entropy → plan is genuinely ambiguous,
+                #                         not just slow.
+                #   iteration            — total loop iterations so far
+                #   replan_signal        — the signal being raised; makes the
+                #                         JSONL log grep-able without parsing
+                #
+                # RB-1 / SI-1 FIX: Previously raised RuntimeError("TASK_FAILED:stagnation").
+                # main.py's replan handler checked str(e) == "REPLAN_REQUIRED" which
+                # NEVER matched, so every stagnated task shut down instead of replanning.
+                # MAX_REPLANS=3, begin_replan_sequence(), arm_for_replan(), and all
+                # cross-replan belief continuity were permanently unreachable dead code.
+                #
+                # Fix: raise RuntimeError(REPLAN_SIGNAL) — uses the canonical constant
+                # so the signal string is defined in exactly one place and main.py's
+                # check `str(e) != "REPLAN_REQUIRED"` correctly branches to the replan
+                # sequence instead of propagating to _force_safe_shutdown().
+                _entropy = belief.entropy() if hasattr(belief, "entropy") else 0.0
                 journal.record({
-                    "event": "stagnation_abort",
+                    "event": "replan_trigger",
+                    "replan_signal": REPLAN_SIGNAL,
                     "step": current_step_index,
                     "stagnant_iterations": stagnant_iterations,
+                    "stagnant_limit": stagnant_limit,
+                    "iteration": iteration,
+                    "belief_entropy": round(_entropy, 4),
                 })
-                raise RuntimeError("TASK_FAILED:stagnation")
+                raise RuntimeError(REPLAN_SIGNAL)
 
             previous_perception = perception_snapshot
 
