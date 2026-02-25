@@ -376,8 +376,16 @@ class BeliefState:
         # _iteration_counter, making seeds identical when action strings are
         # similar. _sample_counter eliminates this within-round collision.
         self._sample_counter += 1
+        # H-02 FIX (MATH-05): Use commitment_chain_hash (mutable, updated per
+        # record_action() call) instead of commitment_hash (static alias for
+        # task_identity_hash).  When commitment_hash was used, identical task
+        # intent + identical iteration/sample counters produced cryptographically
+        # identical Thompson samples across sessions — adversarial environments
+        # could exploit the deterministic exploration pattern.
+        # commitment_chain_hash advances with every action recorded, so even
+        # for the same intent the seed is unique per action history.
         seed_material = (
-            f"{self.commitment_hash}:{action}:{self._iteration_counter}:{self._sample_counter}"
+            f"{self.commitment_chain_hash}:{action}:{self._iteration_counter}:{self._sample_counter}"
         ).encode("utf-8")
 
         digest = hashlib.sha256(seed_material).digest()
