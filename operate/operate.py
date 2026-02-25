@@ -501,6 +501,12 @@ def _execute_autonomous_loop(
             # -------------------------------------------------------
             # ACTION EXECUTION
             # -------------------------------------------------------
+            # P0-B FIX (RT-02): Initialise exec_result before the try block so
+            # the variable is always bound.  In the except path action_success is
+            # False and the "output" in {} check short-circuits safely — but any
+            # future refactor that sets action_success=True inside the except
+            # block would hit NameError without this initialisation.
+            exec_result: dict = {}
             try:
                 exec_result = _execute_decision(
                     action=selected_action,
@@ -536,8 +542,16 @@ def _execute_autonomous_loop(
             # -------------------------------------------------------
             # REWARD & REGRET UPDATE
             # -------------------------------------------------------
-            best_reward = belief.global_best_reward() or 0.0
+            # P0-F FIX (SI-04/MATH-06): Sample best_reward AFTER record_action()
+            # so the current action's reward is included before comparing.
+            # Previously best_reward was sampled BEFORE record_action(), causing
+            # the bandit to accumulate false regret on the single best action:
+            # when an action achieved a new global best (e.g. first 'done'
+            # returning 1.0), regret was computed as old_best − 1.0 > 0 (wrong;
+            # should be 0.0 for a record-breaker).  This over-penalised the best
+            # action and drove re-exploration of inferior alternatives.
             belief.record_action(action_key, raw_reward)
+            best_reward = belief.global_best_reward() or 0.0
             belief.update_regret(action_key, raw_reward, best_reward)
 
             journal.record({
