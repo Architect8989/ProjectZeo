@@ -228,6 +228,15 @@ class RestorationSnapshot:
                 "spawned_processes",
                 "window_geometry",
                 "window_z_order",
+                # H-6 FIX: keyboard_modifiers_partially was absent from this
+                # list despite force_release_all() performing modifier-key
+                # release during restoration. The omission implied the keyboard
+                # was fully restored, which is misleading: only modifier keys
+                # (Ctrl, Shift, Alt, Win) are explicitly released. Key-down state
+                # for non-modifier keys (e.g. a held arrow key) is NOT restored.
+                # Adding this entry with the _partially suffix makes the shallow
+                # guarantee explicit and auditable.
+                "keyboard_modifiers_partially",
             ],
             "cursor": {
                 "x": self.cursor.x,
@@ -241,7 +250,7 @@ class RestorationSnapshot:
                 "process_name": self.application.process_name,
                 "pid": self.application.pid,
             },
-            \"metadata\": dict(self.metadata),
+            "metadata": dict(self.metadata),
         }
 
     @classmethod
@@ -265,6 +274,21 @@ class RestorationSnapshot:
             raise ValueError(f"from_dict(): invalid captured_at — {e}") from e
 
         execution_mode = str(data.get("execution_mode", "observer"))
+
+        # SI-3 / P2-1 FIX: Normalize execution_mode to uppercase before use.
+        #
+        # Root cause: from_dict() used the raw string from disk JSON, defaulting
+        # to "observer" (lowercase). validate() checks execution_mode != "OBSERVER"
+        # (uppercase). Because "observer" != "OBSERVER", every snapshot reloaded
+        # from disk failed validate() — but from_dict() never called validate(),
+        # so corrupted or lowercase snapshots silently bypassed the mode guard
+        # and were used by RestoreProvider without any integrity check.
+        #
+        # Two-part fix:
+        #   1. Normalize to uppercase here so the field is always canonical.
+        #   2. Call instance.validate() before returning (see below) so malformed
+        #      snapshots raise ValueError rather than reaching RestoreProvider.
+        execution_mode = execution_mode.upper().strip() or "OBSERVER"
 
         cursor_d = data.get("cursor", {})
         if not isinstance(cursor_d, dict):
@@ -290,7 +314,7 @@ class RestorationSnapshot:
         metadata = dict(data.get("metadata", {}))
 
         # Reconstruct with the ORIGINAL snapshot_id (do not re-derive).
-        return cls(
+        instance = cls(
             snapshot_id=snapshot_id,
             captured_at=captured_at,
             execution_mode=execution_mode,
@@ -299,6 +323,28 @@ class RestorationSnapshot:
             application=application,
             metadata=metadata,
         )
+
+        # SI-3 FIX: Validate the reconstructed snapshot before returning.
+        #
+        # Root cause: from_dict() previously returned the instance without
+        # calling validate(). Corrupted JSON on disk (wrong execution_mode,
+        # negative captured_at, empty snapshot_id, etc.) would be loaded into
+        # memory as a RestorationSnapshot and used by RestoreProvider without
+        # any integrity check. The broken snapshot would survive until the first
+        # actual restore attempt, where it might cause unpredictable behaviour.
+        #
+        # Fix: call validate() here and convert any ValueError into a structured
+        # ValueError so SnapshotProvider._reload_from_disk() can log and discard
+        # the corrupted file rather than crashing the reload loop.
+        try:
+            instance.validate()
+        except ValueError as _val_err:
+            raise ValueError(
+                f"from_dict(): snapshot {snapshot_id!r} failed integrity check — "
+                f"{_val_err}"
+            ) from _val_err
+
+        return instance
 
 
 # FIX-04 (SI-02): Declare the nonce counter as a TRUE class-level attribute
