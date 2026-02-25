@@ -16,15 +16,7 @@ from adapters.apis_safety_layer import apply_patches
 # =========================================================
 _LOCAL_REGISTRY: Dict[str, str] = {
     "qwen2.5-vl": "adapters.qwen_ollama_adapter.QwenOllamaAdapter",
-    # FIX RB-7: llava was misclassified in _CLOUD_REGISTRY. LLaVA is served
-    # by local Ollama and never routes through cloud APIs. Moving it here
-    # ensures OLLAMA_ONLY=1 mode can use llava without hitting the cloud-block
-    # guard, and that llava users are not incorrectly denied at runtime.
-    #
-    # QwenOllamaAdapter is provider-agnostic: the model name ("llava") is
-    # passed through directly to ollama.Client().chat(), so no adapter-level
-    # changes are needed. The only requirement is that 'llava' is pulled
-    # locally via `ollama pull llava` before use.
+    
     "llava": "adapters.qwen_ollama_adapter.QwenOllamaAdapter",
     # Extension point — add new local models here:
     # "llama3.2-vision": "adapters.llama_ollama_adapter.LlamaOllamaAdapter",
@@ -65,39 +57,10 @@ _PATCH_LOCK = threading.Lock()
 _MODEL_PATTERN = re.compile(r"^[a-zA-Z0-9.\-_:/]+$")
 
 
-# SI-8 / H8 FIX: Bound the adapter cache with LRU eviction.
-#
-# Bug: _ADAPTER_CACHE was an unbounded plain dict. Different version tags
-# (e.g. "qwen2.5-vl:7b-instruct" vs "qwen2.5-vl:latest") created separate
-# cache entries, each with its own ThreadPoolExecutor. In long-running
-# processes with many model variants the cache grew without bound, leaking
-# thread-pool resources proportional to distinct model name strings seen.
-#
-# Fix: use an OrderedDict capped at _ADAPTER_CACHE_MAX_SIZE entries. On
-# insertion beyond the cap, the least-recently-used entry (first in dict
-# order) is evicted. The build-lock design is preserved; eviction uses
-# _ADAPTER_CACHE_LOCK for thread safety.
+
 _ADAPTER_CACHE_MAX_SIZE: int = 10
 
-# AUDIT-SI-1 FIX: Bound _ADAPTER_BUILD_LOCKS with LRU eviction.
-#
-# Previous bug: _ADAPTER_BUILD_LOCKS was an unbounded plain dict. Every
-# distinct model name string (including version-tagged variants like
-# "qwen2.5-vl:7b-instruct" and "qwen2.5-vl:latest") created a permanent
-# Lock entry that was never removed. In a multi-model or model-version-
-# rotating deployment, the dict grew without bound, leaking threading.Lock
-# objects (~200 bytes each) proportional to the number of distinct model
-# name strings seen across the process lifetime.
-#
-# Fix: use an OrderedDict capped at _BUILD_LOCKS_MAX_SIZE entries with LRU
-# eviction, mirroring the adapter cache strategy. The cap is set to
-# _ADAPTER_CACHE_MAX_SIZE * 2 (20) to ensure that every model that has a
-# cached adapter also retains its build lock, preventing a race where an
-# evicted lock is re-created while a build is still in-flight for the same
-# model. On eviction the oldest (least-recently-used) lock is removed; this
-# is safe because an evicted lock can only be referenced by threads that
-# finished construction and cached the result — all future callers will hit
-# the adapter cache before reaching the build lock.
+
 _BUILD_LOCKS_MAX_SIZE: int = _ADAPTER_CACHE_MAX_SIZE * 2  # 20
 
 from collections import OrderedDict as _OrderedDict
@@ -144,19 +107,7 @@ del _raw_ollama_only  # remove intermediate from module namespace
 
 
 def _get_model_build_lock(model_name: str) -> threading.Lock:
-    """
-    Return the per-model build lock, creating it if it doesn't exist.
-
-    AUDIT-SI-1 FIX: Uses an LRU-bounded OrderedDict (_ADAPTER_BUILD_LOCKS)
-    instead of an unbounded plain dict. On insertion of a new model name
-    beyond _BUILD_LOCKS_MAX_SIZE, the least-recently-used entry is evicted.
-    Eviction is safe: by the time a lock is evicted, all threads that held
-    it have completed construction and cached the adapter. Future callers
-    for that model hit the adapter cache before reaching this function.
-
-    The LRU update (move_to_end) runs under _BUILD_LOCKS_LOCK so concurrent
-    callers see a consistent ordering.
-    """
+    
     with _BUILD_LOCKS_LOCK:
         if model_name in _ADAPTER_BUILD_LOCKS:
             # Promote to most-recently-used
@@ -246,8 +197,7 @@ class AdapterFactory:
         model_name = _validate_model_name(model_name)
         _ensure_patches()
 
-        # Fast path: return cached adapter without acquiring build lock.
-        # SI-8 / H8 FIX: Use _cache_get() which also updates LRU order.
+        
         with _ADAPTER_CACHE_LOCK:
             cached = _cache_get(model_name)
             if cached is not None:
