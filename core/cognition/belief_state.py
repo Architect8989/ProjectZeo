@@ -19,54 +19,7 @@ class BeliefState:
 
     MIN_ENTROPY_FLOOR = 0.3
 
-    # -----------------------------------------------------------------------
-    # RT-03 / B-MATH-01 FIX: BOOTSTRAP_REWARD_SCALE corrected from 0.5 → 1.0
-    #
-    # Root cause of RT-03:
-    #   The previous value (0.5) was inherited from an obsolete [0, 1] reward
-    #   convention where 0.5 was the neutral midpoint.  The current reward
-    #   contract is [-1.0, 1.0] where 0.0 is neutral.  With scale=0.5 and the
-    #   formula  normalised = (reward / BOOTSTRAP_REWARD_SCALE) * REWARD_CLAMP:
-    #
-    #     reward =  1.0  →  (1.0/0.5)*3.0  =  6.0  → clamped → +3.0
-    #     reward =  0.8  →  (0.8/0.5)*3.0  =  4.8  → clamped → +3.0  ← indistinguishable!
-    #     reward =  0.5  →  (0.5/0.5)*3.0  =  3.0  →          +3.0  ← same as success!
-    #     reward =  0.0  →  (0.0/0.5)*3.0  =  0.0  →           0.0  ← neutral (OK)
-    #     reward = -0.5  → (-0.5/0.5)*3.0  = -3.0  →          -3.0  ← at floor
-    #     reward = -1.0  → (-1.0/0.5)*3.0  = -6.0  → clamped → -3.0 ← same as -0.5
-    #
-    #   All rewards in (0.5, 1.0] collapsed to +3.0 in the bootstrap phase (n < 3).
-    #   The system's own done reward (1.0) and success reward (0.8) were
-    #   IDENTICAL during bootstrapping — the bandit could not distinguish a
-    #   "task complete" signal from an ordinary step success.
-    #
-    # Fix: BOOTSTRAP_REWARD_SCALE = RAW_REWARD_MAX = 1.0
-    #   With scale=1.0:
-    #     reward =  1.0  →  (1.0/1.0)*3.0  =  3.0  → +3.0 (maximum positive)
-    #     reward =  0.8  →  (0.8/1.0)*3.0  =  2.4  → +2.4 (DISTINGUISHABLE from done)
-    #     reward =  0.5  →  (0.5/1.0)*3.0  =  1.5  → +1.5 (partial credit)
-    #     reward =  0.0  →  (0.0/1.0)*3.0  =  0.0  →  0.0 (neutral — unchanged)
-    #     reward = -0.5  → (-0.5/1.0)*3.0  = -1.5  → -1.5 (DISTINGUISHABLE from total fail)
-    #     reward = -1.0  → (-1.0/1.0)*3.0  = -3.0  → -3.0 (minimum, floor)
-    #
-    #   Full gradient is preserved across the entire [-1, 1] range for the
-    #   first 2 bootstrap samples.  The Welford renormalization at n=3 still
-    #   fires as before as a retroactive correction path and is unaffected by
-    #   this change.
-    #
-    # Corrected contract:
-    #   Raw rewards are expected in [-1.0, 1.0] where:
-    #     -1.0 = complete failure / policy abort
-    #      0.0 = neutral / no progress (TRUE NEUTRAL POINT)
-    #     +1.0 = complete success / done
-    #   The scale maps [-1, 1] → [-REWARD_CLAMP, REWARD_CLAMP] via:
-    #     normalised = (reward / BOOTSTRAP_REWARD_SCALE) * REWARD_CLAMP
-    #
-    # HAR-3 (Math): Saturation still exists at the floor/ceiling:
-    #   rewards of exactly ±1.0 produce ±3.0 (the clamp value), which is
-    #   correct — a perfect success/failure is mapped to the maximum
-    #   distinguishable score.  No intermediate values are lost.
-    # -----------------------------------------------------------------------
+    
     BOOTSTRAP_REWARD_SCALE: float = 1.0   # maps raw reward range [-1, 1] → z-score range
 
     # RB-CRIT-1 FIX: REWARD_CLAMP and NORMALIZE_EPS defined here as they were
@@ -107,12 +60,7 @@ class BeliefState:
             if intent_hash
             else "GENESIS"
         )
-        # H-7 FIX (documented trust boundary):
-        #   - WITHIN a single uncompromised process: genuine Merkle chain, insertion
-        #     or reordering of recorded actions is detectable.
-        #   - ACROSS a compromised process: chain can be forged via direct attribute
-        #     assignment; no external root of trust exists.
-        #   Intended use: post-hoc audit of uncompromised sessions only.
+        
         self.commitment_chain_hash: str = self.task_identity_hash
 
         self._iteration_counter: int = 0
@@ -191,24 +139,7 @@ class BeliefState:
 
         self.state_probabilities = {s: v / total for s, v in pruned.items()}
 
-        # B-MATH-06 FIX: Entropy floor blend optimization.
-        #
-        # Root cause: the previous code called self.entropy() TWICE per update
-        # cycle when below the floor — once in the outer `if self.entropy() <`
-        # guard, and once more on the first iteration of the inner loop body
-        # (`_H = self.entropy()`).  In stable high-certainty environments where
-        # one application dominates belief (entropy < MIN_ENTROPY_FLOOR on every
-        # update), this produced an O(n) entropy() call per update for up to 20
-        # iterations — wasteful since entropy() iterates all state_probabilities
-        # on each call.
-        #
-        # Fix: compute entropy ONCE before the guard and reuse it as the loop
-        # seed.  The loop recomputes only after it has mutated state_probabilities
-        # (i.e. at the END of each blend iteration, not the start).  This
-        # eliminates the redundant first-loop entropy() call and reduces total
-        # entropy() invocations from (1 + iterations) to (iterations) — a 1-call
-        # saving per update in the common path, and prevents computing entropy
-        # twice before any blend has occurred.
+        
         _current_entropy = self.entropy()
         if _current_entropy < self.MIN_ENTROPY_FLOOR:
             _MAX_BLEND_WEIGHT = 0.30
@@ -299,31 +230,62 @@ class BeliefState:
     # =========================================================
 
     def thompson_sample(self, action: str) -> float:
+        
         rewards = self.action_rewards.get(action)
         if not rewards:
-            return 0.5
+            return 0.0  # Return prior mean (neutral) not 0.5 (which implied Beta scale)
 
         recent = list(rewards)[-self.THOMPSON_WINDOW:]
-        scaled = [(r + self.REWARD_CLAMP) / (2 * self.REWARD_CLAMP) for r in recent]
-        scaled = [min(1.0, max(0.0, v)) for v in scaled]
+        n = len(recent)
 
-        alpha = 1.0 + sum(scaled)
-        beta = 1.0 + sum(1.0 - v for v in scaled)
+        # ---- Posterior parameter computation (Normal-Normal conjugate) ----
+        # Prior parameters
+        _mu0: float = 0.0                              # neutral prior mean
+        _sigma0_sq: float = self.REWARD_CLAMP ** 2    # wide prior variance (= 9.0)
 
+        # Observation noise: use Welford variance when available; else prior-width
+        _welford_n = self._welford_n.get(action, 0)
+        if _welford_n >= 3:
+            # Welford M2/(n-1) is the unbiased sample variance of the NORMALISED
+            # reward stream. Use it as σ² of the observation noise, clamped to
+            # [NORMALIZE_EPS, ∞) to prevent division by zero on zero-variance actions.
+            _obs_variance = max(
+                self._welford_M2.get(action, 0.0) / max(_welford_n - 1, 1),
+                self.NORMALIZE_EPS,
+            )
+        else:
+            # Insufficient data: assume maximum observation noise (conservative,
+            # promotes exploration during bootstrap phase)
+            _obs_variance = _sigma0_sq
+
+        # Posterior precision (= 1/variance)
+        _prior_prec = 1.0 / _sigma0_sq
+        _obs_prec = n / _obs_variance          # sum over n i.i.d. observations
+
+        _post_prec = _prior_prec + _obs_prec   # posterior precision
+        _post_variance = 1.0 / _post_prec      # posterior variance = σₙ²
+
+        # Posterior mean
+        _sum_rewards = sum(recent)
+        _post_mean = _post_variance * (_prior_prec * _mu0 + _sum_rewards / _obs_variance)
+
+        # Clamp posterior mean to valid reward range (numerical safety)
+        _post_mean = max(-self.REWARD_CLAMP, min(self.REWARD_CLAMP, _post_mean))
+
+        # ---- Deterministic seed (preserved from original implementation) ----
         self._sample_counter += 1
-        # H-02 FIX: Use commitment_chain_hash (mutable per-action) rather than
-        # task_identity_hash (static) to seed the RNG.  This ensures Thompson
-        # samples are unique per action history, not just per intent.
         seed_material = (
             f"{self.commitment_chain_hash}:{action}:{self._iteration_counter}:{self._sample_counter}"
         ).encode("utf-8")
-
         digest = hashlib.sha256(seed_material).digest()
         seed = int.from_bytes(digest[:8], byteorder="big", signed=False)
 
+        # ---- Sample from Gaussian posterior ----
         rng = np.random.default_rng(seed)
-        sample = rng.beta(alpha, beta)
-        return float(sample)
+        sample = rng.normal(loc=_post_mean, scale=math.sqrt(_post_variance))
+
+        # Clamp sample to valid range (tails of Gaussian extend beyond clamp)
+        return float(max(-self.REWARD_CLAMP, min(self.REWARD_CLAMP, sample)))
 
     # =========================================================
     # REGRET TRACKING
@@ -393,25 +355,7 @@ class BeliefState:
         self._welford_M2[action] = new_M2
 
         if n >= 3:
-            # B-MATH-02 FIX: Apply Bessel's correction (n-1 denominator) for
-            # unbiased sample variance.  Population variance (n denominator)
-            # systematically underestimates true variance by a factor of n/(n-1):
-            #   n=3  → underestimate by 33%  (risk penalty 33% too small)
-            #   n=10 → underestimate by 10%  (risk penalty 10% too small)
-            #   n=30 → underestimate by 3.3% (negligible)
-            #
-            # With population variance, high-variance actions (oscillating
-            # success/failure) appear safer than they are for n < 30.  This
-            # causes the bandit to under-penalize unstable actions and over-
-            # explore them relative to what the risk-adjusted EU formula intends.
-            #
-            # Fix: divide by max(n-1, 1) instead of n.
-            #   At n=1 (max(0,1)=1): single sample has variance=0 (correct).
-            #   At n=2 (max(1,1)=1): unbiased s² = M2/1 — aggressive but correct.
-            #   At n≥3:              standard Bessel correction s² = M2/(n-1).
-            #
-            # NORMALIZE_EPS guards against zero-variance degenerate actions
-            # (all rewards identical) where std would be exactly 0.0.
+            
             variance = new_M2 / max(n - 1, 1)   # B-MATH-02: Bessel correction
             std = math.sqrt(max(variance, self.NORMALIZE_EPS))
             normalised = (reward - new_mean) / std
@@ -433,10 +377,7 @@ class BeliefState:
                         existing.extend(renormalized)
 
         else:
-            # Bootstrap path (n < 3): use BOOTSTRAP_REWARD_SCALE.
-            # RT-03 FIX: BOOTSTRAP_REWARD_SCALE is now 1.0 (was 0.5).
-            # Gradient is now fully preserved across [-1, 1] for the first 2
-            # samples: reward=0.8 → +2.4, reward=1.0 → +3.0 (distinguishable).
+            
             normalised = (reward / self.BOOTSTRAP_REWARD_SCALE) * self.REWARD_CLAMP
             normalised = max(-self.REWARD_CLAMP, min(self.REWARD_CLAMP, normalised))
 
@@ -503,16 +444,7 @@ class BeliefState:
         }
 
     def to_dict(self) -> dict:
-        """
-        Serialize the full BeliefState to a JSON-safe dict.
-
-        NOTE on key naming: iteration and sample counters are stored with their
-        canonical underscore-prefix names ("_iteration_counter", "_sample_counter")
-        matching the instance attribute names.  Callers that read these keys
-        (e.g. main.py building the thompson_state stub) MUST use the underscore
-        forms.  AuthorityStateSerializer.persist() accepts both forms and
-        normalizes to underscore-prefix internally.
-        """
+        
         return {
             # Belief distribution
             "state_probabilities": dict(self.state_probabilities),
@@ -548,21 +480,7 @@ class BeliefState:
 
     @classmethod
     def from_dict(cls, data: dict, *, intent_hash: str = "") -> "BeliefState":
-        """
-        Reconstruct a BeliefState from a dict produced by to_dict().
-
-        Preserves action counts, reward history, Welford statistics,
-        regret, commitment_hash, and Thompson counters so that cross-replan
-        learning is not lost.
-
-        Parameters
-        ----------
-        data : dict
-            Serialized state from BeliefState.to_dict().
-        intent_hash : str
-            The intent string for the current task (used only when creating
-            a fallback instance).
-        """
+        
         if not isinstance(data, dict):
             return cls(intent_hash=intent_hash)
 
