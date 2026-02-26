@@ -1,7 +1,15 @@
 import os
 import platform
 import subprocess
-import pyautogui
+
+
+try:
+    import pyautogui as _pyautogui  # noqa: F401
+    _PYAUTOGUI_AVAILABLE: bool = True
+except ImportError:
+    _pyautogui = None  # type: ignore[assignment]
+    _PYAUTOGUI_AVAILABLE: bool = False
+
 from PIL import Image, ImageDraw, ImageGrab
 
 
@@ -11,33 +19,16 @@ class VisionUnavailableError(RuntimeError):
 
 
 def capture_screen_with_cursor(file_path):
-    """
-    Capture the current screen to file_path.
-
-    RB-02 FIX: Headless Linux support.
-    ─────────────────────────────────────────────────────────────────────────
-    Original code called ImageGrab.grab() unconditionally on Linux, which
-    requires an X11 DISPLAY environment variable. On headless SSH sessions
-    and CI runners, DISPLAY is not set, causing an OSError at every capture.
-
-    New flow (Linux):
-      1. If DISPLAY is set → use existing Xlib / ImageGrab path (unchanged).
-      2. If DISPLAY is absent → try CLI backends in order:
-           a. scrot -  (writes PNG to stdout)
-           b. import -window root png:- (ImageMagick)
-           c. gnome-screenshot -f <path>
-      3. If all CLI backends fail → raise VisionUnavailableError so the
-         caller (observer) can surface a clean error instead of crashing.
-
-    Windows: still uses pyautogui (unchanged — RB-03 is the Windows fix
-    for the vision *adapter*, not the capture path).
-    macOS: unchanged (screencapture -C).
-    ─────────────────────────────────────────────────────────────────────────
-    """
+    
     user_platform = platform.system()
 
     if user_platform == "Windows":
-        screenshot = pyautogui.screenshot()
+        if not _PYAUTOGUI_AVAILABLE:
+            raise VisionUnavailableError(
+                "pyautogui is not installed. "
+                "Install it with: pip install pyautogui"
+            )
+        screenshot = _pyautogui.screenshot()
         screenshot.save(file_path)
 
     elif user_platform == "Linux":
@@ -66,34 +57,21 @@ def capture_screen_with_cursor(file_path):
                     # compositor restart, etc.) — fall through to pyautogui.
                     pass
 
-            # RB-4 FIX: pyautogui fallback when Xlib unavailable OR X11 capture
-            # raised an exception (display set but unreachable at the moment of
-            # capture — e.g. Xvfb crashed mid-session, stale DISPLAY env var).
-            #
-            # Previous code: on ImportError, pyautogui.screenshot() was called
-            # directly. If pyautogui also needed a display (which it does via
-            # scrot/ImageMagick on some distros), it raised a bare Exception that
-            # propagated upward as an unclassified error, preventing
-            # VisionUnavailableError from being raised and making the failure
-            # invisible to the observer.
-            #
-            # Fix: wrap pyautogui.screenshot() in try/except. On failure, fall
-            # through to _headless_capture() (the same backend used when DISPLAY
-            # is absent entirely). If _headless_capture() also fails it raises
-            # VisionUnavailableError — a clean, typed signal the observer can
-            # surface rather than a raw Exception.
-            try:
-                screenshot = pyautogui.screenshot()
-                screenshot.save(file_path)
-                return
-            except Exception:
-                # pyautogui failed — X11 is configured but not actually reachable.
-                # Fall through to headless backends.
-                pass
+            # RB-4 / RB-MED-1 FIX: pyautogui fallback when Xlib unavailable OR
+            # X11 capture raised an exception.  Now gated on _PYAUTOGUI_AVAILABLE
+            # so the absence of pyautogui falls cleanly through to headless CLI
+            # backends rather than raising AttributeError.
+            if _PYAUTOGUI_AVAILABLE:
+                try:
+                    screenshot = _pyautogui.screenshot()
+                    screenshot.save(file_path)
+                    return
+                except Exception:
+                    # pyautogui failed — fall through to headless backends.
+                    pass
 
             # Last resort: headless CLI backends (scrot, import, gnome-screenshot).
-            # _headless_capture() raises VisionUnavailableError if none succeed,
-            # giving the caller a clean typed signal rather than a raw exception.
+            # _headless_capture() raises VisionUnavailableError if none succeed.
             _headless_capture(file_path)
 
         else:
@@ -113,32 +91,7 @@ def capture_screen_with_cursor(file_path):
 
 
 def _headless_capture(file_path: str) -> None:
-    """
-    Attempt headless screenshot capture using available CLI tools.
-
-    AUDIT-RD-1 / H-5 FIX: Reduced per-backend timeout and added environment
-    probing to avoid blocking on misconfigured partial X11 tooling.
-
-    Root cause: under a system where Xvfb is installed but not running,
-    ImageMagick's `import -window root png:-` blocks waiting for an X display
-    connection for the full 5-second timeout. With 3 backends × 5s each the
-    total capture latency reached 15s, far exceeding ATOMIC_WINDOW_SECONDS=0.5
-    in SnapshotProvider and causing SnapshotProviderError → task abort.
-
-    Fixes:
-      1. Per-backend timeout reduced from 5s → 1.5s. Any functional backend
-         (scrot stdout pipe, gnome-screenshot file write) responds well within
-         1.5s. Only genuinely hung processes (X display blocked) take longer —
-         exactly the case we want to skip fast.
-      2. ImageMagick backend is now gated on a lightweight X display probe:
-         `xdpyinfo -display <display>` with a 0.5s timeout. If the display is
-         not reachable, we skip ImageMagick entirely rather than blocking.
-         This eliminates the primary source of the 5-second stall.
-      3. scrot empty-stdout guard preserved (HARDEN-5 FIX).
-
-    Tries in order: scrot, ImageMagick import (if display probe passes),
-    gnome-screenshot. Raises VisionUnavailableError if none succeed.
-    """
+    
     # Backend 1: scrot (lightweight X11-free capable on some distros)
     try:
         result = subprocess.run(
@@ -146,12 +99,7 @@ def _headless_capture(file_path: str) -> None:
             capture_output=True,
             timeout=1.5,  # AUDIT-RD-1: reduced from 5s → 1.5s
         )
-        # HARDEN-5 FIX: Check len(result.stdout) > 0 before writing.
-        # Older scrot versions (< 1.0) do not support the "-" (stdout) flag.
-        # They return exit code 0 with empty stdout, causing a zero-byte PNG
-        # file to be written and the function to return success silently. All
-        # downstream processing then fails on the empty/invalid image with
-        # cryptic PIL errors instead of a clear VisionUnavailableError.
+        
         if result.returncode == 0 and len(result.stdout) > 0:
             with open(file_path, "wb") as f:
                 f.write(result.stdout)
@@ -159,17 +107,7 @@ def _headless_capture(file_path: str) -> None:
     except (FileNotFoundError, subprocess.TimeoutExpired):
         pass
 
-    # Backend 2: ImageMagick import (requires virtual framebuffer or Xvfb)
-    #
-    # AUDIT-RD-1 / H-5 FIX: Probe the X display before attempting `import`.
-    # If DISPLAY is set but the display server is not actually reachable
-    # (Xvfb installed but not running, stale DISPLAY env var, etc.), `import`
-    # blocks indefinitely waiting for an X connection. The 1.5s timeout alone
-    # is insufficient because the socket connection attempt itself can hang
-    # longer than the subprocess.run() timeout on some Linux kernels.
-    #
-    # Guard: run `xdpyinfo` with a 0.5s hard timeout. If it fails or times
-    # out, the X server is not reachable — skip ImageMagick entirely.
+    
     _display = os.environ.get("DISPLAY", "").strip()
     _imagemagick_allowed = False
     if _display:
