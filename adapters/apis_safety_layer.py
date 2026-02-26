@@ -5,7 +5,14 @@ import types
 import importlib
 import pathlib
 
-_PATCHED = False
+
+
+_MODULE_PATCHES_APPLIED: bool = False  # set to True in apply_patches(); read via is_patched()
+
+
+def is_patched() -> bool:
+    """Return True if apply_patches() has been successfully called in this process."""
+    return _MODULE_PATCHES_APPLIED
 
 
 # ============================================================
@@ -45,18 +52,22 @@ def _get_apis() -> object:
 # PUBLIC ENTRY
 # ============================================================
 
-def apply_patches():
-    # DETERMINISM FIX (double-wrap): Store the applied flag as an attribute on
-    # the target apis module rather than as a module-level bool on this safety
-    # layer. If this module is reloaded (importlib.reload) the local _PATCHED
-    # bool resets to False and patches would be applied again, double-wrapping
-    # already-wrapped functions.
+def apply_patches() -> None:
+    # RD-01 FIX: Use _MODULE_PATCHES_APPLIED (this module) as the primary
+    # idempotency guard.  The target-module attribute (_safety_patches_applied)
+    # is kept as a secondary defence-in-depth guard against double-wrapping
+    # of individual functions when the apis module itself is reloaded.
     #
-    # Storing the flag on the target module survives reloads of this module
-    # because the apis module object identity is preserved across reloads of
-    # the safety layer. Even if the apis module itself is reloaded, _wrap_provider
-    # guards against double-wrapping via the _apis_safety_wrapped attribute on
-    # each function object.
+    # Ordering matters:
+    #   1. Check _MODULE_PATCHES_APPLIED first (cheap, this-module attribute).
+    #   2. If False, resolve the apis module and check its attribute.
+    #   3. Apply patches.
+    #   4. Set BOTH flags to True atomically within the same call.
+    global _MODULE_PATCHES_APPLIED
+
+    if _MODULE_PATCHES_APPLIED:
+        return
+
     try:
         apis = _get_apis()
     except RuntimeError:
@@ -69,13 +80,23 @@ def apply_patches():
         return
 
     if getattr(apis, "_safety_patches_applied", False):
+        # Target module already patched (e.g. this module was reloaded but the
+        # target module was not). Mark this module as patched too so future
+        # calls short-circuit on the cheaper _MODULE_PATCHES_APPLIED check.
+        _MODULE_PATCHES_APPLIED = True
         return
+
     setattr(apis, "_safety_patches_applied", True)
 
     _patch_all_providers()
     _disable_cloud_fallbacks()
     _disable_screenshot_writes()
     _guard_dispatch()
+
+    # RD-01 FIX: Set this module's flag LAST — after all patches succeed.
+    # If any patch raises, _MODULE_PATCHES_APPLIED stays False and the next
+    # call to apply_patches() will retry from scratch.
+    _MODULE_PATCHES_APPLIED = True
 
 
 def uninstall_patches():
