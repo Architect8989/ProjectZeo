@@ -619,6 +619,31 @@ def main(llm_callable: Callable, model_name: str) -> None:
                                     )
                                     new_snapshot_id = snapshot_id
 
+                                # RB-MED-2 FIX: Detect and warn when the replan snapshot
+                                # fallback produces a no-op restoration.
+                                #
+                                # Root cause: if take_snapshot() fails and new_snapshot_id
+                                # falls back to the existing snapshot_id, then the later call
+                                # to restore_provider.restore_snapshot(snapshot_id) in the
+                                # finally block will find "already completed" in the ledger
+                                # and return silently without restoring anything.  No
+                                # exception is raised, no log is emitted — the no-op is
+                                # invisible.
+                                #
+                                # Fix: detect the equality here, immediately after the
+                                # fallback assignment, and emit a structured warning so
+                                # operators know restoration will be skipped.
+                                if new_snapshot_id == snapshot_id:
+                                    print(
+                                        "[MAIN] WARNING RESTORATION_SKIPPED: replan_snapshot_fallback — "
+                                        f"new_snapshot_id == snapshot_id == {snapshot_id!r}. "
+                                        "The replan snapshot failed; the prior snapshot ID will be "
+                                        "used for restoration.  The ledger may treat this as "
+                                        "'already completed' and perform no restoration.  "
+                                        "Verify environment state manually after task completion.",
+                                        file=sys.stderr,
+                                    )
+
                                 mode.attach_snapshot(new_snapshot_id)
                                 mode.arm_for_replan(intent)
 
