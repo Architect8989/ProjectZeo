@@ -9,27 +9,7 @@ import numpy as np
 
 
 class BeliefState:
-    """
-    Probabilistic belief state for the autonomous execution kernel.
-
-    Maintains:
-      - Bayesian belief distribution over task states
-      - Action reward history with Welford incremental normalisation
-      - UCB1, Expected Utility, and Thompson Sampling scoring
-      - Regret tracking with configurable temporal decay
-      - Commitment chain (deterministic RNG seed chain per action)
-
-    HARD CONTRACTS:
-      - No side effects outside self
-      - All public methods are re-entrant (no shared mutable module state)
-      - thompson_sample() is deterministic given the same commitment_chain_hash,
-        action, _iteration_counter, and _sample_counter
-      - record_action() extends the commitment chain before any other mutation
-    """
-
-    # ------------------------------------------------------------------
-    # CLASS-LEVEL CONSTANTS
-    # ------------------------------------------------------------------
+    
 
     EXPLORATION_C = 1.4
     RISK_LAMBDA = 0.3
@@ -489,14 +469,39 @@ class BeliefState:
             normalised = (reward - new_mean) / std
             normalised = max(-self.REWARD_CLAMP, min(self.REWARD_CLAMP, normalised))
 
-            # On crossing n=3, retroactively renormalise the two bootstrap entries
+            # SI-04 FIX: On crossing n=3, retroactively renormalise the two
+            # bootstrap entries using the mean and std of ENTRIES 1–2 ONLY.
+            #
+            # Root cause of previous defect: the code passed ``new_mean``
+            # (which is mean(entries 1, 2, 3) after Welford update) as the
+            # renormalisation baseline for entries 1 and 2.  This introduced
+            # systematic bias because entry 3's value influenced the mean used
+            # to normalise entries 1 and 2.  A high entry-3 reward shifted the
+            # mean up, making entries 1-2 appear to have *lower* z-scores than
+            # they actually earned relative to their own distribution.
+            #
+            # Fix: compute a separate two-sample mean from the first two raw
+            # rewards BEFORE the Welford update.  This two-sample mean is the
+            # correct baseline for renormalising entries 1 and 2.
+            #
+            # The std must still be derived from the full 3-sample Welford
+            # statistics because 2 samples do not yield a meaningful variance
+            # estimate (n-1 = 1; sample variance from 2 points is 0 or the
+            # full range, both unreliable).  Using std from n=3 is a known
+            # mild bias but is bounded and corrects itself as n grows.
             if n == 3 and action in self._raw_action_rewards:
                 raw_deque = self._raw_action_rewards[action]
                 if len(raw_deque) >= 2:
                     old_entries = list(raw_deque)[:2]
+
+                    # SI-04 FIX: Use mean of entries 1-2, NOT new_mean (1-2-3)
+                    _two_sample_mean = (old_entries[0] + old_entries[1]) / 2.0
+
                     renormalized = []
                     for r in old_entries:
-                        z = (r - new_mean) / std
+                        # z-score each entry relative to the 2-sample mean but
+                        # using the 3-sample std (see note above).
+                        z = (r - _two_sample_mean) / std
                         renormalized.append(
                             max(-self.REWARD_CLAMP, min(self.REWARD_CLAMP, z))
                         )
@@ -515,8 +520,14 @@ class BeliefState:
         self.action_counts[action] = self.action_counts.get(action, 0) + 1
 
     # =========================================================================
-    # GLOBAL BEST REWARD
+    # REGRET FLUSH ON TASK SUCCESS (IH-05 FIX)
     # =========================================================================
+
+    def flush_regret_on_success(self) -> None:
+        
+        self.regret.clear()
+
+
 
     def global_best_reward(self) -> "float | None":
         """Return the highest raw reward observed across all actions, or None."""
