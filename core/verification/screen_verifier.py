@@ -1,12 +1,27 @@
 from typing import List, Dict, Any, Optional
 
-try:
-    import easyocr
-    _OCR_AVAILABLE = True
-    _reader = easyocr.Reader(["en"], gpu=False)
-except Exception:
-    _OCR_AVAILABLE = False
-    _reader = None
+
+
+_OCR_AVAILABLE: bool = False
+_reader = None
+_reader_init_attempted: bool = False
+
+
+def _get_reader():
+    """Lazily initialise and return the easyocr Reader. Returns None if unavailable."""
+    global _OCR_AVAILABLE, _reader, _reader_init_attempted
+    if _reader_init_attempted:
+        return _reader  # either a Reader or None — already determined
+
+    _reader_init_attempted = True
+    try:
+        import easyocr as _easyocr
+        _reader = _easyocr.Reader(["en"], gpu=False)
+        _OCR_AVAILABLE = True
+    except Exception:
+        _OCR_AVAILABLE = False
+        _reader = None
+    return _reader
 
 
 # -------------------------------------------------
@@ -14,11 +29,12 @@ except Exception:
 # -------------------------------------------------
 
 def _extract_text(image) -> List[str]:
-    if not _OCR_AVAILABLE or image is None:
+    reader = _get_reader()
+    if reader is None or image is None:
         return []
 
     try:
-        result = _reader.readtext(image)
+        result = reader.readtext(image)
         return [
             r[1].strip().lower()
             for r in result
