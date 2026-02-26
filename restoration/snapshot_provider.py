@@ -38,12 +38,8 @@ class SnapshotProvider:
     SNAPSHOT_SCHEMA_VERSION = "2.2"
 
     MAX_SNAPSHOTS = 128
-    # FIX RB-3: Raised from 3600s (1h) to 6300s (105min) so snapshots survive
-    # the full MAX_TASK_SECONDS=5400s window plus a 15min restoration buffer.
-    # The previous value of 3600s guaranteed restoration failure for any task
-    # running longer than 60 minutes because get_snapshot() enforced TTL at
-    # retrieval time, returning None and triggering _force_safe_shutdown().
-    MAX_SNAPSHOT_AGE_SECONDS = 6300
+    
+    MAX_SNAPSHOT_AGE_SECONDS = 10800
     # P0-A FIX (RT-01): Raised from 0.5s to 2.0s.  Under OS load, the three
     # sequential syscalls (cursor + focused_window + active_app) can each take
     # 200 ms+, totalling >600 ms even without genuine OS hangs.  The previous
@@ -188,27 +184,7 @@ class SnapshotProvider:
                     snap = RestorationSnapshot.from_dict(data)
                     captured = float(snap.metadata.get("captured_at_wallclock", 0))
 
-                    # H-4 FIX: Dual-direction timestamp sanity check.
-                    #
-                    # Two NTP-related failure modes that the original code missed:
-                    #
-                    # 1. FAR PAST: Snapshots older than 2 * MAX_SNAPSHOT_AGE_SECONDS
-                    #    (12600s / ~3.5h) should never appear after a clean shutdown
-                    #    because normal expiry removes them.  If one appears it was
-                    #    written during a previous process run under a severely skewed
-                    #    clock or survived an unexpected filesystem restore.  Accepting
-                    #    it risks restoring workspace state that is hours stale.
-                    #
-                    # 2. FAR FUTURE: captured_at > now + 60s means the snapshot was
-                    #    written by a process whose system clock was ahead by more than
-                    #    60 seconds. After an NTP correction that steps the clock
-                    #    backward, the snapshot would appear to never expire (now < captured_at
-                    #    always) and would survive indefinitely in memory and on disk.
-                    #    This could chain into a restoration from arbitrarily old state.
-                    #
-                    # Fix: reject snapshots in either anomalous category, delete the
-                    # file, and log a diagnostic. The 60s grace window for future
-                    # timestamps tolerates minor clock skew without false positives.
+                    
                     _max_age = self.MAX_SNAPSHOT_AGE_SECONDS * 2  # 12600s hard reject
                     _future_grace = 60.0  # tolerate up to 60s clock skew
 
@@ -351,25 +327,7 @@ class SnapshotProvider:
         if not self._observer.is_healthy():
             raise SnapshotProviderError("Observer unhealthy")
 
-        # RB-5 FIX: Wrap observer.snapshot() in try/except SnapshotProviderError.
-        #
-        # Root cause: is_healthy() checked the observer thread's health flag, but
-        # the flag was set by the observer thread on its OWN schedule. Between
-        # is_healthy()==True and observer.snapshot(), the observer thread could:
-        #   - Lose its display connection (X11 disconnect, Wayland compositor restart)
-        #   - Hit an internal exception in the perception pipeline
-        #   - Be interrupted by the OS scheduler and leave snapshot() in a partial state
-        #
-        # Any exception from observer.snapshot() propagated as a bare exception
-        # through IntentListener._listen_loop(), which swallowed it in except:pass
-        # and immediately re-polled. The intent file was NOT consumed, so the system
-        # attempted arming again on the next poll tick. This created a tight retry
-        # loop (every POLL_INTERVAL=0.1s) that generated noisy logs and burned CPU.
-        #
-        # Fix: catch any exception from observer.snapshot() and re-raise as
-        # SnapshotProviderError so the caller (IntentListener._listen_loop) sees a
-        # typed, expected exception with a diagnostic message, logs it properly as
-        # arm_failure_reason, and backs off before retrying.
+        
         try:
             observer_state = self._observer.snapshot()
         except SnapshotProviderError:
@@ -434,15 +392,7 @@ class SnapshotProvider:
 
         window_title = focused_window["title"].strip()
 
-        # FIX-05 (RTB-05): When the desktop is bare (no focused window),
-        # get_focused_window() returns an empty title. The original guard
-        # raised SnapshotProviderError("Focused window invalid") unconditionally,
-        # permanently blocking task arming with no user diagnostic.
-        #
-        # Fallback: use the active application title as the window identity
-        # sentinel. If that is also empty, use the "__bare_desktop__" sentinel
-        # so snapshots can still be taken and restored (restoration will skip
-        # window focus since no window was focused at snapshot time).
+        
         if not window_title:
             if isinstance(active_app, dict) and isinstance(active_app.get("title"), str):
                 window_title = active_app["title"].strip()
@@ -476,25 +426,7 @@ class SnapshotProvider:
             pid=None,  # deterministic & portable
         )
 
-        # ---------------- METADATA (CANONICALIZED) ----------------
-
-        # SI-05 FIX: Populate metadata['extended'] with observable OS state
-        # so RestoreVerifier's extended checks can actually fire.
-        #
-        # Bug: metadata['extended'] was always set to {} — an empty dict.
-        # RestoreVerifier._verify_extended() iterates over metadata['extended']
-        # and only runs checks when keys are present. With an empty dict, ALL
-        # extended checks (window geometry, process list, browser state) were
-        # permanently skipped. The extended verification path was dead code.
-        #
-        # Fix: populate with the lightweight fields that can be captured
-        # cross-platform without heavy dependencies:
-        #   - window_geometry: via xdotool (Linux) or approximate
-        #   - process_snapshot: names of running processes via psutil
-        #
-        # Browser state (CDP) and cryptographic file hashes are P3 items
-        # and not included here; this patch covers the minimum viable
-        # extended capture that makes verification non-trivially useful.
+        
         extended: dict = {}
 
         # Window geometry (Linux/xdotool)
