@@ -17,38 +17,10 @@ class InstallationError(RuntimeError):
     pass
 
 
-# ==========================================================
-# PATCH §R2: Curated terminal install lookup table
-#
-# Covers the most common dev tools across Linux (apt/snap),
-# macOS (brew), and Windows (choco/winget).
-#
-# Keys are lowercase tool names matching tool["name"].lower().
-# Each entry maps OS → preferred install command.
-# ==========================================================
-
-# ==========================================================
-# PATCH §DEF-7(a): Lazy, runtime OS detection.
-#
-# Previously these flags were evaluated at module import time:
-#   _LINUX_HAS_APT = bool(shutil.which("apt-get"))
-# This caused the lookup table to permanently reflect the pre-install
-# state.  If apt-get is installed mid-session (unusual but possible),
-# the table would still claim it's unavailable.
-#
-# Fix: wrap detection in a function that is called at install time,
-# not at import time.
-# ==========================================================
-
 import shutil
 
 
 def _get_linux_pkg_manager() -> str:
-    """
-    Return the best available package manager name on Linux at call time.
-    Re-checks shutil.which() on every call so mid-session installs are visible.
-    Returns 'apt-get', 'snap', or '' (empty string → no known pkg manager).
-    """
     if shutil.which("apt-get"):
         return "apt-get"
     if shutil.which("snap"):
@@ -78,7 +50,6 @@ def _winget(pkg: str) -> str:
 
 
 COMMON_INSTALL_COMMANDS: Dict[str, Dict[str, str]] = {
-    # ---- Node.js / JavaScript ----
     "node": {
         "Linux":   "curl -fsSL https://deb.nodesource.com/setup_lts.x | sudo -E bash - && sudo apt-get install -y nodejs",
         "Darwin":  _brew("node"),
@@ -109,7 +80,6 @@ COMMON_INSTALL_COMMANDS: Dict[str, Dict[str, str]] = {
         "Darwin":  "curl -fsSL https://bun.sh/install | bash",
         "Windows": "powershell -c \"irm bun.sh/install.ps1|iex\"",
     },
-    # ---- Python ----
     "python": {
         "Linux":   _apt("python3 python3-pip python3-venv"),
         "Darwin":  _brew("python3"),
@@ -125,19 +95,16 @@ COMMON_INSTALL_COMMANDS: Dict[str, Dict[str, str]] = {
         "Darwin":  "python3 -m ensurepip --upgrade",
         "Windows": "python -m ensurepip --upgrade",
     },
-    # ---- Version Control ----
     "git": {
         "Linux":   _apt("git"),
         "Darwin":  _brew("git"),
         "Windows": _choco("git"),
     },
-    # ---- Containers ----
     "docker": {
         "Linux":   "curl -fsSL https://get.docker.com | sh",
         "Darwin":  "brew install --cask docker",
         "Windows": _choco("docker-desktop"),
     },
-    # ---- Build tools ----
     "make": {
         "Linux":   _apt("build-essential"),
         "Darwin":  "xcode-select --install",
@@ -148,7 +115,6 @@ COMMON_INSTALL_COMMANDS: Dict[str, Dict[str, str]] = {
         "Darwin":  "xcode-select --install",
         "Windows": _choco("mingw"),
     },
-    # ---- Databases ----
     "postgresql": {
         "Linux":   _apt("postgresql postgresql-contrib"),
         "Darwin":  _brew("postgresql"),
@@ -174,7 +140,6 @@ COMMON_INSTALL_COMMANDS: Dict[str, Dict[str, str]] = {
         "Darwin":  "brew tap mongodb/brew && brew install mongodb-community",
         "Windows": _choco("mongodb"),
     },
-    # ---- Shell utilities ----
     "curl": {
         "Linux":   _apt("curl"),
         "Darwin":  _brew("curl"),
@@ -195,13 +160,11 @@ COMMON_INSTALL_COMMANDS: Dict[str, Dict[str, str]] = {
         "Darwin":  _brew("jq"),
         "Windows": _choco("jq"),
     },
-    # ---- Go ----
     "go": {
         "Linux":   "curl -fsSL https://go.dev/dl/go1.22.0.linux-amd64.tar.gz | sudo tar -C /usr/local -xzf - && echo 'export PATH=$PATH:/usr/local/go/bin' >> ~/.bashrc",
         "Darwin":  _brew("go"),
         "Windows": _choco("golang"),
     },
-    # ---- Rust ----
     "cargo": {
         "Linux":   "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y",
         "Darwin":  "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y",
@@ -212,7 +175,6 @@ COMMON_INSTALL_COMMANDS: Dict[str, Dict[str, str]] = {
         "Darwin":  "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y",
         "Windows": "winget install Rustlang.Rustup",
     },
-    # ---- Java ----
     "java": {
         "Linux":   _apt("default-jdk"),
         "Darwin":  _brew("openjdk"),
@@ -223,7 +185,6 @@ COMMON_INSTALL_COMMANDS: Dict[str, Dict[str, str]] = {
         "Darwin":  _brew("openjdk"),
         "Windows": _choco("openjdk"),
     },
-    # ---- Misc ----
     "ffmpeg": {
         "Linux":   _apt("ffmpeg"),
         "Darwin":  _brew("ffmpeg"),
@@ -244,27 +205,36 @@ class AutonomousInstaller:
     PAGE_LOAD_TIMEOUT = 10.0
     MAX_ITERATIONS = 120
     MAX_PERCEPTION_BYTES = 10_000
-
-    TERMINAL_INSTALL_TIMEOUT_SECONDS = 300  # 5 min for large downloads
-
+    TERMINAL_INSTALL_TIMEOUT_SECONDS = 300
     REQUIRED_FIELDS = {"name", "official_url"}
 
-    # HARD-2: Patterns that must never be executed from LLM-generated commands.
-    # Mirrors ExecutionPlanner.DANGEROUS_PATTERNS. Applied in Tier-3 LLM fallback
-    # before run_command() is called to prevent prompt-injection exploits.
     _DANGEROUS_PATTERNS = [
         r"\brm\s+-rf\b",
         r"\bdd\b",
         r"\bmkfs\b",
         r"\bformat\b",
         r"\bchmod\s+777\b",
+        r"\bchown\s+root\b",
         r"\bnc\b",
         r"\bnetcat\b",
         r"\bcrontab\b",
         r"^\s*at\s",
+        r"\bperl\s+-e\b",
+        r"\bruby\s+-e\b",
+        r"\bnode\s+-e\b",
+        r"\bpython[23]?\s+-c\b",
         r"\bbase64\b.*-d",
         r"\beval\b.*\$\(",
+        r"\bpowershell\b.*-[Ee]ncodedCommand\b",
+        r"\bpowershell\b.*-[Ee]nc\s",
+        r"[&|]\s*chmod\s+[+]?x\b.*[&|].*\./",
+        r"\|\s*perl\b",
+        r"\|\s*ruby\b",
+        r"\|\s*node\b",
+        r"\|\s*python[23]?\b",
     ]
+
+    _COORD_OVERSHOOT_FRACTION: float = 0.10
 
     def __init__(
         self,
@@ -287,38 +257,13 @@ class AutonomousInstaller:
         self._os = os_backend
         self._llm = llm_callable
         self._verifier = StepVerifier()
-
-        # RB-05 FIX: Accept a shared Ollama client to avoid creating new
-        # ollama.Client() instances on every _try_terminal_install() call.
-        # Repeated Client() construction without teardown exhausts the httpx
-        # connection pool under rapid replan loops with unknown tools.
         self._shared_ollama_client = shared_ollama_client
 
-        # SI-03 FIX: Removed the dead _PerceptionSanitizer inner class and the
-        # self._sanitizer assignment. The inner class declared MAX_PERCEPTION_BYTES
-        # but exposed no methods and was never called — self._sanitizer was assigned
-        # but never referenced. The HARD-8 comment claimed the class avoided
-        # ReasoningEngine.__new__() misuse, which was accurate, but the sanitizer
-        # object itself was entirely unused. _sanitize_perception() is defined
-        # directly on AutonomousInstaller and called via self._sanitize_perception().
-        # Removing the dead object eliminates the misleading HARD-8 commentary and
-        # the false impression that sanitization is delegated to a nested class.
-
-        # Pre-compile dangerous-pattern regexes once at construction time.
         self._compiled_dangerous = [
             re.compile(p, re.IGNORECASE) for p in self._DANGEROUS_PATTERNS
         ]
 
     def _validate_llm_command(self, cmd: str) -> None:
-        """
-        HARD-2: Reject LLM-generated commands that match DANGEROUS_PATTERNS.
-
-        run_command() executes with shell=True, so an unvalidated LLM response
-        like 'rm -rf /' or 'dd if=/dev/zero of=/dev/sda' would be executed
-        directly. Validate before execution.
-
-        Raises InstallationError if the command is dangerous.
-        """
         for pattern in self._compiled_dangerous:
             if pattern.search(cmd):
                 raise InstallationError(
@@ -326,27 +271,7 @@ class AutonomousInstaller:
                     f"matches dangerous pattern {pattern.pattern!r}: {cmd!r}"
                 )
 
-    # =================================================
-    # PUBLIC API
-    # =================================================
-
     def install_tool(self, tool: Dict[str, Any]) -> None:
-        """
-        Install a tool.
-
-        Strategy (in order):
-          1. Terminal install — pre-specified commands in tool dict.
-          2. Terminal install — COMMON_INSTALL_COMMANDS lookup table.
-          3. Browser-UI install — navigate official_url and LLM-drive clicks.
-
-        The tool dict MUST include:
-          name         : str  — display name of the tool
-          official_url : str  — https:// URL of the official download page
-        Optional:
-          version_command  : str       — shell command to verify installation
-          min_version      : str       — semver floor
-          install_commands : list[str] — pre-specified commands (highest priority)
-        """
         self._validate_tool_schema(tool)
 
         name = tool["name"]
@@ -360,56 +285,28 @@ class AutonomousInstaller:
         if not self._observer.is_healthy():
             raise InstallationError("Observer unhealthy — aborting install")
 
-        # PATCH §R2: terminal install via lookup table (no vision LLM misuse)
         if self._try_terminal_install(tool):
             if self._is_already_installed(tool):
                 return
-            # Terminal ran something but verification failed — try browser UI
 
-        # Browser-UI fallback
         self._browser_ui_install(tool)
 
-    # =================================================
-    # TERMINAL INSTALL PATH (PATCH §R2)
-    # =================================================
-
     def _try_terminal_install(self, tool: Dict[str, Any]) -> bool:
-        """
-        PATCH §R2 + §DEF-7: Two-tier terminal install strategy.
-
-        Tier 1: plan-supplied install_commands (highest fidelity).
-        Tier 2: COMMON_INSTALL_COMMANDS lookup table by tool name + OS.
-        Tier 3 (DEF-7b): LLM text-only fallback for tools not in the table.
-
-        DEF-7(a): OS detection is now performed at call time via
-        _get_linux_pkg_manager(), not at import time, so mid-session
-        package manager installs are reflected correctly.
-
-        Returns True if any command was attempted (success or failure).
-        """
         name = tool["name"]
         os_name = platform.system()
 
-        # --- Tier 1: plan-supplied commands ---
         pre_specified = tool.get("install_commands", [])
         if isinstance(pre_specified, list) and pre_specified:
             for cmd in pre_specified:
                 if isinstance(cmd, str) and cmd.strip():
                     try:
                         result = self._os.run_command(cmd.strip())
-                        # FIX RTB-05: run_command() returns subprocess.CompletedProcess,
-                        # not a dict. The previous isinstance(result, dict) check was
-                        # always False, so success was never detected and all commands
-                        # always ran even after the first one succeeded.
                         if hasattr(result, "returncode") and result.returncode == 0:
                             return True
-                        # Try next command if this one failed
                     except Exception:
                         continue
-            # All pre-specified commands tried (may have failed)
             return True
 
-        # --- Tier 2: lookup table ---
         name_lower = name.lower().strip()
         known = COMMON_INSTALL_COMMANDS.get(name_lower, {})
         cmd = known.get(os_name)
@@ -421,40 +318,23 @@ class AutonomousInstaller:
             except Exception:
                 return False
 
-        # --- Tier 3: FIX-03 (RB-A2) — Direct text-only Ollama call ---
-        #
-        # Original defect: self._llm() was routed through _make_llm_callable →
-        # QwenOllamaAdapter.get_next_action(), which captures a live screenshot
-        # and ALWAYS returns List[dict] of UI operations (click/type/hotkey).
-        # The Tier-3 branch expected a plain shell command string.
-        # _normalize_llm_command() extracted first.get("command") from a click
-        # dict → None. llm_cmd was None. Tier-3 silently returned False and
-        # fell through to _browser_ui_install(), which hangs on headless systems.
-        #
-        # Fix: bypass self._llm entirely. Call the Ollama HTTP client directly
-        # using a text-only chat (no screenshot), identical to the pattern used
-        # by ExecutionPlanner._call_llm_text(). This guarantees a plain text
-        # response suitable for shell execution.
         try:
             import os as _os_mod
             import ollama as _ollama
             import httpx as _httpx
 
-            # Resolve the model name: prefer explicit env var, fall back to default.
             _model = _os_mod.environ.get("LLM_MODEL", "qwen2.5-vl:7b-instruct")
 
             pkg_mgr = _get_linux_pkg_manager() if os_name == "Linux" else ""
             pkg_mgr_hint = f" Package manager available: {pkg_mgr}." if pkg_mgr else ""
 
-            # RB-05 FIX: Reuse shared_ollama_client if provided by caller
-            # (operate_main passes the planner's existing client). Only create
-            # a new client when running standalone (no shared client available).
             if self._shared_ollama_client is not None:
                 client = self._shared_ollama_client
             else:
                 client = _ollama.Client(
                     timeout=_httpx.Timeout(connect=10.0, read=60.0, write=5.0, pool=2.0)
                 )
+
             response = client.chat(
                 model=_model,
                 messages=[
@@ -479,7 +359,6 @@ class AutonomousInstaller:
                 options={"temperature": 0},
             )
 
-            # Extract plain text from Ollama response object (≥0.2 and legacy dict)
             llm_cmd: Optional[str] = None
             if hasattr(response, "message") and hasattr(response.message, "content"):
                 llm_cmd = response.message.content
@@ -490,24 +369,16 @@ class AutonomousInstaller:
                 llm_cmd = llm_cmd.strip().strip("`\"'")
 
             if llm_cmd and len(llm_cmd) > 4 and "\n" not in llm_cmd:
-                # HARD-2: Validate LLM-generated command against DANGEROUS_PATTERNS
-                # before execution. LLM responses are untrusted and could contain
-                # destructive commands (rm -rf /, dd if=/dev/zero) via prompt injection.
                 self._validate_llm_command(llm_cmd)
                 self._os.run_command(llm_cmd)
                 return True
 
         except Exception:
-            pass  # LLM fallback failed — fall through to browser UI
+            pass
 
         return False
 
-    # =================================================
-    # BROWSER-UI INSTALL PATH
-    # =================================================
-
     def _browser_ui_install(self, tool: Dict[str, Any]) -> None:
-
         name = tool["name"]
         url = tool["official_url"]
 
@@ -554,10 +425,6 @@ class AutonomousInstaller:
 
         raise InstallationError(f"Installation timed out: {name}")
 
-    # =================================================
-    # DECISION LOOP
-    # =================================================
-
     def _decide_next_action(
         self,
         *,
@@ -598,10 +465,6 @@ class AutonomousInstaller:
 
         return decision
 
-    # =================================================
-    # ACTION EXECUTION
-    # =================================================
-
     def _execute_action(
         self,
         action: Dict[str, Any],
@@ -618,7 +481,6 @@ class AutonomousInstaller:
                 coords = self._resolve_click_target(target, perception)
 
             if coords is None:
-                # Fallback: use LLM-provided absolute coordinates
                 x = action.get("x")
                 y = action.get("y")
                 if isinstance(x, (int, float)) and isinstance(y, (int, float)):
@@ -630,37 +492,39 @@ class AutonomousInstaller:
                     f"{target!r} (no OCR match and no x/y coordinates)"
                 )
 
-            # RB-04 FIX: Coordinate normalization guard.
-            # ─────────────────────────────────────────────────────────────
-            # operate.py's _execute_decision() normalizes absolute pixel
-            # coords before calling os_backend.mouse(), but this installer
-            # path calls self._os.click() directly without normalization.
-            # LLM-generated coordinates (e.g. x=847, y=512 on 1920×1080)
-            # land at the wrong screen position when os_backend expects
-            # normalized [0.0, 1.0] values.
-            #
-            # Fix: if either coordinate exceeds 1.0, assume absolute pixel
-            # space and normalize using the screen dimensions from os_backend.
-            # ─────────────────────────────────────────────────────────────
             cx, cy = coords
+
             if cx > 1.0 or cy > 1.0:
                 try:
                     sw, sh = self._os.screen_size()
-                    if sw > 0 and sh > 0:
-                        cx = cx / sw
-                        cy = cy / sh
-                    else:
+                    if sw <= 0 or sh <= 0:
                         raise InstallationError(
-                            f"screen_size() returned zero dimensions: ({sw},{sh})"
+                            f"screen_size() returned invalid dimensions: "
+                            f"({sw}, {sh}) — cannot validate click coordinates"
                         )
                 except InstallationError:
                     raise
-                except Exception as _e:
+                except Exception as _se:
                     raise InstallationError(
-                        f"Cannot normalize click coords ({cx},{cy}): {_e}"
-                    ) from _e
+                        f"Cannot determine screen size for coordinate validation: "
+                        f"{_se}"
+                    ) from _se
 
-            # Clamp after normalization to guard floating-point overshoot
+                _max_x = sw * (1.0 + self._COORD_OVERSHOOT_FRACTION)
+                _max_y = sh * (1.0 + self._COORD_OVERSHOOT_FRACTION)
+
+                if cx > _max_x or cy > _max_y:
+                    raise InstallationError(
+                        f"LLM-generated click coordinates ({cx:.0f}, {cy:.0f}) "
+                        f"exceed screen bounds {sw}×{sh} by more than "
+                        f"{self._COORD_OVERSHOOT_FRACTION * 100:.0f}%. "
+                        "This indicates the model hallucinated coordinates for "
+                        "a different screen resolution. Retrying action selection."
+                    )
+
+                cx = cx / sw
+                cy = cy / sh
+
             cx = max(0.0, min(1.0, cx))
             cy = max(0.0, min(1.0, cy))
 
@@ -715,12 +579,7 @@ class AutonomousInstaller:
 
         return None
 
-    # =================================================
-    # VERIFICATION
-    # =================================================
-
     def _is_already_installed(self, tool: Dict[str, Any]) -> bool:
-
         version_cmd = tool.get("version_command")
         min_version = tool.get("min_version")
 
@@ -747,10 +606,6 @@ class AutonomousInstaller:
         except (VerificationError, Exception):
             return False
 
-    # =================================================
-    # BROWSER UTILITIES
-    # =================================================
-
     def _open_browser(self) -> None:
         try:
             self._os.open_browser()
@@ -768,10 +623,6 @@ class AutonomousInstaller:
 
     def _wait_ui(self) -> None:
         time.sleep(self.UI_SETTLE_DELAY)
-
-    # =================================================
-    # LLM RESPONSE NORMALISATION
-    # =================================================
 
     def _normalize_llm_response(self, response) -> dict:
         import re
@@ -849,7 +700,6 @@ class AutonomousInstaller:
                 )
 
     def _sanitize_perception(self, perception) -> dict:
-
         if not isinstance(perception, dict):
             return {"note": "perception unavailable"}
 
@@ -886,7 +736,6 @@ class AutonomousInstaller:
         return safe
 
     def _validate_tool_schema(self, tool: Dict[str, Any]) -> None:
-
         if not isinstance(tool, dict):
             raise InstallationError("Tool must be dictionary")
 
