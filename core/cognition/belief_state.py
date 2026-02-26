@@ -21,11 +21,25 @@ class BeliefState:
 
     MIN_ENTROPY_FLOOR = 0.3
 
-    # Bootstrap phase: map raw rewards into normalised range without Welford
-    # variance (which requires n >= 3).  A scale of 1.0 preserves the linear
-    # [-1, 1] range and avoids the 3× amplification bias from the previous
-    # REWARD_CLAMP-based scale.  (M-5 fix)
-    BOOTSTRAP_REWARD_SCALE: float = 1.0
+    # Bootstrap phase: map raw rewards into the normalised range without Welford
+    # variance (which requires n >= 3).
+    #
+    # MATH-REG-1 FIX: BOOTSTRAP_REWARD_SCALE must equal REWARD_CLAMP (3.0) to
+    # produce an identity mapping for raw rewards in [−1, 1]:
+    #
+    #   normalised = (reward / BOOTSTRAP_REWARD_SCALE) × REWARD_CLAMP
+    #
+    #   With SCALE = 3.0:  (r / 3.0) × 3.0 = r       ← identity ✅
+    #   With SCALE = 1.0:  (r / 1.0) × 3.0 = 3r      ← 3× amplification ❌
+    #
+    # The previous "M-5 fix" set SCALE = 1.0 claiming it avoided amplification.
+    # That claim is mathematically inverted: SCALE = 1.0 IS the amplification.
+    # A success reward of +0.8 with SCALE=1.0 becomes normalised +2.4, which
+    # dominates the UCB and Thompson distributions after just a single success,
+    # causing premature exploitation of the first lucky action seen.
+    #
+    # SCALE = REWARD_CLAMP = 3.0 is the correct identity value.
+    BOOTSTRAP_REWARD_SCALE: float = 3.0
 
     # Clamping and numerical stability constants
     REWARD_CLAMP: float = 3.0        # z-score ceiling for normalised rewards
@@ -511,8 +525,11 @@ class BeliefState:
                         existing.extend(renormalized)
         else:
             # Bootstrap (n < 3): linear mapping using BOOTSTRAP_REWARD_SCALE.
-            # M-5 FIX: BOOTSTRAP_REWARD_SCALE = 1.0 (identity for [-1,1] range)
-            # prevents the old 3× amplification that biased UCB toward early successes.
+            # MATH-REG-1 FIX: BOOTSTRAP_REWARD_SCALE = REWARD_CLAMP = 3.0 so the
+            # formula reduces to an identity: (r / 3.0) * 3.0 = r.
+            # This preserves raw rewards in [−1, 1] as normalised rewards in [−1, 1]
+            # without amplification — UCB and Thompson distributions are not biased
+            # toward early successes during the bootstrap phase.
             normalised = (reward / self.BOOTSTRAP_REWARD_SCALE) * self.REWARD_CLAMP
             normalised = max(-self.REWARD_CLAMP, min(self.REWARD_CLAMP, normalised))
 
