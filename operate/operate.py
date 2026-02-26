@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import concurrent.futures
+import hashlib
+import os
 import sys
 import time
 import json
@@ -58,6 +60,71 @@ MAX_COMMAND_OUTPUT_BYTES = 4096
 
 # Maximum dynamic candidates from ReasoningEngine on stagnant steps (H-03 fix)
 MAX_DYNAMIC_CANDIDATES = 3
+
+# ------------------------------------------------------------------
+# RB-LOW-1 FIX: Human-confirmation signal-file mechanism
+# ------------------------------------------------------------------
+# When a high-risk action triggers REQUIRE_HUMAN_CONFIRMATION the system
+# writes a pending-approval marker to /tmp/.  The user signals approval by
+# deleting (or touching-and-deleting) that file.  The confirmation loop
+# polls for the file's ABSENCE — the inverse of the previous behaviour,
+# which re-called a deterministic policy function and therefore could never
+# reach ALLOW.
+#
+# Signal-file path format:
+#   /tmp/projectzeo_approve_<16-char action key>.signal
+#
+# Workflow:
+#   1. System writes the file with action JSON as content.
+#   2. System logs path to stderr so the user knows where to look.
+#   3. Loop polls every WAIT_RETRY_SECONDS for up to MAX_WAIT_RETRIES.
+#   4. If file absent  → APPROVED  (user deleted it).
+#   5. If file present after timeout → DENIED (−0.3 reward, continue).
+#   6. File is always cleaned up after the loop (success or timeout).
+
+_SIGNAL_DIR: str = "/tmp"
+_SIGNAL_PREFIX: str = "projectzeo_approve_"
+
+
+def _approval_signal_path(action_key: str) -> str:
+    """Return the path of the approval signal file for this action key."""
+    return os.path.join(_SIGNAL_DIR, f"{_SIGNAL_PREFIX}{action_key}.signal")
+
+
+def _write_approval_signal(action_key: str, action: dict, reason: str) -> str:
+    """Write the pending-approval signal file and return its path."""
+    path = _approval_signal_path(action_key)
+    try:
+        content = json.dumps(
+            {
+                "action_key": action_key,
+                "action": action,
+                "reason": reason,
+                "instruction": (
+                    f"Delete this file to approve the action: {path}\n"
+                    "The file will be cleaned up automatically after "
+                    f"{MAX_WAIT_RETRIES * WAIT_RETRY_SECONDS:.0f}s."
+                ),
+            },
+            indent=2,
+        )
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(content)
+    except OSError as e:
+        # /tmp write failure is non-fatal; log and continue to timed-out denial
+        print(
+            f"[OPERATE] Warning: could not write approval signal file {path!r}: {e}",
+            file=sys.stderr,
+        )
+    return path
+
+
+def _remove_approval_signal(path: str) -> None:
+    """Remove the signal file; ignore errors (already deleted by user, race, etc.)."""
+    try:
+        os.remove(path)
+    except OSError:
+        pass
 
 
 class AuthorityAbortError(RuntimeError):
@@ -491,19 +558,52 @@ def _execute_autonomous_loop(
                     "action_key": action_key,
                     "reason": _policy_reason,
                 })
+
+                # RB-LOW-1 FIX: Signal-file human-approval mechanism.
+                #
+                # Previous implementation re-called policy_engine.validate_action_dict()
+                # with identical arguments inside the loop.  The function is
+                # deterministic — given the same action and focused_app it always
+                # returns the same REQUIRE_HUMAN_CONFIRMATION result.  The loop
+                # therefore NEVER reached the ALLOW branch; human approval was
+                # structurally unreachable.
+                #
+                # Fix: write a signal file to /tmp and poll for its ABSENCE.
+                # The user deletes the file to approve.  The policy engine is
+                # NOT re-called inside the loop — only the file-system state is
+                # checked.  This makes the approval path reachable.
+                _signal_path = _write_approval_signal(
+                    action_key, selected_action, _policy_reason or ""
+                )
+                print(
+                    f"[OPERATE] HUMAN CONFIRMATION REQUIRED\n"
+                    f"  Action : {selected_action.get('operation')!r}\n"
+                    f"  Reason : {_policy_reason}\n"
+                    f"  Approve: delete the file → {_signal_path}",
+                    file=sys.stderr,
+                )
+
                 _phc_wait = 0
                 _phc_approved = False
-                while _phc_wait < MAX_WAIT_RETRIES:
-                    time.sleep(WAIT_RETRY_SECONDS)
-                    _phc_wait += 1
-                    _re_policy, _ = policy_engine.validate_action_dict(
-                        selected_action,
-                        focused_app=_focused_app_for_policy,
-                    )
-                    if _re_policy == PolicyEngine.ALLOW:
-                        _phc_approved = True
-                        break
+                try:
+                    while _phc_wait < MAX_WAIT_RETRIES:
+                        time.sleep(WAIT_RETRY_SECONDS)
+                        _phc_wait += 1
+                        # Approved when the signal file no longer exists
+                        if not os.path.exists(_signal_path):
+                            _phc_approved = True
+                            break
+                finally:
+                    # Always clean up — whether approved, timed-out, or interrupted
+                    _remove_approval_signal(_signal_path)
+
                 if not _phc_approved:
+                    journal.record({
+                        "event": "policy_human_confirmation_denied",
+                        "step": current_step_index,
+                        "action_key": action_key,
+                        "waited_seconds": _phc_wait * WAIT_RETRY_SECONDS,
+                    })
                     belief.record_action(action_key, -0.3)
                     best_reward = belief.global_best_reward() or 0.0
                     belief.update_regret(action_key, -0.3, best_reward)
@@ -512,6 +612,12 @@ def _execute_autonomous_loop(
                         raise RuntimeError(REPLAN_SIGNAL)
                     previous_perception = perception_snapshot
                     continue
+                else:
+                    journal.record({
+                        "event": "policy_human_confirmation_approved",
+                        "step": current_step_index,
+                        "action_key": action_key,
+                    })
 
             # ------------------------------------------------------------------
             # Authority evaluation
@@ -706,7 +812,7 @@ def _execute_decision(
         press/hotkey → os_backend.press()
         command      → os_backend.exec()
         file_create  → os_backend.write_file()
-        install      → installer.install() or os_backend.exec()
+        install      → installer.install_tool() or os_backend.exec()
         scroll       → pyautogui.scroll()
         verify       → os_backend.exec() (command method) or no-op (screenshot)
         done         → immediate success (DONE sentinel)
@@ -870,12 +976,22 @@ def _execute_decision(
                     "output": combined_output,
                 }
             elif installer is not None:
-                # UI-based install fallback via AutonomousInstaller
-                tool_name = (
-                    tool_spec.get("name", "") if isinstance(tool_spec, dict) else ""
-                )
+                # UI-based install fallback via AutonomousInstaller.
+                #
+                # RB-CRIT-2 FIX: The previous code called installer.install(tool_name)
+                # where tool_name is a str.  AutonomousInstaller exposes only
+                # install_tool(tool: Dict) — there is no install(str) method.
+                # Every UI-based install path therefore raised AttributeError.
+                #
+                # Fix: pass the full tool_spec dict (which the caller already has)
+                # to install_tool(), which is the method the class actually defines.
+                # If tool_spec is not a dict (e.g. None or a stray string), we
+                # construct a minimal dict with a 'name' key so install_tool()
+                # always receives a well-formed argument.
+                if not isinstance(tool_spec, dict):
+                    tool_spec = {"name": str(tool_spec) if tool_spec else ""}
                 try:
-                    installer.install(tool_name)
+                    installer.install_tool(tool_spec)
                     return {"success": True, "reward": 0.8}
                 except Exception as inst_err:
                     return {
