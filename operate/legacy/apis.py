@@ -5,15 +5,19 @@ import os
 import time
 import traceback
 
-# FIX-02 (RB-A4): Deferred / optional easyocr import.
-#
-# Previously "import easyocr" at module level caused a crash on any machine
-# where EasyOCR is not installed (Ollama-only, CI, headless containers).
-# apis_safety_layer._patch_all_providers() → apply_patches() → _ensure_patches()
-# → build_llm() imported this module, triggering the crash before any task ran.
-#
-# Fix: wrap at module level with try/except. The lazy _get_ocr_reader() guard
-# raises a clear ImportError only when OCR is actually requested — not at import.
+
+_raw = os.environ.get("OLLAMA_ONLY", "1").strip().lower()
+if _raw in ("1", "true", "yes"):
+    raise ImportError(
+        "operate.legacy.apis cannot be imported when OLLAMA_ONLY is set. "
+        "Cloud API functions in this module are disabled. "
+        "Use QwenOllamaAdapter (adapters/qwen_ollama_adapter.py) for local inference. "
+        "To enable cloud APIs, start the system with --allow-cloud or set OLLAMA_ONLY=0 "
+        "BEFORE importing this module."
+    )
+del _raw  # remove temporary from module namespace
+
+
 try:
     import easyocr as easyocr
 except ImportError:
@@ -46,21 +50,7 @@ config = Config()
 _OCR_READER = None
 
 def _get_ocr_reader():
-    """
-    FIX RB-4: Guard against null easyocr module before calling Reader().
-
-    Bug: easyocr was imported with try/except at module level, setting it to
-    None on ImportError (FIX-02/RB-A4). However, _get_ocr_reader() called
-    easyocr.Reader(["en"]) unconditionally, raising:
-        AttributeError: 'NoneType' object has no attribute 'Reader'
-
-    This crash path is not exercised by the primary Ollama/QwenOllamaAdapter
-    flow (which has its own guarded OCR initialisation), but is a latent
-    crash for any caller of this legacy module on systems without EasyOCR.
-
-    Fix: raise a clear ImportError (not AttributeError) when easyocr is None,
-    matching the standard behaviour of a conditionally-available dependency.
-    """
+    
     global _OCR_READER
     if _OCR_READER is not None:
         return _OCR_READER
