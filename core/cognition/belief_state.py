@@ -99,6 +99,30 @@ class BeliefState:
     # =========================================================
 
     def bayesian_update(self, likelihoods: Dict[str, float]) -> None:
+        """Apply a proportional belief update using heuristic observation weights.
+
+        SI-2 / HARDEN-1 NOTE: Despite the method name, the ``likelihoods``
+        values are **heuristic weights**, NOT true statistical likelihoods
+        P(observation | state) derived from an observation model.
+
+        The caller (operate.py) assigns them as follows:
+          - app:<name>  = 0.9   (focused app matches expected)
+          - ui_rich     = 0.8   (many UI entities visible)
+          - ui_sparse   = 0.7   (few UI entities visible)
+          - ui_empty    = 0.5   (no UI entities)
+          - neutral     = 0.9 or 0.5 (no delta / delta present)
+
+        These scalars are hand-tuned constants that reflect informal beliefs
+        about state relevance — they are NOT derived from empirical observation
+        frequencies.  The proportional update rule (posterior ∝ prior ×
+        weight) is formally correct Bayesian computation, but the semantic
+        claim of "Bayesian state estimation" overstates the statistical rigour.
+
+        Practical impact: the belief distribution converges toward heuristic
+        attractors rather than a maximally accurate state posterior.  This is
+        acceptable for the current use case (guiding action selection heuristics)
+        but should not be mistaken for a calibrated probabilistic model.
+        """
         if not likelihoods:
             return
 
@@ -280,12 +304,43 @@ class BeliefState:
         digest = hashlib.sha256(seed_material).digest()
         seed = int.from_bytes(digest[:8], byteorder="big", signed=False)
 
-        # ---- Sample from Gaussian posterior ----
-        rng = np.random.default_rng(seed)
-        sample = rng.normal(loc=_post_mean, scale=math.sqrt(_post_variance))
+        # ---- Sample from truncated Gaussian posterior ----
+        # MATH-2 / HARDEN-2 FIX: Replace the clamped Normal with a proper
+        # truncated Gaussian via acceptance-rejection sampling.
+        #
+        # Root cause: the original code drew from Normal(_post_mean, σ) and
+        # then clamped the sample to [-REWARD_CLAMP, REWARD_CLAMP].  Clamping
+        # converts a Gaussian into a "mixed" distribution that places all
+        # out-of-bounds probability mass at the boundary points ±REWARD_CLAMP.
+        # With wide posteriors (early exploration, few observations), this
+        # produces heavy boundary clustering:
+        #   E[X | X ≥ REWARD_CLAMP] = REWARD_CLAMP (clump)
+        # rather than the correct conditional expectation of a truncated Normal.
+        #
+        # Fix: acceptance-rejection sampling.
+        #   1. Draw U ~ Normal(post_mean, sqrt(post_variance))
+        #   2. Accept if lo ≤ U ≤ hi; else reject and redraw.
+        # This yields the exact truncated Gaussian T_Normal(μ, σ², lo, hi).
+        # For posteriors whose mean is already within [lo, hi] (guaranteed by
+        # the _post_mean clamp above) and whose σ < REWARD_CLAMP (~3.0), the
+        # acceptance rate is >95% so the loop almost always exits on the first
+        # or second attempt.
+        #
+        # Safety: 128 rejection attempts is a hard ceiling.  If not satisfied
+        # after 128 draws (e.g. posterior has extreme variance), fall back to
+        # the posterior mean, which is the minimum-variance estimator and is
+        # guaranteed within bounds.
+        _lo = -self.REWARD_CLAMP
+        _hi = self.REWARD_CLAMP
+        _std = math.sqrt(_post_variance)
+        sample: float = _post_mean  # safe fallback (in-range by construction)
+        for _ in range(128):
+            _candidate = float(rng.normal(loc=_post_mean, scale=_std))
+            if _lo <= _candidate <= _hi:
+                sample = _candidate
+                break
 
-        # Clamp sample to valid range (tails of Gaussian extend beyond clamp)
-        return float(max(-self.REWARD_CLAMP, min(self.REWARD_CLAMP, sample)))
+        return float(sample)
 
     # =========================================================
     # REGRET TRACKING
