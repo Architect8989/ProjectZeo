@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import sys
 import time
 import json
 from typing import Any, Dict, Optional, List
@@ -30,6 +31,7 @@ from policy.engine import PolicyEngine, PolicyViolationError
 from config.timeouts import MAX_STAGNANT_ITERS_UI, MAX_STAGNANT_ITERS_COMMAND
 
 
+# pyautogui is optional — import once at module level (FIX RT-05)
 try:
     import pyautogui as _pyautogui
     _PYAUTOGUI_AVAILABLE: bool = True
@@ -37,27 +39,35 @@ except ImportError:
     _pyautogui = None  # type: ignore[assignment]
     _PYAUTOGUI_AVAILABLE: bool = False
 
+
+# ------------------------------------------------------------------
+# CONSTANTS
+# ------------------------------------------------------------------
+
 MAX_PERCEPTION_ENTITIES = 20
 MAX_PERCEPTION_JSON_BYTES = 10_000
 
-
 REPLAN_SIGNAL: str = "REPLAN_REQUIRED"
 
-# PATCH §1.11: WAIT should pause and retry, not immediately replan
+# WAIT should pause and retry, not immediately replan (PATCH §1.11)
 WAIT_RETRY_SECONDS = 0.5
-MAX_WAIT_RETRIES = 10  # 5s total wait before replanning
+MAX_WAIT_RETRIES = 10  # 5 seconds total before giving up and replanning
 
-# Max bytes of command output stored per step in execution_log
+# Max bytes of command output stored per step in execution_log (bounded, not unlimited)
 MAX_COMMAND_OUTPUT_BYTES = 4096
 
-# FIX H-03: Maximum dynamic candidate actions proposed by ReasoningEngine
-# when static plan action is not producing progress.
+# Maximum dynamic candidates from ReasoningEngine on stagnant steps (H-03 fix)
 MAX_DYNAMIC_CANDIDATES = 3
 
 
 class AuthorityAbortError(RuntimeError):
+    """Raised when a human-authority decision requires immediate task termination."""
     pass
 
+
+# =========================================================================
+# PUBLIC ENTRY POINT
+# =========================================================================
 
 def operate_main(
     *,
@@ -71,23 +81,37 @@ def operate_main(
     watchdog=None,
     prior_belief_state: Optional[dict] = None,
     belief_state_out: Optional[list] = None,
-):
+) -> None:
     """
-    Main execution entry point.
+    Main execution entry point for a single task run.
 
-    prior_belief_state (MATH-NEW-03 FIX):
-        Optional dict from BeliefState.to_dict() from a previous replan attempt.
-        When provided, the BeliefState is reconstructed from it via
-        BeliefState.from_dict(), preserving action counts, regret history, Welford
-        statistics, and Thompson counter state across replans. This prevents the
-        bandit from forgetting that certain actions were ineffective and re-exploring
-        them from scratch after a replan.
-
-    belief_state_out (MATH-NEW-03 FIX):
-        Optional single-element list. When provided, the final serialized
-        BeliefState is placed in it (belief_state_out[0]) after the loop exits
-        so the caller (main.py) can forward it to the next replan via
-        prior_belief_state. Cleared and repopulated on every call.
+    Parameters
+    ----------
+    terminal_prompt : str
+        The task objective / intent string.
+    execution_plan : ExecutionPlan
+        Validated plan produced by ExecutionPlanner.create_plan().
+    planner : ExecutionPlanner, optional
+        Planner instance used for LLM callable access and world-graph updates.
+    observer : ObserverCore, optional
+        Live observer for screen perception snapshots.
+    world_graph : WorldGraph, optional
+        World-graph for semantic entity tracking and delta computation.
+    os_backend : OperatingSystem, optional
+        OS interaction backend (mouse, keyboard, exec, file I/O).
+    max_wallclock_seconds : int
+        Hard wall-clock timeout for the entire task.
+    watchdog : RuntimeWatchdog, optional
+        CPU/wall-clock watchdog; checked on each loop iteration.
+    prior_belief_state : dict, optional
+        Serialised BeliefState from a previous replan attempt.  When provided,
+        the BeliefState is reconstructed via BeliefState.from_dict() to preserve
+        action history, Welford statistics, and Thompson counter across replans.
+    belief_state_out : list, optional
+        Single-element output list.  On any exit path, the final serialised
+        BeliefState is placed in belief_state_out[0] so the caller can forward
+        it to the next replan via prior_belief_state.  Cleared and repopulated
+        on every call.
     """
     if not isinstance(execution_plan, ExecutionPlan):
         raise ValueError("execution_plan must be an ExecutionPlan instance")
@@ -97,23 +121,44 @@ def operate_main(
 
     os_backend = os_backend or OperatingSystem()
 
+    # ------------------------------------------------------------------
+    # PolicyEngine — load allowed apps from policy.yaml if available
+    # ------------------------------------------------------------------
     policy_engine = PolicyEngine()
     try:
-        import os as _os_mod, yaml as _yaml  # type: ignore[import]
+        import os as _os_mod
+        import yaml as _yaml  # type: ignore[import]
         _policy_path = _os_mod.path.join(
             _os_mod.path.dirname(__file__), "..", "policy.yaml"
         )
         if _os_mod.path.exists(_policy_path):
-            with open(_policy_path, "r") as _pf:
+            with open(_policy_path, "r", encoding="utf-8") as _pf:
                 _pcfg = _yaml.safe_load(_pf) or {}
             _allowed = _pcfg.get("allowed_apps")
             if isinstance(_allowed, list):
                 policy_engine = PolicyEngine(allowed_apps=set(_allowed))
     except ImportError:
-        pass
-    except Exception:
-        pass
+        # FIX RB-3: Log the missing dependency explicitly rather than silently
+        # ignoring the failure.  Operators must know the policy file was not
+        # loaded so they can install pyyaml or accept the default allowlist.
+        print(
+            "[operate_main] WARNING: pyyaml is not installed — policy.yaml was not loaded. "
+            "PolicyEngine is running with the built-in default application allowlist. "
+            "To enable custom policy configuration, install pyyaml: "
+            "  pip install pyyaml",
+            file=sys.stderr,
+        )
+    except Exception as _policy_err:
+        # Non-fatal: policy.yaml may be malformed; log and continue with defaults
+        print(
+            f"[operate_main] WARNING: Failed to load policy.yaml: {_policy_err}. "
+            "PolicyEngine is running with the built-in default application allowlist.",
+            file=sys.stderr,
+        )
 
+    # ------------------------------------------------------------------
+    # Accessibility backend (optional AT-SPI path)
+    # ------------------------------------------------------------------
     try:
         accessibility_backend = AccessibilityBackend()
         if observer is not None:
@@ -121,20 +166,27 @@ def operate_main(
     except Exception:
         accessibility_backend = None
 
+    # ------------------------------------------------------------------
+    # Core services
+    # ------------------------------------------------------------------
     journal = ActionJournal()
     input_arbitrator = InputArbitrator()
     verifier = StepVerifier()
     progress = ProgressTracker(execution_plan)
 
-    # SI-03 FIX: Use public get_llm_callable() instead of private attribute.
+    # SI-03 FIX: Use public get_llm_callable() — never reach into private _llm_call
     if hasattr(planner, "get_llm_callable"):
         llm_callable = planner.get_llm_callable()
     else:
         llm_callable = getattr(planner, "_llm_call", None)
     if not callable(llm_callable):
-        raise RuntimeError("Planner LLM callable unavailable")
+        raise RuntimeError(
+            "Planner LLM callable unavailable — planner must expose get_llm_callable() "
+            "or have a callable _llm_call attribute."
+        )
 
-    installer = None
+    # AutonomousInstaller — wired when observer is available
+    installer: Optional[AutonomousInstaller] = None
     if observer is not None:
         _shared_client = getattr(planner, "_ollama_client", None)
         installer = AutonomousInstaller(
@@ -146,7 +198,10 @@ def operate_main(
 
     reasoning_engine = ReasoningEngine(llm_callable=llm_callable)
 
-    
+    # FIX RB-A3: Per-task executor — isolates timeout guarantees between tasks.
+    # A module-level singleton executor shares ONE worker thread; a blocking call
+    # in one task starves the next.  Creating per-task gives each task its own
+    # isolated thread pool.
     _task_ui_executor = concurrent.futures.ThreadPoolExecutor(
         max_workers=1,
         thread_name_prefix="ui_timeout_worker",
@@ -176,9 +231,13 @@ def operate_main(
     finally:
         input_arbitrator.shutdown()
         # FIX RB-A3: Shut down the per-task executor on all exit paths.
-        # wait=False: do not block the main thread waiting for a stuck UI thread.
+        # wait=False: never block the main thread waiting for a stuck UI thread.
         _task_ui_executor.shutdown(wait=False)
 
+
+# =========================================================================
+# AUTONOMOUS EXECUTION LOOP
+# =========================================================================
 
 def _execute_autonomous_loop(
     *,
@@ -200,7 +259,7 @@ def _execute_autonomous_loop(
     prior_belief_state: Optional[dict] = None,
     belief_state_out: Optional[list] = None,
     task_ui_executor: Optional[concurrent.futures.ThreadPoolExecutor] = None,
-):
+) -> None:
 
     start_ts = time.time()
     progress.start_execution()
@@ -210,12 +269,16 @@ def _execute_autonomous_loop(
         "objective": execution_plan.objective,
     })
 
-    
+    # ------------------------------------------------------------------
+    # BeliefState — reconstruct from prior replan if available
+    # ------------------------------------------------------------------
     belief: BeliefState
     if prior_belief_state is not None:
         try:
-            belief = BeliefState.from_dict(prior_belief_state, intent_hash=terminal_prompt)
-            belief.consecutive_high_stability_count = 0
+            belief = BeliefState.from_dict(
+                prior_belief_state, intent_hash=terminal_prompt
+            )
+            belief.consecutive_high_stability_count = 0  # reset stability on replan
             journal.record({"event": "belief_state_restored", "from_prior": True})
         except Exception as _bs_err:
             belief = BeliefState(intent_hash=terminal_prompt)
@@ -227,27 +290,21 @@ def _execute_autonomous_loop(
     else:
         belief = BeliefState(intent_hash=terminal_prompt)
 
-    # MATH-NEW-01 FIX: set_plan_horizon() is called fresh on every
-    # operate_main() invocation, so each replan re-tunes regret decay to the
-    # new plan's actual step count. There is no frozen-initial-plan-length
-    # issue because the loop does not survive across replans.
+    # MATH-NEW-01: set_plan_horizon() called fresh per operate_main() invocation
+    # so each replan re-tunes regret decay to the new plan's step count
     _plan_real_steps = max(len(execution_plan.steps) - 1, 1)
     belief.set_plan_horizon(_plan_real_steps)
 
-    # MATH-NEW-02 FIX: Tune EXPLOIT_SATURATION_N to the plan horizon so that
-    # short plans don't remain in exploration-heavy weighting for their entire
-    # execution. ActionRanker.set_plan_horizon() sets saturation to
-    # max(10, plan_steps * 2): short plans saturate at ~20 visits, long plans
-    # at proportionally higher values.
+    # MATH-NEW-02: Tune ActionRanker saturation to the plan horizon so that
+    # short plans don't remain exploration-heavy for their entire execution
     action_ranker = ActionRanker()
     action_ranker.set_plan_horizon(_plan_real_steps)
 
-    # PATCH §1.11: bounded command output log fed into world_graph
+    # Bounded command output log fed into world_graph for context enrichment
     execution_log: Dict[int, Dict[str, str]] = {}
 
     iteration = 0
     stagnant_iterations = 0
-
     max_iterations = max(
         len(execution_plan.steps) * (MAX_STAGNANT_ITERS_COMMAND + 1),
         25,
@@ -260,6 +317,7 @@ def _execute_autonomous_loop(
     try:
         while iteration < max_iterations:
 
+            # Wall-clock timeout
             if time.time() - start_ts > max_wallclock_seconds:
                 journal.record({"event": "execution_timeout"})
                 raise RuntimeError("TASK_FAILED:timeout")
@@ -271,13 +329,14 @@ def _execute_autonomous_loop(
                 journal.record({"event": "execution_complete"})
                 return
 
+            # Heartbeat: keep InputArbitrator watchdog alive
             input_arbitrator.soc_action_started()
             input_arbitrator.clear_emergency_reclaim()
 
             iteration += 1
             current_step = execution_plan.steps[current_step_index]
 
-            # PATCH §R6: stagnation limit depends on step type
+            # Stagnation limit varies by step type (PATCH §R6)
             step_type = current_step.type
             stagnant_limit = (
                 MAX_STAGNANT_ITERS_COMMAND
@@ -285,8 +344,10 @@ def _execute_autonomous_loop(
                 else MAX_STAGNANT_ITERS_UI
             )
 
+            # ------------------------------------------------------------------
+            # Perception snapshot
+            # ------------------------------------------------------------------
             perception_snapshot = None
-
             if observer:
                 try:
                     snap = observer.snapshot()
@@ -298,12 +359,14 @@ def _execute_autonomous_loop(
                             perception_snapshot = dict(perception_snapshot)
                             perception_snapshot["last_command_output"] = step_log
                         world_graph.update(perception_snapshot)
-
                 except Exception:
                     log_warn("Observer snapshot failed")
 
             world_snapshot = world_graph.snapshot() if world_graph else {}
 
+            # ------------------------------------------------------------------
+            # World-graph delta & belief update
+            # ------------------------------------------------------------------
             delta = None
             if previous_snapshot and world_graph:
                 try:
@@ -313,7 +376,6 @@ def _execute_autonomous_loop(
                     delta = None
 
             if isinstance(world_snapshot, dict):
-
                 entities = world_snapshot.get("entities", [])
                 if isinstance(entities, list):
                     entities = entities[:MAX_PERCEPTION_ENTITIES]
@@ -323,9 +385,7 @@ def _execute_autonomous_loop(
 
                 try:
                     if len(json.dumps(bounded)) <= MAX_PERCEPTION_JSON_BYTES:
-
                         likelihoods: Dict[str, float] = {}
-
                         focused_app = bounded.get("focused_app")
                         entity_count = len(bounded.get("entities", []))
 
@@ -341,14 +401,15 @@ def _execute_autonomous_loop(
                             likelihoods["ui_empty"] = 0.5
 
                         likelihoods["neutral"] = 0.5 if delta else 0.9
-
                         belief.bayesian_update(likelihoods)
-
                 except Exception:
                     pass
 
             previous_snapshot = world_snapshot
 
+            # ------------------------------------------------------------------
+            # Candidate action selection
+            # ------------------------------------------------------------------
             raw_actions = current_step.action
             candidate_actions: List[Dict[str, Any]] = []
 
@@ -359,8 +420,9 @@ def _execute_autonomous_loop(
                     a for a in raw_actions if isinstance(a, dict)
                 )
 
+            # Fallback: ask ReasoningEngine for dynamic candidates on stagnant steps
             if not candidate_actions and reasoning_engine is not None:
-                perception_for_reasoning = {}
+                perception_for_reasoning: Dict[str, Any] = {}
                 if isinstance(perception_snapshot, dict):
                     perception_for_reasoning = perception_snapshot
                 elif isinstance(world_snapshot, dict):
@@ -386,14 +448,16 @@ def _execute_autonomous_loop(
             if not candidate_actions:
                 raise RuntimeError("TASK_FAILED:no_candidate_actions")
 
+            # Thompson-UCB-EU composite selection via ActionRanker
             selected_action = action_ranker.select(
                 actions=candidate_actions,
                 belief_state=belief,
             )
-
             action_key = action_ranker.action_key(selected_action)
 
-            
+            # ------------------------------------------------------------------
+            # Policy gate
+            # ------------------------------------------------------------------
             _focused_app_for_policy = (
                 world_snapshot.get("focused_app", "__unknown_app__")
                 if isinstance(world_snapshot, dict)
@@ -421,8 +485,6 @@ def _execute_autonomous_loop(
                 continue
 
             if _policy_decision == PolicyEngine.REQUIRE_HUMAN_CONFIRMATION:
-                # Pause and wait for human to approve (up to MAX_WAIT_RETRIES
-                # slots) before re-evaluating.  If authority clears → proceed.
                 journal.record({
                     "event": "policy_human_confirmation_required",
                     "step": current_step_index,
@@ -442,7 +504,6 @@ def _execute_autonomous_loop(
                         _phc_approved = True
                         break
                 if not _phc_approved:
-                    # Still blocked — treat as stagnation.
                     belief.record_action(action_key, -0.3)
                     best_reward = belief.global_best_reward() or 0.0
                     belief.update_regret(action_key, -0.3, best_reward)
@@ -452,17 +513,16 @@ def _execute_autonomous_loop(
                     previous_perception = perception_snapshot
                     continue
 
+            # ------------------------------------------------------------------
+            # Authority evaluation
+            # ------------------------------------------------------------------
             is_high_risk = selected_action.get("operation") in {
                 "command", "install", "file_create"
             }
-
-            
             if is_high_risk:
-                # High-risk operations require sustained stability: at least 3
-                # consecutive observations with high stability score.
+                # High-risk requires 3 consecutive stable observations
                 soc_confident = belief.consecutive_high_stability_count >= 3
             else:
-                # Low-risk operations only need momentary stability.
                 soc_confident = belief.environment_stability > 0.7
 
             authority = input_arbitrator.evaluate(
@@ -483,7 +543,6 @@ def _execute_autonomous_loop(
                 while wait_retries < MAX_WAIT_RETRIES:
                     time.sleep(WAIT_RETRY_SECONDS)
                     wait_retries += 1
-                    # Re-evaluate with current stability on each retry
                     _soc_retry = (
                         belief.consecutive_high_stability_count >= 3
                         if is_high_risk
@@ -500,13 +559,13 @@ def _execute_autonomous_loop(
                         raise AuthorityAbortError(
                             "Human authority abort during WAIT — task terminated"
                         )
-                    if authority == AuthorityDecision.CONTINUE:
-                        break
 
             if authority == AuthorityDecision.ABORT:
                 raise AuthorityAbortError("Human authority abort — task terminated")
 
-            
+            # ------------------------------------------------------------------
+            # Execute action
+            # ------------------------------------------------------------------
             exec_result: dict = {}
             try:
                 exec_result = _execute_decision(
@@ -533,14 +592,14 @@ def _execute_autonomous_loop(
                     "error": str(exec_exc),
                 })
 
-            # Record command output for world-graph enrichment.
-            if "output" in (exec_result if action_success else {}):
+            # Bounded command output for world-graph context
+            if action_success and "output" in exec_result:
                 output_text = str(exec_result.get("output", ""))
                 execution_log[current_step_index] = {
                     "output": output_text[:MAX_COMMAND_OUTPUT_BYTES]
                 }
 
-            
+            # Bandit update
             belief.record_action(action_key, raw_reward)
             best_reward = belief.global_best_reward() or 0.0
             belief.update_regret(action_key, raw_reward, best_reward)
@@ -553,9 +612,9 @@ def _execute_autonomous_loop(
                 "reward": raw_reward,
             })
 
-            # -------------------------------------------------------
-            # STEP VERIFICATION & ADVANCEMENT
-            # -------------------------------------------------------
+            # ------------------------------------------------------------------
+            # Step verification & advancement
+            # ------------------------------------------------------------------
             if action_success:
                 verify_result = verifier.verify_step(
                     current_step,
@@ -580,11 +639,10 @@ def _execute_autonomous_loop(
             else:
                 stagnant_iterations += 1
 
-            # -------------------------------------------------------
-            # STAGNATION GUARD
-            # -------------------------------------------------------
+            # ------------------------------------------------------------------
+            # Stagnation guard
+            # ------------------------------------------------------------------
             if stagnant_iterations >= stagnant_limit:
-                
                 _entropy = belief.entropy() if hasattr(belief, "entropy") else 0.0
                 journal.record({
                     "event": "replan_trigger",
@@ -599,22 +657,25 @@ def _execute_autonomous_loop(
 
             previous_perception = perception_snapshot
 
-        # Loop exhausted without reaching DONE step.
+        # Loop exhausted without reaching DONE step
         raise RuntimeError("TASK_FAILED:max_iterations_exceeded")
 
     except (RuntimeError, AuthorityAbortError):
         raise
 
     finally:
-        # Persist the final BeliefState for the next replan.
+        # Persist the final BeliefState on ALL exit paths (success, failure, exception)
         if belief_state_out is not None:
             belief_state_out.clear()
             try:
                 belief_state_out.append(belief.to_dict())
             except Exception:
-                pass
+                pass  # Serialisation failure must never propagate on shutdown path
 
 
+# =========================================================================
+# ACTION DISPATCHER
+# =========================================================================
 
 def _execute_decision(
     *,
@@ -630,35 +691,43 @@ def _execute_decision(
     """
     Dispatch `action` to the OS backend and return an execution result dict.
 
-    Action dispatch is determined by the `operation` field:
-      click         → os_backend.mouse()
-      write / type  → os_backend.write()
-      press / hotkey→ os_backend.press()
-      command       → os_backend.exec()
-      file_create   → os_backend.write_file()
-      install       → installer.install() or os_backend.exec()
-      scroll        → pyautogui.scroll()
-      done          → success immediately (DONE sentinel)
-      (unknown)     → no-op, success=False
+    Returns
+    -------
+    dict with keys:
+        success   : bool
+        reward    : float  (0.8 success, -0.5 failure, 1.0 done)
+        output    : str    (command stdout+stderr, if applicable)
+        returncode: int    (command exit code — RT-B1 fix, required by StepVerifier)
+        reason    : str    (optional; describes why an action could not execute)
 
-    Rewards are assigned by outcome:
-      success       →  0.8
-      failure/error → -0.5
-      done          →  1.0
+    Dispatch table (by `operation` field):
+        click        → os_backend.mouse()
+        write/type   → os_backend.write()
+        press/hotkey → os_backend.press()
+        command      → os_backend.exec()
+        file_create  → os_backend.write_file()
+        install      → installer.install() or os_backend.exec()
+        scroll       → pyautogui.scroll()
+        verify       → os_backend.exec() (command method) or no-op (screenshot)
+        done         → immediate success (DONE sentinel)
+        (unknown)    → structured failure, reward -0.5
     """
     from core.safety.action_timeout import run_with_timeout, ActionTimeout
 
     op = (action.get("operation") or "").lower().strip()
 
+    # DONE sentinel — always succeeds immediately with maximum reward
     if op == "done":
         return {"success": True, "reward": 1.0}
 
     if not op:
-        return {"success": False, "reward": -0.5}
+        return {"success": False, "reward": -0.5, "reason": "empty operation field"}
 
     try:
+        # ------------------------------------------------------------------
+        # CLICK
+        # ------------------------------------------------------------------
         if op == "click":
-            # Click by coordinates (percentage) or by label (OCR fallback).
             x = action.get("x")
             y = action.get("y")
             if x is not None and y is not None:
@@ -669,7 +738,6 @@ def _execute_decision(
                     executor=task_ui_executor,
                 )
             else:
-                
                 label = action.get("label") or action.get("text") or ""
                 if label:
                     return {
@@ -680,14 +748,16 @@ def _execute_decision(
                             "OCR unavailable or label not found; replanning required"
                         ),
                     }
-                else:
-                    return {"success": False, "reward": -0.5}
+                return {"success": False, "reward": -0.5, "reason": "click: no x/y or label"}
             return {"success": True, "reward": 0.8}
 
+        # ------------------------------------------------------------------
+        # WRITE / TYPE
+        # ------------------------------------------------------------------
         elif op in ("write", "type"):
             content = str(action.get("content") or action.get("text") or "")
             if not content:
-                return {"success": False, "reward": -0.5}
+                return {"success": False, "reward": -0.5, "reason": "write: empty content"}
             run_with_timeout(
                 lambda: os_backend.write(content),
                 seconds=30.0,
@@ -696,12 +766,15 @@ def _execute_decision(
             )
             return {"success": True, "reward": 0.8}
 
+        # ------------------------------------------------------------------
+        # PRESS / HOTKEY / KEY
+        # ------------------------------------------------------------------
         elif op in ("press", "hotkey", "key"):
             keys = action.get("keys") or action.get("key")
             if isinstance(keys, str):
                 keys = [keys]
             if not isinstance(keys, list) or not keys:
-                return {"success": False, "reward": -0.5}
+                return {"success": False, "reward": -0.5, "reason": "press: no keys specified"}
             run_with_timeout(
                 lambda: os_backend.press(keys),
                 seconds=15.0,
@@ -710,15 +783,10 @@ def _execute_decision(
             )
             return {"success": True, "reward": 0.8}
 
+        # ------------------------------------------------------------------
+        # SCROLL (FIX RT-05: uses module-level _pyautogui alias)
+        # ------------------------------------------------------------------
         elif op == "scroll":
-            # RT-05 FIX: Use the module-level _pyautogui alias (imported at the
-            # top of this file) and the _PYAUTOGUI_AVAILABLE flag instead of
-            # deferring `import pyautogui` here.
-            #
-            # If pyautogui is unavailable, return a structured failure with a
-            # clear reason so operators can diagnose the dependency gap.  The
-            # failure reward (-0.5) is identical to other hard failures and
-            # feeds correctly into the Welford normaliser and Thompson sampler.
             if not _PYAUTOGUI_AVAILABLE:
                 return {
                     "success": False,
@@ -739,18 +807,20 @@ def _execute_decision(
             )
             return {"success": True, "reward": 0.8}
 
+        # ------------------------------------------------------------------
+        # COMMAND
+        # ------------------------------------------------------------------
         elif op == "command":
             cmd = str(action.get("command") or "").strip()
             if not cmd:
-                return {"success": False, "reward": -0.5}
+                return {"success": False, "reward": -0.5, "reason": "command: empty command"}
             from config.timeouts import INSTALL_COMMAND_TIMEOUT_SECONDS
             result = os_backend.exec(cmd, timeout=int(INSTALL_COMMAND_TIMEOUT_SECONDS))
             success = (result.returncode == 0)
             reward = 0.8 if success else -0.5
             output = (result.stdout or "") + (result.stderr or "")
-            # RT-B1 FIX: Include "returncode" so StepVerifier._verify_command()
-            # can extract it from the dict.  Previously the dict lacked this key,
-            # causing hasattr(result, "returncode") to be False, making every
+            # FIX RT-B1: Include returncode so StepVerifier._verify_command()
+            # can extract it.  Previously the key was absent, making every
             # COMMAND_EXECUTION step fail verification unconditionally.
             return {
                 "success": success,
@@ -759,14 +829,20 @@ def _execute_decision(
                 "returncode": result.returncode,
             }
 
+        # ------------------------------------------------------------------
+        # FILE CREATE
+        # ------------------------------------------------------------------
         elif op == "file_create":
             path = str(action.get("path") or "").strip()
             content_str = str(action.get("content") or "")
             if not path:
-                return {"success": False, "reward": -0.5}
+                return {"success": False, "reward": -0.5, "reason": "file_create: no path"}
             os_backend.write_file(path, content_str)
             return {"success": True, "reward": 0.8}
 
+        # ------------------------------------------------------------------
+        # INSTALL
+        # ------------------------------------------------------------------
         elif op == "install":
             tool_spec = action.get("tool", {})
             install_cmds = (
@@ -775,12 +851,14 @@ def _execute_decision(
                 else []
             )
             if install_cmds and isinstance(install_cmds, list):
-                # Terminal-first install path.
+                # Terminal-first install path
                 from config.timeouts import INSTALL_COMMAND_TIMEOUT_SECONDS
                 all_ok = True
                 combined_output = ""
                 for cmd in install_cmds:
-                    r = os_backend.exec(cmd, timeout=int(INSTALL_COMMAND_TIMEOUT_SECONDS))
+                    r = os_backend.exec(
+                        cmd, timeout=int(INSTALL_COMMAND_TIMEOUT_SECONDS)
+                    )
                     combined_output += (r.stdout or "") + (r.stderr or "")
                     if r.returncode != 0:
                         all_ok = False
@@ -792,7 +870,7 @@ def _execute_decision(
                     "output": combined_output,
                 }
             elif installer is not None:
-                # UI-based install fallback via AutonomousInstaller.
+                # UI-based install fallback via AutonomousInstaller
                 tool_name = (
                     tool_spec.get("name", "") if isinstance(tool_spec, dict) else ""
                 )
@@ -806,34 +884,56 @@ def _execute_decision(
                         "output": str(inst_err),
                     }
             else:
-                return {"success": False, "reward": -0.5}
+                return {
+                    "success": False,
+                    "reward": -0.5,
+                    "reason": (
+                        "install: no install_commands in tool spec and installer unavailable. "
+                        "Ensure install_commands is populated in the plan step."
+                    ),
+                }
 
+        # ------------------------------------------------------------------
+        # VERIFY
+        # ------------------------------------------------------------------
         elif op == "verify":
-            # Verification steps always return success to allow the plan to
-            # advance; actual verification is performed by StepVerifier.
             method = action.get("method", "screenshot")
             if method == "command":
                 cmd = str(action.get("command") or "").strip()
                 if cmd:
-                    from config.timeouts import INSTALL_COMMAND_TIMEOUT_SECONDS
                     r = os_backend.exec(cmd, timeout=30)
                     return {
                         "success": r.returncode == 0,
                         "reward": 0.6 if r.returncode == 0 else -0.3,
                         "output": (r.stdout or "") + (r.stderr or ""),
+                        "returncode": r.returncode,
                     }
+            # Screenshot verify — StepVerifier handles the actual comparison
             return {"success": True, "reward": 0.6}
 
+        # ------------------------------------------------------------------
+        # UNKNOWN OPERATION
+        # ------------------------------------------------------------------
         else:
-            # Unknown operation — log and return soft failure.
             log_warn(f"_execute_decision: unknown operation {op!r}")
-            return {"success": False, "reward": -0.5}
+            return {
+                "success": False,
+                "reward": -0.5,
+                "reason": (
+                    f"unknown operation {op!r}. Valid operations: "
+                    "click, write, type, press, hotkey, key, scroll, "
+                    "command, file_create, install, verify, done."
+                ),
+            }
 
     except ActionTimeout as toe:
-        log_warn(f"_execute_decision: action timeout — {toe}")
-        return {"success": False, "reward": -0.5}
+        log_warn(f"_execute_decision: action timeout [{op}] — {toe}")
+        return {"success": False, "reward": -0.5, "reason": f"action_timeout: {toe}"}
 
     except Exception as exc:
-        log_warn(f"_execute_decision: unexpected error — {exc}")
-        return {"success": False, "reward": -0.5}
-
+        log_warn(f"_execute_decision: unexpected error [{op}] — {exc}")
+        return {
+            "success": False,
+            "reward": -0.5,
+            "reason": f"unexpected_error: {exc}",
+        }
