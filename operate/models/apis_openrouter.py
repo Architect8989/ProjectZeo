@@ -7,15 +7,18 @@ import uuid
 import httpx
 from typing import List, Tuple, Dict, Optional
 
-# ============================================================
-# HARD CONSTRAINTS
-# ============================================================
-# - OpenRouter ONLY
-# - No OpenAI SDK
-# - No Gemini SDK
-# - No silent fallback
-# - Fail hard on any deviation
-# ============================================================
+
+_raw_ollama = os.environ.get("OLLAMA_ONLY", "1").strip().lower()
+if _raw_ollama in ("1", "true", "yes"):
+    raise ImportError(
+        "operate.models.apis_openrouter cannot be imported when OLLAMA_ONLY is set. "
+        "OpenRouter cloud API access is disabled. "
+        "Use QwenOllamaAdapter (adapters/qwen_ollama_adapter.py) for local inference. "
+        "To enable cloud APIs, start the system with --allow-cloud or set OLLAMA_ONLY=0."
+    )
+del _raw_ollama
+
+
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1/chat/completions"
 
