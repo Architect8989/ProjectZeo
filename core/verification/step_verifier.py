@@ -226,19 +226,41 @@ class StepVerifier:
         step: ExecutionStep,
         result: Any,
     ) -> Tuple[bool, str, Dict[str, Any]]:
+        # RT-B1 FIX: Accept BOTH subprocess.CompletedProcess (has .returncode
+        # attribute) AND dict (has "returncode" key).
+        #
+        # Root cause: _execute_decision() in operate.py returns a dict for the
+        # "command" operation:
+        #   {"success": bool, "reward": float, "output": str, "returncode": int}
+        # but the original guard checked `hasattr(result, "returncode")` which
+        # is always False for a dict → every COMMAND_EXECUTION and
+        # TOOL_INSTALLATION step failed verification unconditionally, causing
+        # 120 iterations of stagnation → REPLAN → max_replans_exceeded →
+        # TASK_FAILED even when the command itself succeeded.
+        #
+        # Fix: extract returncode from whichever format is provided.
+        # If neither format applies, the result is genuinely missing.
+        if result is None:
+            return False, "missing command result", {}
 
-        if result is None or not hasattr(result, "returncode"):
+        if hasattr(result, "returncode"):
+            # subprocess.CompletedProcess path
+            returncode = result.returncode
+        elif isinstance(result, dict) and "returncode" in result:
+            # dict path (from _execute_decision)
+            returncode = result["returncode"]
+        else:
             return False, "missing command result", {}
 
         verification = step.verification or {}
         expected_codes = verification.get("expected_return_codes", [0])
 
-        if result.returncode not in expected_codes:
-            return False, f"unexpected return code: {result.returncode}", {
-                "returncode": result.returncode
+        if returncode not in expected_codes:
+            return False, f"unexpected return code: {returncode}", {
+                "returncode": returncode
             }
 
-        return True, "", {"returncode": result.returncode}
+        return True, "", {"returncode": returncode}
 
     # =================================================
     # FILE VERIFICATION
