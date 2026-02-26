@@ -9,11 +9,7 @@ from operate.exceptions import ModelNotRecognizedException
 from adapters.apis_safety_layer import apply_patches
 
 
-# =========================================================
-# LOCAL MODEL REGISTRY
-# Maps base model name → fully-qualified adapter class path.
-# These are served by dedicated local adapters (Ollama, etc.)
-# =========================================================
+
 _LOCAL_REGISTRY: Dict[str, str] = {
     "qwen2.5-vl": "adapters.qwen_ollama_adapter.QwenOllamaAdapter",
     
@@ -100,22 +96,25 @@ def _cache_get(model_name: str) -> "Any | None":
 
 
 import os as _os_module
-_raw_ollama_only = _os_module.environ.get("OLLAMA_ONLY", "1").strip().lower()
+
+
+_raw_ollama_only: str = _os_module.environ.get("OLLAMA_ONLY", "1").strip().lower()
+
 
 _CLOUD_ACCESS_PERMITTED: bool = _raw_ollama_only not in ("1", "true", "yes")
-del _raw_ollama_only  # remove intermediate from module namespace
 
-
-_ollama_only_env = _os_module.environ.get("OLLAMA_ONLY", "1").strip().lower()
-_ollama_only_set = _ollama_only_env in ("1", "true", "yes")
+# Contradiction guard: if OLLAMA_ONLY signals cloud-is-forbidden but the
+# derived flag says permitted, something has gone wrong in this module itself.
+_ollama_only_set: bool = _raw_ollama_only in ("1", "true", "yes")
 if _ollama_only_set and _CLOUD_ACCESS_PERMITTED:
-    
     raise RuntimeError(
         "FACTORY_INIT_CONTRADICTION: OLLAMA_ONLY is set but "
         "_CLOUD_ACCESS_PERMITTED=True — cloud access is forbidden. "
         "Check for conflicting environment mutations at import time."
     )
-del _ollama_only_env, _ollama_only_set
+
+# Remove all temporaries — keep only _CLOUD_ACCESS_PERMITTED in module scope
+del _raw_ollama_only, _ollama_only_set
 
 
 def _get_model_build_lock(model_name: str) -> threading.Lock:
@@ -202,57 +201,7 @@ def _is_cloud_allowed() -> bool:
 
 
 def reconfigure_cloud_access(allow: bool) -> bool:
-    """
-    HARDEN-10: Runtime cloud access reconfiguration.
-
-    Root cause of audit finding (MEDIUM):
-      _CLOUD_ACCESS_PERMITTED is frozen at import time by reading os.environ at
-      module load. Any post-import mutation of os.environ["OLLAMA_ONLY"] is
-      silently ignored. Code that attempts runtime reconfiguration (e.g. test
-      fixtures, orchestrators that need to enable/disable cloud access per task)
-      operates on stale state with no indication that the change had no effect.
-
-    Fix: provide reconfigure_cloud_access() as the ONLY safe way to change
-    cloud access after process start. It:
-      1. Updates the module-level _CLOUD_ACCESS_PERMITTED flag atomically under
-         _ADAPTER_CACHE_LOCK (same lock that guards all cache reads/writes).
-      2. Clears the _ADAPTER_CACHE so that newly constructed adapters use the
-         updated permission. Stale cached adapters built under the old permission
-         would otherwise continue to function — creating a window where a cloud
-         adapter might be returned after cloud was disabled (or vice versa).
-      3. Returns the previous value so callers can restore the original state in
-         finally blocks or teardown.
-
-    Thread safety:
-      The flag write and cache clear are both performed under _ADAPTER_CACHE_LOCK.
-      Concurrent build operations that acquired a build_lock before this call
-      may complete and insert their adapter into the cache; however, their
-      adapter will have been constructed under the OLD permission and will be
-      evicted on the next _cache_put() call under the new permission. This is
-      an acceptable transient race because:
-        - In production (OLLAMA_ONLY=1), cloud is never permitted and this
-          function is never called.
-        - In test environments, test isolation between cloud/non-cloud tests
-          must be enforced at a higher level (subprocess boundaries are ideal).
-
-    Parameters
-    ----------
-    allow : bool
-        True → permit cloud model access (equivalent to OLLAMA_ONLY=0).
-        False → deny cloud model access (equivalent to OLLAMA_ONLY=1).
-
-    Returns
-    -------
-    bool
-        The PREVIOUS value of _CLOUD_ACCESS_PERMITTED, so callers can restore
-        the original state in a finally block:
-
-            prev = reconfigure_cloud_access(True)
-            try:
-                ... cloud operations ...
-            finally:
-                reconfigure_cloud_access(prev)
-    """
+    
     global _CLOUD_ACCESS_PERMITTED
 
     with _ADAPTER_CACHE_LOCK:
