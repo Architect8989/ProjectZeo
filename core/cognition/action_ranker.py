@@ -13,6 +13,10 @@ class ActionRanker:
     MAX_EXPLORATION_BONUS = 1.0  # prevent UCB domination
     MIN_EXPLORATION_BONUS = 0.0  # FIX MATH-05: prevent exploitation suppression
 
+    
+    EXPLORATION_FLOOR_COUNT: int = 3
+    EXPLORATION_FLOOR_BONUS: float = 0.1
+
     # MATH-NEW-02 FIX: Default saturation; tuned by set_plan_horizon().
     _DEFAULT_EXPLOIT_SATURATION_N = 50
 
@@ -49,8 +53,14 @@ class ActionRanker:
                 if rewards else 0.0
             )
 
+            # SI-05 FIX: Apply exploration floor for underexplored actions.
+            # When count < EXPLORATION_FLOOR_COUNT, guarantee a minimum bonus of
+            # EXPLORATION_FLOOR_BONUS so that underexplored actions always receive
+            # meaningful exploration credit regardless of mean_reward magnitude.
             # FIX MATH-05: clamp to [MIN_EXPLORATION_BONUS, MAX_EXPLORATION_BONUS].
             exploration_bonus = ucb_full - mean_reward
+            if n < self.EXPLORATION_FLOOR_COUNT:
+                exploration_bonus = max(exploration_bonus, self.EXPLORATION_FLOOR_BONUS)
             exploration_bonus = max(
                 self.MIN_EXPLORATION_BONUS,
                 min(exploration_bonus, self.MAX_EXPLORATION_BONUS),
@@ -101,30 +111,7 @@ class ActionRanker:
         if len(candidates) == 1:
             selected_index = candidates[0]
         else:
-            # RT-08 FIX: Deterministic tie-breaking via commitment chain hash.
-            #
-            # Root cause: the previous code unconditionally called
-            #   bytes.fromhex(_chain[:16])
-            # On the very first record_action() call (or on a fresh BeliefState
-            # that has not yet recorded any action), commitment_chain_hash equals
-            # "GENESIS" — the sentinel set in __init__.  "GENESIS" is not valid
-            # hexadecimal, so bytes.fromhex("GENESIS") raises ValueError.  The
-            # except-all handler silently fell through to candidates[0], making
-            # tie-breaking non-deterministic across runs in the genesis state.
-            #
-            # Fix: detect non-hex chain values explicitly before calling fromhex.
-            # Three cases handled:
-            #   1. chain is "GENESIS" (initial state, no actions recorded yet):
-            #      fall back to stable index-0 selection — deterministic and correct.
-            #   2. chain is a valid hex string of length >= 16:
-            #      use the first 8 bytes as a big-endian integer to index into
-            #      candidates — same as before but without the ValueError risk.
-            #   3. chain is non-empty but too short / partially non-hex:
-            #      hash the chain string itself to produce a stable integer —
-            #      this handles any future non-hex sentinel values gracefully.
-            #
-            # All paths are deterministic for the same chain value, preserving
-            # the tie-breaking guarantee.
+            
             selected_index = self._deterministic_tiebreak(
                 candidates, belief_state
             )
