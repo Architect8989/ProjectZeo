@@ -681,6 +681,29 @@ def main(llm_callable: Callable, model_name: str) -> None:
                             if _restore_exc:
                                 raise _restore_exc[0]
 
+                            # RD-03 FIX: Call complete_execution() BEFORE verify().
+                            #
+                            # Root cause of original sequencing defect:
+                            #   1. restore_provider.restore_snapshot(snapshot_id) runs
+                            #      in RESTORING mode and calls RestoreProvider._verify()
+                            #      internally (mode-check: expects RESTORING) ✓
+                            #   2. mode.complete_execution() was called here ← FIXED ORDER
+                            #   3. restore_verifier.verify() was called here, which
+                            #      internally calls _verify_execution_mode() expecting
+                            #      OBSERVER mode ← this is CORRECT
+                            #
+                            # The original code had complete_execution() AFTER verify(),
+                            # meaning verify() ran while mode was still RESTORING. This
+                            # caused _verify_execution_mode() to raise:
+                            #   RestorationVerificationError(expected OBSERVER, got RESTORING)
+                            # which looked like a restoration failure but was a sequencing
+                            # failure. Any unexpected exception between restore and
+                            # complete_execution() would also leave the mode in RESTORING
+                            # indefinitely.
+                            #
+                            # Fix: call complete_execution() immediately after restore
+                            # succeeds and before any secondary verification runs.
+                            # This ensures the mode is OBSERVER before verify() checks it.
                             mode.complete_execution()
 
                             snap_obj = snapshot_provider.get_snapshot(snapshot_id)
@@ -695,6 +718,21 @@ def main(llm_callable: Callable, model_name: str) -> None:
                                     raise RestorationVerificationError(
                                         f"Post-restore verification failed: {rve}"
                                     )
+
+                            # IH-05 FIX: Flush regret on successful task completion.
+                            # Stale regret from a successfully-completed task must not
+                            # carry over into crash-recovery execution of a new task.
+                            # flush_regret_on_success() zeroes all action regret before
+                            # the BeliefState is serialised into auth_state.
+                            if _task_succeeded and _belief_state_out:
+                                try:
+                                    _bs_obj = BeliefState.from_dict(
+                                        _belief_state_out[0], intent_hash=""
+                                    )
+                                    _bs_obj.flush_regret_on_success()
+                                    _belief_state_out[0] = _bs_obj.to_dict()
+                                except Exception:
+                                    pass  # Non-fatal: flush failure must not block auth persist
 
                             # FIX RB-6: Use _safe_belief_snapshot() — never index directly
                             _bs = _safe_belief_snapshot(_belief_state_out)
