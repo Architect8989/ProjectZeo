@@ -33,77 +33,99 @@ from restoration.restore_provider import RestoreProvider
 from restoration.restore_verifier import RestoreVerifier, RestorationVerificationError
 
 from core.planner.execution_planner import ExecutionPlanner
-
-
 from core.safety.runtime_watchdog import RuntimeWatchdog, WatchdogViolation
-
 
 from adapters.apis_safety_layer import uninstall_patches
 from core.cognition.belief_state import BeliefState
 
 
-def _shutdown_executor(executor, wait: bool = False) -> None:
-    """
-    RB-08 FIX: Python 3.8 compatibility for ThreadPoolExecutor.shutdown().
-    """
-    if sys.version_info >= (3, 9):
-        executor.shutdown(wait=wait, cancel_futures=True)
-    else:
-        executor.shutdown(wait=wait)
-
+# ------------------------------------------------------------------
+# CONSTANTS
+# ------------------------------------------------------------------
 
 # PATCH §1.5: reduced from 2.0s to 0.25s for lower intent-to-task latency
 HEARTBEAT_INTERVAL = 0.25
 
-MAX_TASK_SECONDS = 90 * 60
-MAX_REPLANS = 3
+MAX_TASK_SECONDS = 90 * 60      # 90 minutes per task
+MAX_REPLANS = 3                 # max replan attempts before TASK_FAILED
 
-# FIX-4: Extended from 8s to 150s
+# FIX-4: Extended from 8s to 150s for CPU inference compat
 WARMUP_TIMEOUT_SECONDS = 150.0
 WARMUP_STABLE_FRAMES = 3
 
-# DEF-4: Hard timeout for the restoration phase.
+# Hard timeout for the restoration phase (thread-enforced)
 RESTORE_TIMEOUT_SECONDS = 60.0
 
-# PATCH §main-7: max retries for transient vision/observer health failures
+# Max retries for transient vision/observer health failures at task start
 HEALTH_RETRY_MAX = 5
 HEALTH_RETRY_INTERVAL = 1.0
 
-# EVO-4: vision restart on ObserverBlindnessError before giving up
+# Vision restart grace period after ObserverBlindnessError
 VISION_RESTART_GRACE_SECONDS = 5.0
 
+
+# ------------------------------------------------------------------
+# MODULE-LEVEL STATE
+# ------------------------------------------------------------------
 
 _TASK_START: Optional[float] = None
 _TASK_LOCK = threading.Lock()
 _SHUTDOWN_EVENT = threading.Event()
 
 
-# ============================================================
+# ------------------------------------------------------------------
 # THREAD-SAFE TASK TIMING
-# ============================================================
+# ------------------------------------------------------------------
 
-def _set_task_start(ts: float):
+def _set_task_start(ts: float) -> None:
     global _TASK_START
     with _TASK_LOCK:
         _TASK_START = ts
 
 
-def _clear_task_start():
+def _clear_task_start() -> None:
     global _TASK_START
     with _TASK_LOCK:
         _TASK_START = None
 
 
-def _get_task_start():
+def _get_task_start() -> Optional[float]:
     with _TASK_LOCK:
         return _TASK_START
 
 
-# ============================================================
-# SAFE SHUTDOWN
-# ============================================================
+# ------------------------------------------------------------------
+# BELIEF STATE HELPER (FIX RB-6)
+# ------------------------------------------------------------------
 
-def _force_safe_shutdown(os_backend, auth_state, reason: str):
+def _safe_belief_snapshot(belief_state_out: list) -> dict:
+    """
+    FIX RB-6: Safe accessor for belief_state_out[0].
+
+    Returns the serialised BeliefState dict when available, or an empty dict
+    when the list is empty or the access raises.  This prevents IndexError from
+    masking the original exception in the restoration finally block.
+
+    Root cause: if operate_main() raises during init (before the finally block
+    in _execute_autonomous_loop appends to belief_state_out), then
+    belief_state_out is empty.  Accessing [0] directly raises IndexError and
+    replaces the original exception in the traceback.
+    """
+    try:
+        return belief_state_out[0] if belief_state_out else {}
+    except Exception:
+        return {}
+
+
+# ------------------------------------------------------------------
+# SAFE SHUTDOWN
+# ------------------------------------------------------------------
+
+def _force_safe_shutdown(os_backend, auth_state, reason: str) -> None:
+    """
+    Emergency failsafe: release all automated input and mark auth state safe.
+    Best-effort — never raises.
+    """
     try:
         os_backend.force_release_all(reason=reason)
     except Exception:
@@ -115,45 +137,62 @@ def _force_safe_shutdown(os_backend, auth_state, reason: str):
     print(f"[SAFE-SHUTDOWN] {reason}", file=sys.stderr)
 
 
-def _signal_handler(signum, frame):
+def _signal_handler(signum, frame) -> None:
     _SHUTDOWN_EVENT.set()
 
 
-def _install_signal_handlers():
+def _install_signal_handlers() -> None:
+    """
+    Register SIGINT, SIGTERM, and SIGQUIT (Unix) to set the shutdown event.
+
+    Previously only SIGINT was handled; SIGTERM from systemd/Kubernetes would
+    kill the process immediately without triggering the atexit sequence or
+    running _force_safe_shutdown().
+    """
     signal.signal(signal.SIGINT, _signal_handler)
     signal.signal(signal.SIGTERM, _signal_handler)
     if hasattr(signal, "SIGQUIT"):
         signal.signal(signal.SIGQUIT, _signal_handler)
 
 
-# ============================================================
-# STARTUP VALIDATION (HARDEN-10 / P0-1 FIX)
-# ============================================================
+# ------------------------------------------------------------------
+# STARTUP VALIDATION
+# ------------------------------------------------------------------
 
 def _validate_runtime_dependencies() -> list:
-    
+    """
+    Pre-flight dependency check.  Returns a list of (severity, message) tuples.
+
+    Severity values:
+      "FATAL"   — process cannot function; startup will be aborted.
+      "WARNING" — degraded functionality; startup continues with the limitation noted.
+
+    FIX H-6: Missing DISPLAY / WAYLAND_DISPLAY on Linux is now FATAL (was WARNING).
+    Without a display server, every pyautogui call fails with a display connection
+    error.  Escalating to FATAL gives operators a clear root cause immediately
+    rather than an opaque cascade of action failures.
+    """
     issues = []
 
-    # 1. pyautogui (P0-1 FIX)
+    # 1. pyautogui — required for all UI actions
     try:
         import pyautogui as _pya
-        # Also verify X11/display is accessible by testing size()
-        _pya.size()
+        _pya.size()  # Also verifies X11/display accessibility
     except ImportError:
         issues.append((
             "FATAL",
             "pyautogui is not installed. Install with: pip install pyautogui. "
-            "All UI actions (click, type, press, scroll) will fail."
+            "All UI actions (click, type, press, scroll) will fail.",
         ))
     except Exception as e:
         issues.append((
             "FATAL",
             f"pyautogui cannot access display: {e}. "
             "On headless systems set DISPLAY=:99 and start Xvfb: "
-            "Xvfb :99 -screen 0 1920x1080x24 &"
+            "Xvfb :99 -screen 0 1920x1080x24 &",
         ))
 
-    # 2. AT-SPI (policy validation)
+    # 2. AT-SPI — optional; fallback to validate_action_dict() is active
     try:
         import pyatspi  # noqa: F401
     except ImportError:
@@ -161,45 +200,53 @@ def _validate_runtime_dependencies() -> list:
             "WARNING",
             "pyatspi is not available. AT-SPI-based policy validation is disabled. "
             "validate_action_dict() (non-AT-SPI path) is active as fallback. "
-            "Install with: pip install pyatspi (Linux only)."
+            "Install with: pip install pyatspi (Linux only).",
         ))
 
-    # 3. xdotool on Linux
     import platform as _platform
     if _platform.system() == "Linux":
-        import shutil
-        if not shutil.which("xdotool"):
+        import shutil as _shutil
+
+        # 3. xdotool — required for window focus operations
+        if not _shutil.which("xdotool"):
             issues.append((
                 "WARNING",
                 "xdotool not found. Window focus and geometry operations will fail. "
-                "Install with: sudo apt-get install xdotool (Debian/Ubuntu)"
+                "Install with: sudo apt-get install xdotool",
             ))
-        if not shutil.which("wmctrl"):
+
+        # 4. wmctrl — required for application activation on Linux
+        if not _shutil.which("wmctrl"):
             issues.append((
                 "WARNING",
                 "wmctrl not found. Application activation (focus) will fail on Linux. "
-                "Install with: sudo apt-get install wmctrl"
+                "Install with: sudo apt-get install wmctrl",
             ))
 
-    # 4. DISPLAY on Linux
-    if _platform.system() == "Linux":
-        import os as _os
-        if not _os.environ.get("DISPLAY") and not _os.environ.get("WAYLAND_DISPLAY"):
+        # 5. DISPLAY / WAYLAND_DISPLAY — FIX H-6: FATAL (was WARNING)
+        #    Without a display server, pyautogui.size() already raised above and
+        #    injected a FATAL.  This guard catches the case where pyautogui was
+        #    not installed but the display is also missing.
+        if not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY"):
             issues.append((
-                "WARNING",
-                "DISPLAY and WAYLAND_DISPLAY are both unset. "
-                "UI operations will fail unless a virtual framebuffer is running. "
-                "Set DISPLAY=:99 or start with Xvfb."
+                "FATAL",
+                "DISPLAY and WAYLAND_DISPLAY are both unset on Linux. "
+                "UI operations will fail — pyautogui requires a running X11 or Wayland display. "
+                "To run headlessly: "
+                "(1) Start Xvfb: Xvfb :99 -screen 0 1920x1080x24 & "
+                "(2) Set DISPLAY: export DISPLAY=:99 "
+                "OR run ProjectZeo from inside a graphical desktop session.",
             ))
 
     return issues
 
 
-# ============================================================
+# ------------------------------------------------------------------
 # UTILITIES
-# ============================================================
+# ------------------------------------------------------------------
 
 def _ingest_latest_perception(observer, world_graph) -> bool:
+    """Pull the latest observer snapshot into the world graph. Returns True on success."""
     snap = observer.snapshot()
     if not isinstance(snap, dict):
         return False
@@ -212,7 +259,8 @@ def _ingest_latest_perception(observer, world_graph) -> bool:
     return True
 
 
-def _enforce_task_timeout():
+def _enforce_task_timeout() -> None:
+    """Raise RuntimeError if the current task has exceeded MAX_TASK_SECONDS."""
     start = _get_task_start()
     if start is None:
         return
@@ -222,8 +270,10 @@ def _enforce_task_timeout():
 
 def _safe_begin_restoration(mode: ModeController) -> bool:
     """
+    Attempt to transition mode to RESTORING.  Returns True if restoration should
+    proceed, False if it should be skipped (e.g. task never reached EXECUTING).
+
     PATCH §1.5: begin_restoration() only accepts EXECUTING mode.
-    Returns True if restoration should proceed, False if it should be skipped.
     """
     current = mode.mode
 
@@ -235,40 +285,66 @@ def _safe_begin_restoration(mode: ModeController) -> bool:
             return False
 
     if current is SystemMode.RESTORING:
-        return True
+        return True  # Already in RESTORING — proceed
 
     if current in (SystemMode.PLANNING, SystemMode.ARMED, SystemMode.OBSERVER):
         try:
             mode.force_observer()
         except Exception:
             pass
-        return False
+        return False  # Task never started executing — skip restoration
 
     return False
 
 
-# ============================================================
+def _shutdown_executor(executor, wait: bool = False) -> None:
+    """
+    Python 3.8-compatible ThreadPoolExecutor shutdown.
+
+    Python ≥3.9 supports cancel_futures=True; earlier versions do not.
+    """
+    if sys.version_info >= (3, 9):
+        executor.shutdown(wait=wait, cancel_futures=True)
+    else:
+        executor.shutdown(wait=wait)
+
+
+# ------------------------------------------------------------------
 # MAIN ENTRY
-# ============================================================
+# ------------------------------------------------------------------
 
-def main(llm_callable: Callable, model_name: str):
+def main(llm_callable: Callable, model_name: str) -> None:
+    """
+    Main entry point for the ProjectZeo autonomous execution kernel.
 
+    Parameters
+    ----------
+    llm_callable : callable
+        Vision LLM adapter callable (get_next_action).
+    model_name : str
+        Model identifier string (e.g. "qwen2.5-vl:7b-instruct").
+
+    Raises
+    ------
+    RuntimeError
+        If llm_callable is not callable, model_name is invalid, or a FATAL
+        startup dependency is missing.
+    """
     if not callable(llm_callable):
         raise RuntimeError("llm_callable must be a callable")
 
     if not isinstance(model_name, str) or not model_name.strip():
         raise RuntimeError("model_name must be a non-empty string")
 
-    
+    # Pre-flight dependency check
     _dep_issues = _validate_runtime_dependencies()
     _has_fatal = False
     for _severity, _msg in _dep_issues:
-        _log_fn = print  # use print since logging may not be configured yet
         if _severity == "FATAL":
             _has_fatal = True
-            _log_fn(f"[STARTUP] FATAL: {_msg}", file=sys.stderr)
+            print(f"[STARTUP] FATAL: {_msg}", file=sys.stderr)
         else:
-            _log_fn(f"[STARTUP] WARNING: {_msg}", file=sys.stderr)
+            print(f"[STARTUP] WARNING: {_msg}", file=sys.stderr)
 
     if _has_fatal:
         raise RuntimeError(
@@ -276,6 +352,9 @@ def main(llm_callable: Callable, model_name: str):
             "Fix the listed dependencies before starting ProjectZeo."
         )
 
+    # ------------------------------------------------------------------
+    # Core infrastructure
+    # ------------------------------------------------------------------
     os_backend = OperatingSystem()
     state_path = os.path.join(os.getcwd(), ".authority_state.json")
     auth_state = AuthorityStateSerializer(state_path)
@@ -296,14 +375,11 @@ def main(llm_callable: Callable, model_name: str):
     _install_signal_handlers()
     atexit.register(lambda: _force_safe_shutdown(os_backend, auth_state, "atexit"))
 
-    
     watchdog = RuntimeWatchdog()
-
     env_fingerprint = collect_environment_fingerprint()
-
     persisted = auth_state.load()
 
-    
+    # Crash recovery: restore BeliefState from persisted state if available
     _crash_recovery_belief_state: "dict | None" = persisted.get("belief_state_full")
 
     if persisted.get("dirty") or persisted.get("restore_required"):
@@ -317,9 +393,9 @@ def main(llm_callable: Callable, model_name: str):
     vision_runtime.start()
     observer_loop.start()
 
-    # --------------------------------------------------------
-    # Warmup — extended to 150s for CPU inference compat.
-    # --------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Warmup — extended to 150s for CPU inference compatibility
+    # ------------------------------------------------------------------
     stable_frames = 0
     warmup_deadline = time.time() + WARMUP_TIMEOUT_SECONDS
     _warmup_achieved = False
@@ -337,13 +413,17 @@ def main(llm_callable: Callable, model_name: str):
         time.sleep(0.1)
 
     if not _warmup_achieved:
+        # Include observer/vision health state in the warning for diagnostics
+        _obs_healthy = observer.is_healthy()
+        _vis_healthy = vision_runtime.is_healthy()
         print(
             f"[WARMUP] WARNING: warmup did not reach {WARMUP_STABLE_FRAMES} stable frames "
             f"within {WARMUP_TIMEOUT_SECONDS:.0f}s. "
+            f"observer_healthy={_obs_healthy}, vision_healthy={_vis_healthy}, "
             f"entity_count={world_graph.entity_count()}, stable_frames={stable_frames}. "
-            f"Proceeding with degraded world model. "
-            f"If running on a bare desktop, ensure at least one application window is "
-            f"visible before arming, or increase WARMUP_TIMEOUT_SECONDS.",
+            "Proceeding with degraded world model. "
+            "If running on a bare desktop, ensure at least one application window is "
+            "visible before arming, or increase WARMUP_TIMEOUT_SECONDS.",
             file=sys.stderr,
         )
         try:
@@ -352,23 +432,26 @@ def main(llm_callable: Callable, model_name: str):
                 "stable_frames_achieved": stable_frames,
                 "required": WARMUP_STABLE_FRAMES,
                 "entity_count": world_graph.entity_count(),
+                "observer_healthy": _obs_healthy,
+                "vision_healthy": _vis_healthy,
                 "timeout_seconds": WARMUP_TIMEOUT_SECONDS,
             })
         except Exception:
             pass
 
+    # ------------------------------------------------------------------
+    # Restoration infrastructure
+    # ------------------------------------------------------------------
     snapshot_provider = SnapshotProvider(
         observer=observer,
         os_backend=os_backend,
         mode_controller=mode,
     )
-
     restore_provider = RestoreProvider(
         os_backend=os_backend,
         mode_controller=mode,
         snapshot_provider=snapshot_provider,
     )
-
     restore_verifier = RestoreVerifier(
         os_backend=os_backend,
         mode_controller=mode,
@@ -388,7 +471,7 @@ def main(llm_callable: Callable, model_name: str):
             try:
                 _enforce_task_timeout()
 
-                
+                # Watchdog check
                 try:
                     watchdog.check()
                 except WatchdogViolation as wv:
@@ -401,7 +484,6 @@ def main(llm_callable: Callable, model_name: str):
 
                 if mode.mode == SystemMode.PLANNING:
                     mode.check_planning_timeout()
-
                 if mode.mode == SystemMode.ARMED:
                     mode.check_armed_timeout()
 
@@ -409,9 +491,12 @@ def main(llm_callable: Callable, model_name: str):
                     time.sleep(HEARTBEAT_INTERVAL)
                     continue
 
+                # --------------------------------------------------------
+                # Task start
+                # --------------------------------------------------------
                 _set_task_start(time.time())
-                # FIX-C3: Reset watchdog start time when a new task begins so the
-                # 1-hour wall-clock limit applies per-task, not per-process.
+                # Reset watchdog per-task so the 1-hour wall-clock limit applies
+                # per task, not per process lifetime
                 watchdog.start_time = time.time()
                 replan_count = 0
 
@@ -425,6 +510,7 @@ def main(llm_callable: Callable, model_name: str):
                 if not intent or not intent.strip():
                     raise RuntimeError("Invalid intent")
 
+                # Shut down previous planner's executor to avoid thread leaks
                 if _current_planner is not None:
                     try:
                         _shutdown_executor(_current_planner._executor, wait=False)
@@ -438,6 +524,7 @@ def main(llm_callable: Callable, model_name: str):
                 )
                 _current_planner = planner
 
+                # Health gate before planning
                 for _health_attempt in range(HEALTH_RETRY_MAX):
                     try:
                         mode.begin_planning()
@@ -457,7 +544,7 @@ def main(llm_callable: Callable, model_name: str):
                         mode.update_observer_health(observer.is_healthy())
                         mode.update_vision_status(vision_runtime.is_healthy())
 
-                
+                # Planning (CPU-monitored by watchdog)
                 try:
                     watchdog.pause_cpu()
                     execution_plan = planner.create_plan(
@@ -485,10 +572,7 @@ def main(llm_callable: Callable, model_name: str):
                 mode.execute()
 
                 _task_succeeded = False
-
-                
                 _belief_state_out: list = []
-                
                 _prior_belief_state: Optional[dict] = _crash_recovery_belief_state
                 _crash_recovery_belief_state = None  # consume once
 
@@ -505,8 +589,8 @@ def main(llm_callable: Callable, model_name: str):
                                 world_graph=world_graph,
                                 os_backend=os_backend,
                                 watchdog=watchdog,
-                                prior_belief_state=_prior_belief_state,   # MATH-NEW-03
-                                belief_state_out=_belief_state_out,       # MATH-NEW-03
+                                prior_belief_state=_prior_belief_state,
+                                belief_state_out=_belief_state_out,
                             )
                             _task_succeeded = True
                             break
@@ -515,10 +599,8 @@ def main(llm_callable: Callable, model_name: str):
                             if str(e) != "REPLAN_REQUIRED":
                                 raise
 
-                            # Capture belief state for the next replan attempt.
-                            _prior_belief_state = (
-                                _belief_state_out[0] if _belief_state_out else None
-                            )
+                            # FIX RB-6: Use _safe_belief_snapshot() — never access [0] directly
+                            _prior_belief_state = _safe_belief_snapshot(_belief_state_out) or None
 
                             replan_count += 1
                             if replan_count > MAX_REPLANS:
@@ -538,19 +620,15 @@ def main(llm_callable: Callable, model_name: str):
                                     new_snapshot_id = snapshot_id
 
                                 mode.attach_snapshot(new_snapshot_id)
-
-                                
                                 mode.arm_for_replan(intent)
 
                                 _ingest_latest_perception(observer, world_graph)
                                 planner.update_world_snapshot(world_graph.snapshot())
 
                                 mode.begin_planning()
-
                                 env_fingerprint = collect_environment_fingerprint()
                                 planner.refresh_environment(env_fingerprint)
 
-                                # RB-1 FIX: Pause CPU monitoring during replan LLM call.
                                 try:
                                     watchdog.pause_cpu()
                                     execution_plan = planner.create_plan(
@@ -569,7 +647,6 @@ def main(llm_callable: Callable, model_name: str):
                                 )
                                 mode.mark_planning_complete()
                                 mode.execute()
-
                                 snapshot_id = new_snapshot_id
 
                             finally:
@@ -582,7 +659,7 @@ def main(llm_callable: Callable, model_name: str):
                         try:
                             _restore_exc: list = []
 
-                            def _do_restore():
+                            def _do_restore() -> None:
                                 try:
                                     restore_provider.restore_snapshot(snapshot_id)
                                 except Exception as _e:
@@ -619,6 +696,8 @@ def main(llm_callable: Callable, model_name: str):
                                         f"Post-restore verification failed: {rve}"
                                     )
 
+                            # FIX RB-6: Use _safe_belief_snapshot() — never index directly
+                            _bs = _safe_belief_snapshot(_belief_state_out)
                             auth_state.persist(
                                 execution_mode="OBSERVER",
                                 automation_active=False,
@@ -627,21 +706,16 @@ def main(llm_callable: Callable, model_name: str):
                                 dirty=False,
                                 thompson_state=(
                                     {
-                                        
-                                        "_iteration_counter": _belief_state_out[0].get("_iteration_counter", 0),
-                                        "_sample_counter":    _belief_state_out[0].get("_sample_counter", 0),
-                                        "commitment_chain_hash": _belief_state_out[0].get(
+                                        "_iteration_counter": _bs.get("_iteration_counter", 0),
+                                        "_sample_counter": _bs.get("_sample_counter", 0),
+                                        "commitment_chain_hash": _bs.get(
                                             "commitment_chain_hash",
-                                            _belief_state_out[0].get("commitment_hash", ""),
+                                            _bs.get("commitment_hash", ""),
                                         ),
                                     }
-                                    if _belief_state_out else None
+                                    if _bs else None
                                 ),
-                                # FIX SI-4: Persist full BeliefState for
-                                # crash-recovery bandit continuity.
-                                belief_state_full=(
-                                    _belief_state_out[0] if _belief_state_out else None
-                                ),
+                                belief_state_full=_bs if _bs else None,
                             )
 
                         except Exception as cleanup_err:
@@ -653,6 +727,8 @@ def main(llm_callable: Callable, model_name: str):
                             raise
                     else:
                         try:
+                            # FIX RB-6: Use _safe_belief_snapshot() here too
+                            _bs = _safe_belief_snapshot(_belief_state_out)
                             auth_state.persist(
                                 execution_mode="OBSERVER",
                                 automation_active=False,
@@ -661,24 +737,21 @@ def main(llm_callable: Callable, model_name: str):
                                 dirty=False,
                                 thompson_state=(
                                     {
-                                        # RT-02 FIX (second site): same correction as above.
-                                        "_iteration_counter": _belief_state_out[0].get("_iteration_counter", 0),
-                                        "_sample_counter":    _belief_state_out[0].get("_sample_counter", 0),
-                                        "commitment_chain_hash": _belief_state_out[0].get(
+                                        "_iteration_counter": _bs.get("_iteration_counter", 0),
+                                        "_sample_counter": _bs.get("_sample_counter", 0),
+                                        "commitment_chain_hash": _bs.get(
                                             "commitment_chain_hash",
-                                            _belief_state_out[0].get("commitment_hash", ""),
+                                            _bs.get("commitment_hash", ""),
                                         ),
                                     }
-                                    if _belief_state_out else None
+                                    if _bs else None
                                 ),
-                                # FIX SI-4: Persist full BeliefState.
-                                belief_state_full=(
-                                    _belief_state_out[0] if _belief_state_out else None
-                                ),
+                                belief_state_full=_bs if _bs else None,
                             )
                         except Exception:
                             pass
 
+                    # Environment re-fingerprint after successful task
                     if _task_succeeded:
                         try:
                             env_fingerprint = collect_environment_fingerprint()
@@ -724,29 +797,30 @@ def main(llm_callable: Callable, model_name: str):
             time.sleep(HEARTBEAT_INTERVAL)
 
     finally:
-        # GAP-3: shutdown last active planner executor on exit
+        # Shut down last active planner executor to avoid thread leaks
         if _current_planner is not None:
             try:
                 _shutdown_executor(_current_planner._executor, wait=False)
             except Exception:
                 pass
-        try:
-            intent_listener.stop()
-        except Exception:
-            pass
-        try:
-            observer_loop.stop()
-        except Exception:
-            pass
-        try:
-            vision_runtime.stop()
-        except Exception:
-            pass
 
-        
+        for _cleanup_fn, _cleanup_name in [
+            (intent_listener.stop, "intent_listener"),
+            (observer_loop.stop, "observer_loop"),
+            (vision_runtime.stop, "vision_runtime"),
+        ]:
+            try:
+                _cleanup_fn()
+            except Exception as _e:
+                print(
+                    f"[MAIN] Warning: {_cleanup_name}.stop() raised: {_e}",
+                    file=sys.stderr,
+                )
+
+        # Restore builtins.open — best-effort, non-fatal on shutdown path
         try:
             uninstall_patches()
         except Exception:
-            pass  # Non-fatal — shutdown path must not raise
+            pass
 
         _force_safe_shutdown(os_backend, auth_state, "shutdown")
