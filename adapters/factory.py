@@ -106,6 +106,18 @@ _CLOUD_ACCESS_PERMITTED: bool = _raw_ollama_only not in ("1", "true", "yes")
 del _raw_ollama_only  # remove intermediate from module namespace
 
 
+_ollama_only_env = _os_module.environ.get("OLLAMA_ONLY", "1").strip().lower()
+_ollama_only_set = _ollama_only_env in ("1", "true", "yes")
+if _ollama_only_set and _CLOUD_ACCESS_PERMITTED:
+    
+    raise RuntimeError(
+        "FACTORY_INIT_CONTRADICTION: OLLAMA_ONLY is set but "
+        "_CLOUD_ACCESS_PERMITTED=True — cloud access is forbidden. "
+        "Check for conflicting environment mutations at import time."
+    )
+del _ollama_only_env, _ollama_only_set
+
+
 def _get_model_build_lock(model_name: str) -> threading.Lock:
     
     with _BUILD_LOCKS_LOCK:
