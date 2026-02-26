@@ -1,5 +1,17 @@
 from __future__ import annotations
 
+import os as _os
+
+
+_raw = _os.environ.get("OLLAMA_ONLY", "1").strip().lower()
+if _raw in ("1", "true", "yes"):
+    raise ImportError(
+        "operate.models.apis cannot be imported when OLLAMA_ONLY is set. "
+        "Use QwenOllamaAdapter (adapters/qwen_ollama_adapter.py) for local inference. "
+        "Cloud API wrapper functions are disabled when OLLAMA_ONLY=1."
+    )
+del _raw
+
 
 def _legacy():
     """Lazy import of legacy apis — called at function invocation time only."""
