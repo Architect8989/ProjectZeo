@@ -29,29 +29,7 @@ from policy.engine import PolicyEngine, PolicyViolationError
 
 from config.timeouts import MAX_STAGNANT_ITERS_UI, MAX_STAGNANT_ITERS_COMMAND
 
-# RT-05 FIX: Move pyautogui import to module top-level with availability flag.
-#
-# Root cause: the previous code deferred `import pyautogui` inside the
-# `elif op == "scroll":` branch of _execute_decision().  On headless CI
-# environments or systems without pyautogui installed, the ImportError was
-# caught by the outer `except Exception` handler which returned
-# {"success": False, "reward": -0.5} with no diagnostic.  The operator saw
-# scroll silently failing with a generic failure reward and no indication
-# that the dependency was missing.  The startup validator
-# (_validate_runtime_dependencies in run.py) did not check for pyautogui,
-# so the system would happily start, run for an arbitrary number of steps,
-# and then produce inexplicable -0.5 rewards on every scroll action.
-#
-# Fix (two parts):
-#   1. Import pyautogui here at module load time inside a try/except so that
-#      import failure is detected once at startup, not on every scroll call.
-#   2. Set _PYAUTOGUI_AVAILABLE = True/False based on the import outcome.
-#      The scroll branch now checks this flag and returns a structured error
-#      with a clear "pyautogui_unavailable" reason rather than a silent -0.5.
-#
-# Part 2 of the fix (in run.py's _validate_runtime_dependencies) emits a
-# FATAL startup error if pyautogui is missing and scrolling is needed, so
-# operators see the dependency gap before any task runs.
+
 try:
     import pyautogui as _pyautogui
     _PYAUTOGUI_AVAILABLE: bool = True
@@ -62,27 +40,7 @@ except ImportError:
 MAX_PERCEPTION_ENTITIES = 20
 MAX_PERCEPTION_JSON_BYTES = 10_000
 
-# -----------------------------------------------------------------------
-# P2-2 / RB-1 FIX: Canonical replan signal constant.
-#
-# Root cause (PRODUCTION-DISQUALIFYING):
-#   operate.py raised RuntimeError("TASK_FAILED:stagnation") on stagnation.
-#   main.py's replan handler checked: if str(e) != "REPLAN_REQUIRED": raise
-#   These two strings NEVER matched. Every stagnated task triggered
-#   _force_safe_shutdown() instead of replanning. MAX_REPLANS=3,
-#   begin_replan_sequence(), arm_for_replan(), and all cross-replan belief
-#   continuity were unreachable dead code.
-#
-# Fix: define REPLAN_SIGNAL here as the single source of truth for the
-# signal string. Both the raise site (stagnation abort below) and the
-# caller (main.py) must use this constant — not inline literals — so that
-# any future rename is a one-line change, not a grep-and-pray operation.
-#
-# Recovery classification:
-#   REPLAN_SIGNAL        → recoverable; replan and retry (stagnation)
-#   TASK_FAILED:timeout  → terminal; replan won't help (wall-clock exceeded)
-#   TASK_FAILED:*        → terminal; propagate to outer handler
-# -----------------------------------------------------------------------
+
 REPLAN_SIGNAL: str = "REPLAN_REQUIRED"
 
 # PATCH §1.11: WAIT should pause and retry, not immediately replan
@@ -188,27 +146,7 @@ def operate_main(
 
     reasoning_engine = ReasoningEngine(llm_callable=llm_callable)
 
-    # FIX RB-A3: Per-task UI executor — replaces removed module-level singleton.
-    #
-    # The old code in action_timeout.py used a module-level
-    # `_UI_EXECUTOR = ThreadPoolExecutor(max_workers=1)` shared across ALL tasks.
-    # When task A submitted a blocking UI action (e.g. pyautogui waiting on a
-    # frozen display), the single shared worker was occupied. Task B's action
-    # was enqueued but never picked up until task A unblocked. Task B's 30-second
-    # timeout therefore started counting while the worker was still in task A —
-    # meaning task B's timeout guarantee was completely violated.
-    #
-    # Fix: each call to operate_main() creates its own single-worker executor.
-    # The executor is passed to run_with_timeout() via the `executor=` parameter
-    # (new in the fixed action_timeout.py). After the task completes (any exit
-    # path), the executor is shut down with wait=False. The background thread
-    # (if still running a blocking OS call) drains naturally; we do not block
-    # the main thread waiting for it.
-    #
-    # max_workers=1: UI operations must be sequential — the display event queue
-    # is not thread-safe on most backends (pyautogui, xdotool). A single worker
-    # enforces that only one UI action runs at a time, which is also correct for
-    # any sequentially ordered execution plan.
+    
     _task_ui_executor = concurrent.futures.ThreadPoolExecutor(
         max_workers=1,
         thread_name_prefix="ui_timeout_worker",
@@ -272,24 +210,7 @@ def _execute_autonomous_loop(
         "objective": execution_plan.objective,
     })
 
-    # MATH-NEW-03 FIX: Restore BeliefState from a prior replan when available.
-    #
-    # Root cause: each replan calls operate_main() fresh, constructing a new
-    # BeliefState from scratch. The bandit forgets all action counts, regret
-    # history, Welford statistics, and Thompson counter state from prior
-    # attempts. On a second replan for the same intent, low-reward actions
-    # that were clearly identified as ineffective in the first run are
-    # re-explored from the uninformative uniform prior.
-    #
-    # Fix: when prior_belief_state is provided (a dict from BeliefState.to_dict()
-    # persisted by the caller after the previous operate_main() call), reconstruct
-    # via BeliefState.from_dict(). The reconstructed instance preserves action
-    # counts, reward history, Welford stats, commitment_hash, and Thompson
-    # counters, so the second replan can exploit what was already learned.
-    #
-    # A fresh BeliefState is always used when no prior state is provided (first
-    # run) or when restoration fails (safe fallback — task continues with
-    # degraded cross-replan learning but no crash).
+    
     belief: BeliefState
     if prior_belief_state is not None:
         try:
@@ -472,35 +393,70 @@ def _execute_autonomous_loop(
 
             action_key = action_ranker.action_key(selected_action)
 
+            
+            _focused_app_for_policy = (
+                world_snapshot.get("focused_app", "__unknown_app__")
+                if isinstance(world_snapshot, dict)
+                else "__unknown_app__"
+            )
+            _policy_decision, _policy_reason = policy_engine.validate_action_dict(
+                selected_action,
+                focused_app=_focused_app_for_policy,
+            )
+
+            if _policy_decision == PolicyEngine.DENY:
+                belief.record_action(action_key, -0.5)
+                best_reward = belief.global_best_reward() or 0.0
+                belief.update_regret(action_key, -0.5, best_reward)
+                journal.record({
+                    "event": "policy_deny",
+                    "step": current_step_index,
+                    "action_key": action_key,
+                    "reason": _policy_reason,
+                })
+                stagnant_iterations += 1
+                if stagnant_iterations >= stagnant_limit:
+                    raise RuntimeError(REPLAN_SIGNAL)
+                previous_perception = perception_snapshot
+                continue
+
+            if _policy_decision == PolicyEngine.REQUIRE_HUMAN_CONFIRMATION:
+                # Pause and wait for human to approve (up to MAX_WAIT_RETRIES
+                # slots) before re-evaluating.  If authority clears → proceed.
+                journal.record({
+                    "event": "policy_human_confirmation_required",
+                    "step": current_step_index,
+                    "action_key": action_key,
+                    "reason": _policy_reason,
+                })
+                _phc_wait = 0
+                _phc_approved = False
+                while _phc_wait < MAX_WAIT_RETRIES:
+                    time.sleep(WAIT_RETRY_SECONDS)
+                    _phc_wait += 1
+                    _re_policy, _ = policy_engine.validate_action_dict(
+                        selected_action,
+                        focused_app=_focused_app_for_policy,
+                    )
+                    if _re_policy == PolicyEngine.ALLOW:
+                        _phc_approved = True
+                        break
+                if not _phc_approved:
+                    # Still blocked — treat as stagnation.
+                    belief.record_action(action_key, -0.3)
+                    best_reward = belief.global_best_reward() or 0.0
+                    belief.update_regret(action_key, -0.3, best_reward)
+                    stagnant_iterations += 1
+                    if stagnant_iterations >= stagnant_limit:
+                        raise RuntimeError(REPLAN_SIGNAL)
+                    previous_perception = perception_snapshot
+                    continue
+
             is_high_risk = selected_action.get("operation") in {
                 "command", "install", "file_create"
             }
 
-            # FIX RB-A4: Compute soc_confident using the risk-aware formula
-            # BEFORE the authority gate, then pass it into the gate.
-            #
-            # Previous code:
-            #   _soc_initial = belief.environment_stability > 0.7
-            #   authority = input_arbitrator.evaluate(..., soc_confident=_soc_initial)
-            #   ...
-            #   # AFTER the gate (lines 490-492) — never connected to anything:
-            #   if is_high_risk:
-            #       soc_confident = belief.consecutive_high_stability_count >= 3
-            #   else:
-            #       soc_confident = belief.environment_stability > 0.7
-            #
-            # Root cause: the correct risk-aware `soc_confident` was computed at
-            # lines 490–492 but was NEVER used — neither passed to
-            # input_arbitrator.evaluate() nor to any other consumer. The authority
-            # gate always received the low-risk formula (_soc_initial) regardless
-            # of whether the operation was high-risk. High-risk operations (command,
-            # install, file_create) that should require `consecutive_high_stability_count
-            # >= 3` were instead approved on the weaker `environment_stability > 0.7`
-            # threshold — allowing them to execute when the environment was only
-            # momentarily stable.
-            #
-            # Fix: compute the correct risk-aware soc_confident value once, here,
-            # before the evaluate() call, and pass it directly.
+            
             if is_high_risk:
                 # High-risk operations require sustained stability: at least 3
                 # consecutive observations with high stability score.
@@ -550,14 +506,7 @@ def _execute_autonomous_loop(
             if authority == AuthorityDecision.ABORT:
                 raise AuthorityAbortError("Human authority abort — task terminated")
 
-            # -------------------------------------------------------
-            # ACTION EXECUTION
-            # -------------------------------------------------------
-            # P0-B FIX (RT-02): Initialise exec_result before the try block so
-            # the variable is always bound.  In the except path action_success is
-            # False and the "output" in {} check short-circuits safely — but any
-            # future refactor that sets action_success=True inside the except
-            # block would hit NameError without this initialisation.
+            
             exec_result: dict = {}
             try:
                 exec_result = _execute_decision(
@@ -591,17 +540,7 @@ def _execute_autonomous_loop(
                     "output": output_text[:MAX_COMMAND_OUTPUT_BYTES]
                 }
 
-            # -------------------------------------------------------
-            # REWARD & REGRET UPDATE
-            # -------------------------------------------------------
-            # P0-F FIX (SI-04/MATH-06): Sample best_reward AFTER record_action()
-            # so the current action's reward is included before comparing.
-            # Previously best_reward was sampled BEFORE record_action(), causing
-            # the bandit to accumulate false regret on the single best action:
-            # when an action achieved a new global best (e.g. first 'done'
-            # returning 1.0), regret was computed as old_best − 1.0 > 0 (wrong;
-            # should be 0.0 for a record-breaker).  This over-penalised the best
-            # action and drove re-exploration of inferior alternatives.
+            
             belief.record_action(action_key, raw_reward)
             best_reward = belief.global_best_reward() or 0.0
             belief.update_regret(action_key, raw_reward, best_reward)
@@ -645,32 +584,7 @@ def _execute_autonomous_loop(
             # STAGNATION GUARD
             # -------------------------------------------------------
             if stagnant_iterations >= stagnant_limit:
-                # H-9 FIX: Emit a structured telemetry event BEFORE raising
-                # so that post-hoc analysis can determine replan frequency,
-                # belief entropy at the trigger point, and which step stalled.
-                #
-                # Fields:
-                #   stagnant_iterations  — how many failed/unverified iterations
-                #   stagnant_limit       — threshold that was reached
-                #   step                 — plan step index that stalled
-                #   belief_entropy       — Shannon entropy of belief distribution
-                #                         at the trigger moment (nats); high
-                #                         entropy → plan is genuinely ambiguous,
-                #                         not just slow.
-                #   iteration            — total loop iterations so far
-                #   replan_signal        — the signal being raised; makes the
-                #                         JSONL log grep-able without parsing
-                #
-                # RB-1 / SI-1 FIX: Previously raised RuntimeError("TASK_FAILED:stagnation").
-                # main.py's replan handler checked str(e) == "REPLAN_REQUIRED" which
-                # NEVER matched, so every stagnated task shut down instead of replanning.
-                # MAX_REPLANS=3, begin_replan_sequence(), arm_for_replan(), and all
-                # cross-replan belief continuity were permanently unreachable dead code.
-                #
-                # Fix: raise RuntimeError(REPLAN_SIGNAL) — uses the canonical constant
-                # so the signal string is defined in exactly one place and main.py's
-                # check `str(e) != "REPLAN_REQUIRED"` correctly branches to the replan
-                # sequence instead of propagating to _force_safe_shutdown().
+                
                 _entropy = belief.entropy() if hasattr(belief, "entropy") else 0.0
                 journal.record({
                     "event": "replan_trigger",
@@ -701,19 +615,6 @@ def _execute_autonomous_loop(
                 pass
 
 
-# =============================================================================
-# ACTION DISPATCH — P0 FIX: _execute_decision() was entirely absent.
-#
-# The loop in _execute_autonomous_loop() called action_ranker.select() to
-# pick an action and computed authority / soc_confident correctly, but then
-# had no mechanism to actually dispatch the selected action to the OS backend.
-# Every iteration was a no-op: no clicks, no keystrokes, no commands were
-# ever sent. This is the function that bridges the cognition layer to the OS.
-#
-# Returns a dict with at minimum:
-#   {"success": bool, "reward": float}
-# Optionally includes "output" (str) for command steps.
-# =============================================================================
 
 def _execute_decision(
     *,
@@ -768,19 +669,7 @@ def _execute_decision(
                     executor=task_ui_executor,
                 )
             else:
-                # Label/text click: x/y coordinates are required.
-                # FIX-2 (HIGH): The previous implementation silently fell back
-                # to clicking screen centre (0.5, 0.5) when a label was present
-                # but OCR/coordinate resolution had failed.  That behaviour:
-                #   - Clicked the wrong target on every non-centre UI element
-                #   - Returned success=True / reward=0.8 despite doing nothing useful
-                #   - Caused stagnation loops because the task never progressed
-                #
-                # Fix: return failure immediately so the planner is forced to
-                # replan and either acquire real coordinates or choose a different
-                # action.  The reward of -0.5 is identical to other hard failures
-                # (missing content, missing keys) and feeds correctly into the
-                # Welford normaliser and Thompson sampler.
+                
                 label = action.get("label") or action.get("text") or ""
                 if label:
                     return {
@@ -859,7 +748,16 @@ def _execute_decision(
             success = (result.returncode == 0)
             reward = 0.8 if success else -0.5
             output = (result.stdout or "") + (result.stderr or "")
-            return {"success": success, "reward": reward, "output": output}
+            # RT-B1 FIX: Include "returncode" so StepVerifier._verify_command()
+            # can extract it from the dict.  Previously the dict lacked this key,
+            # causing hasattr(result, "returncode") to be False, making every
+            # COMMAND_EXECUTION step fail verification unconditionally.
+            return {
+                "success": success,
+                "reward": reward,
+                "output": output,
+                "returncode": result.returncode,
+            }
 
         elif op == "file_create":
             path = str(action.get("path") or "").strip()
