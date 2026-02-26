@@ -113,7 +113,21 @@ if _ollama_only_set and _CLOUD_ACCESS_PERMITTED:
         "Check for conflicting environment mutations at import time."
     )
 
-# Remove all temporaries — keep only _CLOUD_ACCESS_PERMITTED in module scope
+# H-1 FIX: Preserve the startup OLLAMA_ONLY intent as an immutable sentinel.
+#
+# _OLLAMA_ONLY_FROZEN records whether OLLAMA_ONLY was asserted at process
+# startup (module import time).  reconfigure_cloud_access(allow=True) checks
+# this sentinel and raises RuntimeError if it is True, preventing any
+# runtime bypass of the process-startup enforcement.
+#
+# This is a defence-in-depth measure.  The primary freeze is the module-level
+# _CLOUD_ACCESS_PERMITTED = False assignment above.  The secondary defence is
+# that _CLOUD_ACCESS_PERMITTED can be mutated by reconfigure_cloud_access(),
+# but only if OLLAMA_ONLY was NOT set at startup.
+_OLLAMA_ONLY_FROZEN: bool = _ollama_only_set
+
+# Remove all temporaries — keep only _CLOUD_ACCESS_PERMITTED and
+# _OLLAMA_ONLY_FROZEN in module scope
 del _raw_ollama_only, _ollama_only_set
 
 
@@ -201,8 +215,44 @@ def _is_cloud_allowed() -> bool:
 
 
 def reconfigure_cloud_access(allow: bool) -> bool:
-    
+    """Reconfigure cloud access at runtime.
+
+    H-1 FIX: If ``OLLAMA_ONLY`` was set at process startup (i.e.
+    ``_OLLAMA_ONLY_FROZEN`` is True) then cloud access can never be
+    re-enabled via this function.  Attempting ``allow=True`` raises
+    ``RuntimeError`` to make the bypass attempt explicit and visible
+    rather than silently mutating a flag the operator set in the
+    environment.
+
+    Parameters
+    ----------
+    allow : bool
+        True to enable cloud model routing; False to disable it.
+
+    Returns
+    -------
+    bool
+        The previous value of ``_CLOUD_ACCESS_PERMITTED``.
+
+    Raises
+    ------
+    RuntimeError
+        If ``allow=True`` and ``OLLAMA_ONLY`` was set at process startup.
+    """
     global _CLOUD_ACCESS_PERMITTED
+
+    # H-1 FIX: Guard against runtime bypass of the startup OLLAMA_ONLY flag.
+    # If _OLLAMA_ONLY_FROZEN is True the operator explicitly set OLLAMA_ONLY
+    # in the environment; we must honour that intent and refuse to re-enable
+    # cloud access programmatically.
+    if allow and _OLLAMA_ONLY_FROZEN:
+        raise RuntimeError(
+            "reconfigure_cloud_access(allow=True) refused: "
+            "OLLAMA_ONLY was set at process startup and its enforcement "
+            "is frozen for the lifetime of this process. "
+            "To enable cloud access, restart the process with OLLAMA_ONLY=0 "
+            "(or unset) in the environment BEFORE importing adapters.factory."
+        )
 
     with _ADAPTER_CACHE_LOCK:
         previous = _CLOUD_ACCESS_PERMITTED
