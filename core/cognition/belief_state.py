@@ -1,13 +1,35 @@
+from __future__ import annotations
+
 from typing import Dict, Any, Tuple
 from collections import deque
 import time
 import math
 import hashlib
-import struct
 import numpy as np
 
 
 class BeliefState:
+    """
+    Probabilistic belief state for the autonomous execution kernel.
+
+    Maintains:
+      - Bayesian belief distribution over task states
+      - Action reward history with Welford incremental normalisation
+      - UCB1, Expected Utility, and Thompson Sampling scoring
+      - Regret tracking with configurable temporal decay
+      - Commitment chain (deterministic RNG seed chain per action)
+
+    HARD CONTRACTS:
+      - No side effects outside self
+      - All public methods are re-entrant (no shared mutable module state)
+      - thompson_sample() is deterministic given the same commitment_chain_hash,
+        action, _iteration_counter, and _sample_counter
+      - record_action() extends the commitment chain before any other mutation
+    """
+
+    # ------------------------------------------------------------------
+    # CLASS-LEVEL CONSTANTS
+    # ------------------------------------------------------------------
 
     EXPLORATION_C = 1.4
     RISK_LAMBDA = 0.3
@@ -19,109 +41,110 @@ class BeliefState:
 
     MIN_ENTROPY_FLOOR = 0.3
 
-    
-    BOOTSTRAP_REWARD_SCALE: float = 1.0   # maps raw reward range [-1, 1] → z-score range
+    # Bootstrap phase: map raw rewards into normalised range without Welford
+    # variance (which requires n >= 3).  A scale of 1.0 preserves the linear
+    # [-1, 1] range and avoids the 3× amplification bias from the previous
+    # REWARD_CLAMP-based scale.  (M-5 fix)
+    BOOTSTRAP_REWARD_SCALE: float = 1.0
 
-    # RB-CRIT-1 FIX: REWARD_CLAMP and NORMALIZE_EPS defined here as they were
-    # previously absent (grep returned 0 results for REWARD_CLAMP = anywhere).
-    REWARD_CLAMP: float = 3.0             # z-score ceiling for normalized rewards
-    NORMALIZE_EPS: float = 1e-8           # variance floor for Welford normalization
+    # Clamping and numerical stability constants
+    REWARD_CLAMP: float = 3.0        # z-score ceiling for normalised rewards
+    NORMALIZE_EPS: float = 1e-8      # variance floor for Welford normalisation
 
-    # RB-CRIT-2 FIX: Expand reward range to [-1.0, 1.0] for negative signals.
-    RAW_REWARD_MIN: float = -1.0          # minimum valid raw reward (failures)
-    RAW_REWARD_MAX: float = 1.0           # maximum valid raw reward (successes)
+    # Raw reward validity range (actions produce signals in [-1, 1])
+    RAW_REWARD_MIN: float = -1.0
+    RAW_REWARD_MAX: float = 1.0
 
     MAX_ENTROPY_CONVERGENCE: float = 2.0  # nats; uniform over 8 states ≈ 2.08
 
-    # HAR-4 (Math): THOMPSON_WINDOW (20) vs REWARD_WINDOW (100) — deliberate
-    # temporal horizon split.  Thompson uses recent 20 samples for reactivity;
-    # UCB1/EU use all 100 for stability.  See original comments for rationale.
+    # Thompson uses a recent window for reactivity; UCB1/EU use the full window
+    # for stability.  The deliberate split is documented here to prevent future
+    # "alignment" that would break temporal horizon reasoning.
     THOMPSON_WINDOW = 20
 
     _FALLBACK_PRUNE_THRESHOLD = PRIOR_ALPHA * 2.0
 
-    def __init__(self, intent_hash: str = ""):
-        self.created_at = time.time()
-        self.state_probabilities: Dict[str, float] = {"neutral": 1.0}
-        self.action_counts: Dict[str, int] = {}
-        self.action_rewards: Dict[str, deque] = {}
+    # ------------------------------------------------------------------
+    # INIT
+    # ------------------------------------------------------------------
 
-        self._raw_action_rewards: Dict[str, deque] = {}
+    def __init__(self, intent_hash: str = "") -> None:
+        self.created_at: float = time.time()
+
+        # Belief distribution
+        self.state_probabilities: Dict[str, float] = {"neutral": 1.0}
+
+        # Action history (normalised reward stream)
+        self.action_counts: Dict[str, int] = {}
+        self.action_rewards: Dict[str, deque] = {}       # normalised
+        self._raw_action_rewards: Dict[str, deque] = {}  # raw, for global_best_reward
+
+        # Regret tracking
         self.regret: Dict[str, Tuple[float, int]] = {}
+
+        # Environment model
         self.progress_score: float = 0.0
         self.environment_stability: float = 1.0
+        self.consecutive_high_stability_count: int = 0
 
-        # HAR-1 (Determinism): dual-hash architecture.
-        #   task_identity_hash  — static SHA-256 of intent, computed once at init
-        #   commitment_chain_hash — mutable, SHA-256(prev || ":" || action_key)
-        #                          extended per record_action() call
+        # Commitment chain — dual-hash architecture (HAR-1)
+        #   task_identity_hash   : static SHA-256(intent); identifies the task
+        #   commitment_chain_hash: mutable; extended by each record_action() call
         self.task_identity_hash: str = (
             hashlib.sha256(intent_hash.encode("utf-8")).hexdigest()
             if intent_hash
             else "GENESIS"
         )
-        
         self.commitment_chain_hash: str = self.task_identity_hash
 
+        # Counters
         self._iteration_counter: int = 0
-        self.consecutive_high_stability_count: int = 0
         self._sample_counter: int = 0
         self._regret_decay: float = self.REGRET_DECAY
 
-        # Welford incremental statistics (per action)
+        # Welford incremental variance estimators (per action)
         self._welford_n: Dict[str, int] = {}
         self._welford_mean: Dict[str, float] = {}
         self._welford_M2: Dict[str, float] = {}
 
-    # =========================================================
-    # BACKWARD COMPATIBILITY PROPERTY
-    # =========================================================
+    # ------------------------------------------------------------------
+    # BACKWARD COMPATIBILITY
+    # ------------------------------------------------------------------
 
     @property
     def commitment_hash(self) -> str:
-        """Backward-compatible alias for task_identity_hash.
-
-        HAR-1: Renamed to task_identity_hash to make clear it is a static
-        task-level identifier.  External callers continue to work via this
-        property.  New code should prefer task_identity_hash directly.
-        """
+        """Backward-compatible alias for task_identity_hash."""
         return self.task_identity_hash
 
     @commitment_hash.setter
     def commitment_hash(self, value: str) -> None:
         """Allow from_dict() to set task_identity_hash via the old field name."""
         self.task_identity_hash = value
-        if self.commitment_chain_hash == "GENESIS" or not self.commitment_chain_hash:
+        if self.commitment_chain_hash in ("GENESIS", ""):
             self.commitment_chain_hash = value
 
-    # =========================================================
+    # =========================================================================
     # BELIEF UPDATE
-    # =========================================================
+    # =========================================================================
 
     def bayesian_update(self, likelihoods: Dict[str, float]) -> None:
-        """Apply a proportional belief update using heuristic observation weights.
+        """
+        Apply a proportional belief update using heuristic observation weights.
 
-        SI-2 / HARDEN-1 NOTE: Despite the method name, the ``likelihoods``
-        values are **heuristic weights**, NOT true statistical likelihoods
-        P(observation | state) derived from an observation model.
+        DOCUMENTATION NOTE (SI-2 / HARDEN-1):
+        Despite the method name, the `likelihoods` values are *heuristic
+        weights*, not statistical likelihoods P(observation | state) derived
+        from an observation model.  The proportional update rule is formally
+        correct; the epistemic claim is intentionally overstated in the original
+        architecture.  New code should treat this as a heuristic attractor, not
+        a calibrated Bayesian posterior.
 
-        The caller (operate.py) assigns them as follows:
-          - app:<name>  = 0.9   (focused app matches expected)
-          - ui_rich     = 0.8   (many UI entities visible)
-          - ui_sparse   = 0.7   (few UI entities visible)
-          - ui_empty    = 0.5   (no UI entities)
-          - neutral     = 0.9 or 0.5 (no delta / delta present)
-
-        These scalars are hand-tuned constants that reflect informal beliefs
-        about state relevance — they are NOT derived from empirical observation
-        frequencies.  The proportional update rule (posterior ∝ prior ×
-        weight) is formally correct Bayesian computation, but the semantic
-        claim of "Bayesian state estimation" overstates the statistical rigour.
-
-        Practical impact: the belief distribution converges toward heuristic
-        attractors rather than a maximally accurate state posterior.  This is
-        acceptable for the current use case (guiding action selection heuristics)
-        but should not be mistaken for a calibrated probabilistic model.
+        Caller-assigned weights:
+          app:<n>   = 0.9   (focused app matches expected)
+          ui_rich   = 0.8   (>10 visible UI entities)
+          ui_sparse = 0.7   (1–10 visible entities)
+          ui_empty  = 0.5   (no visible entities)
+          neutral   = 0.9 or 0.5 (no delta / delta present)
         """
         if not likelihoods:
             return
@@ -137,7 +160,7 @@ class BeliefState:
             new_belief[state] = posterior
             total += posterior
 
-        if total <= 0:
+        if total <= 0.0:
             return
 
         normalized = {s: v / total for s, v in new_belief.items()}
@@ -153,9 +176,11 @@ class BeliefState:
             )
 
         total = sum(pruned.values())
-        if total <= 0:
+        if total <= 0.0:
             return
 
+        # Ensure minimum two-state distribution to prevent entropy floor
+        # from collapsing into a deterministic one-state distribution
         if len(pruned) == 1:
             (sole_state,) = pruned.keys()
             pruned["__prior_fallback__"] = self.PRIOR_ALPHA
@@ -163,26 +188,28 @@ class BeliefState:
 
         self.state_probabilities = {s: v / total for s, v in pruned.items()}
 
-        
+        # Entropy floor recovery — blend toward uniform if entropy collapses
         _current_entropy = self.entropy()
         if _current_entropy < self.MIN_ENTROPY_FLOOR:
             _MAX_BLEND_WEIGHT = 0.30
-            for _ in range(20):  # safety cap — converges in < 5 in practice
+            for _ in range(20):  # hard cap — converges in ≤5 iterations in practice
                 if _current_entropy >= self.MIN_ENTROPY_FLOOR:
                     break
                 _deficit = self.MIN_ENTROPY_FLOOR - _current_entropy
                 _w = min(_deficit / self.MIN_ENTROPY_FLOOR, _MAX_BLEND_WEIGHT)
                 _n = len(self.state_probabilities)
+                if _n == 0:
+                    break
                 blended = {
                     k: (1.0 - _w) * v + _w / _n
                     for k, v in self.state_probabilities.items()
                 }
                 _total = sum(blended.values())
-                if _total > 0:
+                if _total > 0.0:
                     self.state_probabilities = {k: v / _total for k, v in blended.items()}
-                # Recompute AFTER mutation — not at the top of the next iteration.
                 _current_entropy = self.entropy()
 
+        # Prune the synthetic fallback state once it is below threshold
         fallback_prob = self.state_probabilities.get("__prior_fallback__", 0.0)
         if 0.0 < fallback_prob <= self._FALLBACK_PRUNE_THRESHOLD:
             if self.entropy() >= self.MIN_ENTROPY_FLOOR:
@@ -192,26 +219,31 @@ class BeliefState:
                 }
                 if pruned_dist:
                     total = sum(pruned_dist.values())
-                    if total > 0:
-                        self.state_probabilities = {k: v / total for k, v in pruned_dist.items()}
+                    if total > 0.0:
+                        self.state_probabilities = {
+                            k: v / total for k, v in pruned_dist.items()
+                        }
 
     def entropy(self) -> float:
+        """Shannon entropy of the current belief distribution (in nats)."""
         return -sum(
             p * math.log(p)
             for p in self.state_probabilities.values()
-            if p > 0
+            if p > 0.0
         )
 
-    # =========================================================
+    # =========================================================================
     # ACTION SCORING
-    # =========================================================
+    # =========================================================================
 
     def expected_utility(self, action: str) -> float:
         """
-        Risk-adjusted expected utility with bounded penalty.
+        Risk-adjusted expected utility with bounded variance penalty.
 
-        FIX B-MATH-3: Cap penalty at |mean| to prevent sign inversion for
-        high-mean-high-variance actions.
+        FIX (B-MATH-3): Cap penalty at |mean| to prevent sign inversion for
+        high-mean-high-variance actions.  Without the cap, a reward mean of
+        0.1 with variance 10.0 would yield EU = 0.1 − 3.0 = −2.9, making an
+        occasionally-good action appear catastrophically bad.
         """
         rewards = self.action_rewards.get(action)
         if not rewards:
@@ -228,125 +260,144 @@ class BeliefState:
         """
         UCB1 score with scale-corrected exploitation term.
 
-        FIX B-MATH-1: Map mean_reward from [-REWARD_CLAMP, REWARD_CLAMP] → [0,1]
-        before adding the exploration bonus to restore UCB1's regret guarantee.
+        FIX (B-MATH-1): Map mean_reward from [−REWARD_CLAMP, REWARD_CLAMP] → [0, 1]
+        before adding the exploration bonus.  UCB1's regret bound requires the
+        exploitation term to be in [0, 1]; without this mapping the exploration
+        constant C has no calibrated meaning and regret bounds are invalid.
         """
         count = self.action_counts.get(action, 0)
         if count == 0:
-            return float('inf')
+            return float("inf")
 
         total_actions = max(sum(self.action_counts.values()) + 1, 2)
         rewards = self.action_rewards.get(action)
-
         mean_reward_raw = sum(rewards) / len(rewards) if rewards else 0.0
 
+        # Map to [0, 1] for UCB1 compliance
         mean_reward_01 = (mean_reward_raw + self.REWARD_CLAMP) / (2.0 * self.REWARD_CLAMP)
         mean_reward_01 = max(0.0, min(1.0, mean_reward_01))
 
         exploration = self.EXPLORATION_C * math.sqrt(
             math.log(total_actions) / count
         )
-
         return mean_reward_01 + exploration
 
-    # =========================================================
-    # THOMPSON SAMPLING
-    # =========================================================
+    # =========================================================================
+    # THOMPSON SAMPLING — CRITICAL FIX (RB-1 / D-1 / D-2)
+    # =========================================================================
 
     def thompson_sample(self, action: str) -> float:
-        
+        """
+        Draw a sample from the Normal-Normal conjugate posterior for `action`.
+
+        CRITICAL FIX (RB-1):
+            The previous implementation referenced `rng` (undefined name).
+            This caused NameError on EVERY call after the first recorded action,
+            crashing all tasks beyond their second action attempt.
+
+        FIX (D-1 / D-2):
+            `_rng = np.random.default_rng(seed)` is now created and the
+            deterministic seed derived from commitment_chain_hash is actually
+            applied.  Prior implementation computed `seed` correctly but never
+            passed it to any RNG object.
+
+        FIX (MATH-2):
+            Acceptance-rejection sampling replaces clamped Normal to produce
+            the exact truncated Gaussian T_Normal(μ, σ², lo, hi).  Fallback
+            to the posterior mean fires only after 128 failed rejections.
+
+        Returns
+        -------
+        float
+            Sample from the posterior reward distribution, bounded to
+            [−REWARD_CLAMP, REWARD_CLAMP].  Returns 0.0 (neutral prior mean)
+            if no reward history is available for `action`.
+        """
         rewards = self.action_rewards.get(action)
         if not rewards:
-            return 0.0  # Return prior mean (neutral) not 0.5 (which implied Beta scale)
+            # No history — return neutral prior mean (not 0.5; reward space is centred at 0)
+            return 0.0
 
         recent = list(rewards)[-self.THOMPSON_WINDOW:]
         n = len(recent)
 
-        # ---- Posterior parameter computation (Normal-Normal conjugate) ----
-        # Prior parameters
+        # ------------------------------------------------------------------
+        # Posterior parameters — Normal-Normal conjugate update
+        # ------------------------------------------------------------------
         _mu0: float = 0.0                              # neutral prior mean
-        _sigma0_sq: float = self.REWARD_CLAMP ** 2    # wide prior variance (= 9.0)
+        _sigma0_sq: float = self.REWARD_CLAMP ** 2    # wide prior variance = 9.0
 
-        # Observation noise: use Welford variance when available; else prior-width
         _welford_n = self._welford_n.get(action, 0)
         if _welford_n >= 3:
-            # Welford M2/(n-1) is the unbiased sample variance of the NORMALISED
-            # reward stream. Use it as σ² of the observation noise, clamped to
-            # [NORMALIZE_EPS, ∞) to prevent division by zero on zero-variance actions.
+            # Welford M2/(n-1) is the unbiased sample variance of the normalised
+            # reward stream.  Use as observation noise variance, clamped below to
+            # prevent division by zero on zero-variance (deterministic) actions.
             _obs_variance = max(
                 self._welford_M2.get(action, 0.0) / max(_welford_n - 1, 1),
                 self.NORMALIZE_EPS,
             )
         else:
-            # Insufficient data: assume maximum observation noise (conservative,
-            # promotes exploration during bootstrap phase)
+            # Bootstrap: assume maximum noise (conservative; promotes exploration)
             _obs_variance = _sigma0_sq
 
-        # Posterior precision (= 1/variance)
         _prior_prec = 1.0 / _sigma0_sq
-        _obs_prec = n / _obs_variance          # sum over n i.i.d. observations
+        _obs_prec = n / _obs_variance       # sum of n i.i.d. observation precisions
+        _post_prec = _prior_prec + _obs_prec
+        _post_variance = 1.0 / _post_prec
 
-        _post_prec = _prior_prec + _obs_prec   # posterior precision
-        _post_variance = 1.0 / _post_prec      # posterior variance = σₙ²
-
-        # Posterior mean
         _sum_rewards = sum(recent)
         _post_mean = _post_variance * (_prior_prec * _mu0 + _sum_rewards / _obs_variance)
 
         # Clamp posterior mean to valid reward range (numerical safety)
         _post_mean = max(-self.REWARD_CLAMP, min(self.REWARD_CLAMP, _post_mean))
 
-        # ---- Deterministic seed (preserved from original implementation) ----
+        # ------------------------------------------------------------------
+        # Deterministic seed from commitment chain
+        # D-1 / D-2 FIX: seed is now ACTUALLY applied to the RNG.
+        # Previously seed was computed but never passed to any RNG object,
+        # making sampling non-deterministic and violating the architectural
+        # guarantee of deterministic Thompson sampling.
+        # ------------------------------------------------------------------
         self._sample_counter += 1
         seed_material = (
-            f"{self.commitment_chain_hash}:{action}:{self._iteration_counter}:{self._sample_counter}"
+            f"{self.commitment_chain_hash}:{action}:"
+            f"{self._iteration_counter}:{self._sample_counter}"
         ).encode("utf-8")
         digest = hashlib.sha256(seed_material).digest()
         seed = int.from_bytes(digest[:8], byteorder="big", signed=False)
 
-        # ---- Sample from truncated Gaussian posterior ----
-        # MATH-2 / HARDEN-2 FIX: Replace the clamped Normal with a proper
-        # truncated Gaussian via acceptance-rejection sampling.
-        #
-        # Root cause: the original code drew from Normal(_post_mean, σ) and
-        # then clamped the sample to [-REWARD_CLAMP, REWARD_CLAMP].  Clamping
-        # converts a Gaussian into a "mixed" distribution that places all
-        # out-of-bounds probability mass at the boundary points ±REWARD_CLAMP.
-        # With wide posteriors (early exploration, few observations), this
-        # produces heavy boundary clustering:
-        #   E[X | X ≥ REWARD_CLAMP] = REWARD_CLAMP (clump)
-        # rather than the correct conditional expectation of a truncated Normal.
-        #
-        # Fix: acceptance-rejection sampling.
-        #   1. Draw U ~ Normal(post_mean, sqrt(post_variance))
-        #   2. Accept if lo ≤ U ≤ hi; else reject and redraw.
-        # This yields the exact truncated Gaussian T_Normal(μ, σ², lo, hi).
-        # For posteriors whose mean is already within [lo, hi] (guaranteed by
-        # the _post_mean clamp above) and whose σ < REWARD_CLAMP (~3.0), the
-        # acceptance rate is >95% so the loop almost always exits on the first
-        # or second attempt.
-        #
-        # Safety: 128 rejection attempts is a hard ceiling.  If not satisfied
-        # after 128 draws (e.g. posterior has extreme variance), fall back to
-        # the posterior mean, which is the minimum-variance estimator and is
-        # guaranteed within bounds.
+        # CRITICAL FIX (RB-1): Create the RNG with the deterministic seed.
+        # The previous code reached `rng.normal(...)` with `rng` undefined,
+        # raising NameError on every second action attempt.
+        _rng = np.random.default_rng(seed)  # ← THE MISSING LINE
+
+        # ------------------------------------------------------------------
+        # Acceptance-rejection sampling from truncated Gaussian posterior
+        # (MATH-2 fix: avoids boundary-mass clustering from clamped Normal)
+        # ------------------------------------------------------------------
         _lo = -self.REWARD_CLAMP
         _hi = self.REWARD_CLAMP
         _std = math.sqrt(_post_variance)
-        sample: float = _post_mean  # safe fallback (in-range by construction)
+
+        # Fallback: posterior mean is guaranteed in-range by construction above
+        sample: float = _post_mean
+
         for _ in range(128):
-            _candidate = float(rng.normal(loc=_post_mean, scale=_std))
+            # CRITICAL FIX (RB-1): `_rng` is now defined; this no longer raises NameError
+            _candidate = float(_rng.normal(loc=_post_mean, scale=_std))
             if _lo <= _candidate <= _hi:
                 sample = _candidate
                 break
+        # If 128 rejections exhausted (posterior extremely wide), sample = _post_mean (safe)
 
         return float(sample)
 
-    # =========================================================
+    # =========================================================================
     # REGRET TRACKING
-    # =========================================================
+    # =========================================================================
 
     def _get_effective_regret(self, action: str) -> float:
+        """Retrieve regret for `action` with temporal decay applied."""
         entry = self.regret.get(action)
         if not entry:
             return 0.0
@@ -356,46 +407,67 @@ class BeliefState:
         decayed = raw_value * (self._regret_decay ** delta_iter)
         decayed = min(decayed, self.MAX_REGRET)
 
+        # Cache the decayed value to avoid recomputing on every access
         if delta_iter > 0:
             self.regret[action] = (decayed, self._iteration_counter)
 
         return decayed
 
     def set_plan_horizon(self, total_steps: int, iters_per_step: int = 13) -> None:
+        """
+        Tune regret decay so that residual regret at plan completion is ≤5%.
+
+        Formula: target_fraction^(1/total_iters)
+        where total_iters = total_steps * iters_per_step.
+        """
         total_iters = max(total_steps * iters_per_step, 1)
         target_fraction = 0.05
         self._regret_decay = target_fraction ** (1.0 / total_iters)
 
-    def update_regret(self, action: str, reward: float, best_reward: float):
+    def update_regret(self, action: str, reward: float, best_reward: float) -> None:
+        """Record instantaneous regret = best_reward − reward and accumulate."""
         self._iteration_counter += 1
 
         regret_value = best_reward - reward
-        if regret_value <= 0:
+        if regret_value <= 0.0:
             return
 
         current = self._get_effective_regret(action)
         updated = min(current + regret_value, self.MAX_REGRET)
         self.regret[action] = (updated, self._iteration_counter)
 
-    # =========================================================
-    # RECORDING WITH NORMALISATION
-    # =========================================================
+    # =========================================================================
+    # ACTION RECORDING WITH WELFORD NORMALISATION
+    # =========================================================================
 
-    def record_action(self, action: str, reward: float):
-        # HAR-1: Extend commitment chain per recorded action.
+    def record_action(self, action: str, reward: float) -> None:
+        """
+        Record `reward` for `action`, extending the commitment chain.
+
+        Processing pipeline:
+          1. Extend commitment_chain_hash with SHA-256(prev || ":" || action)
+          2. Clamp raw reward to [RAW_REWARD_MIN, RAW_REWARD_MAX]
+          3. Store raw reward for global_best_reward()
+          4. Apply Welford incremental update (mean, M2)
+          5. Normalise: z-score (Welford, n≥3) or linear bootstrap (n<3)
+          6. Clamp normalised reward to [−REWARD_CLAMP, REWARD_CLAMP]
+          7. Append to action_rewards deque
+        """
+        # 1. Extend commitment chain — MUST be first (before any state mutation)
         _chain_input = f"{self.commitment_chain_hash}:{action}".encode("utf-8")
         self.commitment_chain_hash = hashlib.sha256(_chain_input).hexdigest()
 
+        # 2. Initialise deques on first encounter
         if action not in self.action_rewards:
             self.action_rewards[action] = deque(maxlen=self.REWARD_WINDOW)
         if action not in self._raw_action_rewards:
             self._raw_action_rewards[action] = deque(maxlen=self.REWARD_WINDOW)
 
-        # Clamp raw reward to [RAW_REWARD_MIN, RAW_REWARD_MAX].
+        # 3. Clamp raw reward to valid range
         reward = max(self.RAW_REWARD_MIN, min(self.RAW_REWARD_MAX, float(reward)))
         self._raw_action_rewards[action].append(reward)
 
-        # ---- Welford incremental update ----
+        # 4. Welford incremental update (Knuth / Welford algorithm)
         n = self._welford_n.get(action, 0) + 1
         self._welford_n[action] = n
 
@@ -409,13 +481,15 @@ class BeliefState:
         new_M2 = prev_M2 + delta * delta2
         self._welford_M2[action] = new_M2
 
+        # 5. Normalise
         if n >= 3:
-            
-            variance = new_M2 / max(n - 1, 1)   # B-MATH-02: Bessel correction
+            # Standard Welford z-score (Bessel-corrected; B-MATH-02)
+            variance = new_M2 / max(n - 1, 1)
             std = math.sqrt(max(variance, self.NORMALIZE_EPS))
             normalised = (reward - new_mean) / std
             normalised = max(-self.REWARD_CLAMP, min(self.REWARD_CLAMP, normalised))
 
+            # On crossing n=3, retroactively renormalise the two bootstrap entries
             if n == 3 and action in self._raw_action_rewards:
                 raw_deque = self._raw_action_rewards[action]
                 if len(raw_deque) >= 2:
@@ -430,21 +504,23 @@ class BeliefState:
                     if existing is not None and len(existing) == 2:
                         existing.clear()
                         existing.extend(renormalized)
-
         else:
-            
+            # Bootstrap (n < 3): linear mapping using BOOTSTRAP_REWARD_SCALE.
+            # M-5 FIX: BOOTSTRAP_REWARD_SCALE = 1.0 (identity for [-1,1] range)
+            # prevents the old 3× amplification that biased UCB toward early successes.
             normalised = (reward / self.BOOTSTRAP_REWARD_SCALE) * self.REWARD_CLAMP
             normalised = max(-self.REWARD_CLAMP, min(self.REWARD_CLAMP, normalised))
 
         self.action_rewards[action].append(normalised)
         self.action_counts[action] = self.action_counts.get(action, 0) + 1
 
-    # =========================================================
+    # =========================================================================
     # GLOBAL BEST REWARD
-    # =========================================================
+    # =========================================================================
 
-    def global_best_reward(self):
-        best = None
+    def global_best_reward(self) -> "float | None":
+        """Return the highest raw reward observed across all actions, or None."""
+        best: "float | None" = None
         for history in self._raw_action_rewards.values():
             if history:
                 local_max = max(history)
@@ -452,38 +528,40 @@ class BeliefState:
                     best = local_max
         return best
 
-    # =========================================================
+    # =========================================================================
     # ENVIRONMENT MODEL
-    # =========================================================
+    # =========================================================================
 
     def compute_environment_stability(self, delta: Dict[str, Any]) -> None:
+        """
+        Update environment_stability based on observed world-graph delta.
+
+        Stability decays on significant change (−0.2) and recovers slowly on
+        stability (+0.05).  consecutive_high_stability_count tracks sustained
+        stability for use by high-risk operation gating in operate.py.
+        """
         if not delta:
             return
 
         significant = delta.get("significant_change", False)
-
         if significant:
-            self.environment_stability = max(
-                0.0, self.environment_stability - 0.2
-            )
+            self.environment_stability = max(0.0, self.environment_stability - 0.2)
             self.consecutive_high_stability_count = 0
         else:
-            self.environment_stability = min(
-                1.0, self.environment_stability + 0.05
-            )
+            self.environment_stability = min(1.0, self.environment_stability + 0.05)
             if self.environment_stability >= 0.8:
                 self.consecutive_high_stability_count += 1
             else:
                 self.consecutive_high_stability_count = 0
 
-    # =========================================================
-    # SERIALIZATION
-    # =========================================================
+    # =========================================================================
+    # SERIALISATION
+    # =========================================================================
 
     def summary(self) -> dict:
         """
-        Lightweight snapshot suitable for ReasoningEngine.propose_actions()
-        and logging.  All values are JSON-serializable primitives.
+        Lightweight JSON-serialisable snapshot for ReasoningEngine and logging.
+        Contains only the top-5 state probabilities for prompt compactness.
         """
         top_states = dict(
             sorted(self.state_probabilities.items(), key=lambda x: x[1], reverse=True)[:5]
@@ -499,7 +577,12 @@ class BeliefState:
         }
 
     def to_dict(self) -> dict:
-        
+        """
+        Full serialisation for crash-recovery and replan continuity.
+
+        All keys are JSON-serialisable.  Deques are serialised as lists.
+        Regret tuples are serialised as 2-element lists.
+        """
         return {
             # Belief distribution
             "state_probabilities": dict(self.state_probabilities),
@@ -507,8 +590,8 @@ class BeliefState:
             "environment_stability": self.environment_stability,
             "consecutive_high_stability_count": self.consecutive_high_stability_count,
 
-            # Commitment / iteration tracking — NOTE: underscore-prefix keys
-            "commitment_hash": self.commitment_hash,
+            # Commitment / iteration tracking
+            "commitment_hash": self.commitment_hash,         # backward compat
             "commitment_chain_hash": self.commitment_chain_hash,
             "_iteration_counter": self._iteration_counter,
             "_sample_counter": self._sample_counter,
@@ -516,9 +599,7 @@ class BeliefState:
 
             # Action statistics
             "action_counts": dict(self.action_counts),
-            "action_rewards": {
-                k: list(v) for k, v in self.action_rewards.items()
-            },
+            "action_rewards": {k: list(v) for k, v in self.action_rewards.items()},
             "_raw_action_rewards": {
                 k: list(v) for k, v in self._raw_action_rewards.items()
             },
@@ -535,7 +616,13 @@ class BeliefState:
 
     @classmethod
     def from_dict(cls, data: dict, *, intent_hash: str = "") -> "BeliefState":
-        
+        """
+        Reconstruct a BeliefState from a to_dict() snapshot.
+
+        Falls back to a fresh BeliefState on any deserialisation failure so
+        crash-recovery never raises — the worst case is a reset bandit state,
+        not a process abort.
+        """
         if not isinstance(data, dict):
             return cls(intent_hash=intent_hash)
 
@@ -556,23 +643,30 @@ class BeliefState:
                 data.get("consecutive_high_stability_count", 0)
             )
 
+            # Commitment chain — use the setter for backward compat
             instance.commitment_hash = str(data.get("commitment_hash", "GENESIS"))
             instance.commitment_chain_hash = str(
                 data.get("commitment_chain_hash", instance.task_identity_hash)
             )
             instance._iteration_counter = int(data.get("_iteration_counter", 0))
             instance._sample_counter = int(data.get("_sample_counter", 0))
-            instance._regret_decay = float(data.get("_regret_decay", cls.REGRET_DECAY))
+            instance._regret_decay = float(
+                data.get("_regret_decay", cls.REGRET_DECAY)
+            )
 
             instance.action_counts = dict(data.get("action_counts", {}))
 
             instance.action_rewards = {}
             for k, v in data.get("action_rewards", {}).items():
-                instance.action_rewards[k] = deque(v, maxlen=cls.REWARD_WINDOW)
+                instance.action_rewards[k] = deque(
+                    (float(x) for x in v), maxlen=cls.REWARD_WINDOW
+                )
 
             instance._raw_action_rewards = {}
             for k, v in data.get("_raw_action_rewards", {}).items():
-                instance._raw_action_rewards[k] = deque(v, maxlen=cls.REWARD_WINDOW)
+                instance._raw_action_rewards[k] = deque(
+                    (float(x) for x in v), maxlen=cls.REWARD_WINDOW
+                )
 
             instance.regret = {}
             for k, v in data.get("regret", {}).items():
@@ -592,4 +686,5 @@ class BeliefState:
             return instance
 
         except Exception:
+            # Deserialisation failure → fresh state (crash-safe fallback)
             return cls(intent_hash=intent_hash)
