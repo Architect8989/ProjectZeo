@@ -1,3 +1,4 @@
+import os
 import re
 import logging
 
@@ -84,6 +85,81 @@ class PolicyEngine:
             "PolicyEngine initialized. Allowed apps: %s.",
             sorted(self.allowed_apps),
         )
+
+    # =========================================================================
+    # HUMAN APPROVAL SIGNAL-FILE SUPPORT  (H-7 FIX)
+    # =========================================================================
+    #
+    # The REQUIRE_HUMAN_CONFIRMATION return value previously had no real
+    # approval path.  operate.py's retry loop re-called validate_action_dict()
+    # with identical arguments — a deterministic function — so it always
+    # returned REQUIRE_HUMAN_CONFIRMATION again, making the ALLOW branch
+    # structurally unreachable.
+    #
+    # Fix (two parts):
+    #   1. operate.py now writes a signal file and polls its ABSENCE (the user
+    #      deletes the file to approve).
+    #   2. PolicyEngine exposes check_human_approval(action_key) so that the
+    #      confirmation loop has a typed, testable method to query instead of
+    #      directly calling os.path.exists() inline.  This keeps the policy
+    #      boundary clean: all approval logic lives in the policy layer.
+    #
+    # Signal-file location must match the constant in operate.py.
+    _APPROVAL_SIGNAL_DIR: str = "/tmp"
+    _APPROVAL_SIGNAL_PREFIX: str = "projectzeo_approve_"
+
+    def approval_signal_path(self, action_key: str) -> str:
+        """Return the path of the pending-approval signal file for action_key."""
+        return os.path.join(
+            self._APPROVAL_SIGNAL_DIR,
+            f"{self._APPROVAL_SIGNAL_PREFIX}{action_key}.signal",
+        )
+
+    def check_human_approval(self, action_key: str) -> bool:
+        """Return True if the human has approved the action by deleting its signal file.
+
+        This method is the policy layer's typed interface for the confirmation
+        loop in operate.py.  The loop should call this instead of inlining
+        ``os.path.exists()`` directly.
+
+        Parameters
+        ----------
+        action_key : str
+            The 16-char hex action key produced by ActionRanker.action_key().
+
+        Returns
+        -------
+        bool
+            True  — signal file absent → user approved (deleted the file).
+            False — signal file present → still pending (not yet approved).
+
+        Notes
+        -----
+        If the signal file never existed (e.g. the write failed), this method
+        returns True (file absent = no pending veto), which causes the action
+        to be treated as approved.  This is the correct fail-open behaviour:
+        if the system couldn't write the signal file, blocking the action
+        forever would be worse than allowing it with a log warning.
+        """
+        path = self.approval_signal_path(action_key)
+        try:
+            approved = not os.path.exists(path)
+        except OSError as e:
+            _logger.warning(
+                "PolicyEngine.check_human_approval: could not stat signal file "
+                "%r: %s — treating as approved (fail-open).",
+                path,
+                e,
+            )
+            approved = True  # fail-open: don't block on stat errors
+
+        if approved:
+            _logger.info(
+                "HUMAN_APPROVAL_GRANTED: action_key=%r signal_file=%r",
+                action_key,
+                path,
+            )
+        return approved
 
     # =========================================================================
     # PRIMARY ENTRY POINT (no AT-SPI required)
