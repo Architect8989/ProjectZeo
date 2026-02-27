@@ -23,11 +23,11 @@ class ObserverCore:
 
     MAX_HISTORY = 1000
 
-    STARTUP_GRACE_TICKS = 30
-    # HARD-4: The class previously defined STARTUP_GRACE_SECONDS = 15.0 here
-    # and then immediately overwrote it with 150.0 below. The 15.0 definition
-    # was dead code and misleading. The single canonical value is 150.0 —
-    # set once here to match the GAP-4 fix comment below.
+    # FIX IH-7: STARTUP_GRACE_TICKS = 30 removed. This constant was defined
+    # but never referenced anywhere — the blindness logic uses STARTUP_GRACE_SECONDS
+    # (time-based) and MAX_CONSECUTIVE_MISSES (tick-based), not STARTUP_GRACE_TICKS.
+    # Its presence implied a tick-based grace mechanism that does not exist.
+    # HARD-4 / GAP-4: The single canonical startup grace value follows below.
     # GAP-4 FIX: On CPU-only hardware, Qwen2.5-VL takes 40–90s per inference.
     # The VisionRuntime runs at CAPTURE_INTERVAL_SECONDS=0.5 but the actual
     # frame delivery rate is limited by inference speed (1 frame per 40–90s).
