@@ -18,9 +18,25 @@ class BeliefState:
     MAX_STATES = 64
     MAX_REGRET = 100.0
 
+    # FIX IH-2: MIN_ENTROPY_FLOOR documented with mathematical justification.
+    # Shannon entropy for a 2-state uniform distribution is ln(2) ≈ 0.693 nats.
+    # A floor of 0.3 nats corresponds to an effective state count of exp(0.3) ≈ 1.35
+    # — between a Dirac delta (0 nats, complete certainty) and a 2-state distribution.
+    # This allows the belief to reach up to ~97% confidence in a single state while
+    # still maintaining non-zero residual probability mass across alternatives.
+    #
+    # Rationale for 0.3 (not ln(2) ≈ 0.693):
+    # Setting the floor at ln(2) would prevent the belief from becoming more than ~70%
+    # confident in any single state. For deterministic environments (script runners,
+    # automated pipelines), this artificially inflates entropy and degrades exploitation.
+    # 0.3 permits high confidence while maintaining minimum exploration.
+    #
+    # Valid range: (0.0, ln(MAX_STATES)]. Operators needing stricter exploration can
+    # raise this value; values above ln(2) will prevent the system from expressing
+    # majority confidence in any single state.
     MIN_ENTROPY_FLOOR = 0.3
 
-    BOOTSTRAP_REWARD_SCALE: float = 3.0
+    BOOTSTRAP_REWARD_SCALE: float = 1.0  # FIX MS-6: was 3.0; 3.0 produced identity transform (reward/3.0)*3.0=reward, storing raw [-1,1] for n<3 but z-scores [-3,3] for n>=3, causing distribution discontinuity. 1.0 maps raw [-1,1]->[- 3,3] matching z-score scale.
 
     REWARD_CLAMP: float = 3.0
     NORMALIZE_EPS: float = 1e-8
@@ -33,6 +49,16 @@ class BeliefState:
     THOMPSON_WINDOW = 20
 
     _FALLBACK_PRUNE_THRESHOLD = PRIOR_ALPHA * 2.0
+
+    # FIX MS-5: Single-step regret cap.
+    # When global_best_reward() returns 1.0 from any action, every other
+    # action's regret grows by (1.0 - actual_reward) per iteration. For actions
+    # with consistent reward ~-0.5, this is +1.5 per step, reaching MAX_REGRET
+    # in ~67 iterations and permanently suppressing them from selection.
+    # A cross-action outlier (one action spiked to 1.0 once) should not drive
+    # regret to maximum for all other actions on the very next iteration.
+    # Cap: single-step regret contribution ≤ 1.5 (half of REWARD_CLAMP range).
+    REGRET_SINGLE_STEP_CAP: float = 1.5
 
     def __init__(self, intent_hash: str = "") -> None:
         self.created_at: float = time.time()
@@ -266,6 +292,12 @@ class BeliefState:
         if regret_value <= 0.0:
             return
 
+        # FIX MS-5: Cap single-step regret contribution.
+        # Prevents a cross-action best_reward outlier from driving cumulative
+        # regret to MAX_REGRET in one step, which would permanently suppress
+        # all actions that had that step as their last regret update.
+        regret_value = min(regret_value, self.REGRET_SINGLE_STEP_CAP)
+
         current = self._get_effective_regret(action)
         updated = min(current + regret_value, self.MAX_REGRET)
         self.regret[action] = (updated, self._iteration_counter)
@@ -302,14 +334,21 @@ class BeliefState:
             normalised = max(-self.REWARD_CLAMP, min(self.REWARD_CLAMP, normalised))
 
             if n == 3 and action in self._raw_action_rewards:
+                # FIX MF-4: Use new_mean (3-sample mean) not _two_sample_mean.
+                # Original defect: retroactive z-scores were computed relative to
+                # the 2-sample mean of the first two entries, while the current
+                # entry's z-score was relative to the 3-sample mean (new_mean).
+                # This meant entries 0-1 and entry 2 were normalized around
+                # different origins — a distribution discontinuity that corrupted
+                # UCB and Thompson scores for exactly one iteration (n=3 boundary).
+                # Fix: all 3 entries are now z-scored around the same new_mean.
                 raw_deque = self._raw_action_rewards[action]
                 if len(raw_deque) >= 2:
                     old_entries = list(raw_deque)[:2]
-                    _two_sample_mean = (old_entries[0] + old_entries[1]) / 2.0
-
                     renormalized = []
                     for r in old_entries:
-                        z = (r - _two_sample_mean) / std
+                        # FIX: use new_mean (3-sample mean) consistently
+                        z = (r - new_mean) / std
                         renormalized.append(
                             max(-self.REWARD_CLAMP, min(self.REWARD_CLAMP, z))
                         )
