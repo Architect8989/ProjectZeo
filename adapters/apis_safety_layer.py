@@ -53,20 +53,17 @@ def _get_apis() -> object:
 # ============================================================
 
 def apply_patches() -> None:
-    # RD-01 FIX: Use _MODULE_PATCHES_APPLIED (this module) as the primary
-    # idempotency guard.  The target-module attribute (_safety_patches_applied)
-    # is kept as a secondary defence-in-depth guard against double-wrapping
-    # of individual functions when the apis module itself is reloaded.
-    #
-    # Ordering matters:
-    #   1. Check _MODULE_PATCHES_APPLIED first (cheap, this-module attribute).
-    #   2. If False, resolve the apis module and check its attribute.
-    #   3. Apply patches.
-    #   4. Set BOTH flags to True atomically within the same call.
+    
     global _MODULE_PATCHES_APPLIED
 
     if _MODULE_PATCHES_APPLIED:
         return
+
+    # RT-03 / SI-03 FIX: Install screenshot guard FIRST — unconditionally.
+    # This guard must be active even on Ollama-only installs where the cloud
+    # API module is absent.  Previously this call was after _get_apis(), so
+    # Ollama-only installs never reached it.
+    _disable_screenshot_writes()
 
     try:
         apis = _get_apis()
@@ -74,9 +71,12 @@ def apply_patches() -> None:
         import sys
         print(
             "[APIS-SAFETY] Warning: could not resolve operate apis module — "
-            "provider patches skipped (OK for Ollama-only path)",
+            "cloud provider patches skipped (OK for Ollama-only path). "
+            "Screenshot write guard is installed.",
             file=sys.stderr,
         )
+        # Screenshot guard is installed; mark complete so we don't retry.
+        _MODULE_PATCHES_APPLIED = True
         return
 
     if getattr(apis, "_safety_patches_applied", False):
@@ -90,7 +90,6 @@ def apply_patches() -> None:
 
     _patch_all_providers()
     _disable_cloud_fallbacks()
-    _disable_screenshot_writes()
     _guard_dispatch()
 
     # RD-01 FIX: Set this module's flag LAST — after all patches succeed.
@@ -100,37 +99,7 @@ def apply_patches() -> None:
 
 
 def uninstall_patches():
-    """
-    AUDIT-SI-2 FIX: Restore builtins.open to its original value with
-    structured logging and post-uninstall verification.
-
-    Previous issue: the try/except:pass in main.py around uninstall_patches()
-    swallowed any failure silently. If uninstall itself threw, the patched
-    builtins.open remained active for the rest of the process lifetime with
-    no diagnostic. This was operationally benign in production (process
-    exits) but interfered with in-process test isolation.
-
-    Fixes applied:
-      1. Structured log.info() confirms the original open was restored,
-         including a verifiable identity check (is original).
-      2. A post-uninstall assertion logs an explicit ERROR if builtins.open
-         is still the patched version after restoration — surfaces the
-         failure rather than silently continuing.
-      3. The sentinel attributes (_original_open_pre_safety_patch,
-         _safety_open_installed) are cleaned up atomically.
-
-    NOTE ON THREAD-LOCAL SCOPING:
-    The global builtins.open patch is safe in production (single shutdown
-    path, process terminates). For test isolation without subprocess
-    boundaries, the recommended alternative is to scope the patch to a
-    threading.local() object and restore per-thread in teardown. This is
-    a deeper refactor deferred to a future hardening pass; the structured
-    logging below provides the minimum viable auditability for now.
-
-    Call this in test teardown or when completely shutting down the safety
-    layer. Without this, builtins.open remains patched for the process
-    lifetime — correct for production, problematic for in-process tests.
-    """
+    
     import builtins as _builtins_mod
     import logging as _logging
 
@@ -188,19 +157,7 @@ def _wrap_provider(fn):
     is_async = inspect.iscoroutinefunction(fn)
 
     def _validate_no_mutation(snapshot, checked_copy, name):
-        # H2 FIX: Compare the deep copy that was passed to the provider
-        # (checked_copy = safe_messages) against the snapshot taken of it
-        # before the call. This detects whether the provider mutated the
-        # message list it received.
-        #
-        # Previous bug: the function compared 'caller_snapshot' against
-        # 'messages' (the original caller reference). The provider only ever
-        # receives 'safe_messages' (a deep copy) — it has no reference to
-        # 'messages'. Therefore 'messages' can never be mutated by the provider
-        # and the check always passed, making mutation detection a structural
-        # no-op. Swapping to compare caller_snapshot against safe_messages
-        # makes the check meaningful: if the provider mutated its copy of the
-        # message list, we catch it here.
+        
         if checked_copy != snapshot:
             raise RuntimeError(
                 f"[APIS-SAFETY] Provider mutated caller messages: {name}"
@@ -284,18 +241,7 @@ def _wrap_provider(fn):
 # ============================================================
 
 def _patch_all_providers():
-    """
-    HARD-5: Patch both the wrapper module (operate.models.apis) AND the
-    legacy implementation module (operate.legacy.apis).
-
-    The previous implementation only patched the thin wrapper layer. Any code
-    that imports from operate.legacy.apis directly (bypassing the wrapper)
-    received no safety-layer enforcement. Cloud API functions in the legacy
-    module were unpatched — immutability enforcement, temperature injection,
-    and validation did not apply to them.
-
-    Fix: apply _wrap_provider() to both modules' call_* functions.
-    """
+    
     modules_to_patch = []
 
     # Primary (wrapper) module — always present
@@ -383,29 +329,7 @@ def _disable_screenshot_writes():
                 f"[APIS-SAFETY] Failed to patch PIL save: {e}"
             )
 
-    # ---- Guard builtins.open with frame inspection ----
-    # HARDEN-2 (SI-NEW-01): Install guarded_open on builtins.open, but scope
-    # the interception to calls that originate from within the operate apis
-    # modules (operate.legacy.apis, operate.models.apis).
-    #
-    # The previous implementation blocked ALL process-wide open() calls to
-    # paths containing "screenshot" regardless of call origin. This caused:
-    #   - Legitimate writes to paths like "screenshots/log.txt" to silently fail
-    #   - Any directory named "screenshot" to be write-blocked system-wide
-    #   - No timeout or scope limit — permanent process-wide side effect
-    #
-    # Fix: use inspect.stack() to check the call origin before blocking. Only
-    # calls where any frame's module name matches the operate apis pattern are
-    # intercepted. All other callers pass through to the real open() unchanged.
-    # This preserves the safety invariant while eliminating false-positive blocks
-    # on legitimate writes from unrelated code.
-    #
-    # Performance note: inspect.stack() is O(depth) per open() call, which is
-    # acceptable because guarded_open is only reached after the path-substring
-    # check (cheap) and the mode-write check (cheap) both pass. The full stack
-    # walk only runs for write opens to screenshot-like paths — a rare event in
-    # production. In tests with many open() calls on non-screenshot paths the
-    # overhead is zero (early return before inspect.stack()).
+    
     import builtins as _builtins_mod
     _real_open = getattr(_builtins_mod, "_original_open_pre_safety_patch", None)
     if _real_open is None:
