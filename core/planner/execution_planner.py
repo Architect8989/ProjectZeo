@@ -202,6 +202,18 @@ class ExecutionPlanner:
             except Exception:
                 pass
 
+        # FIX MF-5: Log explicit warning when falling back to VL model for text planning.
+        # VL models are memory-heavy and slower for text-only tasks. Operators need
+        # to know this is happening so they can either: (a) pull the text variant,
+        # or (b) set LLM_TEXT_MODEL env var to bypass the derivation entirely.
+        import sys as _sys
+        print(
+            f"[ExecutionPlanner] WARNING: No separate text model found for {vision_model_name!r}. "
+            "Using vision model for text-only planning calls. Performance will be degraded. "
+            "To suppress: (1) pull the text variant (remove '-vl' from model name in Ollama), "
+            "or (2) set LLM_TEXT_MODEL env var to an explicit text model name.",
+            file=_sys.stderr,
+        )
         return vision_model_name
 
     def update_world_snapshot(self, snapshot: Dict[str, Any]):
@@ -361,41 +373,67 @@ class ExecutionPlanner:
         except Exception:
             return [{"goal": objective}]
 
-    def _call_llm_text(self, prompt: str) -> str:
-        try:
-            import ollama
-            import httpx
+    def _call_llm_text(self, prompt: str, *, max_retries: int = 2) -> str:
+        """
+        Call text LLM with retry logic.
 
-            _model = self._text_model_name
-            client = self._ollama_client
-            if client is None:
-                raise PlanningError("Ollama client unavailable for text-only planning call")
+        FIX MF-2: A single transient LLM hiccup (network timeout, Ollama OOM
+        recovery, model context flush) previously propagated immediately as
+        PlanningError, causing main.py to call _force_safe_shutdown() and
+        terminate the entire kernel. A single bad inference should not kill
+        the task — retry first.
 
-            response = client.chat(
-                model=_model,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": (
-                            "You are a step-expansion planning engine. "
-                            "Return ONLY valid JSON. No prose. No markdown fences."
-                        ),
-                    },
-                    {"role": "user", "content": prompt},
-                ],
-                options={"temperature": 0},
-            )
+        Retry policy:
+          - max_retries=2: attempt up to 3 total calls (1 initial + 2 retries).
+          - Each retry uses a fresh client.chat() call (stateless inference).
+          - PlanningError subclasses (invalid args, client unavailable) are not
+            retried — they indicate a structural problem, not a transient failure.
+          - Only generic Exception is retried.
+        """
+        _model = self._text_model_name
+        client = self._ollama_client
+        if client is None:
+            raise PlanningError("Ollama client unavailable for text-only planning call")
 
-            if hasattr(response, "message") and hasattr(response.message, "content"):
-                return response.message.content
-            if isinstance(response, dict):
-                return response.get("message", {}).get("content", "")
-            return str(response)
+        _last_exc: Exception = RuntimeError("unreachable")
 
-        except PlanningError:
-            raise
-        except Exception as exc:
-            raise PlanningError(f"_call_llm_text failed: {exc}") from exc
+        for _attempt in range(max_retries + 1):
+            try:
+                response = client.chat(
+                    model=_model,
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": (
+                                "You are a step-expansion planning engine. "
+                                "Return ONLY valid JSON. No prose. No markdown fences."
+                            ),
+                        },
+                        {"role": "user", "content": prompt},
+                    ],
+                    options={"temperature": 0},
+                )
+
+                if hasattr(response, "message") and hasattr(response.message, "content"):
+                    return response.message.content
+                if isinstance(response, dict):
+                    return response.get("message", {}).get("content", "")
+                return str(response)
+
+            except PlanningError:
+                raise  # structural — do not retry
+            except Exception as exc:
+                _last_exc = exc
+                if _attempt < max_retries:
+                    import time as _time
+                    _backoff = 1.0 * (2 ** _attempt)  # 1s, 2s
+                    _time.sleep(_backoff)
+                    continue
+                raise PlanningError(
+                    f"_call_llm_text failed after {max_retries + 1} attempts: {exc}"
+                ) from exc
+
+        raise PlanningError(f"_call_llm_text retry exhausted: {_last_exc}") from _last_exc
 
     def _expand_goal(
         self, goal: str, *, include_screen_context: bool = False
@@ -469,12 +507,35 @@ class ExecutionPlanner:
         except _json.JSONDecodeError:
             pass
 
-        bracket_match = _re.search(r".*", text, _re.DOTALL)
-        if bracket_match:
+        # FIX RB-1 CRITICAL: The original r".*" with re.DOTALL matched the ENTIRE
+        # string -- identical to what json.loads(text) already tried and failed.
+        # bracket_match.group(0) was always the full string; json.loads always raised
+        # the same JSONDecodeError. LLM responses with surrounding prose permanently
+        # raised PlanningError instead of extracting the embedded JSON array.
+        #
+        # Fix: use explicit bracket-extraction patterns.
+
+        # Attempt 2: extract outermost JSON array from surrounding prose
+        array_match = _re.search(r"(\[[\s\S]*\])", text)
+        if array_match:
             try:
-                result = _json.loads(bracket_match.group(0))
+                result = _json.loads(array_match.group(1))
                 if isinstance(result, list):
                     return result
+            except _json.JSONDecodeError:
+                pass
+
+        # Attempt 3: extract outermost JSON object (may wrap steps under a "steps" key)
+        obj_match = _re.search(r"(\{[\s\S]*\})", text)
+        if obj_match:
+            try:
+                result = _json.loads(obj_match.group(1))
+                if isinstance(result, list):
+                    return result
+                if isinstance(result, dict) and "steps" in result:
+                    steps = result["steps"]
+                    if isinstance(steps, list):
+                        return steps
             except _json.JSONDecodeError:
                 pass
 
