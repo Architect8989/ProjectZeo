@@ -463,6 +463,35 @@ class SnapshotProvider:
         except Exception:
             pass
 
+        # IH-1 FIX: Capture window Z-order so RestoreVerifier._verify_window_z_order()
+        # has data to verify. Previously window_z_order was never populated in
+        # metadata["extended"], making _verify_window_z_order() always short-circuit
+        # at "if z is None: return" — the verification was dead code despite being reachable.
+        # Fix: attempt to capture Z-order via xdotool getwindowstackingorder.
+        # Non-fatal: Z-order capture is best-effort (xdotool may be absent).
+        try:
+            import subprocess as _sp_zo
+            _zo_result = _sp_zo.run(
+                ["xdotool", "getwindowstackingorder"],
+                capture_output=True,
+                timeout=2,
+            )
+            if _zo_result.returncode == 0:
+                _stacking = _zo_result.stdout.strip().decode("utf-8", errors="replace").split()
+                # Get the currently active window ID to find its Z-order position
+                _active_result = _sp_zo.run(
+                    ["xdotool", "getactivewindow"],
+                    capture_output=True,
+                    timeout=2,
+                )
+                if _active_result.returncode == 0:
+                    _active_wid = _active_result.stdout.strip().decode("utf-8", errors="replace")
+                    if _active_wid in _stacking:
+                        # Z-order index: 0 = bottommost, len-1 = topmost
+                        extended["window_z_order"] = _stacking.index(_active_wid)
+        except Exception:
+            pass  # xdotool absent or timed out — non-fatal
+
         # Active process snapshot (psutil — cross-platform)
         try:
             import psutil as _psutil  # noqa: PLC0415
