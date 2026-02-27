@@ -377,19 +377,69 @@ class ExecutionPlanner:
         """
         Call text LLM with retry logic.
 
-        FIX MF-2: A single transient LLM hiccup (network timeout, Ollama OOM
+        RT-02 / SI-02 FIX — Injection scanning
+        ----------------------------------------
+        Planning prompts were previously sent to ``ollama.Client.chat()``
+        without any safety checks.  The safety layer wraps
+        ``operate.models.apis.call_*`` functions but has no reach into the
+        Ollama SDK.  A crafted intent string could reach the planning LLM
+        unfiltered.
+
+        Fix: the prompt is normalised (NFKC + ASCII lowercasing) and
+        scanned against ``INJECTION_MARKERS`` before every call.  A match
+        raises ``PlanningError`` immediately, preventing the injection from
+        reaching the LLM.
+
+        FIX MF-2 — Retry with exponential back-off
+        -------------------------------------------
+        A single transient LLM hiccup (network timeout, Ollama OOM
         recovery, model context flush) previously propagated immediately as
-        PlanningError, causing main.py to call _force_safe_shutdown() and
-        terminate the entire kernel. A single bad inference should not kill
-        the task — retry first.
+        ``PlanningError``, causing main.py to call ``_force_safe_shutdown()``
+        and terminate the entire kernel.  A single bad inference should not
+        kill the task — retry first.
 
         Retry policy:
           - max_retries=2: attempt up to 3 total calls (1 initial + 2 retries).
           - Each retry uses a fresh client.chat() call (stateless inference).
-          - PlanningError subclasses (invalid args, client unavailable) are not
-            retried — they indicate a structural problem, not a transient failure.
-          - Only generic Exception is retried.
+          - PlanningError (structural) is not retried.
+          - Only generic Exception is retried, with 1s / 2s back-off.
         """
+        # RT-02 / SI-02 FIX: Scan the planning prompt for injection markers
+        # BEFORE sending to the LLM.  This covers the Ollama path which is not
+        # reached by the apis_safety_layer provider wrappers.
+        try:
+            from core.security.injection_markers import (
+                INJECTION_MARKERS,
+                normalize_for_injection_check,
+            )
+            _normalized_prompt = normalize_for_injection_check(prompt)
+            for _marker in INJECTION_MARKERS:
+                if _marker in _normalized_prompt:
+                    raise PlanningError(
+                        f"Planning prompt rejected: injection marker detected "
+                        f"({_marker!r}).  This indicates a crafted intent string "
+                        "attempting to hijack the planning LLM.  Task aborted."
+                    )
+        except PlanningError:
+            raise
+        except ImportError:
+            # Security module unavailable (stripped deployment); fall back to
+            # a minimal inline check covering the most critical phrase.
+            _lp = prompt.lower()
+            if "ignore previous instructions" in _lp or "ignore all previous" in _lp:
+                raise PlanningError(
+                    "Planning prompt rejected: injection marker detected (inline fallback)."
+                )
+        except Exception:
+            # Never let the injection scan itself crash planning — log and continue.
+            import sys as _sys
+            print(
+                "[ExecutionPlanner._call_llm_text] WARNING: injection scan raised "
+                "an unexpected error — continuing without scan.  Check "
+                "core/security/injection_markers.py.",
+                file=_sys.stderr,
+            )
+
         _model = self._text_model_name
         client = self._ollama_client
         if client is None:
