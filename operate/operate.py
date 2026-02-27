@@ -370,6 +370,21 @@ def _execute_autonomous_loop(
     # Bounded command output log fed into world_graph for context enrichment
     execution_log: Dict[int, Dict[str, str]] = {}
 
+    # FIX IH-4: Global visited-action set to bound dynamic candidate exploration.
+    # ReasoningEngine.propose_actions() is called on stagnant iterations and returns
+    # up to MAX_DYNAMIC_CANDIDATES fresh candidates per call. If the LLM consistently
+    # proposes different candidates each call (due to perception noise), the action
+    # space grows without bound. UCB assigns score=inf to every unvisited candidate,
+    # so the system always prefers new dynamic candidates over known-good actions —
+    # a persistent exploration loop that never converges on any finite horizon.
+    #
+    # Fix: track all action keys that have been tried. When proposing dynamic
+    # candidates, filter out any candidate whose key is already in the visited set.
+    # The visited set is bounded at _VISITED_ACTION_MAX to prevent unbounded growth.
+    # When the set is full, the oldest entries are evicted (insertion-ordered dict trick).
+    _visited_action_keys: dict = {}  # ordered set: {action_key: True}
+    _VISITED_ACTION_MAX = 200        # cap at 200 unique action keys per task run
+
     iteration = 0
     stagnant_iterations = 0
     max_iterations = max(
@@ -503,11 +518,20 @@ def _execute_autonomous_loop(
                         k=MAX_DYNAMIC_CANDIDATES,
                     )
                     if dynamic_candidates:
-                        candidate_actions = dynamic_candidates
+                        # IH-4: Filter out candidates already tried to prevent
+                        # infinite UCB exploration of perpetually-novel candidates.
+                        fresh_candidates = [
+                            c for c in dynamic_candidates
+                            if action_ranker.action_key(c) not in _visited_action_keys
+                        ]
+                        # Use fresh candidates if available; fall back to all dynamic
+                        # candidates only if every one has been tried (exploration exhausted).
+                        candidate_actions = fresh_candidates or dynamic_candidates
                         journal.record({
                             "event": "dynamic_candidates_used",
                             "step": current_step_index,
                             "count": len(candidate_actions),
+                            "fresh_count": len(fresh_candidates),
                         })
                 except Exception as re_err:
                     log_warn(f"ReasoningEngine fallback failed: {re_err}")
@@ -521,6 +545,12 @@ def _execute_autonomous_loop(
                 belief_state=belief,
             )
             action_key = action_ranker.action_key(selected_action)
+
+            # IH-4: Record action key as visited. Evict oldest when full.
+            if len(_visited_action_keys) >= _VISITED_ACTION_MAX:
+                _oldest = next(iter(_visited_action_keys))
+                del _visited_action_keys[_oldest]
+            _visited_action_keys[action_key] = True
 
             # ------------------------------------------------------------------
             # Policy gate
@@ -698,12 +728,27 @@ def _execute_autonomous_loop(
                     "error": str(exec_exc),
                 })
 
-            # Bounded command output for world-graph context
-            if action_success and "output" in exec_result:
-                output_text = str(exec_result.get("output", ""))
-                execution_log[current_step_index] = {
-                    "output": output_text[:MAX_COMMAND_OUTPUT_BYTES]
-                }
+            # FIX MF-3: Accumulate command output (success AND failure) per step.
+            # Original: execution_log[current_step_index] was overwritten on each
+            # successful action, so the LLM saw only the LAST successful output when
+            # replanning. On stagnant iterations (all failures), execution_log was
+            # never updated at all — the LLM had no failure context to diagnose the
+            # stagnation. Fix: append to a list per step index, capped at 5 entries.
+            # Both success and failure outputs are recorded so the LLM receives full
+            # stagnation history rather than only the last successful output.
+            if "output" in exec_result and exec_result.get("output"):
+                output_text = str(exec_result.get("output", ""))[:MAX_COMMAND_OUTPUT_BYTES]
+                _step_entry = execution_log.setdefault(current_step_index, {"outputs": []})
+                _step_outputs = _step_entry.get("outputs", [])
+                if len(_step_outputs) < 5:  # cap at 5 entries to bound context size
+                    _step_outputs.append({
+                        "success": action_success,
+                        "output": output_text,
+                        "iteration": iteration,
+                    })
+                    _step_entry["outputs"] = _step_outputs
+                    _step_entry["last_output"] = output_text  # convenience alias
+                    execution_log[current_step_index] = _step_entry
 
             # Bandit update
             belief.record_action(action_key, raw_reward)
