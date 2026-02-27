@@ -108,3 +108,39 @@ If restoration cannot be verified: execution halted, failure recorded, system st
 | v1.0 | Initial |
 | v2.0 | Extended verification stubs |
 | v3.0 | **H-1/H-3:** Explicit non-restoration list. Title changed from "Restoration Contract" to "Restoration Scope Declaration". Keyboard modifiers partial-restoration documented. Trust boundary section added. |
+
+---
+
+## 📋 IH-6 ADDENDUM — Explicit Scope Declaration
+
+**IH-6 FIX:** This section addresses the gap where the detailed scope was declared only in
+`snapshot_types.py:to_dict()` (code comments) but not in this contract document.
+
+### What "Restoration Successful" Means — Precise Definition
+
+Restoration is **workspace aesthetics only**. The system:
+
+1. **Moves the cursor** back to its pre-task XY position (within ±5px).
+2. **Re-focuses the window** that was active before the task (fuzzy title match, Levenshtein ≤2).
+3. **Re-activates the application** that was active before the task (best title match).
+4. **Releases all automated input** (keyboard modifiers, mouse buttons).
+5. **Resets execution mode** to OBSERVER.
+
+### What "Restoration Successful" Does NOT Mean
+
+- ❌ Files or directories created, modified, or deleted are **not reversed**.
+- ❌ Processes spawned during the task are **not terminated**.
+- ❌ Browser history, URLs, tabs, or form state are **not restored**.
+- ❌ Clipboard contents are **not restored**.
+- ❌ Network connections or downloads are **not reversed**.
+- ❌ Package installations (apt, pip, npm, brew) are **not uninstalled**.
+- ❌ Window geometry (position and size) is captured and soft-verified but **not hard-required**.
+- ❌ Window Z-order (stacking) is captured (as of v3.1) and verified only if `xdotool` is available.
+
+### Recommendation
+
+For tasks requiring full OS state rollback, run ProjectZeo inside:
+- A container with ephemeral storage
+- A VM with snapshot-before/rollback-after
+- A filesystem with copy-on-write support (btrfs, ZFS)
+
