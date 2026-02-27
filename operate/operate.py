@@ -61,26 +61,7 @@ MAX_COMMAND_OUTPUT_BYTES = 4096
 # Maximum dynamic candidates from ReasoningEngine on stagnant steps (H-03 fix)
 MAX_DYNAMIC_CANDIDATES = 3
 
-# ------------------------------------------------------------------
-# RB-LOW-1 FIX: Human-confirmation signal-file mechanism
-# ------------------------------------------------------------------
-# When a high-risk action triggers REQUIRE_HUMAN_CONFIRMATION the system
-# writes a pending-approval marker to /tmp/.  The user signals approval by
-# deleting (or touching-and-deleting) that file.  The confirmation loop
-# polls for the file's ABSENCE — the inverse of the previous behaviour,
-# which re-called a deterministic policy function and therefore could never
-# reach ALLOW.
-#
-# Signal-file path format:
-#   /tmp/projectzeo_approve_<16-char action key>.signal
-#
-# Workflow:
-#   1. System writes the file with action JSON as content.
-#   2. System logs path to stderr so the user knows where to look.
-#   3. Loop polls every WAIT_RETRY_SECONDS for up to MAX_WAIT_RETRIES.
-#   4. If file absent  → APPROVED  (user deleted it).
-#   5. If file present after timeout → DENIED (−0.3 reward, continue).
-#   6. File is always cleaned up after the loop (success or timeout).
+
 
 _SIGNAL_DIR: str = "/tmp"
 _SIGNAL_PREFIX: str = "projectzeo_approve_"
@@ -149,37 +130,7 @@ def operate_main(
     prior_belief_state: Optional[dict] = None,
     belief_state_out: Optional[list] = None,
 ) -> None:
-    """
-    Main execution entry point for a single task run.
-
-    Parameters
-    ----------
-    terminal_prompt : str
-        The task objective / intent string.
-    execution_plan : ExecutionPlan
-        Validated plan produced by ExecutionPlanner.create_plan().
-    planner : ExecutionPlanner, optional
-        Planner instance used for LLM callable access and world-graph updates.
-    observer : ObserverCore, optional
-        Live observer for screen perception snapshots.
-    world_graph : WorldGraph, optional
-        World-graph for semantic entity tracking and delta computation.
-    os_backend : OperatingSystem, optional
-        OS interaction backend (mouse, keyboard, exec, file I/O).
-    max_wallclock_seconds : int
-        Hard wall-clock timeout for the entire task.
-    watchdog : RuntimeWatchdog, optional
-        CPU/wall-clock watchdog; checked on each loop iteration.
-    prior_belief_state : dict, optional
-        Serialised BeliefState from a previous replan attempt.  When provided,
-        the BeliefState is reconstructed via BeliefState.from_dict() to preserve
-        action history, Welford statistics, and Thompson counter across replans.
-    belief_state_out : list, optional
-        Single-element output list.  On any exit path, the final serialised
-        BeliefState is placed in belief_state_out[0] so the caller can forward
-        it to the next replan via prior_belief_state.  Cleared and repopulated
-        on every call.
-    """
+    
     if not isinstance(execution_plan, ExecutionPlan):
         raise ValueError("execution_plan must be an ExecutionPlan instance")
 
@@ -370,18 +321,7 @@ def _execute_autonomous_loop(
     # Bounded command output log fed into world_graph for context enrichment
     execution_log: Dict[int, Dict[str, str]] = {}
 
-    # FIX IH-4: Global visited-action set to bound dynamic candidate exploration.
-    # ReasoningEngine.propose_actions() is called on stagnant iterations and returns
-    # up to MAX_DYNAMIC_CANDIDATES fresh candidates per call. If the LLM consistently
-    # proposes different candidates each call (due to perception noise), the action
-    # space grows without bound. UCB assigns score=inf to every unvisited candidate,
-    # so the system always prefers new dynamic candidates over known-good actions —
-    # a persistent exploration loop that never converges on any finite horizon.
-    #
-    # Fix: track all action keys that have been tried. When proposing dynamic
-    # candidates, filter out any candidate whose key is already in the visited set.
-    # The visited set is bounded at _VISITED_ACTION_MAX to prevent unbounded growth.
-    # When the set is full, the oldest entries are evicted (insertion-ordered dict trick).
+    
     _visited_action_keys: dict = {}  # ordered set: {action_key: True}
     _VISITED_ACTION_MAX = 200        # cap at 200 unique action keys per task run
 
@@ -567,7 +507,10 @@ def _execute_autonomous_loop(
 
             if _policy_decision == PolicyEngine.DENY:
                 belief.record_action(action_key, -0.5)
-                best_reward = belief.global_best_reward() or 0.0
+                # RT-05 / SI-04 FIX: Cap best_reward at 0.9 to prevent DONE
+                # sentinel (reward=1.0) from permanently inflating the regret
+                # reference for all subsequent actions.
+                best_reward = min(belief.global_best_reward() or 0.0, 0.9)
                 belief.update_regret(action_key, -0.5, best_reward)
                 journal.record({
                     "event": "policy_deny",
@@ -635,7 +578,10 @@ def _execute_autonomous_loop(
                         "waited_seconds": _phc_wait * WAIT_RETRY_SECONDS,
                     })
                     belief.record_action(action_key, -0.3)
-                    best_reward = belief.global_best_reward() or 0.0
+                    # RT-05 / SI-04 FIX: Cap best_reward at 0.9 to prevent DONE
+                    # sentinel (reward=1.0) from permanently inflating the regret
+                    # reference for all subsequent actions.
+                    best_reward = min(belief.global_best_reward() or 0.0, 0.9)
                     belief.update_regret(action_key, -0.3, best_reward)
                     stagnant_iterations += 1
                     if stagnant_iterations >= stagnant_limit:
@@ -752,7 +698,10 @@ def _execute_autonomous_loop(
 
             # Bandit update
             belief.record_action(action_key, raw_reward)
-            best_reward = belief.global_best_reward() or 0.0
+            # RT-05 / SI-04 FIX: Cap best_reward at 0.9 to prevent DONE
+            # sentinel (reward=1.0) from permanently inflating the regret
+            # reference for all subsequent actions.
+            best_reward = min(belief.global_best_reward() or 0.0, 0.9)
             belief.update_regret(action_key, raw_reward, best_reward)
 
             journal.record({
