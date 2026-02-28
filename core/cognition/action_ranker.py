@@ -220,9 +220,25 @@ class ActionRanker:
         """
         Map Shannon entropy (nats) to a Softmax temperature τ.
 
-        Uses a ``tanh`` mapping so that τ increases smoothly from
-        ``MIN_TAU`` (low entropy / high confidence) to ``MAX_TAU``
-        (high entropy / high uncertainty), with a hard floor/ceiling.
+        H7 FIX (B2.5): Replaced the tanh-based mapping with a log-linear
+        (piecewise-log) mapping that scales meaningfully across the full entropy
+        range [0, ln(MAX_STATES)] rather than saturating early.
+
+        The tanh-based mapping (``tanh(entropy) * MAX_TAU``) reaches 95% of
+        MAX_TAU at entropy ≈ 1.83 nats (≈ 6-state uniform distribution).
+        Beyond 6 states at equal probability the temperature barely increased,
+        making the "entropy-adaptive" label misleading for larger belief
+        distributions (up to 64 states / 4.16 nats maximum).
+
+        New mapping:
+          - MAX_ENTROPY = ln(MAX_STATES) = ln(64) ≈ 4.16 nats (fully uniform)
+          - τ = MIN_TAU + (MAX_TAU - MIN_TAU) * (entropy / MAX_ENTROPY)
+            clamped to [MIN_TAU, MAX_TAU].
+          - This is linear in entropy, giving equal temperature weight to each
+            additional nat of uncertainty across the full operating range.
+          - A 2-state uniform belief (entropy≈0.69) → τ≈0.39.
+          - A 64-state uniform belief (entropy≈4.16) → τ=1.50 (MAX_TAU).
+          - A single-state belief (entropy=0.0) → τ=0.15 (MIN_TAU).
 
         Parameters
         ----------
@@ -235,8 +251,12 @@ class ActionRanker:
         float
             Temperature τ ∈ [MIN_TAU, MAX_TAU].
         """
+        import math as _math
         entropy = max(0.0, float(entropy))
-        tau = math.tanh(entropy) * self.MAX_TAU
+        # Maximum entropy for a MAX_STATES uniform distribution
+        _MAX_ENTROPY = _math.log(64)  # ln(64) ≈ 4.158 nats
+        # Linear interpolation from MIN_TAU (entropy=0) to MAX_TAU (entropy=MAX_ENTROPY)
+        tau = self.MIN_TAU + (self.MAX_TAU - self.MIN_TAU) * (entropy / _MAX_ENTROPY)
         return max(self.MIN_TAU, min(self.MAX_TAU, tau))
 
     # ------------------------------------------------------------------
