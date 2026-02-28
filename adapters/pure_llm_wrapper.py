@@ -21,25 +21,29 @@ class PureLLMWrapper:
 
     _patch_applied = False
 
-    # P1-1 FIX: Protect _patch_applied with a class-level threading.Lock.
+    # H-2 FIX: _patch_lock is now a proper class-level attribute assignment
+    # inside the class body, not a forward type annotation + post-class
+    # assignment.  The original code:
     #
-    # Root cause: _patch_applied is a class-level boolean shared by all
-    # instances. The check-and-set sequence:
-    #   if not PureLLMWrapper._patch_applied:
-    #       apply_patches()
-    #       PureLLMWrapper._patch_applied = True
-    # is a non-atomic read-modify-write. Under concurrent instantiation (two
-    # threads both calling AdapterFactory.build_llm() for cloud models at
-    # the same time), both threads can read _patch_applied=False, both call
-    # apply_patches(), and both set _patch_applied=True. The double-apply is
-    # functionally safe (apply_patches() is idempotent via _apis_safety_wrapped
-    # guards on individual functions) but creates noisy redundant work and
-    # masks potential future non-idempotency bugs in apply_patches().
+    #   (inside class body)
+    #   _patch_lock: "threading.Lock"   ← creates a class annotation only;
+    #                                      the attribute does NOT exist yet
     #
-    # Fix: add _patch_lock class-level Lock (same pattern as factory.py's
-    # _PATCH_LOCK). The __init__ check now holds the lock for the entire
-    # check-and-set, making it atomic.
-    _patch_lock: "threading.Lock"
+    #   (after class definition)
+    #   PureLLMWrapper._patch_lock = threading.Lock()
+    #
+    # is fragile: the annotation in the class body creates no actual attribute.
+    # Only the post-class assignment creates it.  In any non-standard import
+    # sequence (importlib partial reload, test framework class isolation,
+    # __init_subclass__ triggered before module execution completes) an
+    # __init__ call could execute before the post-class line, causing:
+    #   AttributeError: type object 'PureLLMWrapper' has no attribute '_patch_lock'
+    #
+    # Fix: assign the lock directly as a class attribute inside the class body.
+    # Python evaluates class bodies sequentially; _patch_lock is available as
+    # a true class attribute from the moment the class definition completes,
+    # with no dependency on post-class module code.
+    _patch_lock: threading.Lock = threading.Lock()
 
     # RB-07 FIX: _executor is now an INSTANCE attribute (created in __init__),
     # not a class attribute.
@@ -292,8 +296,7 @@ class PureLLMWrapper:
             f"Model '{self.model_name}' returned unsupported type: {type(result)}"
         )
 
-# P1-1 FIX: Initialize the class-level lock OUTSIDE the frozen dataclass body
-# (same pattern as RestoreSnapshot._nonce_lock and factory.py's _PATCH_LOCK).
-# Must be done after the class is defined so Python sees it as a plain class
-# attribute, not a dataclass field.
-PureLLMWrapper._patch_lock = threading.Lock()  # type: ignore[attr-defined]
+# H-2 FIX COMPLETE: _patch_lock is now assigned inside the class body above.
+# The previous post-class assignment line has been removed:
+#   PureLLMWrapper._patch_lock = threading.Lock()  ← removed
+# See the class body comment for the full rationale.
