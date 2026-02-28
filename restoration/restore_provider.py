@@ -18,42 +18,17 @@ class RestorationError(RuntimeError):
 
 
 class RestoreProvider:
-    """
-    Restores workspace cosmetics (cursor, focused window, active application)
-    to the state captured in a RestorationSnapshot.
-
-    HARD CONTRACTS:
-      - restore() is idempotent: calling it twice with the same snapshot_id
-        is a no-op (ledger deduplication).
-      - restore() only operates in SystemMode.RESTORING; raises RestorationError
-        otherwise (fail-closed).
-      - All OS calls are best-effort; failure to restore window/app is logged but
-        does NOT abort the sequence — cursor restoration alone is considered a
-        partial success rather than a hard failure.
-
-    THREAD SAFETY:
-      - A single threading.Lock() serialises all restore() calls.
-      - Ledger I/O is performed under the same lock.
-    """
+    
 
     CURSOR_TOLERANCE_PX = 5
 
-    # FIX RB-4: Raised from 5 attempts × 0.25s = 1.25s total
-    # to 10 attempts × 0.50s = 5.0s total.
-    #
-    # Measured compositor focus-propagation latencies:
-    #   X11 / GNOME:    ~0.15–0.40s
-    #   X11 / i3:       ~0.10–0.25s
-    #   Wayland / GNOME: ~0.20–0.80s
-    #   Wayland / sway:  ~0.30–1.20s
-    #   Wayland / hyprland: ~0.50–4.20s  ← drives this threshold
-    #
-    # 5.0s provides a 20% safety margin over the worst measured case.
+    
     POST_ACTION_DELAY: float = 0.50     # was 0.25s
     MAX_VERIFY_ATTEMPTS: int = 10       # was 5 → total window: 10 × 0.50 = 5.0s
 
     MAX_LEDGER_ENTRIES = 10_000
-    MAX_TITLE_DISTANCE = 2
+    
+    MAX_TITLE_DISTANCE = 5
 
     _RESTORE_LEDGER_PATH: str = os.path.join(
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -202,21 +177,7 @@ class RestoreProvider:
     # =========================================================================
 
     def restore(self, snapshot: RestorationSnapshot) -> None:
-        """
-        Restore workspace to the state captured in `snapshot`.
-
-        Steps (under self._lock):
-          1. Idempotency check — skip if snapshot already completed (ledger)
-          2. Mode guard — only allowed in RESTORING mode
-          3. Stop automated input and release all keys/buttons
-          4. _restore_application() — activate target application (best-effort)
-          5. _restore_window()     — focus target window (best-effort)
-          6. _restore_cursor()     — reposition cursor (hard requirement)
-          7. _verify()             — assert expected state (hard requirement)
-          8. Record snapshot_id in ledger
-
-        Raises RestorationError on any hard failure.
-        """
+        
         if not isinstance(snapshot, RestorationSnapshot):
             raise RestorationError(
                 f"restore() requires RestorationSnapshot, got {type(snapshot).__name__}"
@@ -254,6 +215,9 @@ class RestoreProvider:
             # Hard verification — raises RestorationError on failure
             self._verify(snapshot)
 
+            
+            self._report_unrestored_processes(snapshot)
+
             # Record successful completion with current timestamp
             # SI-4 / H9 FIX: timestamp (not just sentinel) enables oldest-first eviction
             self._completed_snapshots[snapshot_id] = time.time()
@@ -264,14 +228,7 @@ class RestoreProvider:
     # =========================================================================
 
     def _restore_application(self, snapshot: RestorationSnapshot) -> None:
-        """
-        Activate the application captured in the snapshot.
-
-        GAP-02 FIX: Logs explicitly when the target application is no longer
-        running (OSError from activate_application) so operators see
-        "application was killed during task" instead of the opaque
-        "Post-restore verification failed" message that previously appeared.
-        """
+        
         if snapshot.application.process_name == "__bare_desktop__":
             return  # Bare desktop: no application to activate
 
@@ -339,23 +296,7 @@ class RestoreProvider:
     # =========================================================================
 
     def _verify(self, snapshot: RestorationSnapshot) -> None:
-        """
-        Verify that the workspace matches the snapshot state.
-
-        FIX RB-4: MAX_VERIFY_ATTEMPTS raised from 5 to 10, POST_ACTION_DELAY
-        from 0.25s to 0.50s — total window: 5.0s (covers slow Wayland compositors).
-
-        DIAGNOSTIC FIX: Tracks cursor / window / application failures separately
-        and reports all three counts in the RestorationError message.  Previously
-        all three were collapsed into a single "5 attempts" count.
-
-        HARDEN-9 (stagnation disambiguation):
-            _verify_cursor_failures   — OS call returned wrong cursor position
-            _verify_window_failures   — focused window title did not match
-            _verify_app_failures      — active application did not match
-        These counters appear in the error message so root-cause analysis requires
-        only reading the exception text, not log correlation.
-        """
+        
         if self._mode.mode is not SystemMode.RESTORING:
             raise RestorationError(
                 "Verification attempted outside RESTORING mode — "
@@ -455,12 +396,27 @@ class RestoreProvider:
         return prev[-1]
 
     def _strict_match(self, expected: str, actual: str) -> bool:
-        """True iff expected and actual are equal or within MAX_TITLE_DISTANCE edits."""
+        
         if not expected or not actual:
             return False
         if expected == actual:
             return True
-        return self._levenshtein(expected, actual) <= self.MAX_TITLE_DISTANCE
+        if self._levenshtein(expected, actual) <= self.MAX_TITLE_DISTANCE:
+            return True
+
+        # Token-overlap fallback — handles dynamic-title browser windows (IH-5 fix).
+        expected_tokens = set(expected.split())
+        actual_tokens = set(actual.split())
+        shared = expected_tokens & actual_tokens
+        # Only count substantive tokens (length ≥ 4) to avoid trivial matches.
+        substantive_shared = [t for t in shared if len(t) >= 4]
+        if substantive_shared:
+            longest = max(len(t) for t in substantive_shared)
+            # Require the shared token to represent ≥ 40% of expected title length.
+            if len(expected) > 0 and longest / len(expected) >= 0.40:
+                return True
+
+        return False
 
     def _validate_window(self, current_window, snapshot: RestorationSnapshot) -> bool:
         """True iff the currently focused window matches the snapshot's window title."""
@@ -477,6 +433,100 @@ class RestoreProvider:
         expected = self._normalize(snapshot.focus.window_id)
         actual = self._normalize(current_window["title"])
         return self._strict_match(expected, actual)
+
+    def _report_unrestored_processes(self, snapshot: RestorationSnapshot) -> None:
+        
+        baseline_pids = snapshot.metadata.get("process_census_pids")
+        if not baseline_pids:
+            # Census was not captured at snapshot time (degraded mode or legacy
+            # snapshot without census).  Cannot compute diff — skip silently.
+            print(
+                "[RestoreProvider] DEBUG: No process census in snapshot metadata — "
+                "unrestored-process diff skipped (IH-6).",
+                file=sys.stderr,
+            )
+            return
+
+        try:
+            # Collect current PID set using the same strategy as snapshot creation.
+            current_pids: list = []
+            try:
+                import os as _os2
+                current_pids = sorted(
+                    int(e) for e in _os2.listdir("/proc") if e.isdigit()
+                )
+            except Exception:
+                try:
+                    import psutil as _psutil
+                    current_pids = sorted(
+                        p.pid for p in _psutil.process_iter(["pid"])
+                    )
+                except Exception:
+                    print(
+                        "[RestoreProvider] DEBUG: Cannot enumerate current PIDs "
+                        "— unrestored-process diff skipped (IH-6).",
+                        file=sys.stderr,
+                    )
+                    return
+
+            baseline_set = set(baseline_pids)
+            current_set = set(current_pids)
+            new_pids = sorted(current_set - baseline_set)
+
+            if not new_pids:
+                print(
+                    f"[RestoreProvider] IH-6: Process census diff: 0 new processes "
+                    f"since snapshot {snapshot.snapshot_id!r}. No unrestored processes.",
+                    file=sys.stderr,
+                )
+                return
+
+            # Attempt to resolve PID → process name for actionable reporting.
+            pid_names: dict = {}
+            for pid in new_pids:
+                try:
+                    import os as _os3
+                    _comm_path = f"/proc/{pid}/comm"
+                    if _os3.path.exists(_comm_path):
+                        with open(_comm_path, "r") as _f:
+                            pid_names[pid] = _f.read().strip()
+                except Exception:
+                    pass
+                if pid not in pid_names:
+                    try:
+                        import psutil as _psutil2
+                        pid_names[pid] = _psutil2.Process(pid).name()
+                    except Exception:
+                        pid_names[pid] = "<unknown>"
+
+            pid_summary = ", ".join(
+                f"{pid}({pid_names.get(pid, '?')})" for pid in new_pids
+            )
+
+            print(
+                f"[RestoreProvider] WARNING IH-6: {len(new_pids)} process(es) spawned "
+                f"during task execution were NOT restored: {pid_summary}. "
+                "These processes persist on the OS after restoration. "
+                "For full process isolation, run ProjectZeo in a container or VM with snapshots.",
+                file=sys.stderr,
+            )
+
+            # Store the diff in snapshot metadata for downstream consumers.
+            # The snapshot is frozen (dataclass frozen=True) so we update the
+            # dict that was already stored in metadata — this modifies the
+            # in-memory dict object without reassigning the frozen field.
+            try:
+                snapshot.metadata["unrestored_pids"] = new_pids
+                snapshot.metadata["unrestored_pid_names"] = pid_names
+            except Exception:
+                pass  # metadata dict may be immutable in some configurations
+
+        except Exception as _diff_err:
+            print(
+                f"[RestoreProvider] DEBUG: Process census diff failed unexpectedly: "
+                f"{_diff_err}. Restoration is still complete.",
+                file=sys.stderr,
+            )
 
     def _validate_application(
         self, current_app, snapshot: RestorationSnapshot
