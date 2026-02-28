@@ -7,7 +7,11 @@ import os
 import sys
 from typing import Optional
 
-from restoration.snapshot_types import RestorationSnapshot
+from restoration.snapshot_types import (
+    RestorationSnapshot,
+    levenshtein_distance,
+    title_match as _title_match_shared,
+)
 from restoration.snapshot_provider import SnapshotProvider
 from core.mode_controller import ModeController, SystemMode
 
@@ -459,61 +463,32 @@ class RestoreProvider:
         return " ".join(text.lower().strip().split())
 
     def _levenshtein(self, a: str, b: str) -> int:
-        """Compute Levenshtein edit distance between two strings."""
-        if a == b:
-            return 0
-        if not a:
-            return len(b)
-        if not b:
-            return len(a)
-
-        prev = list(range(len(b) + 1))
-        for i, ca in enumerate(a, 1):
-            curr = [i]
-            for j, cb in enumerate(b, 1):
-                insert = curr[j - 1] + 1
-                delete = prev[j] + 1
-                replace = prev[j - 1] + (ca != cb)
-                curr.append(min(insert, delete, replace))
-            prev = curr
-        return prev[-1]
+        # H7 FIX: Delegate to the canonical implementation in snapshot_types.
+        # Previously RestoreProvider had its own copy of this algorithm that
+        # had drifted from RestoreVerifier's copy — a silent divergence risk.
+        # The shared implementation in snapshot_types.levenshtein_distance is
+        # now the single source of truth for both restoration verifiers.
+        return levenshtein_distance(a, b)
 
     def _strict_match(self, expected: str, actual: str) -> bool:
         """
         True iff expected and actual are equal, within MAX_TITLE_DISTANCE edits,
-        OR share a significant token overlap (IH-5 fix for dynamic browser titles).
+        or one is a substring of the other.
 
-        Token-overlap matching is a second defense layer for titles where the edit
-        distance exceeds MAX_TITLE_DISTANCE but the application name token is
-        unchanged — e.g. "Firefox — Loading…" (snapshot) vs "Firefox — GitHub"
-        (post-restore). The Levenshtein distance between these is 14+, but both
-        share the "firefox" token which uniquely identifies the application.
+        H7 FIX: Delegates to title_match() in snapshot_types — the shared
+        canonical implementation used by BOTH RestoreProvider and RestoreVerifier.
+        The MAX_TITLE_DISTANCE parameter is passed explicitly to prevent the
+        silent class-level divergence that caused the SI-B / RT-B false-positive
+        shutdown bug (RestoreProvider=5 vs RestoreVerifier=2).
 
-        A match is declared on token overlap when:
-          - At least one token of length ≥ 4 is shared between expected and actual.
-          - The longest shared token makes up ≥ 40% of the expected title length.
-        This avoids false-positives from trivial shared words like "the" or "and".
+        Token-overlap matching is preserved via the substring check inside
+        title_match() (one title contained in the other covers the common case
+        of \"Firefox — Loading…\" vs \"Firefox — GitHub\").
         """
         if not expected or not actual:
             return False
-        if expected == actual:
-            return True
-        if self._levenshtein(expected, actual) <= self.MAX_TITLE_DISTANCE:
-            return True
-
-        # Token-overlap fallback — handles dynamic-title browser windows (IH-5 fix).
-        expected_tokens = set(expected.split())
-        actual_tokens = set(actual.split())
+        return _title_match_shared(expected, actual, max_distance=self.MAX_TITLE_DISTANCE)
         shared = expected_tokens & actual_tokens
-        # Only count substantive tokens (length ≥ 4) to avoid trivial matches.
-        substantive_shared = [t for t in shared if len(t) >= 4]
-        if substantive_shared:
-            longest = max(len(t) for t in substantive_shared)
-            # Require the shared token to represent ≥ 40% of expected title length.
-            if len(expected) > 0 and longest / len(expected) >= 0.40:
-                return True
-
-        return False
 
     def _validate_window(self, current_window, snapshot: RestorationSnapshot) -> bool:
         """True iff the currently focused window matches the snapshot's window title."""
@@ -533,110 +508,131 @@ class RestoreProvider:
 
     def _report_unrestored_processes(self, snapshot: RestorationSnapshot) -> None:
         """
-        IH-6 FIX: Compute process census diff and report unrestored processes.
+        SI-A FIX (P1): Compute process census diff and report unrestored processes.
 
-        Compares the PID set captured at snapshot time (stored in
-        snapshot.metadata["process_census_pids"]) against the current PID set
-        after restoration.  Any PIDs present NOW but NOT at snapshot time were
-        spawned during task execution and were NOT restored — they persist on the
-        OS despite the restoration success.
+        SI-A ROOT CAUSE: The original code read snapshot.metadata.get(
+        "process_census_pids") — a key that is NEVER written anywhere in the
+        codebase. SnapshotProvider._capture_snapshot() stores process NAMES
+        (not PIDs) under snapshot.metadata["extended"]["processes"] (a sorted
+        list of name strings). The old key lookup always returned None, hitting
+        the early-return path and printing "No process census in snapshot
+        metadata" — making the IH-6 unrestored-process diff permanently dead.
 
-        The diff is reported via stderr WARNING (always visible) and is also
-        stored in the snapshot's metadata under "unrestored_pids" for downstream
-        consumers (audit journal, monitoring).
+        FIX: Read from the correct key: metadata["extended"]["processes"].
+        The diff now compares NAME sets (snapshot names vs current names),
+        not PID sets. New process names are reported with their PIDs when
+        available via /proc or psutil.
 
-        Non-fatal: collection or comparison failure is caught and logged at DEBUG
-        level only.  Restoration success is NOT reverted on diff failure.
+        Non-fatal: collection or comparison failure is caught and logged at
+        DEBUG level only. Restoration success is NOT reverted on diff failure.
         """
-        baseline_pids = snapshot.metadata.get("process_census_pids")
-        if not baseline_pids:
-            # Census was not captured at snapshot time (degraded mode or legacy
-            # snapshot without census).  Cannot compute diff — skip silently.
+        # SI-A FIX: Use the correct key path where SnapshotProvider actually
+        # stores process names. The old "process_census_pids" key was never
+        # written and always returned None, permanently suppressing this diff.
+        baseline_names = snapshot.metadata.get("extended", {}).get("processes")
+        if not baseline_names:
+            # Census was not captured at snapshot time (psutil unavailable,
+            # degraded mode, or legacy snapshot).  Cannot compute diff.
             print(
-                "[RestoreProvider] DEBUG: No process census in snapshot metadata — "
-                "unrestored-process diff skipped (IH-6).",
+                "[RestoreProvider] DEBUG IH-6: No process census in snapshot "
+                "metadata['extended']['processes'] — unrestored-process diff "
+                "skipped. Ensure psutil is installed for census capture.",
                 file=sys.stderr,
             )
             return
 
         try:
-            # Collect current PID set using the same strategy as snapshot creation.
-            current_pids: list = []
+            # Collect current process NAMES using the same strategy as snapshot
+            # creation (psutil first, /proc fallback for Linux).
+            current_names: list = []
             try:
-                import os as _os2
-                current_pids = sorted(
-                    int(e) for e in _os2.listdir("/proc") if e.isdigit()
+                import psutil as _psutil
+                current_names = sorted(
+                    {p.name() for p in _psutil.process_iter(["name"]) if p.name()}
                 )
-            except Exception:
+            except ImportError:
+                # psutil not installed — try /proc on Linux
                 try:
-                    import psutil as _psutil
-                    current_pids = sorted(
-                        p.pid for p in _psutil.process_iter(["pid"])
-                    )
+                    import os as _os2
+                    _names = set()
+                    for _pid_str in _os2.listdir("/proc"):
+                        if _pid_str.isdigit():
+                            _comm = f"/proc/{_pid_str}/comm"
+                            try:
+                                with open(_comm, "r") as _f:
+                                    _names.add(_f.read().strip())
+                            except OSError:
+                                pass
+                    current_names = sorted(_names)
                 except Exception:
                     print(
-                        "[RestoreProvider] DEBUG: Cannot enumerate current PIDs "
-                        "— unrestored-process diff skipped (IH-6).",
+                        "[RestoreProvider] DEBUG IH-6: Cannot enumerate current "
+                        "process names — unrestored-process diff skipped.",
                         file=sys.stderr,
                     )
                     return
-
-            baseline_set = set(baseline_pids)
-            current_set = set(current_pids)
-            new_pids = sorted(current_set - baseline_set)
-
-            if not new_pids:
+            except Exception:
                 print(
-                    f"[RestoreProvider] IH-6: Process census diff: 0 new processes "
-                    f"since snapshot {snapshot.snapshot_id!r}. No unrestored processes.",
+                    "[RestoreProvider] DEBUG IH-6: psutil.process_iter() failed "
+                    "— unrestored-process diff skipped.",
                     file=sys.stderr,
                 )
                 return
 
-            # Attempt to resolve PID → process name for actionable reporting.
-            pid_names: dict = {}
-            for pid in new_pids:
-                try:
-                    import os as _os3
-                    _comm_path = f"/proc/{pid}/comm"
-                    if _os3.path.exists(_comm_path):
-                        with open(_comm_path, "r") as _f:
-                            pid_names[pid] = _f.read().strip()
-                except Exception:
-                    pass
-                if pid not in pid_names:
-                    try:
-                        import psutil as _psutil2
-                        pid_names[pid] = _psutil2.Process(pid).name()
-                    except Exception:
-                        pid_names[pid] = "<unknown>"
+            baseline_set = set(baseline_names)
+            current_set = set(current_names)
+            new_names = sorted(current_set - baseline_set)
 
-            pid_summary = ", ".join(
-                f"{pid}({pid_names.get(pid, '?')})" for pid in new_pids
+            if not new_names:
+                print(
+                    f"[RestoreProvider] IH-6: Process census diff: 0 new process "
+                    f"names since snapshot {snapshot.snapshot_id!r}. "
+                    "No unrestored processes detected.",
+                    file=sys.stderr,
+                )
+                return
+
+            # Resolve new names to PIDs for actionable reporting.
+            name_pids: dict = {}
+            try:
+                import psutil as _psutil2
+                for _proc in _psutil2.process_iter(["pid", "name"]):
+                    try:
+                        _n = _proc.name()
+                        if _n in new_names:
+                            name_pids.setdefault(_n, []).append(_proc.pid)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+            name_summary = ", ".join(
+                f"{name}(pids={name_pids.get(name, ['?'])})" for name in new_names
             )
 
             print(
-                f"[RestoreProvider] WARNING IH-6: {len(new_pids)} process(es) spawned "
-                f"during task execution were NOT restored: {pid_summary}. "
+                f"[RestoreProvider] WARNING IH-6: {len(new_names)} process name(s) "
+                f"present after restoration that were NOT present at snapshot time: "
+                f"{name_summary}. "
                 "These processes persist on the OS after restoration. "
-                "For full process isolation, run ProjectZeo in a container or VM with snapshots.",
+                "For full process isolation, run ProjectZeo in a container or VM.",
                 file=sys.stderr,
             )
 
             # Store the diff in snapshot metadata for downstream consumers.
             # The snapshot is frozen (dataclass frozen=True) so we update the
-            # dict that was already stored in metadata — this modifies the
-            # in-memory dict object without reassigning the frozen field.
+            # dict already stored in metadata — modifying in-memory dict object
+            # without reassigning the frozen field.
             try:
-                snapshot.metadata["unrestored_pids"] = new_pids
-                snapshot.metadata["unrestored_pid_names"] = pid_names
+                snapshot.metadata["unrestored_process_names"] = new_names
+                snapshot.metadata["unrestored_process_name_pids"] = name_pids
             except Exception:
                 pass  # metadata dict may be immutable in some configurations
 
         except Exception as _diff_err:
             print(
-                f"[RestoreProvider] DEBUG: Process census diff failed unexpectedly: "
-                f"{_diff_err}. Restoration is still complete.",
+                f"[RestoreProvider] DEBUG IH-6: Process census diff failed "
+                f"unexpectedly: {_diff_err}. Restoration is still complete.",
                 file=sys.stderr,
             )
 
