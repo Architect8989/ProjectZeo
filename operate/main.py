@@ -70,14 +70,35 @@ def main_entry(
         world_graph = WorldGraph()
         env_fingerprint = collect_environment_fingerprint()
 
+        # FIX: llm_call=None immediately raises PlanningError in ExecutionPlanner.
+        # This standalone entry builds a real adapter from LLM_MODEL env var.
+        # In production the full kernel (run.py → main.py) wires this properly.
+        import os as _os
+        _model_name = model or _os.environ.get("LLM_MODEL", "").strip()
+        if not _model_name:
+            raise RuntimeError(
+                "model must be provided via argument or LLM_MODEL env var"
+            )
+        from adapters.factory import build_llm as _build_llm
+        import asyncio as _asyncio
+
+        _adapter = _build_llm(_model_name)
+
+        def _llm_callable(messages, objective=None, session_id=None):
+            async def _invoke():
+                return await _adapter.get_next_action(
+                    messages=messages, objective=objective, session_id=session_id
+                )
+            ops, err = _asyncio.run(_invoke())
+            if err:
+                raise RuntimeError(f"LLM error: {err}")
+            return ops or []
+
         planner = ExecutionPlanner(
-            llm_call=None,  # expected injected via higher-level orchestrator
+            llm_call=_llm_callable,
             environment_fingerprint=env_fingerprint,
             world_graph=world_graph,
         )
-
-        if not callable(planner._llm_call):
-            raise RuntimeError("ExecutionPlanner LLM callable not configured")
 
         log_info("[SYSTEM] Starting SOC execution")
 
