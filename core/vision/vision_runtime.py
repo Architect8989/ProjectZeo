@@ -23,35 +23,15 @@ class VisionDegradedError(RuntimeError):
     pass
 
 
-# ==================================================
-# PYTHON VERSION COMPAT HELPER  (FIX-C2)
-# ==================================================
+
 
 def _shutdown_executor_compat(executor, wait: bool = False) -> None:
-    """
-    FIX-C2 (RB-2): Python 3.8 compatible ThreadPoolExecutor shutdown.
-
-    The cancel_futures parameter was added in Python 3.9.  On Python 3.8,
-    passing it raises:
-        TypeError: shutdown() got an unexpected keyword argument 'cancel_futures'
-
-    This helper passes cancel_futures=True only when running Python >= 3.9,
-    and falls back to shutdown(wait=wait) on older versions.
-
-    Previously, vision_runtime.stop() called shutdown directly with
-    cancel_futures=True; the resulting TypeError was silently swallowed
-    by main.py's `except Exception: pass` block, causing the executor to
-    never shut down and daemon threads to leak for the process lifetime.
-    """
+    
     if sys.version_info >= (3, 9):
         executor.shutdown(wait=wait, cancel_futures=True)
     else:
         executor.shutdown(wait=wait)
 
-
-# ==================================================
-# CONFIG
-# ==================================================
 
 MAX_ALLOWED_LATENCY_SECONDS  = 120.0
 NETWORK_CONNECT_TIMEOUT      = 5.0
@@ -64,17 +44,8 @@ MAX_CONSECUTIVE_FAILURES = 5
 CAPTURE_INTERVAL_SECONDS = 0.5
 
 
-# ==================================================
-# OLLAMA RESPONSE SHIM  (FIX-3)
-# ==================================================
-
 def _extract_vision_content(response: Any) -> str:
-    """
-    FIX-3: Compatibility shim for ollama response shapes.
-
-    ollama >=0.2: object with attribute access  → response.message.content
-    ollama  <0.2: dict                          → response["message"]["content"]
-    """
+    
     if hasattr(response, "message"):
         message = response.message
         if hasattr(message, "content"):
@@ -97,10 +68,6 @@ def _extract_vision_content(response: Any) -> str:
         f"Cannot extract content from ollama response type: {type(response)}"
     )
 
-
-# ==================================================
-# VISION RUNTIME
-# ==================================================
 
 class VisionRuntime:
 
@@ -163,14 +130,7 @@ class VisionRuntime:
             self._thread.start()
 
     def stop(self) -> None:
-        """
-        FIX-C2 (RB-2): Use _shutdown_executor_compat() instead of calling
-        executor.shutdown(cancel_futures=True) directly.
-
-        Direct use of cancel_futures=True raised TypeError on Python 3.8,
-        which was silently swallowed by the caller, leaking the executor.
-        The compat helper checks sys.version_info before passing the argument.
-        """
+        
         with self._lock:
             self._running = False
 
@@ -206,19 +166,7 @@ class VisionRuntime:
                     if not self._running:
                         return
 
-                    # P0-E FIX (RT-07): Guard against stale frames when CPU
-                    # inference is slow (40-90 s per frame).  The executor
-                    # serialises frames; a new capture is already queued while
-                    # inference for the previous one is still running.  Without
-                    # this check the world graph is updated with minutes-old
-                    # perception data, causing actions to target stale UI state.
-                    #
-                    # If the frame timestamp is older than MAX_ALLOWED_LATENCY_SECONDS
-                    # from NOW (not from inference start), treat this loop iteration
-                    # as a transient failure: increment the failure counter but do
-                    # NOT update last_output.  This forces the consumer to use the
-                    # most recent non-stale frame and marks vision unhealthy after
-                    # MAX_CONSECUTIVE_FAILURES consecutive stale frames.
+                    
                     frame_age = time.time() - output.get("frame_ts", 0.0)
                     if frame_age > MAX_ALLOWED_LATENCY_SECONDS:
                         self._consecutive_failures += 1
@@ -327,16 +275,19 @@ class VisionRuntime:
             "No explanation. No markdown."
         )
 
+        # FIX-IMG: The ollama Python library uses {"images": [base64_str]} NOT
+        # the OpenAI-style content array format {"content": [{"type":"image",...}]}.
+        # Using the content-array format causes ollama to ignore the image entirely
+        # or raise a runtime error, making ALL vision inference silent no-ops.
+        # The correct format has been consistent across ollama >=0.1.x.
         try:
             response = self._ollama_client.chat(
                 model=self._model_name,
                 messages=[
                     {
                         "role": "user",
-                        "content": [
-                            {"type": "text", "text": prompt},
-                            {"type": "image", "image": image_b64},
-                        ],
+                        "content": prompt,
+                        "images": [image_b64],
                     }
                 ],
                 options={"temperature": 0},
@@ -437,9 +388,21 @@ class VisionRuntime:
     def _parse_json(self, raw: str) -> Dict[str, Any]:
         raw = raw.strip()
 
+        
         if raw.startswith("```"):
-            parts = raw.split("```")
-            raw = parts[1] if len(parts) >= 3 else parts[-1]
+            # Remove the opening fence marker
+            raw = raw[3:]
+            # Strip optional language identifier (e.g. "json", "JSON")
+            if "\n" in raw:
+                first_line, remainder = raw.split("\n", 1)
+                stripped_tag = first_line.strip()
+                # Only strip if it's a plain language tag, not start of JSON
+                if stripped_tag and not stripped_tag.startswith(("{", "[")):
+                    raw = remainder
+            # Remove closing fence if present
+            if raw.rstrip().endswith("```"):
+                raw = raw.rstrip()[:-3]
+            raw = raw.strip()
 
         try:
             parsed = json.loads(raw)
