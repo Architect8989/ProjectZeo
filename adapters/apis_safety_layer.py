@@ -387,8 +387,37 @@ def _disable_screenshot_writes():
             return _real_open(file, mode, *args, **kwargs)
         if not _is_screenshot_path(file):
             return _real_open(file, mode, *args, **kwargs)
+        # IH-06 FIX: Restrict stack inspection scope.
+        # (1) Only run the check when DISPLAY is set — headless backends and
+        #     CI environments should not be affected.
+        # (2) Exempt known legitimate screenshot writers (pyautogui, mss,
+        #     operate.utils.screenshot) from the block.  These write to paths
+        #     containing "screenshot" as a normal part of their operation and
+        #     must not be caught by the cloud-API guard.
+        import os as _os_ih06
+        if not _os_ih06.environ.get("DISPLAY"):
+            return _real_open(file, mode, *args, **kwargs)
+        _LEGITIMATE_SCREENSHOT_PATTERNS = (
+            "pyautogui",
+            "mss",
+            "operate/utils/screenshot",
+            "operate.utils.screenshot",
+            "operate\\utils\\screenshot",
+        )
         try:
             stack = inspect.stack()
+            _has_legitimate_caller = any(
+                any(
+                    pat in (frame_info.filename or "") or
+                    pat in (frame_info.frame.f_globals.get("__name__") or "")
+                    for pat in _LEGITIMATE_SCREENSHOT_PATTERNS
+                )
+                for frame_info in stack
+            )
+            # If a legitimate screenshot module is anywhere in the call stack,
+            # pass through without scanning for cloud API patterns.
+            if _has_legitimate_caller:
+                return _real_open(file, mode, *args, **kwargs)
             for frame_info in stack:
                 filename = frame_info.filename or ""
                 module = (frame_info.frame.f_globals.get("__name__") or "")
