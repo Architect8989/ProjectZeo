@@ -912,9 +912,16 @@ def main(llm_callable: Callable, model_name: str) -> None:
                     file=sys.stderr,
                 )
                 try:
+                    # FIX-RESTART: Stop both vision_runtime AND observer_loop,
+                    # then restart both. The original code only restarted
+                    # vision_runtime but not observer_loop — the loop remained
+                    # stopped (or its _stop_event was set), so no new frames
+                    # were ever delivered to ObserverCore after blindness recovery.
+                    observer_loop.stop()
                     vision_runtime.stop()
                     time.sleep(2.0)
                     vision_runtime.start()
+                    observer_loop.start()
                     time.sleep(VISION_RESTART_GRACE_SECONDS)
                     observer.reset_for_new_task()
                     world_graph.reset()
