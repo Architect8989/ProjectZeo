@@ -40,7 +40,12 @@ class ActionRanker:
         actions: List[Dict[str, Any]],
         belief_state,
     ) -> Dict[str, Any]:
-        
+        # RT-A1 FIX (P0): Guard against empty action list.
+        # The original code had a bare raise RuntimeError(...) block indented
+        # as if inside an if-body, but with no if statement — producing an
+        # IndentationError at parse time that prevented action_ranker.py from
+        # compiling entirely, crashing all execution at import.
+        if not actions:
             raise RuntimeError(
                 "ActionRanker.select(): received empty action list — "
                 "caller must provide at least one candidate action."
