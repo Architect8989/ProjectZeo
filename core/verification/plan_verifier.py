@@ -154,10 +154,15 @@ class PlanVerifier:
                         f"Step {step.id} missing UI operation"
                     )
 
-            # PATCH (audit Bug #2): validate TOOL_INSTALLATION action shape.
-            # Require a 'tool' dict with an 'official_url' starting with
-            # 'https://' so that the installer can open the official download
-            # page safely (mirrors the planner-level enforcement).
+            # FIX: TOOL_INSTALLATION steps that use terminal-first install
+            # (via install_commands: ["apt-get install ...", "npm install ..."]) do NOT
+            # require an official_url — the URL is informational metadata.
+            # The original strict check raised PlanVerificationError for EVERY
+            # apt/npm/brew/pip install, blocking the AutonomousInstaller entirely.
+            #
+            # New rule: if install_commands is a non-empty list, official_url is
+            # OPTIONAL (just warn). Only reject if BOTH official_url is missing/invalid
+            # AND install_commands is absent — that means there's truly no install path.
             if step.type == StepType.TOOL_INSTALLATION:
                 tool = step.action.get("tool")
                 if not isinstance(tool, dict):
@@ -166,12 +171,29 @@ class PlanVerifier:
                         f"a 'tool' dict"
                     )
                 official_url = tool.get("official_url", "")
-                if not isinstance(official_url, str) or not official_url.startswith(
-                    "https://"
-                ):
+                install_cmds = tool.get("install_commands", [])
+                has_valid_url = (
+                    isinstance(official_url, str)
+                    and official_url.startswith("https://")
+                )
+                has_install_cmds = (
+                    isinstance(install_cmds, list)
+                    and len(install_cmds) > 0
+                )
+                if not has_valid_url and not has_install_cmds:
                     raise PlanVerificationError(
-                        f"Step {step.id} TOOL_INSTALLATION 'official_url' must "
-                        f"start with 'https://'"
+                        f"Step {step.id} TOOL_INSTALLATION must have either a valid "
+                        f"'official_url' (starting with 'https://') or non-empty "
+                        f"'install_commands'. Got neither — there is no install path."
+                    )
+                # Warn (non-fatal) if official_url is missing but install_commands exist
+                if not has_valid_url and has_install_cmds:
+                    import sys as _sys
+                    print(
+                        f"[PlanVerifier] Step {step.id} TOOL_INSTALLATION has no "
+                        f"'official_url' but has install_commands — proceeding "
+                        f"with terminal-only install path.",
+                        file=_sys.stderr,
                     )
 
     def _verify_required_tools(self, plan: ExecutionPlan) -> None:
