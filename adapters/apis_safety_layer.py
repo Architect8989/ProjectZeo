@@ -293,6 +293,63 @@ def _disable_cloud_fallbacks():
 # ============================================================
 
 def _disable_screenshot_writes():
+    # H6 FIX: Document builtins.open monkey-patch scope and add
+    # PROJECTZEO_DISABLE_OPEN_PATCH=1 escape hatch.
+    #
+    # WHAT THIS PATCH DOES:
+    #   Replaces builtins.open (the built-in open() callable available to ALL
+    #   Python modules in this process) with a guarded version that raises
+    #   RuntimeError when code originating from operate.models.apis or
+    #   operate.legacy.apis attempts to open a file whose path contains the
+    #   substring "screenshot" in write/append/exclusive-create mode.
+    #
+    # WHY THIS IS NECESSARY:
+    #   The cloud API adapters (gpt4v, claude-vision) historically wrote raw
+    #   screenshots to disk as a side-effect of building vision payloads.
+    #   Blocking them at builtins.open prevents the writes regardless of how
+    #   the adapter module organises its internal code.
+    #
+    # SCOPE — PROCESS-WIDE (critical to understand):
+    #   The guarded open() is installed process-wide.  It intercepts write-mode
+    #   opens to any path containing "screenshot" from ANY module.  The guard
+    #   inspects the call-stack to confirm the calling frame originates from an
+    #   apis module before blocking; all other callers pass through unchanged.
+    #   The stack inspection adds a small overhead on every write to a
+    #   "screenshot"-named path regardless of the calling module.
+    #
+    # KNOWN CONFLICT RISK:
+    #   Third-party automation libraries (playwright, pyautogui, mss) that
+    #   legitimately write screenshot files may be affected if their call stack
+    #   happens to include an apis module frame.  In practice, Ollama-only
+    #   deployments never import cloud API modules, so no writes are blocked.
+    #
+    # ESCAPE HATCH (H6):
+    #   Set PROJECTZEO_DISABLE_OPEN_PATCH=1 to skip builtins.open replacement.
+    #   Use ONLY if the patch causes confirmed third-party library conflicts.
+    #
+    #   WARNING: Disabling this patch removes screenshot-write isolation for
+    #   cloud API adapters.  Do NOT use when OLLAMA_ONLY != 1.
+    #
+    # UNINSTALL:
+    #   uninstall_patches() restores the original builtins.open on shutdown.
+
+    import os as _os_h6
+
+    # H6 ESCAPE HATCH — opt out of builtins.open replacement if explicitly
+    # requested by the operator.
+    _skip_open_patch: bool = (
+        _os_h6.environ.get("PROJECTZEO_DISABLE_OPEN_PATCH", "").strip() == "1"
+    )
+    if _skip_open_patch:
+        import sys as _sys_h6
+        print(
+            "[APIS-SAFETY] WARNING H6: PROJECTZEO_DISABLE_OPEN_PATCH=1 — "
+            "builtins.open screenshot write guard is DISABLED. "
+            "Screenshot isolation for cloud API adapters is NOT enforced. "
+            "Do NOT use this setting when cloud API access is enabled.",
+            file=_sys_h6.stderr,
+        )
+
     # RT-A2 FIX (P1): The builtins.open patch and legacy module patch MUST be
     # installed BEFORE _get_apis() is called.  In the original code the
     # _m = _get_apis() call appeared first; if it raised (Ollama-only install
@@ -346,14 +403,14 @@ def _disable_screenshot_writes():
             pass
         return _real_open(file, mode, *args, **kwargs)
 
-    if not getattr(_builtins_mod, "_safety_open_installed", False):
+    if not _skip_open_patch and not getattr(_builtins_mod, "_safety_open_installed", False):
         _builtins_mod.open = guarded_open
         _builtins_mod._safety_open_installed = True
 
     # Also patch the legacy module attribute for backwards compatibility
     try:
         legacy = importlib.import_module("operate.legacy.apis")
-        if not getattr(legacy, "_open_safety_guarded", False):
+        if not _skip_open_patch and not getattr(legacy, "_open_safety_guarded", False):
             legacy.open = guarded_open
             setattr(legacy, "_open_safety_guarded", True)
     except Exception:
@@ -424,6 +481,20 @@ def _guard_dispatch():
         @functools.wraps(original)
         async def guarded(model, messages, objective, session_id):
 
+            # SI-C FIX: Validate that `model` is a non-empty string.
+            # The original dispatcher accepted None or non-string model values
+            # silently — they passed through to the underlying router without
+            # type validation.  A None model (possible if an adapter's
+            # _resolve_model_function() returns None on misconfiguration) would
+            # propagate into Ollama's client.chat(), producing a cryptic
+            # internal error rather than a clear contract violation here.
+            if not isinstance(model, str) or not model.strip():
+                raise RuntimeError(
+                    f"[APIS-SAFETY] Dispatcher model must be a non-empty string, "
+                    f"got: {model!r} (type={type(model).__name__}). "
+                    "Check adapter _resolve_model_function() return value."
+                )
+
             if not isinstance(messages, list):
                 raise RuntimeError(
                     "[APIS-SAFETY] Dispatcher messages must be list"
@@ -447,6 +518,14 @@ def _guard_dispatch():
 
         @functools.wraps(original)
         def guarded(model, messages, objective, session_id):
+
+            # SI-C FIX: Same model type validation as the async path above.
+            if not isinstance(model, str) or not model.strip():
+                raise RuntimeError(
+                    f"[APIS-SAFETY] Dispatcher model must be a non-empty string, "
+                    f"got: {model!r} (type={type(model).__name__}). "
+                    "Check adapter _resolve_model_function() return value."
+                )
 
             if not isinstance(messages, list):
                 raise RuntimeError(
