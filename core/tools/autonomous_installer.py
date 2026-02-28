@@ -51,12 +51,15 @@ def _winget(pkg: str) -> str:
 
 COMMON_INSTALL_COMMANDS: Dict[str, Dict[str, str]] = {
     "node": {
-        "Linux":   "curl -fsSL https://deb.nodesource.com/setup_lts.x | sudo -E bash - && sudo apt-get install -y nodejs",
+        # SI-3 FIX: original "curl -fsSL https://deb.nodesource.com/setup_lts.x | sudo -E bash -"
+        # matched the r"\|\s*bash\b" dangerous pattern and was silently dropped.
+        # Replaced with a direct apt-get install that does not pipe to a shell interpreter.
+        "Linux":   "sudo apt-get update -qq && sudo apt-get install -y nodejs npm",
         "Darwin":  _brew("node"),
         "Windows": _choco("nodejs"),
     },
     "nodejs": {
-        "Linux":   "curl -fsSL https://deb.nodesource.com/setup_lts.x | sudo -E bash - && sudo apt-get install -y nodejs",
+        "Linux":   "sudo apt-get update -qq && sudo apt-get install -y nodejs npm",
         "Darwin":  _brew("node"),
         "Windows": _choco("nodejs"),
     },
@@ -76,7 +79,10 @@ COMMON_INSTALL_COMMANDS: Dict[str, Dict[str, str]] = {
         "Windows": "npm install -g pnpm",
     },
     "bun": {
-        "Linux":   "curl -fsSL https://bun.sh/install | bash",
+        # SI-3 FIX: original "curl -fsSL https://bun.sh/install | bash" matched
+        # the r"\|\s*bash\b" dangerous pattern. Replaced with npm global install
+        # which does not pipe to a shell interpreter.
+        "Linux":   "npm install -g bun",
         "Darwin":  "curl -fsSL https://bun.sh/install | bash",
         "Windows": "powershell -c \"irm bun.sh/install.ps1|iex\"",
     },
@@ -101,7 +107,11 @@ COMMON_INSTALL_COMMANDS: Dict[str, Dict[str, str]] = {
         "Windows": _choco("git"),
     },
     "docker": {
-        "Linux":   "curl -fsSL https://get.docker.com | sh",
+        # SI-3 FIX: original "curl -fsSL https://get.docker.com | sh" matched
+        # both r"\bcurl\b.*\|\s*(?:ba)?sh\b" and r"\|\s*sh\b" dangerous patterns.
+        # Replaced with apt-get install docker.io which is available in Ubuntu
+        # default repositories without piping to a shell interpreter.
+        "Linux":   "sudo apt-get update -qq && sudo apt-get install -y docker.io",
         "Darwin":  "brew install --cask docker",
         "Windows": _choco("docker-desktop"),
     },
@@ -166,12 +176,16 @@ COMMON_INSTALL_COMMANDS: Dict[str, Dict[str, str]] = {
         "Windows": _choco("golang"),
     },
     "cargo": {
-        "Linux":   "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y",
+        # SI-3 FIX: original "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y"
+        # matched r"\bcurl\b.*\|\s*(?:ba)?sh\b" and r"\|\s*sh\b" dangerous patterns.
+        # Replaced with apt-get install cargo which is available in Ubuntu repos.
+        "Linux":   "sudo apt-get update -qq && sudo apt-get install -y cargo",
         "Darwin":  "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y",
         "Windows": _choco("rust"),
     },
     "rustup": {
-        "Linux":   "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y",
+        # SI-3 FIX: same as cargo — replaced curl|sh with apt-get rustup.
+        "Linux":   "sudo apt-get update -qq && sudo apt-get install -y rustup",
         "Darwin":  "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y",
         "Windows": "winget install Rustlang.Rustup",
     },
@@ -191,7 +205,11 @@ COMMON_INSTALL_COMMANDS: Dict[str, Dict[str, str]] = {
         "Windows": _choco("ffmpeg"),
     },
     "gh": {
-        "Linux":   "curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg && echo 'deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main' | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null && sudo apt update && sudo apt install gh -y",
+        # SI-3 FIX: original command used "sudo dd of=/usr/share/keyrings/..."
+        # which matched the r"\bdd\b" dangerous pattern and was silently dropped.
+        # Replaced with sudo snap install which is available on Ubuntu and does
+        # not trigger any dangerous patterns.
+        "Linux":   "sudo snap install gh --classic",
         "Darwin":  _brew("gh"),
         "Windows": _choco("gh"),
     },
