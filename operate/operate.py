@@ -334,6 +334,35 @@ def operate_main(
     verifier = StepVerifier()
     progress = ProgressTracker(execution_plan)
 
+    # H2 FIX (SI-5): Load playbook for this intent at task start.
+    # Previously playbook_store.save_playbook() and load_playbook() were
+    # defined with full disk persistence but never called anywhere in the
+    # execution path — the entire long-horizon memory system was dead
+    # infrastructure.  Every task started from zero knowledge regardless
+    # of prior successful executions.
+    #
+    # Fix: load matching prior actions here and inject them as the first
+    # candidates into the ReasoningEngine fallback pool.  On task success,
+    # save the executed actions so future identical/similar tasks warm-start.
+    from core.memory.playbook_store import load_playbook as _load_playbook, save_playbook as _save_playbook
+    _prior_playbook_actions: list = []
+    try:
+        _pb = _load_playbook(terminal_prompt)
+        if isinstance(_pb, list) and _pb:
+            _prior_playbook_actions = _pb
+            print(
+                f"[operate_main] H2: Loaded playbook for intent "
+                f"({len(_prior_playbook_actions)} prior actions). "
+                "These will be offered as first candidates on stagnant steps.",
+                file=sys.stderr,
+            )
+    except Exception as _pb_load_err:
+        print(
+            f"[operate_main] H2 WARNING: playbook load failed: {_pb_load_err}. "
+            "Proceeding without playbook warm-start.",
+            file=sys.stderr,
+        )
+
     # SI-03 FIX: Use public get_llm_callable() — never reach into private _llm_call
     if hasattr(planner, "get_llm_callable"):
         llm_callable = planner.get_llm_callable()
@@ -356,7 +385,12 @@ def operate_main(
             shared_ollama_client=_shared_client,
         )
 
-    reasoning_engine = ReasoningEngine(llm_callable=llm_callable)
+    # H5 FIX (SI-3): Pass shared ollama_client so ReasoningEngine uses the
+    # text-only path instead of the vision adapter for abstract reasoning.
+    reasoning_engine = ReasoningEngine(
+        llm_callable=llm_callable,
+        ollama_client=getattr(planner, "_ollama_client", None),
+    )
 
     # FIX RB-A3: Per-task executor — isolates timeout guarantees between tasks.
     # A module-level singleton executor shares ONE worker thread; a blocking call
@@ -387,7 +421,26 @@ def operate_main(
             prior_belief_state=prior_belief_state,
             belief_state_out=belief_state_out,
             task_ui_executor=_task_ui_executor,
+            prior_playbook_actions=_prior_playbook_actions,
         )
+        # H2 FIX: Save playbook on successful task completion.
+        # Collect actions from the journal (executed steps) and persist them
+        # so future tasks with identical intent can warm-start from this run.
+        try:
+            _journal_actions = journal.get_all() if hasattr(journal, "get_all") else []
+            if _journal_actions:
+                _save_playbook(terminal_prompt, _journal_actions)
+                print(
+                    f"[operate_main] H2: Saved playbook for intent "
+                    f"({len(_journal_actions)} actions). Future identical tasks "
+                    "will warm-start from this run's successful action sequence.",
+                    file=sys.stderr,
+                )
+        except Exception as _pb_save_err:
+            print(
+                f"[operate_main] H2 WARNING: playbook save failed: {_pb_save_err}.",
+                file=sys.stderr,
+            )
     finally:
         input_arbitrator.shutdown()
         # FIX RB-A3: Shut down the per-task executor on all exit paths.
@@ -419,6 +472,7 @@ def _execute_autonomous_loop(
     prior_belief_state: Optional[dict] = None,
     belief_state_out: Optional[list] = None,
     task_ui_executor: Optional[concurrent.futures.ThreadPoolExecutor] = None,
+    prior_playbook_actions: Optional[List[dict]] = None,
 ) -> None:
 
     start_ts = time.time()
@@ -662,6 +716,24 @@ def _execute_autonomous_loop(
                     elif isinstance(world_snapshot, dict):
                         perception_for_reasoning = world_snapshot
 
+                    # H2 FIX (SI-5): Inject prior playbook actions as first candidates
+                    # before asking ReasoningEngine.  On stagnant steps, unvisited playbook
+                    # actions from prior successful runs of the same intent are prepended so
+                    # the agent tries known-good actions before generating new ones.
+                    _playbook_candidates: List[Dict[str, Any]] = []
+                    if prior_playbook_actions:
+                        _playbook_candidates = [
+                            a for a in prior_playbook_actions
+                            if isinstance(a, dict)
+                            and action_ranker.action_key(a) not in _visited_action_keys
+                        ]
+                        if _playbook_candidates:
+                            journal.record({
+                                "event": "playbook_candidates_injected",
+                                "step": current_step_index,
+                                "count": len(_playbook_candidates),
+                            })
+
                     try:
                         dynamic_candidates = reasoning_engine.propose_actions(
                             objective=execution_plan.objective,
@@ -687,6 +759,11 @@ def _execute_autonomous_loop(
                             })
                     except Exception as re_err:
                         log_warn(f"ReasoningEngine fallback failed: {re_err}")
+
+                    # Prepend playbook candidates (known-good from prior runs) before
+                    # ReasoningEngine-generated candidates so they are seen by ActionRanker.
+                    if _playbook_candidates:
+                        candidate_actions = _playbook_candidates + candidate_actions
 
                 if not candidate_actions:
                     raise RuntimeError("TASK_FAILED:no_candidate_actions")
