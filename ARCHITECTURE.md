@@ -636,3 +636,87 @@ ProjectZeo is a **deterministic execution body** controlled by an **external LLM
 - Self-learning system
 - Adaptive executor
 - Complete state restorer
+
+---
+
+## 16. Audit Findings — Known Architectural Gaps
+
+This section documents confirmed deviations between stated architecture and runtime
+behaviour. All items below have been reported via the 2026-02-28 adversarial audit.
+Fix status is noted; gaps pending future work are marked **OPEN**.
+
+### 16.1 ReasoningEngine — Unreachable in Normal Execution (OPEN)
+
+**Component:** `core/cognition/reasoning_engine.py` / `operate/operate.py`
+
+**Stated Behaviour:**  
+Section 5.3 (Execution Layer) implies that `ReasoningEngine.propose_actions()` provides
+dynamic candidate injection to recover stagnant tasks without triggering a full REPLAN.
+
+**Actual Behaviour:**  
+`propose_actions()` is only called in `_execute_autonomous_loop()` when `candidate_actions`
+is empty.  `candidate_actions` is populated from `current_step.action`, which is always
+non-empty (ExecutionPlanner guarantees a non-null action dict per step, and schema
+validation rejects empty actions).  Therefore `ReasoningEngine` is never reached during
+normal plan execution.
+
+`ReasoningEngine` is only reachable if a step's action dict is null or empty — a condition
+that plan schema validation prevents at planning time.
+
+**Impact:**  
+Stagnation can only be escaped via REPLAN (up to MAX_REPLANS=3), then TASK_FAILED.
+Dynamic candidate injection — a stated stagnation-recovery feature — is inoperative.
+
+**Condition for reachability:**  
+`ReasoningEngine` would be reached if `ExecutionPlanner` produced a step with
+`action = {}` or `action = None`.  This currently cannot happen due to schema validation.
+If future plan sources (e.g., user-injected steps) bypass schema validation, the
+ReasoningEngine path would become live.
+
+**Fix status:** OPEN — architecture documentation updated (this section).  A future fix
+would either (a) remove `ReasoningEngine` as dead code and document stagnation as REPLAN-
+only, or (b) change the trigger condition so `ReasoningEngine` fires after N consecutive
+stagnant iterations regardless of `candidate_actions` emptiness.
+
+---
+
+### 16.2 Restoration Scope — Cosmetic Only
+
+**Stated behaviour:**  
+Sections 6.2 and 6.3 describe restoration as fail-closed and mandatory.
+
+**Actual behaviour:**  
+Restoration is cosmetic: it restores **cursor position and window focus only**.  No OS
+state mutated during task execution (spawned processes, open files, clipboard, network
+connections) is restored.  This matches `restoration_contract.md` Section 5 (explicit
+non-guarantees) but may conflict with implicit operator expectations.
+
+**Fix status:** RESOLVED by documentation.  `RestorationSnapshot.to_dict()` now includes
+an explicit `"restoration_scope": "cursor_and_focus_only"` field and a
+`"restoration_not_restored"` list in the serialised snapshot for audit consumers.
+
+---
+
+### 16.3 Human Confirmation Timeout — Configurable (RESOLVED)
+
+**Original defect:**  
+`MAX_WAIT_RETRIES=10 × WAIT_RETRY_SECONDS=0.5` = 5 seconds.  Human confirmation via
+`/tmp` signal file within 5 seconds was operationally unreachable.
+
+**Fix:**  
+Timeout is now configurable via `PROJECTZEO_CONFIRM_TIMEOUT_SECONDS` env var (default 60s).
+See `operate/operate.py` `_resolve_confirm_timeout()`.
+
+---
+
+### 16.4 Title Distance Asymmetry — Resolved
+
+**Original defect:**  
+`RestoreProvider.MAX_TITLE_DISTANCE=5` vs `RestoreVerifier.MAX_TITLE_DISTANCE=2` caused
+false-positive safe-shutdown on any window title drift of 3–5 characters.
+
+**Fix:**  
+Both now use `MAX_TITLE_DISTANCE=5` (aligned).  Both delegate to the shared
+`levenshtein_distance()` and `title_match()` utility functions in `restoration/snapshot_types.py`
+to prevent future divergence (H7 fix).
+
