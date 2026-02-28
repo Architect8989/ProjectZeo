@@ -19,14 +19,7 @@ class BeliefState:
     RISK_LAMBDA: float = 0.3
     REWARD_WINDOW: int = 100
     PRIOR_ALPHA: float = 0.01
-    # IH-01 FIX: PRIOR_ALPHA (prior smoothing / default state probability for
-    # unseen states) is now separate from LIKELIHOOD_FLOOR (minimum allowed
-    # P(observation|state)).  Previously both roles were filled by PRIOR_ALPHA=0.01,
-    # which prevented any state's posterior from being driven to near-zero by
-    # contradicting evidence.  In correct Bayesian inference, a near-zero likelihood
-    # should collapse that state's posterior — so the likelihood minimum must be
-    # much smaller than the prior.  LIKELIHOOD_FLOOR=1e-10 allows posteriors to be
-    # effectively zeroed while preserving the prior smoothing role of PRIOR_ALPHA.
+    
     LIKELIHOOD_FLOOR: float = 1e-10
     REGRET_DECAY: float = 0.995
     MAX_STATES: int = 64
@@ -35,11 +28,7 @@ class BeliefState:
     
     MIN_ENTROPY_FLOOR: float = 0.3
 
-    # MS-6 FIX: was 3.0; 3.0 produced an identity transform
-    # (reward / 3.0) * 3.0 = reward, storing raw [-1,1] for n < 3 but
-    # z-scores [-3,3] for n >= 3 — a distribution discontinuity at the
-    # n = 3 boundary.  1.0 maps raw [-1,1] → [-3,3], matching the
-    # z-score scale.
+    
     BOOTSTRAP_REWARD_SCALE: float = 1.0
 
     REWARD_CLAMP: float = 3.0
@@ -55,7 +44,7 @@ class BeliefState:
     _FALLBACK_PRUNE_THRESHOLD: float = PRIOR_ALPHA * 2.0
 
     
-    REGRET_SINGLE_STEP_CAP: float = 1.5
+    REGRET_SINGLE_STEP_CAP: float = 2.0
 
     # ------------------------------------------------------------------
     # Construction
@@ -102,16 +91,7 @@ class BeliefState:
 
     @commitment_hash.setter
     def commitment_hash(self, value: str) -> None:
-        """
-        Update the task-identity hash.
-
-        CAUTION: Only call this setter *after* ``commitment_chain_hash``
-        has been initialised.  During ``from_dict()`` deserialization both
-        raw attributes are written directly to avoid the circular
-        dependency: this setter reads ``self.commitment_chain_hash`` on
-        the GENESIS branch, which would raise ``AttributeError`` on a
-        freshly ``__new__``-ed instance.
-        """
+        
         self.task_identity_hash = value
         if self.commitment_chain_hash in ("GENESIS", ""):
             self.commitment_chain_hash = value
@@ -121,18 +101,7 @@ class BeliefState:
     # ------------------------------------------------------------------
 
     def bayesian_update(self, likelihoods: Dict[str, float]) -> None:
-        """
-        Perform a Bayesian posterior update given a likelihood dictionary.
-
-        The update is followed by:
-        1. Normalisation and pruning of near-zero states.
-        2. A single-state guard that injects a ``__prior_fallback__``
-           state to maintain minimum entropy when all probability mass
-           collapses to one state.
-        3. An iterative entropy-floor blending step that raises Shannon
-           entropy to ``MIN_ENTROPY_FLOOR`` nats via uniform blending.
-        4. Removal of the fallback state once entropy is satisfied.
-        """
+        
         if not likelihoods:
             return
 
@@ -179,32 +148,7 @@ class BeliefState:
 
         _current_entropy = self.entropy()
         if _current_entropy < self.MIN_ENTROPY_FLOOR:
-            # IH-02 FIX: Replace the previous adaptive iterative loop (100 iterations,
-            # w_max=0.50) with an analytic closed-form blend weight computation.
-            #
-            # The previous loop used w = deficit/MIN_ENTROPY_FLOOR which produces a
-            # very small weight (≈ 0.033) when the deficit is small relative to the
-            # floor.  For large MAX_STATES (64) distributions with heavy tails, this
-            # weak per-iteration blend could require far more than 100 iterations to
-            # guarantee convergence, violating the stated invariant.
-            #
-            # Analytic approach:
-            #   H(blended) = H((1-w)*p + w*uniform)
-            #   We want H(blended) ≥ MIN_ENTROPY_FLOOR = H_target.
-            #   The exact w* that achieves H_target in one blend is infeasible to
-            #   compute in closed form, but an upper bound is:
-            #     w* = (H_target - H_current) / (ln(n) - H_current)
-            #   where ln(n) is the maximum entropy (fully uniform).
-            #   This w* is exact when H is linear in w (it is convex, so this
-            #   underestimates the required w — meaning after one step with w*
-            #   we may still be below the floor).
-            #
-            # Safe iterative scheme with guaranteed convergence:
-            #   Apply at most 10 iterations, each using w = min(w*, MAX_BLEND_WEIGHT).
-            #   MAX_BLEND_WEIGHT = 0.50 ensures geometric convergence at rate 0.50^k.
-            #   For any distribution, 10 iterations at w≥0.50 shrinks the deficit by
-            #   (0.50)^10 ≈ 1/1000 — sufficient for all practical distributions.
-            #   The analytic w* accelerates convergence when ln(n) >> H_target.
+            
             _MAX_BLEND_WEIGHT = 0.50
             _MAX_ITERATIONS = 10  # analytic w* means far fewer iterations needed
             for _ in range(_MAX_ITERATIONS):
@@ -307,59 +251,12 @@ class BeliefState:
         )
         return mean_reward_01 + exploration
 
-    # MS-T FIX: Minimum observation variance floor to prevent Thompson sampling
-    # from collapsing to a point estimate (pure exploitation, zero exploration)
-    # when an action has constant or nearly-constant reward history.
-    #
-    # ROOT CAUSE: When all reward observations are identical (e.g. every click
-    # returns reward=0.8), Welford online variance produces M2=0. The computation:
-    #   _obs_variance = max(M2 / (n-1), NORMALIZE_EPS) = 1e-8  (astronomically small)
-    #   _obs_prec = n / 1e-8 = n * 10^8  (astronomically large)
-    #   _post_variance ~= 1 / (n * 10^8) ~= 0
-    #   _std = sqrt(0) = 0
-    # numpy normal(loc=mu, scale=0) returns mu deterministically on every call.
-    # The rejection loop exhausts 128 tries returning the same value. Thompson
-    # exploration is permanently suppressed for consistently-rewarded actions.
-    #
-    # FIX: Apply a minimum observation variance floor of MIN_OBS_VARIANCE (0.01).
-    # This ensures std >= sqrt(0.01 / (1 + n * 0.01)) > 0 for all n, preserving
-    # probabilistic sampling diversity while still allowing confident actions to
-    # dominate when warranted. The floor is calibrated so that after n=100
-    # observations at constant reward, std ~= 0.009 — enough sampling diversity
-    # to occasionally explore alternatives without disrupting convergence.
-    #
-    # H5 HARDENING: _zero_variance_count[action] tracks consecutive Thompson
-    # samples that would have collapsed without the floor. When this reaches
-    # ZERO_VARIANCE_WARN_THRESHOLD, emit a structured WARNING so operators can
-    # detect exploration suppression in production logs.
+    
     MIN_OBS_VARIANCE: float = 0.01      # minimum observation variance floor
     ZERO_VARIANCE_WARN_THRESHOLD: int = 5  # consecutive collapses before WARNING
 
     def thompson_sample(self, action: str) -> float:
-        """
-        Draw a Thompson sample from the Normal-Normal conjugate posterior
-        for *action*.
-
-        MS-T FIX: Applies MIN_OBS_VARIANCE floor to observation variance to
-        prevent Thompson sampling from collapsing to a point estimate when
-        reward history is constant (zero Welford variance). Without this fix,
-        any action with uniform reward history (common for reliable UI clicks)
-        would have std=0 and every Thompson sample would equal the posterior
-        mean, permanently suppressing probabilistic exploration.
-
-        H5 HARDENING: Tracks zero-variance collapse events per action and emits
-        a structured WARNING when ZERO_VARIANCE_WARN_THRESHOLD is reached, so
-        operators can detect exploration suppression in production logs.
-
-        Uses Welford online variance when n >= 3; falls back to the prior
-        variance (REWARD_CLAMP^2) for n < 3. Samples outside
-        [-REWARD_CLAMP, +REWARD_CLAMP] are rejected via a 128-trial loop;
-        the clamped posterior mean is the fallback.
-
-        The RNG seed is derived deterministically from the commitment chain
-        hash, action key, iteration counter, and sample counter so that
-        identical inputs always produce identical outputs.
-        """
+        
         rewards = self.action_rewards.get(action)
         if not rewards:
             return 0.0
@@ -427,8 +324,10 @@ class BeliefState:
         _post_mean = max(-self.REWARD_CLAMP, min(self.REWARD_CLAMP, _post_mean))
 
         self._sample_counter += 1
+        
+        _action_key_hash = hashlib.sha256(action.encode("utf-8")).hexdigest()[:8]
         seed_material = (
-            f"{self.commitment_chain_hash}:{action}:"
+            f"{self.commitment_chain_hash}:{_action_key_hash}:"
             f"{self._iteration_counter}:{self._sample_counter}"
         ).encode("utf-8")
         digest = hashlib.sha256(seed_material).digest()
@@ -499,43 +398,8 @@ class BeliefState:
     def update_regret(
         self, action: str, reward: float, best_reward: float
     ) -> None:
-        """
-        Update cumulative regret for *action*.
-
-        Parameters
-        ----------
-        action:
-            Action key (from ``ActionRanker.action_key()``).
-        reward:
-            Observed reward for this step (raw, not normalised).
-        best_reward:
-            Reference best reward.  **Callers must cap this at 0.9** to
-            prevent the DONE sentinel (reward = 1.0) from inflating the
-            reference forever (RT-05 / SI-04 fix — see ``operate.py``).
-
-        RC-1 FIX NOTE: ``_iteration_counter`` is no longer incremented here.
-        It is now incremented in ``record_action()`` instead.  See the
-        RC-1 comment in ``record_action()`` for the full rationale.
-        """
-        # RC-1 FIX: _iteration_counter increment REMOVED from here.
-        # Previously update_regret() was the sole incrementor of
-        # _iteration_counter. On policy-deny paths, operate.py calls
-        # record_action() (to update the commitment chain) but skips
-        # update_regret() (there is no reward to regret-track for denied
-        # actions). This left _iteration_counter un-incremented while the
-        # commitment chain hash advanced — a seed-drift between the two
-        # components that degraded Thompson sample uniqueness on deny paths.
-        # Fix: move the increment into record_action() so it always fires
-        # alongside the chain hash extension, regardless of whether regret
-        # is updated. update_regret() still uses _iteration_counter for the
-        # regret timestamp (self._iteration_counter is read here, just not
-        # written).
-
-        # MF-05 FIX: Enforce the DONE-sentinel cap internally.
-        # operate.py already caps best_reward at 0.9 before calling, but
-        # future callers could pass an uncapped value (e.g. 1.0 from a DONE step).
-        # Clamping here makes the invariant part of the method contract rather
-        # than solely caller-enforced.
+        
+        
         best_reward = min(best_reward, 0.9)
 
         regret_value = best_reward - reward
@@ -552,34 +416,11 @@ class BeliefState:
     # ------------------------------------------------------------------
 
     def record_action(self, action: str, reward: float) -> None:
-        """
-        Record an action execution with its observed reward.
-
-        Steps performed:
-        1. Extend the SHA-256 commitment chain.
-        2. Clamp reward to ``[RAW_REWARD_MIN, RAW_REWARD_MAX]``.
-        3. Update Welford online mean and M₂ accumulator.
-        4. Normalise: z-score (n ≥ 3) or bootstrap scale (n < 3).
-        5. Retroactively re-normalise the first two entries when n
-           transitions to 3, using the 3-sample mean (MF-4 fix).
-        6. Append the normalised reward to the sliding window deque.
-        7. Increment the action visit count.
-        8. Increment _iteration_counter (RC-1 fix — moved from update_regret).
-        """
+        
         _chain_input = f"{self.commitment_chain_hash}:{action}".encode("utf-8")
         self.commitment_chain_hash = hashlib.sha256(_chain_input).hexdigest()
 
-        # RC-1 FIX: Increment _iteration_counter here, co-located with the
-        # commitment chain extension.  Previously the counter was only
-        # incremented in update_regret(), which is NOT called on policy-deny
-        # paths.  record_action() IS always called when an action is executed
-        # (including deny paths), so the counter now advances in lock-step with
-        # the chain hash.  This eliminates the seed drift where thompson_sample()
-        # would produce less unique seeds after a sequence of denied actions
-        # (chain hash advanced, counter did not).
-        #
-        # update_regret() still READS _iteration_counter for regret timestamps
-        # but no longer writes it — see the RC-1 comment in update_regret().
+        
         self._iteration_counter += 1
 
         if action not in self.action_rewards:
@@ -593,16 +434,7 @@ class BeliefState:
         n = self._welford_n.get(action, 0) + 1
         self._welford_n[action] = n
 
-        # MF-06 FIX: When n exceeds REWARD_WINDOW, the Welford accumulators
-        # (_welford_n, _welford_mean, _welford_M2) diverge from the sliding
-        # window deque (maxlen=REWARD_WINDOW).  The deque reflects recent rewards;
-        # Welford reflects all-time history.  For actions with evolving reward
-        # distributions this causes Thompson sampling to use stale variance.
-        #
-        # Fix: when the window is full (n > REWARD_WINDOW), recompute Welford
-        # statistics from scratch using only the current window contents.
-        # This is O(REWARD_WINDOW) but fires at most once per action per reward
-        # recording after the window is saturated — amortized O(1) per call.
+        
         if n > self.REWARD_WINDOW:
             _window = list(self._raw_action_rewards[action])
             if len(_window) > 0:
@@ -669,25 +501,7 @@ class BeliefState:
         """Clear all accumulated regret on task success."""
         self.regret.clear()
 
-    # MS-3 / IH-3 FIX: reset_sample_counter() removed.
-    #
-    # The original public method reset self._sample_counter to 0.  This was
-    # dead code — it was never called anywhere in the execution path — but its
-    # existence was a latent trap: if called between Thompson samples within
-    # the same iteration, it would reset _sample_counter to 0, causing the
-    # same seed material:
-    #
-    #   sha256(f"{chain_hash}:{action}:{iteration}:0")
-    #
-    # to be generated for multiple distinct samples in the same iteration,
-    # making Thompson samples non-unique and breaking the seed-uniqueness
-    # invariant of the commitment chain.
-    #
-    # The counter is incremented inside thompson_sample() and only reset by
-    # reset_for_new_task() (which resets all transient state) and by
-    # the from_dict() deserializer (which restores the persisted value).
-    # No other reset is safe.  The method is removed rather than privatized
-    # to prevent accidental use in future caller code.
+    
 
     def reset_for_new_task(self, intent_hash: str = "") -> None:
         """
@@ -703,13 +517,7 @@ class BeliefState:
         self.regret.clear()
         self.progress_score = 0.0
 
-        # H-3 FIX: Clear _zero_variance_count at task boundaries.
-        # Without this, variance collapse counts accumulated in a previous
-        # task continue counting toward ZERO_VARIANCE_WARN_THRESHOLD in the
-        # next task, potentially triggering the WARNING for the wrong task
-        # context and masking genuine exploration suppression events in the
-        # new task.  reset_for_new_task() is the canonical reset point for
-        # all transient monitoring counters.
+        
         if hasattr(self, "_zero_variance_count"):
             self._zero_variance_count.clear()
 
@@ -882,24 +690,7 @@ class BeliefState:
         try:
             instance: "BeliefState" = cls.__new__(cls)
 
-            # ----------------------------------------------------------
-            # RT-01 FIX: assign raw attributes FIRST, BEFORE any
-            # property setter is called.
-            #
-            # The ``commitment_hash`` property setter reads
-            # ``self.commitment_chain_hash`` on the GENESIS branch:
-            #
-            #   @commitment_hash.setter
-            #   def commitment_hash(self, value):
-            #       self.task_identity_hash = value
-            #       if self.commitment_chain_hash in ("GENESIS", ""):  # ← AttributeError
-            #           self.commitment_chain_hash = value
-            #
-            # On a freshly __new__-ed instance, ``commitment_chain_hash``
-            # does not exist yet, so the conditional raises AttributeError.
-            # Python's ``object.__setattr__`` (plain attribute assignment)
-            # is used here instead to write the raw attribute directly.
-            # ----------------------------------------------------------
+            
 
             _task_identity: str = str(data.get("commitment_hash", "GENESIS"))
             _chain_hash: str = str(
