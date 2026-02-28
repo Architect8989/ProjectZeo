@@ -806,6 +806,15 @@ def main(llm_callable: Callable, model_name: str) -> None:
                                 except Exception:
                                     pass  # auth_state may not support this attribute
 
+                            # IH-05 FIX: Track whether verification was actually
+                            # performed.  If the snapshot expired (snap_obj is None),
+                            # we must not write restore_required=False — that would be
+                            # a false safety record.  Instead write restore_required=True
+                            # so that monitoring and the next run know verification was
+                            # skipped.  Only write restore_required=False when
+                            # verify() actually completed without raising.
+                            _verification_performed = snap_obj is not None
+
                             # IH-05 FIX: Flush regret on successful task completion.
                             # Stale regret from a successfully-completed task must not
                             # carry over into crash-recovery execution of a new task.
@@ -826,7 +835,10 @@ def main(llm_callable: Callable, model_name: str) -> None:
                             auth_state.persist(
                                 execution_mode="OBSERVER",
                                 automation_active=False,
-                                restore_required=False,
+                                # IH-05 FIX: Only claim clean restoration when
+                                # verification actually ran.  Expired TTL → skip
+                                # → restore_required=True so next run re-verifies.
+                                restore_required=not _verification_performed,
                                 last_snapshot_id=None,
                                 dirty=False,
                                 thompson_state=(
