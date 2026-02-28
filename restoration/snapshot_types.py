@@ -75,23 +75,7 @@ class RestorationSnapshot:
     execution_mode: str  # MUST be 'OBSERVER'
     metadata: Dict[str, Any] = field(default_factory=dict)
 
-    # ----------------------------
-    # Construction
-    # ----------------------------
-
-    # HARD-7 / FIX-04 (SI-02): Process-local monotonic counter to prevent ID
-    # collisions when two snapshots are taken within the same millisecond.
-    #
-    # FIX-04: The counter was previously declared as a dataclass instance field
-    # (_nonce_counter: int = 0), which made it a constructor parameter and part
-    # of __eq__/__hash__. Because create() never passed _nonce_counter, all
-    # frozen instances had _nonce_counter=0 in their fields while the actual
-    # counter lived as a class variable mutated by _derive_snapshot_id().
-    # The decoupling between the instance field (always 0) and the class counter
-    # (correct) created latent risk for equality-based deduplication.
-    #
-    # Fix: declare the counter OUTSIDE the dataclass body as a true class
-    # attribute, completely separate from the frozen instance fields.
+    
 
     @staticmethod
     def _derive_snapshot_id(
@@ -102,28 +86,8 @@ class RestorationSnapshot:
         execution_mode: str,
         captured_at: float,
     ) -> str:
-        """
-        HARD-7: Generate a collision-resistant content-addressed snapshot ID.
-
-        Includes a process-local monotonic nonce so that two snapshots taken
-        within the same millisecond (common in replan sequences) produce
-        distinct IDs.  Without this, round(captured_at * 1000) could collide
-        and trigger SnapshotProviderError("Snapshot id collision").
-        """
-        # HARD-3 (RB-6): Thread-safe nonce increment.
-        #
-        # Bug: RestorationSnapshot._nonce_counter += 1 is a non-atomic
-        # read-modify-write on a class-level integer. Under concurrent snapshot
-        # creation (replan sequences that briefly overlap, or test threads),
-        # two threads could read the same counter value and compute identical
-        # nonces. Two snapshots created within the same millisecond would then
-        # produce identical snapshot_ids, causing SnapshotProviderError("Snapshot
-        # id collision") and blocking replan arming.
-        #
-        # Fix: protect the increment with a class-level threading.Lock.
-        # The lock is a module-level singleton (defined after the class body
-        # alongside the counter initialisation) so it is shared across all
-        # calls to _derive_snapshot_id() regardless of when they occur.
+        
+        
         with RestorationSnapshot._nonce_lock:
             RestorationSnapshot._nonce_counter += 1
             nonce = RestorationSnapshot._nonce_counter
@@ -156,8 +120,41 @@ class RestorationSnapshot:
         execution_mode: str,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> "RestorationSnapshot":
+        """
+        Construct and validate a new RestorationSnapshot.
+
+        IH-4 NOTE: The returned ``snapshot_id`` is NOT reproducible across
+        process restarts.  It incorporates ``time.time()`` and a
+        process-local nonce — see ``_derive_snapshot_id()`` for the full
+        limitation analysis.  Callers that need a stable cross-restart
+        reference should store the semantic intent hash separately.
+        """
 
         captured_at = time.time()
+
+        
+        _process_census: list = []
+        try:
+            import os as _os
+            # Linux /proc enumeration — most reliable and zero-dependency.
+            _proc_entries = _os.listdir("/proc")
+            _process_census = sorted(
+                int(e) for e in _proc_entries if e.isdigit()
+            )
+        except Exception:
+            # Non-Linux (macOS, Windows) or permission error — try psutil.
+            try:
+                import psutil as _psutil
+                _process_census = sorted(
+                    p.pid for p in _psutil.process_iter(["pid"])
+                )
+            except Exception:
+                _process_census = []  # census unavailable — degraded mode
+
+        _metadata = dict(metadata or {})
+        if _process_census:
+            _metadata["process_census_pids"] = _process_census
+            _metadata["process_census_at"] = captured_at
 
         snapshot_id = RestorationSnapshot._derive_snapshot_id(
             cursor=cursor,
@@ -174,7 +171,7 @@ class RestorationSnapshot:
             focus=focus,
             application=application,
             execution_mode=execution_mode,
-            metadata=metadata or {},
+            metadata=_metadata,
         )
 
         snapshot.validate()
@@ -206,13 +203,7 @@ class RestorationSnapshot:
     # ----------------------------
 
     def to_dict(self) -> Dict[str, Any]:
-        # HAR-01: Explicitly enumerate what IS and IS NOT restored so that
-        # callers cannot interpret a restoration success as full state rollback.
-        # The restoration_scope field is the authoritative declaration of the
-        # shallow restoration guarantee: only cursor position, focused window,
-        # and active application are restored.  All other state (file contents,
-        # browser URL/tabs/forms, clipboard, network connections, spawned
-        # processes, window geometry/z-order) persists from task execution.
+        
         return {
             "snapshot_id": self.snapshot_id,
             "captured_at": self.captured_at,
@@ -228,14 +219,7 @@ class RestorationSnapshot:
                 "spawned_processes",
                 "window_geometry",
                 "window_z_order",
-                # H-6 FIX: keyboard_modifiers_partially was absent from this
-                # list despite force_release_all() performing modifier-key
-                # release during restoration. The omission implied the keyboard
-                # was fully restored, which is misleading: only modifier keys
-                # (Ctrl, Shift, Alt, Win) are explicitly released. Key-down state
-                # for non-modifier keys (e.g. a held arrow key) is NOT restored.
-                # Adding this entry with the _partially suffix makes the shallow
-                # guarantee explicit and auditable.
+                
                 "keyboard_modifiers_partially",
             ],
             "cursor": {
@@ -275,19 +259,7 @@ class RestorationSnapshot:
 
         execution_mode = str(data.get("execution_mode", "observer"))
 
-        # SI-3 / P2-1 FIX: Normalize execution_mode to uppercase before use.
-        #
-        # Root cause: from_dict() used the raw string from disk JSON, defaulting
-        # to "observer" (lowercase). validate() checks execution_mode != "OBSERVER"
-        # (uppercase). Because "observer" != "OBSERVER", every snapshot reloaded
-        # from disk failed validate() — but from_dict() never called validate(),
-        # so corrupted or lowercase snapshots silently bypassed the mode guard
-        # and were used by RestoreProvider without any integrity check.
-        #
-        # Two-part fix:
-        #   1. Normalize to uppercase here so the field is always canonical.
-        #   2. Call instance.validate() before returning (see below) so malformed
-        #      snapshots raise ValueError rather than reaching RestoreProvider.
+       
         execution_mode = execution_mode.upper().strip() or "OBSERVER"
 
         cursor_d = data.get("cursor", {})
@@ -324,18 +296,7 @@ class RestorationSnapshot:
             metadata=metadata,
         )
 
-        # SI-3 FIX: Validate the reconstructed snapshot before returning.
-        #
-        # Root cause: from_dict() previously returned the instance without
-        # calling validate(). Corrupted JSON on disk (wrong execution_mode,
-        # negative captured_at, empty snapshot_id, etc.) would be loaded into
-        # memory as a RestorationSnapshot and used by RestoreProvider without
-        # any integrity check. The broken snapshot would survive until the first
-        # actual restore attempt, where it might cause unpredictable behaviour.
-        #
-        # Fix: call validate() here and convert any ValueError into a structured
-        # ValueError so SnapshotProvider._reload_from_disk() can log and discard
-        # the corrupted file rather than crashing the reload loop.
+        
         try:
             instance.validate()
         except ValueError as _val_err:
@@ -346,20 +307,6 @@ class RestorationSnapshot:
 
         return instance
 
-
-# FIX-04 (SI-02): Declare the nonce counter as a TRUE class-level attribute
-# OUTSIDE the dataclass body.  Inside the @dataclass(frozen=True) body,
-# any annotation becomes a dataclass field — a constructor parameter and part
-# of __eq__/__hash__.  By placing the assignment here (after the class body),
-# Python sees it as a plain class attribute: mutable, not frozen, not in
-# __init__, and invisible to equality comparisons.
-#
-# This repairs the structural decoupling between the class-level counter
-# (correctly incremented by _derive_snapshot_id) and the per-instance field
-# (always 0 because create() never passed _nonce_counter to __init__).
 RestorationSnapshot._nonce_counter = 0  # type: ignore[attr-defined]
 
-# HARD-3 (RB-6): Class-level lock for thread-safe nonce increment.
-# Must be initialised here (outside the frozen dataclass body) alongside
-# the counter. The lock is shared across all _derive_snapshot_id() calls.
 RestorationSnapshot._nonce_lock = threading.Lock()  # type: ignore[attr-defined]
