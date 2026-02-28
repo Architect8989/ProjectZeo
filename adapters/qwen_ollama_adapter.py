@@ -359,18 +359,15 @@ class QwenOllamaAdapter:
                 {"role": "system", "content": system_content}
             ]
             ollama_messages.extend(history_messages)
+            # FIX-IMG: The ollama Python library uses {"images": [base64_str]}
+            # NOT the OpenAI-style content array {"content": [{"type":"image",...}]}.
+            # The content-array format causes ollama to silently discard the image.
+            # This was the root cause of every vision inference returning empty/wrong
+            # results — the model was answering without seeing the screen.
             ollama_messages.append({
                 "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": user_prompt_text + "\nReturn JSON list of operations.",
-                    },
-                    {
-                        "type": "image",
-                        "image": img_base64,
-                    },
-                ],
+                "content": user_prompt_text + "\nReturn JSON list of operations.",
+                "images": [img_base64],
             })
 
             loop = asyncio.get_running_loop()
