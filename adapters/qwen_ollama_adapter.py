@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import json
 import logging
 import os
@@ -309,16 +310,30 @@ class QwenOllamaAdapter:
         if len(history_messages) > self.MAX_HISTORY_TURNS:
             history_messages = history_messages[-self.MAX_HISTORY_TURNS:]
 
+        # MF-04 FIX: Use ExitStack to guarantee cleanup of both temp files even
+        # if the second NamedTemporaryFile() call itself raises (e.g. /tmp full).
+        # Previously: if _jtf creation raised after _rtf was already created,
+        # raw_tmp_name was set but jpeg_tmp_name remained None, so the finally
+        # block could not clean up raw_tmp_name (it would have been cleaned, but
+        # the symmetric risk exists for disk-full mid-creation scenarios).
+        # ExitStack registers each cleanup the moment the file is created.
         raw_tmp_name = None
         jpeg_tmp_name = None
+        _cleanup_stack = contextlib.ExitStack()
         try:
             _rtf = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
             raw_tmp_name = _rtf.name
             _rtf.close()
+            _cleanup_stack.callback(
+                lambda p=raw_tmp_name: os.unlink(p) if os.path.exists(p) else None
+            )
 
             _jtf = tempfile.NamedTemporaryFile(suffix=".jpeg", delete=False)
             jpeg_tmp_name = _jtf.name
             _jtf.close()
+            _cleanup_stack.callback(
+                lambda p=jpeg_tmp_name: os.unlink(p) if os.path.exists(p) else None
+            )
 
             capture_screen_with_cursor(raw_tmp_name)
             compress_screenshot(raw_tmp_name, jpeg_tmp_name)
@@ -385,12 +400,11 @@ class QwenOllamaAdapter:
             return operations
 
         finally:
-            for _tmp_path in (raw_tmp_name, jpeg_tmp_name):
-                if _tmp_path is not None:
-                    try:
-                        os.unlink(_tmp_path)
-                    except OSError:
-                        pass
+            # ExitStack callbacks handle cleanup of both temp files in LIFO order.
+            # Each callback was registered immediately after the corresponding
+            # NamedTemporaryFile was created, so cleanup fires even if the second
+            # file was never created.
+            _cleanup_stack.close()
 
     # ==========================================================
     # OCR RESOLUTION (FAIL-CLOSED)
