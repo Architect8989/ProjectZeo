@@ -18,14 +18,13 @@ class ReasoningEngine:
     MAX_TEXT_CHARS = 400
     MAX_JSON_CHARS = 8000
 
-    # FIX H4: Reference shared authoritative marker set.
-    # Previously 35 markers were defined inline here; ExecutionPlanner only
-    # had 7 (a subset). The asymmetry left 28 known injection patterns
-    # undetected in planning prompts. Now both classes use the same source.
+    
     _INJECTION_MARKERS = INJECTION_MARKERS
 
-    def __init__(self, llm_callable):
+    def __init__(self, llm_callable, *, ollama_client=None):
+        
         self._llm = llm_callable
+        self._ollama_client = ollama_client
 
     # ==================================================
     # PUBLIC ACTION PROPOSAL
@@ -62,6 +61,37 @@ class ReasoningEngine:
             "role": "user",
             "content": serialized,
         }
+
+        
+        if self._ollama_client is not None:
+            try:
+                import os as _os_h5
+                _model = _os_h5.environ.get("LLM_TEXT_MODEL", "") or _os_h5.environ.get("LLM_MODEL", "")
+                if _model:
+                    response = self._ollama_client.chat(
+                        model=_model,
+                        messages=[{"role": "user", "content": serialized}],
+                        format="json",
+                    )
+                    raw_content = (
+                        response.get("message", {}).get("content", "")
+                        if isinstance(response, dict)
+                        else getattr(
+                            getattr(response, "message", None), "content", ""
+                        ) or ""
+                    )
+                    try:
+                        parsed = __import__("json").loads(raw_content)
+                    except Exception:
+                        parsed = []
+                    return self._normalize_actions(parsed)
+            except Exception as _text_err:
+                _logger.warning(
+                    "[ReasoningEngine] Text-only path failed (%s), "
+                    "falling back to vision adapter: %s",
+                    type(_text_err).__name__, _text_err,
+                )
+                # Fall through to vision adapter below
 
         result = self._llm(
             messages=[prompt],
@@ -128,32 +158,15 @@ class ReasoningEngine:
     # ==================================================
 
     def _truncate_text(self, text: str) -> str:
-        """
-        HAR-5 (MATH-9): Truncate and sanitize entity text.
-
-        Checks against the shared INJECTION_MARKERS set (35 markers) imported
-        from core.security.injection_markers. Both ReasoningEngine and
-        ExecutionPlanner now use the same set, closing the asymmetry where
-        28 markers were caught here but silently passed in planning prompts.
-
-        Returns "" (empty string) if any injection marker is found,
-        suppressing the hostile text from the LLM prompt entirely.
-        Returns text[:MAX_TEXT_CHARS] otherwise.
-        """
+        
         if not isinstance(text, str):
             return ""
 
-        # HAR-6: Apply NFKD + ASCII normalization before matching to defeat
-        # Unicode homoglyph injection bypasses (e.g. using U+03B9 GREEK IOTA
-        # in place of ASCII 'i' in "ιgnore previous instructions").
+        
         lowered = normalize_for_injection_check(text)
         for marker in self._INJECTION_MARKERS:
             if marker in lowered:
-                # H-08 FIX (BOUNDARY-04): Emit a warning instead of silently
-                # returning "".  False positives (e.g. "ignore previous approaches"
-                # matching "ignore previous") previously caused legitimate UI text
-                # to vanish from LLM prompts with no operator visibility, making
-                # stagnation loops impossible to diagnose.
+                
                 _logger.warning(
                     "[ReasoningEngine] Injection marker %r detected in entity text "
                     "(first 80 chars: %r) — text suppressed from LLM prompt.",
