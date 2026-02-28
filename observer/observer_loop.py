@@ -132,6 +132,10 @@ class ObserverLoop:
             if self._running:
                 return
 
+            # FIX-RESTART: Clear stop event before starting so a restart after
+            # ObserverBlindnessError (which sets _stop_event) works correctly.
+            # Without this, stop() → start() sequence left _stop_event set,
+            # causing the new thread to exit immediately on first iteration.
             self._stop_event.clear()
             self._running = True
 
@@ -242,7 +246,12 @@ class ObserverLoop:
                         self._total_frames,
                         health.get("uptime_seconds", -1.0),
                     )
-                    # Propagate by stopping loop and forcing unavailable state.
+                    # FIX-BLIND: Do NOT set _stop_event on blindness — let
+                    # main.py's ObserverBlindnessError handler (which restarts
+                    # vision_runtime then calls observer.reset_for_new_task())
+                    # propagate the recovery. Setting stop_event here meant
+                    # observer_loop.start() on restart silently exited immediately
+                    # because _stop_event was still set.
                     try:
                         self._observer.attach_perception_state(
                             {
@@ -254,7 +263,7 @@ class ObserverLoop:
                     except Exception:
                         pass
 
-                    self._stop_event.set()
+                    # Propagate to main.py for restart handling
                     raise
 
                 except Exception:
