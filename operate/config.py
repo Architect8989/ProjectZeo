@@ -3,7 +3,10 @@ import sys
 import threading
 
 from dotenv import load_dotenv
-from ollama import Client  # Ollama: always present for local provider
+
+# FIX: ollama import is deferred to initialize_ollama() to avoid ImportError
+# on systems where ollama is not yet installed (e.g. fresh setup, CI).
+# The Client is only needed when actually calling initialize_ollama().
 
 
 def is_openrouter_model(model: str) -> bool:
@@ -108,7 +111,13 @@ class Config:
         return genai.GenerativeModel("gemini-pro-vision")
 
     def initialize_ollama(self):
-        """Ollama client. SDK is module-level (always required)."""
+        """Ollama client. Lazy-imports ollama SDK."""
+        try:
+            from ollama import Client  # noqa: PLC0415
+        except ImportError as exc:
+            raise RuntimeError(
+                "ollama SDK not installed. Run: pip install 'ollama>=0.3.0'"
+            ) from exc
         self.ollama_host = self.ollama_host or os.getenv("OLLAMA_HOST")
         return Client(host=self.ollama_host)
 
