@@ -71,6 +71,13 @@ def _cache_put(model_name: str, instance: Any) -> None:
     SI-8 / H8 FIX: Insert into the LRU adapter cache, evicting the oldest
     entry when the cache exceeds _ADAPTER_CACHE_MAX_SIZE.
 
+    H-8 HARDENING: When an adapter is evicted, its ThreadPoolExecutor is shut
+    down immediately (shutdown(wait=False)).  The original code relied on the
+    adapter's __del__ method which is non-deterministic — the GC may not run
+    __del__ for minutes or hours on long-lived processes.  Un-shutdown executors
+    hold live worker threads and prevent the OS thread count from recovering.
+    Explicit shutdown on eviction bounds the executor lifetime to the cache TTL.
+
     Must be called with _ADAPTER_CACHE_LOCK already held.
     """
     _ADAPTER_CACHE[model_name] = instance
@@ -78,7 +85,17 @@ def _cache_put(model_name: str, instance: Any) -> None:
     _ADAPTER_CACHE.move_to_end(model_name)
     # Evict oldest (least-recently-used) entries beyond the cap
     while len(_ADAPTER_CACHE) > _ADAPTER_CACHE_MAX_SIZE:
-        _ADAPTER_CACHE.popitem(last=False)
+        _, evicted = _ADAPTER_CACHE.popitem(last=False)
+        # H-8 FIX: Immediately shut down the evicted adapter's thread pool.
+        # Do NOT wait (wait=False) — we hold _ADAPTER_CACHE_LOCK and waiting
+        # for in-flight tasks could deadlock if those tasks also try to acquire
+        # the cache lock.  Workers will complete their current task then exit.
+        _evicted_executor = getattr(evicted, "_executor", None)
+        if _evicted_executor is not None:
+            try:
+                _evicted_executor.shutdown(wait=False)
+            except Exception:
+                pass  # Never let eviction cleanup crash the cache write
 
 
 def _cache_get(model_name: str) -> "Any | None":
