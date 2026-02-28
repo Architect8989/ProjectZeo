@@ -488,7 +488,8 @@ class RestoreProvider:
         if not expected or not actual:
             return False
         return _title_match_shared(expected, actual, max_distance=self.MAX_TITLE_DISTANCE)
-        shared = expected_tokens & actual_tokens
+        # RTB-02 FIX: removed dead code `shared = expected_tokens & actual_tokens`
+        # (undefined names; unreachable after the return above)
 
     def _validate_window(self, current_window, snapshot: RestorationSnapshot) -> bool:
         """True iff the currently focused window matches the snapshot's window title."""
