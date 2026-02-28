@@ -288,19 +288,58 @@ class BeliefState:
         )
         return mean_reward_01 + exploration
 
+    # MS-T FIX: Minimum observation variance floor to prevent Thompson sampling
+    # from collapsing to a point estimate (pure exploitation, zero exploration)
+    # when an action has constant or nearly-constant reward history.
+    #
+    # ROOT CAUSE: When all reward observations are identical (e.g. every click
+    # returns reward=0.8), Welford online variance produces M2=0. The computation:
+    #   _obs_variance = max(M2 / (n-1), NORMALIZE_EPS) = 1e-8  (astronomically small)
+    #   _obs_prec = n / 1e-8 = n * 10^8  (astronomically large)
+    #   _post_variance ~= 1 / (n * 10^8) ~= 0
+    #   _std = sqrt(0) = 0
+    # numpy normal(loc=mu, scale=0) returns mu deterministically on every call.
+    # The rejection loop exhausts 128 tries returning the same value. Thompson
+    # exploration is permanently suppressed for consistently-rewarded actions.
+    #
+    # FIX: Apply a minimum observation variance floor of MIN_OBS_VARIANCE (0.01).
+    # This ensures std >= sqrt(0.01 / (1 + n * 0.01)) > 0 for all n, preserving
+    # probabilistic sampling diversity while still allowing confident actions to
+    # dominate when warranted. The floor is calibrated so that after n=100
+    # observations at constant reward, std ~= 0.009 — enough sampling diversity
+    # to occasionally explore alternatives without disrupting convergence.
+    #
+    # H5 HARDENING: _zero_variance_count[action] tracks consecutive Thompson
+    # samples that would have collapsed without the floor. When this reaches
+    # ZERO_VARIANCE_WARN_THRESHOLD, emit a structured WARNING so operators can
+    # detect exploration suppression in production logs.
+    MIN_OBS_VARIANCE: float = 0.01      # minimum observation variance floor
+    ZERO_VARIANCE_WARN_THRESHOLD: int = 5  # consecutive collapses before WARNING
+
     def thompson_sample(self, action: str) -> float:
         """
-        Draw a Thompson sample from the Normal–Normal conjugate posterior
+        Draw a Thompson sample from the Normal-Normal conjugate posterior
         for *action*.
 
-        Uses Welford online variance when n ≥ 3; falls back to the prior
-        variance (``REWARD_CLAMP²``) for n < 3.  Samples outside
-        ``[−REWARD_CLAMP, +REWARD_CLAMP]`` are rejected via a 128-trial
-        loop; the clamped posterior mean is the fallback.
+        MS-T FIX: Applies MIN_OBS_VARIANCE floor to observation variance to
+        prevent Thompson sampling from collapsing to a point estimate when
+        reward history is constant (zero Welford variance). Without this fix,
+        any action with uniform reward history (common for reliable UI clicks)
+        would have std=0 and every Thompson sample would equal the posterior
+        mean, permanently suppressing probabilistic exploration.
 
-        The RNG seed is derived deterministically from the commitment
-        chain hash, action key, iteration counter, and sample counter so
-        that identical inputs always produce identical outputs.
+        H5 HARDENING: Tracks zero-variance collapse events per action and emits
+        a structured WARNING when ZERO_VARIANCE_WARN_THRESHOLD is reached, so
+        operators can detect exploration suppression in production logs.
+
+        Uses Welford online variance when n >= 3; falls back to the prior
+        variance (REWARD_CLAMP^2) for n < 3. Samples outside
+        [-REWARD_CLAMP, +REWARD_CLAMP] are rejected via a 128-trial loop;
+        the clamped posterior mean is the fallback.
+
+        The RNG seed is derived deterministically from the commitment chain
+        hash, action key, iteration counter, and sample counter so that
+        identical inputs always produce identical outputs.
         """
         rewards = self.action_rewards.get(action)
         if not rewards:
@@ -313,13 +352,48 @@ class BeliefState:
         _sigma0_sq: float = self.REWARD_CLAMP ** 2
 
         _welford_n = self._welford_n.get(action, 0)
+        _variance_floored = False  # H5: track whether the floor was applied
+
         if _welford_n >= 3:
-            _obs_variance = max(
-                self._welford_M2.get(action, 0.0) / max(_welford_n - 1, 1),
-                self.NORMALIZE_EPS,
+            _raw_obs_variance = (
+                self._welford_M2.get(action, 0.0) / max(_welford_n - 1, 1)
             )
+            # MS-T FIX: Apply minimum variance floor. Without this, constant-
+            # reward actions get _raw_obs_variance=0, which collapses Thompson
+            # sampling to a point estimate (std=0 -> all samples equal mean).
+            if _raw_obs_variance <= self.NORMALIZE_EPS * 10:
+                _obs_variance = self.MIN_OBS_VARIANCE
+                _variance_floored = True
+            else:
+                _obs_variance = max(_raw_obs_variance, self.NORMALIZE_EPS)
         else:
             _obs_variance = _sigma0_sq
+
+        # H5 HARDENING: Track consecutive zero-variance collapse events per action.
+        if not hasattr(self, "_zero_variance_count"):
+            self._zero_variance_count: dict = {}
+
+        if _variance_floored:
+            self._zero_variance_count[action] = (
+                self._zero_variance_count.get(action, 0) + 1
+            )
+            count = self._zero_variance_count[action]
+            if count == self.ZERO_VARIANCE_WARN_THRESHOLD:
+                import sys as _sys
+                print(
+                    f"[BeliefState] WARNING H5: Thompson sampling for action "
+                    f"{action!r} has hit zero-variance floor {count} consecutive "
+                    f"times. Reward history is constant (Welford M2~=0). "
+                    f"MIN_OBS_VARIANCE={self.MIN_OBS_VARIANCE} floor applied to "
+                    f"preserve exploration diversity. This is expected for reliable "
+                    f"UI actions; suppress with PROJECTZEO_DISABLE_THOMPSON_WARN=1 "
+                    f"if intended.",
+                    file=_sys.stderr,
+                )
+        else:
+            # Reset counter when variance is non-zero (action became variable)
+            if action in self._zero_variance_count:
+                self._zero_variance_count[action] = 0
 
         _prior_prec = 1.0 / _sigma0_sq
         _obs_prec = n / _obs_variance
@@ -419,8 +493,24 @@ class BeliefState:
             Reference best reward.  **Callers must cap this at 0.9** to
             prevent the DONE sentinel (reward = 1.0) from inflating the
             reference forever (RT-05 / SI-04 fix — see ``operate.py``).
+
+        RC-1 FIX NOTE: ``_iteration_counter`` is no longer incremented here.
+        It is now incremented in ``record_action()`` instead.  See the
+        RC-1 comment in ``record_action()`` for the full rationale.
         """
-        self._iteration_counter += 1
+        # RC-1 FIX: _iteration_counter increment REMOVED from here.
+        # Previously update_regret() was the sole incrementor of
+        # _iteration_counter. On policy-deny paths, operate.py calls
+        # record_action() (to update the commitment chain) but skips
+        # update_regret() (there is no reward to regret-track for denied
+        # actions). This left _iteration_counter un-incremented while the
+        # commitment chain hash advanced — a seed-drift between the two
+        # components that degraded Thompson sample uniqueness on deny paths.
+        # Fix: move the increment into record_action() so it always fires
+        # alongside the chain hash extension, regardless of whether regret
+        # is updated. update_regret() still uses _iteration_counter for the
+        # regret timestamp (self._iteration_counter is read here, just not
+        # written).
 
         regret_value = best_reward - reward
         if regret_value <= 0.0:
@@ -450,9 +540,23 @@ class BeliefState:
            transitions to 3, using the 3-sample mean (MF-4 fix).
         6. Append the normalised reward to the sliding window deque.
         7. Increment the action visit count.
+        8. Increment _iteration_counter (RC-1 fix — moved from update_regret).
         """
         _chain_input = f"{self.commitment_chain_hash}:{action}".encode("utf-8")
         self.commitment_chain_hash = hashlib.sha256(_chain_input).hexdigest()
+
+        # RC-1 FIX: Increment _iteration_counter here, co-located with the
+        # commitment chain extension.  Previously the counter was only
+        # incremented in update_regret(), which is NOT called on policy-deny
+        # paths.  record_action() IS always called when an action is executed
+        # (including deny paths), so the counter now advances in lock-step with
+        # the chain hash.  This eliminates the seed drift where thompson_sample()
+        # would produce less unique seeds after a sequence of denied actions
+        # (chain hash advanced, counter did not).
+        #
+        # update_regret() still READS _iteration_counter for regret timestamps
+        # but no longer writes it — see the RC-1 comment in update_regret().
+        self._iteration_counter += 1
 
         if action not in self.action_rewards:
             self.action_rewards[action] = deque(maxlen=self.REWARD_WINDOW)
