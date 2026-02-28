@@ -132,29 +132,16 @@ class RestorationSnapshot:
 
         captured_at = time.time()
 
-        
-        _process_census: list = []
-        try:
-            import os as _os
-            # Linux /proc enumeration — most reliable and zero-dependency.
-            _proc_entries = _os.listdir("/proc")
-            _process_census = sorted(
-                int(e) for e in _proc_entries if e.isdigit()
-            )
-        except Exception:
-            # Non-Linux (macOS, Windows) or permission error — try psutil.
-            try:
-                import psutil as _psutil
-                _process_census = sorted(
-                    p.pid for p in _psutil.process_iter(["pid"])
-                )
-            except Exception:
-                _process_census = []  # census unavailable — degraded mode
-
+        # RTB-03 / MF-03 FIX: Removed PID-based process census from create().
+        # _capture_snapshot() in snapshot_provider.py collects process NAMES via
+        # psutil into metadata["extended"]["processes"], which is what
+        # _report_unrestored_processes() actually reads.  The old PID list stored in
+        # metadata["process_census_pids"] here was never consumed by any verification
+        # path, created a schema conflict with the name-based census, and caused the
+        # diff to be silently skipped whenever a snapshot was constructed via
+        # create() directly (e.g. deserialized from from_dict()).  PID collection
+        # belongs exclusively in _capture_snapshot() alongside name resolution.
         _metadata = dict(metadata or {})
-        if _process_census:
-            _metadata["process_census_pids"] = _process_census
-            _metadata["process_census_at"] = captured_at
 
         snapshot_id = RestorationSnapshot._derive_snapshot_id(
             cursor=cursor,
