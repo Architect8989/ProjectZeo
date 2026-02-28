@@ -85,11 +85,34 @@ def main_entry(
         _adapter = _build_llm(_model_name)
 
         def _llm_callable(messages, objective=None, session_id=None):
+            # P5 FIX (RT-2): asyncio.run() raises RuntimeError when called from
+            # within an already-running event loop (e.g. test harnesses, Jupyter,
+            # or any async entry point). This matches the pattern used in run.py's
+            # _make_llm_callable() which correctly handles this case.
             async def _invoke():
                 return await _adapter.get_next_action(
                     messages=messages, objective=objective, session_id=session_id
                 )
-            ops, err = _asyncio.run(_invoke())
+            try:
+                import asyncio as _asyncio_inner
+                loop = _asyncio_inner.get_running_loop()
+            except RuntimeError:
+                loop = None
+
+            if loop is not None and loop.is_running():
+                # Already inside an async context — use run_coroutine_threadsafe
+                # from a new thread to avoid RuntimeError: "This event loop is
+                # already running."
+                import concurrent.futures as _cf
+                with _cf.ThreadPoolExecutor(max_workers=1) as _pool:
+                    future = _pool.submit(
+                        lambda: __import__("asyncio").run(_invoke())
+                    )
+                    ops, err = future.result()
+            else:
+                import asyncio as _asyncio_outer
+                ops, err = _asyncio_outer.run(_invoke())
+
             if err:
                 raise RuntimeError(f"LLM error: {err}")
             return ops or []
