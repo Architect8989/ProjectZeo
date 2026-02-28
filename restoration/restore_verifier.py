@@ -4,7 +4,11 @@ import logging
 import time
 from typing import Optional, Tuple
 
-from restoration.snapshot_types import RestorationSnapshot
+from restoration.snapshot_types import (
+    RestorationSnapshot,
+    levenshtein_distance,
+    title_match as _title_match_shared,
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -75,7 +79,25 @@ class RestoreVerifier:
       See docs/restoration_contract.md for the full declared scope.
     """
 
-    MAX_TITLE_DISTANCE: int = 2
+    # SI-B / RT-B FIX (P0): MAX_TITLE_DISTANCE raised from 2 to 5 to match
+    # RestoreProvider.MAX_TITLE_DISTANCE = 5.
+    #
+    # ORIGINAL DEFECT (asymmetry): RestoreProvider._verify() accepted window
+    # titles with edit distance <= 5 (internal check, runs in RESTORING mode).
+    # RestoreVerifier.verify() rejected titles with edit distance > 2 (external
+    # check, runs in OBSERVER mode). For any title drift of 3-5 characters —
+    # common for browser URLs, loading indicators, unsaved-document markers —
+    # RestoreProvider reported success and transitioned mode to OBSERVER, then
+    # RestoreVerifier raised RestorationVerificationError and triggered
+    # _force_safe_shutdown(). The SAME restoration was judged differently by
+    # the two verifiers, causing false-positive shutdowns on successful tasks.
+    #
+    # FIX: Both verifiers now use the same threshold (5). The token-overlap
+    # fallback in RestoreProvider._strict_match() handles titles where edit
+    # distance exceeds 5 but the application name token is unchanged (e.g.
+    # browser URL changes). RestoreVerifier uses the same _levenshtein() logic,
+    # and with a threshold of 5 the two verdicts are now consistent.
+    MAX_TITLE_DISTANCE: int = 5
 
     def __init__(
         self,
@@ -516,24 +538,13 @@ class RestoreVerifier:
 
     @staticmethod
     def _levenshtein(a: str, b: str) -> int:
-        """Standard O(m·n) Levenshtein edit distance."""
-        if a == b:
-            return 0
-        if not a:
-            return len(b)
-        if not b:
-            return len(a)
-
-        prev = list(range(len(b) + 1))
-        for i, ca in enumerate(a, 1):
-            curr = [i]
-            for j, cb in enumerate(b, 1):
-                insert = curr[j - 1] + 1
-                delete = prev[j] + 1
-                replace = prev[j - 1] + (ca != cb)
-                curr.append(min(insert, delete, replace))
-            prev = curr
-        return prev[-1]
+        # H7 FIX: Delegate to the canonical shared implementation in
+        # snapshot_types.levenshtein_distance.  Previously RestoreVerifier
+        # maintained its own copy of this algorithm independent of
+        # RestoreProvider's copy — a silent divergence risk that allowed the
+        # two implementations to drift (the root cause of SI-B / RT-B).
+        # The shared function is now the single source of truth.
+        return levenshtein_distance(a, b)
 
     def _within_tolerance(
         self,
