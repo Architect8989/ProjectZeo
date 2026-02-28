@@ -310,3 +310,116 @@ class RestorationSnapshot:
 RestorationSnapshot._nonce_counter = 0  # type: ignore[attr-defined]
 
 RestorationSnapshot._nonce_lock = threading.Lock()  # type: ignore[attr-defined]
+
+
+# ---------------------------------------------------------------------------
+# H7 FIX — Shared window-title matching utilities
+# ---------------------------------------------------------------------------
+#
+# DEFECT (SI-B / H7): RestoreProvider and RestoreVerifier each maintained
+# independent copies of _levenshtein() and _strict_match().  The two copies
+# had diverged (MAX_TITLE_DISTANCE = 5 in RestoreProvider vs 2 in
+# RestoreVerifier — the root cause of the false-positive shutdown bug fixed
+# in SI-B/RT-B).  Divergence is only possible because the implementations
+# were not shared.
+#
+# FIX: Move the canonical implementations here, into snapshot_types.py,
+# which is the natural home for restoration data types and their associated
+# matching semantics.  Both RestoreProvider and RestoreVerifier now import
+# and delegate to these functions.  The parameter max_distance is explicit
+# so callers must consciously choose the threshold — there is no longer a
+# silent per-class default that can drift.
+#
+# Usage:
+#   from restoration.snapshot_types import levenshtein_distance, title_match
+#
+#   # Soft match (max 5 chars drift — RestoreProvider threshold):
+#   ok = title_match(expected, actual, max_distance=5)
+#
+#   # Strict match (same threshold after SI-B fix):
+#   ok = title_match(expected, actual, max_distance=5)
+#
+# Both RestoreProvider and RestoreVerifier use max_distance=5 after the
+# SI-B fix.  The parameter is kept explicit so future callers cannot
+# accidentally inherit a wrong default.
+# ---------------------------------------------------------------------------
+
+def levenshtein_distance(a: str, b: str) -> int:
+    """
+    Compute the Levenshtein edit distance between two strings.
+
+    Pure-Python iterative implementation with O(min(len(a), len(b))) space.
+    Used for window title fuzzy matching during restoration verification.
+
+    Parameters
+    ----------
+    a, b:
+        Strings to compare.  Both are treated as-is (no normalisation is
+        applied here; callers are responsible for lowercasing / stripping
+        before calling).
+
+    Returns
+    -------
+    int
+        Edit distance ≥ 0.  Returns 0 when a == b.
+    """
+    if a == b:
+        return 0
+    if not a:
+        return len(b)
+    if not b:
+        return len(a)
+
+    # Keep only two rows to bound memory to O(min(|a|, |b|)).
+    if len(a) < len(b):
+        a, b = b, a
+
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, start=1):
+        curr = [i] + [0] * len(b)
+        for j, cb in enumerate(b, start=1):
+            if ca == cb:
+                curr[j] = prev[j - 1]
+            else:
+                curr[j] = 1 + min(prev[j], curr[j - 1], prev[j - 1])
+        prev = curr
+
+    return prev[len(b)]
+
+
+def title_match(expected: str, actual: str, *, max_distance: int) -> bool:
+    """
+    Return True if *actual* is an acceptable match for *expected*.
+
+    Matching rules (in priority order):
+    1. Exact match after stripping leading/trailing whitespace.
+    2. One string is a substring of the other (handles truncated titles).
+    3. Levenshtein edit distance ≤ max_distance (handles minor drift such
+       as unsaved-indicator asterisks, loading suffixes, tab count changes).
+
+    Parameters
+    ----------
+    expected:
+        The canonical title stored at snapshot time.
+    actual:
+        The title observed at restoration / verification time.
+    max_distance:
+        Maximum Levenshtein edit distance accepted as a match.  Callers
+        must supply this explicitly — there is no module-level default.
+
+        RestoreProvider uses 5 (soft match, RESTORING mode).
+        RestoreVerifier uses 5 (aligned after SI-B fix; was incorrectly 2).
+
+    Returns
+    -------
+    bool
+        True if the titles are close enough to be considered equivalent.
+    """
+    e = expected.strip()
+    a = actual.strip()
+
+    if e == a:
+        return True
+    if e in a or a in e:
+        return True
+    return levenshtein_distance(e, a) <= max_distance
