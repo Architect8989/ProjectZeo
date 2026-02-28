@@ -116,6 +116,41 @@ class ExecutionPlanner:
         r"\|\s*ruby\b",
         r"\|\s*node\b",
         r"\|\s*python[23]?\b",
+        # RT-A8 FIX: Additional dangerous patterns not previously covered.
+        # The original set missed curl/wget pipe-to-shell (the most common
+        # supply-chain attack vector), reverse shells, and double-encoded
+        # base64 eval chains that bypass the single-line base64 pattern.
+        #
+        # curl/wget pipe-to-shell (one-liner and split forms):
+        r"\bcurl\b.*\|\s*(?:ba)?sh\b",
+        r"\bcurl\b.*\|\s*bash\b",
+        r"\bwget\b.*-[Oo]-?\s.*\|\s*(?:ba)?sh\b",
+        r"\bwget\b.*--output-document\s*-\s.*\|\s*(?:ba)?sh\b",
+        r"\|\s*sh\b",        # broad: any pipe directly into sh
+        r"\|\s*bash\b",      # broad: any pipe directly into bash
+        #
+        # Reverse shell patterns:
+        r"bash\s+-[ic]\s+['\"]?>?&\s*/dev/tcp/",     # bash TCP reverse shell
+        r"/dev/tcp/",                                   # any /dev/tcp reference
+        r"/dev/udp/",                                   # any /dev/udp reference
+        r"(?:nc|ncat|socat)\b.*-[el]\b",              # netcat/socat listener
+        r"\bsocat\b.*EXEC:",                            # socat exec binding
+        #
+        # Python/exec base64 double-encoding bypass:
+        r"exec\s*\(\s*(?:__import__\s*\(\s*['\"]base64['\"]|base64)\b",
+        r"python[23]?\s+-c\s+['\"].*exec\s*\(",       # python -c 'exec(...)'
+        r"\bexec\s*\(.*decode\s*\(",                   # exec(b64.decode())
+        #
+        # Privilege escalation shortcuts:
+        r"\bsudo\s+su\b",
+        r"\bsudo\s+-[isS]\b",                          # sudo -i / -s / -S shell
+        r"\bsu\s+-[cl]\b",                             # su -c 'cmd' or su -l
+        #
+        # Multi-line / chained dangerous commands (defense-in-depth):
+        # The original r"\bbase64\b.*-d" required both tokens on the SAME line.
+        # The patterns below catch common split-line alternatives.
+        r"base64\s+--decode\b",
+        r"base64\s+-D\b",     # macOS base64 -D flag
     ]
 
     def __init__(
@@ -139,6 +174,38 @@ class ExecutionPlanner:
 
         self._model_name: Optional[str] = self._extract_model_name(llm_call)
         self._text_model_name: str = self._derive_text_model_name(self._model_name)
+
+        # RT-A4 FIX: Validate the derived text model against Ollama's running
+        # registry at construction time.  _derive_text_model_name() already
+        # queries the registry, but only to CONFIRM the derived name exists —
+        # if the query fails or the model is absent it silently falls back to
+        # the vision model name.  The fallback path is the defect:
+        #
+        #   _call_llm_text() calls client.chat(model=_text_model_name, ...)
+        #   with no `images` key.  When _text_model_name IS the vision model,
+        #   Ollama may reject the prompt-only call (some vl builds require an
+        #   image tensor) or return degraded JSON, causing PlanningError on the
+        #   very first plan creation.
+        #
+        # Fix: set a boolean flag at init time that records whether we are in
+        # degraded-text-model mode (i.e. _text_model_name == _model_name because
+        # no separate text model was found).  _call_llm_text() checks this flag
+        # and routes degraded-mode calls through self._llm_call (the vision
+        # adapter) instead of raw client.chat() — the vision adapter handles
+        # vision-model idiosyncrasies correctly and never sends an empty image
+        # tensor.
+        self._text_model_is_vision_fallback: bool = (
+            self._text_model_name == self._model_name
+            and self._model_name is not None
+        )
+        if self._text_model_is_vision_fallback:
+            import sys as _sys
+            print(
+                f"[ExecutionPlanner] RT-A4: Text model absent — routing text-only "
+                f"planning calls through vision adapter ({self._model_name!r}). "
+                "Pull the text variant or set LLM_TEXT_MODEL to suppress this.",
+                file=_sys.stderr,
+            )
 
         self._ollama_client = None
         try:
@@ -444,6 +511,36 @@ class ExecutionPlanner:
         client = self._ollama_client
         if client is None:
             raise PlanningError("Ollama client unavailable for text-only planning call")
+
+        # RT-A4 FIX: If the text model could not be derived (no separate text
+        # variant found in Ollama's registry), self._text_model_is_vision_fallback
+        # is True and _text_model_name is the vision model name.  Rather than
+        # calling client.chat() directly with the vision model and no images key
+        # (which Ollama may reject or degrade), route through self._llm_call —
+        # the vision adapter — which handles the vision model correctly.
+        if self._text_model_is_vision_fallback:
+            try:
+                messages = [
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a step-expansion planning engine. "
+                            "Return ONLY valid JSON. No prose. No markdown fences."
+                        ),
+                    },
+                    {"role": "user", "content": prompt},
+                ]
+                result = self._llm_call(messages, None, "text_planning_fallback")
+                if isinstance(result, str):
+                    return result
+                if isinstance(result, dict):
+                    content = result.get("content") or result.get("message", {}).get("content", "")
+                    return str(content)
+                return str(result)
+            except Exception as _fallback_exc:
+                raise PlanningError(
+                    f"_call_llm_text vision-adapter fallback failed: {_fallback_exc}"
+                ) from _fallback_exc
 
         _last_exc: Exception = RuntimeError("unreachable")
 
