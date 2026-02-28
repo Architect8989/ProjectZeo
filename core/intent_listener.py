@@ -105,15 +105,29 @@ class IntentListener:
     # ==================================================
 
     def _listen_loop(self):
+        # RT-A6 FIX (P3): Track consecutive arm failures and apply exponential
+        # backoff to avoid flooding /tmp with arm_failure.json at 10 Hz when the
+        # observer remains persistently unhealthy (e.g. display server down).
+        # Without backoff the loop writes 10 sidecars/second, potentially filling
+        # /tmp and masking the root-cause failure with volume.
+        #
+        # Backoff schedule: 0.1s → 0.2s → 0.4s → 0.8s → … → 30s (cap).
+        # The counter resets to 0 on any successful arm or any non-arm-failure event.
+        _consecutive_arm_failures: int = 0
+        _BACKOFF_BASE: float = 0.1          # seconds (= POLL_INTERVAL)
+        _BACKOFF_MAX: float = 30.0          # seconds cap
+
         while self._running:
             try:
                 if self.mode.mode.name != "OBSERVER":
+                    _consecutive_arm_failures = 0  # reset on mode change
                     time.sleep(self.POLL_INTERVAL)
                     continue
 
                 intent, intent_file_path = self._peek_intent()
 
                 if not intent:
+                    _consecutive_arm_failures = 0  # no failure, just no intent yet
                     time.sleep(self.POLL_INTERVAL)
                     continue
 
@@ -142,16 +156,26 @@ class IntentListener:
                         arm_failure_reason = f"arm_failed: {_arm_err}"
 
                 if arm_failure_reason is not None:
+                    _consecutive_arm_failures += 1
+                    # Exponential backoff: 0.1 × 2^(n-1), capped at _BACKOFF_MAX
+                    _backoff = min(
+                        _BACKOFF_BASE * (2 ** (_consecutive_arm_failures - 1)),
+                        _BACKOFF_MAX,
+                    )
                     self._write_arm_failure_sidecar(arm_failure_reason, intent)
                     print(
                         f"[IntentListener] Arm sequence failed ({arm_failure_reason}). "
-                        "Intent file preserved — system will retry on next poll.",
+                        f"Consecutive failures: {_consecutive_arm_failures}. "
+                        f"Retrying in {_backoff:.1f}s "
+                        "(exponential backoff — RT-A6 fix). "
+                        "Intent file preserved.",
                         file=sys.stderr,
                     )
-                    time.sleep(self.POLL_INTERVAL)
+                    time.sleep(_backoff)
                     continue
 
                 # ---- Arm succeeded — now safe to consume (delete) the intent file ----
+                _consecutive_arm_failures = 0  # reset backoff on success
                 self._consume_intent(intent_file_path)
                 self._write_arm_success_sidecar()
 
