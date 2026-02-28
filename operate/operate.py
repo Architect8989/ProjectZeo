@@ -758,8 +758,7 @@ def _execute_autonomous_loop(
                 if stagnant_iterations >= stagnant_limit:
                     raise RuntimeError(REPLAN_SIGNAL)
                 previous_perception = perception_snapshot
-                continue
-                continue
+                continue  # RTB-01 FIX: removed duplicate unreachable continue
 
             if _policy_decision == PolicyEngine.REQUIRE_HUMAN_CONFIRMATION:
                 journal.record({
