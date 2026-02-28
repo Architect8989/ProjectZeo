@@ -437,7 +437,44 @@ class ExecutionPlanner:
             sub_goals = decomposer.decompose(objective)
             return [{"goal": s["goal"]} for s in sub_goals]
 
-        except Exception:
+        except Exception as _decomp_exc:
+            # RT-E FIX: Replace silent fallback with a structured WARNING.
+            #
+            # ORIGINAL DEFECT: The outer except clause silently returned
+            # [{"goal": objective}] when decomposition failed — bypassing
+            # multi-step decomposition entirely without any operator signal.
+            # The cause could be:
+            #   (a) TaskDecomposer import failure (module absent)
+            #   (b) Vision model rejecting text-only decomposition prompt when
+            #       _text_model_is_vision_fallback=True (some Qwen2.5-VL builds
+            #       return an error or empty response for text-only chat calls)
+            #   (c) LLM parse error in decompose() JSON extraction
+            #   (d) Ollama OOM / timeout during decomposition
+            #
+            # Silent bypass means complex objectives (> DECOMPOSE_THRESHOLD_CHARS
+            # chars) that REQUIRE multi-step planning are treated as single-step
+            # goals, degrading plan quality without any operator visibility.
+            #
+            # FIX: Log a WARNING with the exception and the vision-fallback
+            # context flag so operators can distinguish cause (b) from others.
+            # The fallback behaviour (single-step goal) is preserved — this is
+            # still non-fatal — but it is now surfaced.
+            import sys as _sys_rte
+            import logging as _logging_rte
+            _rte_logger = _logging_rte.getLogger(__name__)
+            _rte_logger.warning(
+                "[ExecutionPlanner] RT-E WARNING: Task decomposition failed for "
+                "objective %r (len=%d). Falling back to single-step goal. "
+                "vision_fallback=%s. Exception: %s: %s. "
+                "If vision_fallback=True, the vision model may be rejecting "
+                "text-only decomposition prompts. Consider pulling a dedicated "
+                "text model (e.g. qwen2.5:7b) alongside the VL model.",
+                objective[:80],
+                len(objective),
+                self._text_model_is_vision_fallback,
+                type(_decomp_exc).__name__,
+                _decomp_exc,
+            )
             return [{"goal": objective}]
 
     def _call_llm_text(self, prompt: str, *, max_retries: int = 2) -> str:
