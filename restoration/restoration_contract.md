@@ -1,146 +1,266 @@
-# 🛡️ Restoration Scope Declaration — Execution Authority System
+# 🛡️ Restoration Contract — Execution Authority System
 
-> **Status:** ACTIVE — v3.0  
+> **Status:** FROZEN  
 > **Audience:** Systems engineers, platform architects, auditors  
-> **Purpose:** Define *exactly* what is and is NOT restored, when, how, and how success is verified  
-> **Non-Goal:** No intelligence, UX, or autonomy claims  
->
-> **H-3 NOTE:** This document was previously titled "Restoration Contract".
-> The term "contract" implied enforceable guarantees beyond what is actually delivered.
-> The actual restoration guarantee is **cursor position + window focus + automation release only**.
-> All other state (file system, browser, clipboard, processes) persists from task execution.
+> **Purpose:** Define *exactly* what is restored, when, how, and how success is verified  
+> **Non-Goal:** No intelligence, UX, or autonomy claims
 
 ---
 
-## ⚠️ RESTORATION IS SHALLOW — READ THIS FIRST
+## 🔭 1. Scope
 
-**CRITICAL: Restoration does NOT roll back OS state.**
+This document defines the **binding restoration guarantees** of the Execution Authority System after **any execution attempt**, including abnormal or hostile termination.
 
-When the system reports "restoration successful" it means:
-- The cursor was moved back to its pre-task position (±5px)
-- Window focus was returned to the pre-task window
-- Automated input was released
+This contract applies to:
+- All execution paths
+- All termination modes
+- All future implementations
 
-**Everything else — files written, processes spawned, clipboard changed, browsers navigated, packages installed — persists.**
-
-For full OS state rollback, run ProjectZeo inside a container, VM with snapshots, or a filesystem with copy-on-write support (btrfs/ZFS).
+If an implementation cannot satisfy this contract, the implementation is invalid.
 
 ---
 
-## ✅ 4. Guaranteed State (WILL BE RESTORED)
+## 📘 2. Definitions
 
-- 🖱 Cursor position (±5px tolerance)
-- 🪟 Foreground window focus (Levenshtein ≤2 on title)
-- 🧩 Active application (best match by title)
-- ⌨️ Keyboard modifier keys released (Ctrl, Shift, Alt, Win/Cmd)
-- 🔐 Execution mode reverted to `OBSERVER`
-- 🚫 No automated input after restoration completes
+| Term | Definition |
+|---|---|
+| **Execution** | Period during which the system emits OS input |
+| **Pre-Hijack State** | Workspace state captured immediately before execution |
+| **Restoration** | Process of returning workspace to an acceptable state |
+| **Human Intervention** | Any human-initiated input during execution |
+| **Termination Mode** | Reason execution stopped |
+
+---
+
+## 🧠 3. System Architecture (High Level)
+
+┌───────────────────────┐ │   👁 Observer Layer    │ │  (Vision + Witness)   │ └──────────┬────────────┘ │ ▼ ┌───────────────────────┐ │ 🧭 Authority Layer     │ │  - Arbitration         │ │  - Policy              │ │  - Yield / Abort       │ └──────────┬────────────┘ │ ▼ ┌───────────────────────┐ │ 🤖 SOC (Sealed Engine) │ │  - See → Decide → Act  │ │  - Screen as API       │ └──────────┬────────────┘ │ ▼ ┌───────────────────────┐ │ ♻️ Restoration Engine  │ │  (THIS CONTRACT)       │ └───────────────────────┘
+
+**Key invariant:**  
+> Restoration sits **outside** SOC and **after** authority resolution.
+
+---
+
+## ✅ 4. Guaranteed State (MUST RESTORE)
+
+The system guarantees restoration of the following **minimum viable workspace state**:
+
+### 🎯 4.1 Input & Focus
+- 🖱 Cursor position (screen coordinates)
+- 🪟 Foreground window focus
+- 🧩 Active application process (best identifiable match)
+- ⌨️ Keyboard modality enabled (no stuck modifiers)
+
+### 🔐 4.2 System Control
+- Execution mode reverted to `OBSERVER`
+- No automated input after restoration completes
+
+These guarantees apply **regardless of termination mode**, unless physically impossible (e.g., power loss).
 
 ---
 
 ## ❌ 5. Explicit Non-Guarantees (NOT RESTORED)
 
-**H-1 FIX:** This section is authoritative and exhaustive. Any state not listed in Section 4 is NOT restored.
+The system **does not** guarantee restoration of:
 
-### 5.1 File System
-- Files created, modified, or deleted during execution
-- Package installations (apt, pip, npm, etc.)
-- Configuration file modifications
+- 📋 Clipboard contents
+- 📜 Scroll position
+- 🎞️ UI animations / transitions
+- 🌐 Network state
+- 🧠 Application internal state
+- ↩️ Undo / redo history
 
-### 5.2 Application State
-- Browser URL / tabs / form contents / scroll position
-- Clipboard contents
-- Undo / redo history
-- Application internal state (unsaved work)
+Anything not listed in Section 4 is **explicitly out of scope**.
 
-### 5.3 System State
-- Network connections
-- Running processes (spawned child processes remain running)
-- Window geometry (soft-verified only, not restored)
-- Window Z-order (stub verification, not implemented)
-- System registry / OS configuration changes
+---
 
-### 5.4 Partial Restoration (Best-Effort)
-- `keyboard_modifiers_partially` — modifier keys (Ctrl, Shift, Alt, Win) are released via `force_release_all()`. Non-modifier key state is NOT restored.
+## 🧨 6. Termination Modes
+
+The system recognizes the following termination modes:
+
+NORMAL_COMPLETION EXECUTION_ERROR VISION_FAILURE AUTHORITY_YIELD HUMAN_ABORT PROCESS_CRASH FORCED_TERMINATION (SIGKILL / power loss)
+
+All termination modes MUST attempt restoration except where process death makes it impossible.
 
 ---
 
 ## 🔁 7. Restoration Order (MANDATORY)
 
-1. Cease all automated input immediately
-2. Reassert keyboard/mouse availability (release modifier keys)
-3. Restore cursor position
-4. Restore window focus
-5. Restore active application
-6. Transition to OBSERVER mode
+Restoration MUST occur in the following order:
+
+1️⃣ Cease all automated input immediately 2️⃣ Reassert keyboard/mouse availability 3️⃣ Restore cursor position 4️⃣ Restore window focus 5️⃣ Restore active application 6️⃣ Transition to OBSERVER mode
+
+Deviation is **not permitted**.
 
 ---
 
 ## 🧪 8. Verification Criteria
 
-| Check | Tolerance |
-|---|---|
-| Cursor position | ±5px |
-| Window focus title | Levenshtein ≤2 edits |
-| System mode | must be OBSERVER |
-| Automation released | must be False |
+Restoration is **successful** if and only if:
 
-Extended checks (geometry, z-order, browser, media) are **best-effort soft checks** only.
+- 🖱 Cursor position matches pre-hijack position (± tolerance)
+- 🪟 A valid window has focus
+- 👁 System mode == `OBSERVER`
+- 🚫 No further automated input occurs
+
+Verification is **mandatory**.
 
 ---
 
 ## 🚨 9. Failure Semantics
 
-If restoration cannot be verified: execution halted, failure recorded, system stays in OBSERVER, no automatic retry. Silent failure is prohibited.
+If restoration cannot be verified:
+
+- ⛔ Execution is permanently halted
+- 🧾 Failure artifact is emitted
+- 👁 System remains in `OBSERVER`
+- 🔁 No automatic retry allowed
+
+**Silent failure is prohibited.**
 
 ---
 
-## 🔒 12. Commitment Chain Trust Boundary
+## 🧍 10. Human Intervention Semantics
 
-**H-7 FIX:** The `commitment_chain_hash` in `BeliefState` is a SHA-256 Merkle audit trail for intra-process session integrity. It is NOT tamper-proof against a compromised process — the hash lives in process memory with no external root of trust. Use it for forensic audit of uncompromised sessions only.
+If human input occurs:
 
----
+- ♻️ Restoration MUST still be attempted
+- ✋ Human input MUST NOT be overridden
+- 🧠 Restoration adapts to current visible state
 
-## 📜 Version History
-
-| Version | Change |
-|---|---|
-| v1.0 | Initial |
-| v2.0 | Extended verification stubs |
-| v3.0 | **H-1/H-3:** Explicit non-restoration list. Title changed from "Restoration Contract" to "Restoration Scope Declaration". Keyboard modifiers partial-restoration documented. Trust boundary section added. |
+> The system never fights the human.
 
 ---
 
-## 📋 IH-6 ADDENDUM — Explicit Scope Declaration
+## ♻️ 11. Idempotency Requirements
 
-**IH-6 FIX:** This section addresses the gap where the detailed scope was declared only in
-`snapshot_types.py:to_dict()` (code comments) but not in this contract document.
+Restoration logic MUST be:
 
-### What "Restoration Successful" Means — Precise Definition
+- 🔁 Safe to re-run
+- 🧩 Safe if partially applied
+- ⚠️ Safe if interrupted
 
-Restoration is **workspace aesthetics only**. The system:
+Repeated attempts MUST NOT degrade workspace state.
 
-1. **Moves the cursor** back to its pre-task XY position (within ±5px).
-2. **Re-focuses the window** that was active before the task (fuzzy title match, Levenshtein ≤2).
-3. **Re-activates the application** that was active before the task (best title match).
-4. **Releases all automated input** (keyboard modifiers, mouse buttons).
-5. **Resets execution mode** to OBSERVER.
+---
 
-### What "Restoration Successful" Does NOT Mean
+## 🗂️ 12. Data Schemas
 
-- ❌ Files or directories created, modified, or deleted are **not reversed**.
-- ❌ Processes spawned during the task are **not terminated**.
-- ❌ Browser history, URLs, tabs, or form state are **not restored**.
-- ❌ Clipboard contents are **not restored**.
-- ❌ Network connections or downloads are **not reversed**.
-- ❌ Package installations (apt, pip, npm, brew) are **not uninstalled**.
-- ❌ Window geometry (position and size) is captured and soft-verified but **not hard-required**.
-- ❌ Window Z-order (stacking) is captured (as of v3.1) and verified only if `xdotool` is available.
+### 📦 12.1 Pre-Hijack Snapshot Schema
 
-### Recommendation
+```json
+{
+  "snapshot_id": "uuid",
+  "timestamp": "epoch_ms",
+  "cursor": { "x": 0, "y": 0 },
+  "focused_window": "window_id",
+  "active_app": "process_name",
+  "execution_mode": "OBSERVER"
+}
 
-For tasks requiring full OS state rollback, run ProjectZeo inside:
-- A container with ephemeral storage
-- A VM with snapshot-before/rollback-after
-- A filesystem with copy-on-write support (btrfs, ZFS)
+🧾 12.2 Restoration Result Schema
 
+{
+  "snapshot_id": "uuid",
+  "restoration_attempted": true,
+  "verified": true,
+  "failure_reason": null,
+  "timestamp": "epoch_ms"
+}
+
+🧩 13. State Transition Diagram
+
+[ OBSERVER ]
+     |
+     | intent
+     v
+[ EXECUTING ]
+     |
+     | success / failure / yield / crash
+     v
+[ RESTORING ]
+     |
+     | verified
+     v
+[ OBSERVER ]
+
+No other transitions are allowed.
+
+🚫 14. Non-Goals
+
+This system does NOT aim to:
+
+Rewind application data
+
+Recover unsaved user work
+
+Enforce pixel-perfect layouts
+
+Bypass OS security boundaries
+
+🔒 15. Contract Status
+
+This document is frozen.
+
+Changes require:
+
+Version bump
+
+Backward compatibility review
+
+Re-verification of all implementations
+
+No code may violate this contract.
+
+
+---
+
+## 16. Audit Findings — Restoration Reality (2026-02-28)
+
+This section documents confirmed gaps between the restoration contract and runtime
+behaviour as of the 2026-02-28 adversarial audit.
+
+### 16.1 Scope Reaffirmation
+
+The contract in Section 4 (Guaranteed State) and Section 5 (Explicit Non-Guarantees)
+is accurate.  **Restoration is cursor-position and window-focus only.**  No spawned
+processes, file changes, clipboard, or network state is restored.  This is not a defect;
+it is the stated and intentional scope.
+
+Operators who require full-state rollback should run ProjectZeo inside a VM or container
+with snapshotting (e.g. QEMU/KVM with `virsh snapshot-create-as`, or Docker with
+`docker commit`).
+
+### 16.2 Process Census Diff (IH-6)
+
+**Status:** FIXED (2026-02-28, SI-A fix).
+
+The process census diff (reporting processes spawned during task execution that were not
+terminated by restoration) is now operational.  The original implementation read from
+`snapshot.metadata["process_census_pids"]` — a key that was never written anywhere in the
+codebase.  The fix corrects the key path to `metadata["extended"]["processes"]` (process
+names) and `metadata["process_census_pids"]` (PIDs captured in `snapshot_types.create()`).
+
+Post-restoration, `RestoreProvider._report_unrestored_processes()` now emits a WARNING
+listing any process names present after restoration that were not present at snapshot time.
+
+### 16.3 Secondary Verification Skip on Snapshot TTL Expiry (RT-D)
+
+**Status:** FIXED (2026-02-28, RT-D fix).
+
+When `snapshot_provider.get_snapshot()` returns `None` due to TTL expiry (3-hour limit),
+`restore_verifier.verify()` was previously skipped silently and `restore_required=False`
+was written to `auth_state` — signalling a clean exit without having verified restoration.
+
+The fix adds an explicit WARNING log and sets `auth_state.verification_warning = True`
+when the skip occurs, so the unverified restoration is visible in audit records.
+
+### 16.4 ReasoningEngine and Stagnation Recovery
+
+**Note:** `ReasoningEngine.propose_actions()` is not called during normal plan execution.
+Stagnation recovery occurs exclusively via REPLAN (up to `MAX_REPLANS=3` attempts),
+then `TASK_FAILED`.  See `ARCHITECTURE.md` Section 16.1 for the full analysis.
+
+This does not affect the restoration contract directly, but operators should be aware
+that stagnant tasks terminate via REPLAN → TASK_FAILED, not via dynamic recovery.
+Restoration is still attempted for all termination modes including TASK_FAILED.
