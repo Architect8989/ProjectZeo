@@ -395,21 +395,31 @@ def main(llm_callable: Callable, model_name: str) -> None:
 
     # ------------------------------------------------------------------
     # Warmup — extended to 150s for CPU inference compatibility
+    # P4 FIX (RT-1): Two-phase warmup.
+    # Phase 1 (REQUIRED): vision AND observer healthy — 3 consecutive healthy
+    #   frames.  Does NOT require entity_count > 0.  A bare desktop (zero open
+    #   windows) is a valid operating environment; blocking on entity_count > 0
+    #   caused a 150-second penalty on every cold-start in minimal Xvfb sessions.
+    # Phase 2 (OPTIONAL): entity-warm — at least one visible UI entity.
+    #   Tracked separately; planning proceeds without it but the world model is
+    #   noted as entity-empty for diagnostics.
     # ------------------------------------------------------------------
     stable_frames = 0
+    entity_warm = False
     warmup_deadline = time.time() + WARMUP_TIMEOUT_SECONDS
     _warmup_achieved = False
 
     while time.time() < warmup_deadline:
         if observer.is_healthy() and vision_runtime.is_healthy():
             if _ingest_latest_perception(observer, world_graph):
+                stable_frames += 1
                 if world_graph.entity_count() > 0:
-                    stable_frames += 1
-                    if stable_frames >= WARMUP_STABLE_FRAMES:
-                        _warmup_achieved = True
-                        break
-                else:
-                    stable_frames = 0
+                    entity_warm = True
+                if stable_frames >= WARMUP_STABLE_FRAMES:
+                    _warmup_achieved = True
+                    break
+        else:
+            stable_frames = 0
         time.sleep(0.1)
 
     if not _warmup_achieved:
@@ -432,12 +442,22 @@ def main(llm_callable: Callable, model_name: str) -> None:
                 "stable_frames_achieved": stable_frames,
                 "required": WARMUP_STABLE_FRAMES,
                 "entity_count": world_graph.entity_count(),
+                "entity_warm": entity_warm,
                 "observer_healthy": _obs_healthy,
                 "vision_healthy": _vis_healthy,
                 "timeout_seconds": WARMUP_TIMEOUT_SECONDS,
             })
         except Exception:
             pass
+    elif not entity_warm:
+        # Vision/observer healthy but no UI entities seen — bare desktop.
+        # Task will proceed but planner starts with an empty world model.
+        print(
+            "[WARMUP] INFO: warmup succeeded (observer+vision healthy) but no UI "
+            "entities were detected (bare desktop). Planning proceeds with empty world "
+            "model. Open application windows before submitting tasks for best results.",
+            file=sys.stderr,
+        )
 
     # ------------------------------------------------------------------
     # Restoration infrastructure
@@ -452,10 +472,18 @@ def main(llm_callable: Callable, model_name: str) -> None:
         mode_controller=mode,
         snapshot_provider=snapshot_provider,
     )
+    # P1 FIX (RT-3 / SI-2 / HAR-07): Wire authority_state into RestoreVerifier.
+    # Previously constructed without authority_state=auth_state, so
+    # self._authority_state was always None inside RestoreVerifier, making the
+    # _emit_verification_warning() → authority_state.verification_warning = True
+    # path permanently dead code.  Restoration verification failures were never
+    # recorded in the authority audit file, preventing post-mortem analysis.
+    # Fix: pass auth_state so that HAR-07 structured audit events actually fire.
     restore_verifier = RestoreVerifier(
         os_backend=os_backend,
         mode_controller=mode,
         cursor_tolerance_px=5,
+        authority_state=auth_state,
     )
 
     intent_listener = IntentListener(mode, snapshot_provider)
