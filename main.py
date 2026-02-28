@@ -545,18 +545,52 @@ def main(llm_callable: Callable, model_name: str) -> None:
                         mode.update_vision_status(vision_runtime.is_healthy())
 
                 # Planning (CPU-monitored by watchdog)
-                try:
-                    watchdog.pause_cpu()
-                    execution_plan = planner.create_plan(
-                        objective=intent,
-                        requirements={
-                            "environment": env_fingerprint,
-                            "tools": env_fingerprint.get("tools", []),
-                        },
-                        high_level_steps=[{"goal": intent}],
-                    )
-                finally:
-                    watchdog.resume_cpu()
+                # RT-C FIX: Wrap planner.create_plan() in a retry loop so that
+                # transient LLM failures (OOM subprocess kill, network timeout,
+                # malformed JSON after all internal retries) do not immediately
+                # terminate the process. The planner's internal retry
+                # (_call_llm_text, max_retries=2) handles per-call transient
+                # failures; this outer loop handles persistent failures across
+                # multiple planning attempts (up to _PLAN_MAX_RETRIES=3).
+                # After exhausting retries, the exception propagates normally
+                # and is caught by the outer except Exception → _force_safe_shutdown.
+                _PLAN_MAX_RETRIES = 3
+                _plan_attempt = 0
+                while True:
+                    _plan_attempt += 1
+                    try:
+                        watchdog.pause_cpu()
+                        execution_plan = planner.create_plan(
+                            objective=intent,
+                            requirements={
+                                "environment": env_fingerprint,
+                                "tools": env_fingerprint.get("tools", []),
+                            },
+                            high_level_steps=[{"goal": intent}],
+                        )
+                        break  # success — exit retry loop
+                    except Exception as _plan_err:
+                        watchdog.resume_cpu()
+                        if _plan_attempt >= _PLAN_MAX_RETRIES:
+                            print(
+                                f"[MAIN] Planning failed after {_plan_attempt} "
+                                f"attempt(s): {_plan_err}. Propagating error.",
+                                file=sys.stderr,
+                            )
+                            raise  # exhaust retries — let outer handler deal with it
+                        _plan_delay = min(2.0 ** _plan_attempt, 30.0)  # exp backoff, cap 30s
+                        print(
+                            f"[MAIN] Planning attempt {_plan_attempt}/{_PLAN_MAX_RETRIES} "
+                            f"failed: {type(_plan_err).__name__}: {_plan_err}. "
+                            f"Retrying in {_plan_delay:.1f}s...",
+                            file=sys.stderr,
+                        )
+                        time.sleep(_plan_delay)
+                    finally:
+                        try:
+                            watchdog.resume_cpu()
+                        except Exception:
+                            pass
 
                 mode.attach_execution_plan(f"plan_{int(time.time())}")
                 mode.mark_planning_complete()
@@ -743,6 +777,34 @@ def main(llm_callable: Callable, model_name: str) -> None:
                                     raise RestorationVerificationError(
                                         f"Post-restore verification failed: {rve}"
                                     )
+                            else:
+                                # RT-D FIX (P2): Snapshot TTL has expired between
+                                # capture and retrieval (3-hour TTL, configurable).
+                                # Previously this branch was a silent no-op: verify()
+                                # was skipped and auth_state was written with
+                                # restore_required=False, falsely signaling a clean
+                                # verified exit when verification was never performed.
+                                #
+                                # FIX: Log at WARNING level so the unverified
+                                # restoration is visible in all log aggregators.
+                                # Also set auth_state.verification_warning=True so
+                                # that monitoring can detect unverified restorations
+                                # in the authority audit record (aligns with HAR-07
+                                # RestoreVerifier structured audit event pattern).
+                                print(
+                                    f"[MAIN] WARNING RT-D: Snapshot {snapshot_id!r} "
+                                    "has expired (TTL elapsed between capture and "
+                                    "retrieval). Post-restore verification was SKIPPED. "
+                                    "The system reports clean restoration but the "
+                                    "restoration was NOT independently verified. "
+                                    "Consider reducing task duration or increasing "
+                                    "PROJECTZEO_SNAPSHOT_TTL_SECONDS.",
+                                    file=sys.stderr,
+                                )
+                                try:
+                                    auth_state.verification_warning = True
+                                except Exception:
+                                    pass  # auth_state may not support this attribute
 
                             # IH-05 FIX: Flush regret on successful task completion.
                             # Stale regret from a successfully-completed task must not
