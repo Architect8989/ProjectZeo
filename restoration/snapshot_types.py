@@ -5,6 +5,7 @@ import json
 import os
 import time
 import threading
+import uuid
 from dataclasses import dataclass, field
 from typing import Optional, Dict, Any
 
@@ -86,11 +87,18 @@ class RestorationSnapshot:
         execution_mode: str,
         captured_at: float,
     ) -> str:
-        
-        
-        with RestorationSnapshot._nonce_lock:
-            RestorationSnapshot._nonce_counter += 1
-            nonce = RestorationSnapshot._nonce_counter
+        # H-1 FIX: Replace the process-local _nonce_counter (which resets to 0
+        # on every process restart, making sub-millisecond snapshot ID collisions
+        # possible between a freshly loaded snapshot and a new one created within
+        # 1ms of the crash) with uuid.uuid4().hex[:8].
+        #
+        # uuid4() generates a cryptographically random 128-bit value — the
+        # collision probability is 1/(2^32) ≈ 2.3×10⁻¹⁰ per snapshot pair, which
+        # is negligible for all practical use.  Unlike the counter-based approach,
+        # it provides this guarantee across process restarts without any persistent
+        # state.  The _nonce_counter and _nonce_lock class attributes are no longer
+        # needed and have been removed.
+        nonce = uuid.uuid4().hex[:8]
 
         canonical = json.dumps(
             {
@@ -101,7 +109,7 @@ class RestorationSnapshot:
                 "execution_mode": execution_mode,
                 # Round to nearest millisecond to avoid cross-platform float drift
                 "captured_at_ms": round(captured_at * 1000),
-                # HARD-7: monotonic nonce prevents same-millisecond collisions
+                # H-1 FIX: crypto-random nonce (uuid4 hex) instead of process-local counter
                 "nonce": nonce,
             },
             sort_keys=True,
@@ -293,10 +301,6 @@ class RestorationSnapshot:
             ) from _val_err
 
         return instance
-
-RestorationSnapshot._nonce_counter = 0  # type: ignore[attr-defined]
-
-RestorationSnapshot._nonce_lock = threading.Lock()  # type: ignore[attr-defined]
 
 
 # ---------------------------------------------------------------------------
