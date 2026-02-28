@@ -293,13 +293,87 @@ def _disable_cloud_fallbacks():
 # ============================================================
 
 def _disable_screenshot_writes():
+    # RT-A2 FIX (P1): The builtins.open patch and legacy module patch MUST be
+    # installed BEFORE _get_apis() is called.  In the original code the
+    # _m = _get_apis() call appeared first; if it raised (Ollama-only install
+    # where both apis modules are absent) the entire rest of the function was
+    # skipped, leaving builtins.open unpatched — violating the stated
+    # screenshot-write isolation guarantee for stripped deployments.
+    #
+    # Fix: install builtins.open patch unconditionally first, THEN attempt
+    # the os.makedirs and PIL patches which require the apis module object.
+    # An ImportError from _get_apis() is caught and logged; the builtins.open
+    # patch has already been installed at that point and remains active.
 
     def _is_screenshot_path(path):
         if not isinstance(path, (str, pathlib.Path)):
             return False
         return "screenshot" in str(path).lower()
 
-    _m = _get_apis()
+    # ---- STEP 1: Install builtins.open patch UNCONDITIONALLY ----
+    # This must happen regardless of whether the apis module is available.
+    import builtins as _builtins_mod
+    _real_open = getattr(_builtins_mod, "_original_open_pre_safety_patch", None)
+    if _real_open is None:
+        _real_open = _builtins_mod.open
+        _builtins_mod._original_open_pre_safety_patch = _real_open
+
+    _APIS_MODULE_PATTERNS = (
+        "operate.legacy.apis",
+        "operate.models.apis",
+        "operate/legacy/apis",
+        "operate/models/apis",
+    )
+
+    def guarded_open(file, mode="r", *args, **kwargs):
+        if not ("w" in str(mode) or "a" in str(mode) or "x" in str(mode)):
+            return _real_open(file, mode, *args, **kwargs)
+        if not _is_screenshot_path(file):
+            return _real_open(file, mode, *args, **kwargs)
+        try:
+            stack = inspect.stack()
+            for frame_info in stack:
+                filename = frame_info.filename or ""
+                module = (frame_info.frame.f_globals.get("__name__") or "")
+                if any(pat in filename or pat in module for pat in _APIS_MODULE_PATTERNS):
+                    raise RuntimeError(
+                        "[APIS-SAFETY] Screenshot file write blocked "
+                        f"(origin: {module or filename})"
+                    )
+        except RuntimeError:
+            raise
+        except Exception:
+            pass
+        return _real_open(file, mode, *args, **kwargs)
+
+    if not getattr(_builtins_mod, "_safety_open_installed", False):
+        _builtins_mod.open = guarded_open
+        _builtins_mod._safety_open_installed = True
+
+    # Also patch the legacy module attribute for backwards compatibility
+    try:
+        legacy = importlib.import_module("operate.legacy.apis")
+        if not getattr(legacy, "_open_safety_guarded", False):
+            legacy.open = guarded_open
+            setattr(legacy, "_open_safety_guarded", True)
+    except Exception:
+        pass  # Legacy module absent — acceptable on Ollama-only installs
+
+    # ---- STEP 2: Apply apis-module-specific patches (require _m) ----
+    # These patches are best-effort; absence of the apis module is acceptable
+    # on Ollama-only installs.  The builtins.open guard above already covers
+    # the critical path for stripped deployments.
+    try:
+        _m = _get_apis()
+    except RuntimeError:
+        import sys as _sys
+        print(
+            "[APIS-SAFETY] _disable_screenshot_writes(): apis module absent — "
+            "os.makedirs and PIL Image.save patches skipped (OK for Ollama-only). "
+            "builtins.open screenshot guard is installed.",
+            file=_sys.stderr,
+        )
+        return
 
     # ---- Guard os.makedirs within the apis module ----
     if hasattr(_m, "os") and hasattr(_m.os, "makedirs"):
@@ -328,63 +402,6 @@ def _disable_screenshot_writes():
             raise RuntimeError(
                 f"[APIS-SAFETY] Failed to patch PIL save: {e}"
             )
-
-    
-    import builtins as _builtins_mod
-    _real_open = getattr(_builtins_mod, "_original_open_pre_safety_patch", None)
-    if _real_open is None:
-        # First install — save the true original
-        _real_open = _builtins_mod.open
-        _builtins_mod._original_open_pre_safety_patch = _real_open
-
-    # Modules whose open() calls should be subject to screenshot-write blocking.
-    _APIS_MODULE_PATTERNS = (
-        "operate.legacy.apis",
-        "operate.models.apis",
-        "operate/legacy/apis",
-        "operate/models/apis",
-    )
-
-    def guarded_open(file, mode="r", *args, **kwargs):
-        # Fast path: not a write mode → pass through immediately
-        if not ("w" in str(mode) or "a" in str(mode) or "x" in str(mode)):
-            return _real_open(file, mode, *args, **kwargs)
-        # Fast path: not a screenshot-like path → pass through immediately
-        if not _is_screenshot_path(file):
-            return _real_open(file, mode, *args, **kwargs)
-        # Slow path: write to a screenshot-like path — check call origin.
-        # Only block if the call originates from within the operate apis modules.
-        try:
-            stack = inspect.stack()
-            for frame_info in stack:
-                filename = frame_info.filename or ""
-                module = (frame_info.frame.f_globals.get("__name__") or "")
-                if any(pat in filename or pat in module for pat in _APIS_MODULE_PATTERNS):
-                    raise RuntimeError(
-                        "[APIS-SAFETY] Screenshot file write blocked "
-                        f"(origin: {module or filename})"
-                    )
-        except RuntimeError:
-            raise
-        except Exception:
-            # inspect.stack() failure — fail open (don't block unrelated code)
-            pass
-        return _real_open(file, mode, *args, **kwargs)
-
-    # Install on builtins so ALL modules are covered, but only apis-origin
-    # screenshot writes are blocked (frame inspection above).
-    if not getattr(_builtins_mod, "_safety_open_installed", False):
-        _builtins_mod.open = guarded_open
-        _builtins_mod._safety_open_installed = True
-
-    # Also patch the legacy module attribute for backwards compatibility
-    try:
-        legacy = importlib.import_module("operate.legacy.apis")
-        if not getattr(legacy, "_open_safety_guarded", False):
-            legacy.open = guarded_open
-            setattr(legacy, "_open_safety_guarded", True)
-    except Exception:
-        pass  # Legacy module absent — acceptable on Ollama-only installs
 
 
 # ============================================================
