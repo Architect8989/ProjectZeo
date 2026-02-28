@@ -19,7 +19,7 @@ ProjectZeo is a deterministic, fail-closed system for executing computer interac
 
 ### 2.1 Brain (External LLM)
 
-**Location:** Anthropic Claude API  
+**Location:** Any LLM But VISION BASED
 **Usage:** ONLY during planning phase  
 **Function:** Convert human intent into structured ExecutionPlan  
 **Constraints:**
