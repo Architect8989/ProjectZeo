@@ -53,7 +53,40 @@ REPLAN_SIGNAL: str = "REPLAN_REQUIRED"
 
 # WAIT should pause and retry, not immediately replan (PATCH §1.11)
 WAIT_RETRY_SECONDS = 0.5
-MAX_WAIT_RETRIES = 10  # 5 seconds total before giving up and replanning
+
+# RT-A FIX (P0): Human confirmation timeout is now configurable via
+# PROJECTZEO_CONFIRM_TIMEOUT_SECONDS environment variable.
+#
+# ORIGINAL DEFECT: MAX_WAIT_RETRIES=10 x 0.5s = 5 seconds total. The
+# human operator must notice the /tmp signal file and delete it within 5
+# seconds, which is operationally unreachable. All REQUIRE_HUMAN_CONFIRMATION
+# actions were effectively auto-denied -> stagnation -> REPLAN -> TASK_FAILED.
+#
+# FIX: Default timeout raised to 60s (120 retries x 0.5s). Configurable
+# via PROJECTZEO_CONFIRM_TIMEOUT_SECONDS for slow-notification environments.
+# H4 HARDENING: Effective timeout logged at startup for operator visibility.
+def _resolve_confirm_timeout() -> int:
+    """Read PROJECTZEO_CONFIRM_TIMEOUT_SECONDS env var; default 60s."""
+    raw = os.environ.get("PROJECTZEO_CONFIRM_TIMEOUT_SECONDS", "")
+    try:
+        val = int(raw.strip())
+        if val > 0:
+            return val
+    except (ValueError, AttributeError):
+        pass
+    return 60  # default: 60 seconds
+
+
+_CONFIRM_TIMEOUT_SECONDS: int = _resolve_confirm_timeout()
+MAX_WAIT_RETRIES: int = max(int(_CONFIRM_TIMEOUT_SECONDS / WAIT_RETRY_SECONDS), 1)
+
+# Log effective timeout at import time so it appears in all startup logs.
+print(
+    f"[OPERATE] Human confirmation timeout: {_CONFIRM_TIMEOUT_SECONDS}s "
+    f"({MAX_WAIT_RETRIES} retries x {WAIT_RETRY_SECONDS}s). "
+    "Override with PROJECTZEO_CONFIRM_TIMEOUT_SECONDS env var.",
+    file=__import__("sys").stderr,
+)
 
 # Max bytes of command output stored per step in execution_log (bounded, not unlimited)
 MAX_COMMAND_OUTPUT_BYTES = 4096
@@ -94,7 +127,7 @@ def _write_approval_signal(action_key: str, action: dict, reason: str) -> str:
                 "instruction": (
                     f"Delete this file to approve the action: {path}\n"
                     "The file will be cleaned up automatically after "
-                    f"{MAX_WAIT_RETRIES * WAIT_RETRY_SECONDS:.0f}s."
+                    f"{_CONFIRM_TIMEOUT_SECONDS}s."
                 ),
             },
             indent=2,
@@ -198,8 +231,94 @@ def operate_main(
         )
 
     # ------------------------------------------------------------------
-    # Accessibility backend (optional AT-SPI path)
+    # H2 FIX — Load Bayesian likelihood ratios from likelihoods.json
     # ------------------------------------------------------------------
+    # DEFECT (MS-1 / H2): The likelihood ratios used in bayesian_update()
+    # were hardcoded constants (0.95, 0.75, 1.5, 1.2, 0.8, 1.0) with no
+    # calibration mechanism.  True P(observation|state) ratios depend on
+    # the deployment environment (display resolution, application mix,
+    # task profile) and cannot be calibrated at development time.
+    #
+    # FIX: Load ratios from likelihoods.json at startup.  The file lives
+    # alongside policy.yaml in the project root and uses the same key
+    # structure as the inline code.  If the file is absent or malformed,
+    # the hardcoded defaults below are used and a WARNING is emitted.
+    #
+    # likelihoods.json schema:
+    # {
+    #   "app_match_with_delta":  0.95,  -- P(obs|state) when world changed
+    #   "app_match_no_delta":    0.75,  -- P(obs|state) when world stable
+    #   "ui_rich":               1.50,  -- > ENTITY_RICH_THRESHOLD entities
+    #   "ui_sparse":             1.20,  -- 1 to ENTITY_RICH_THRESHOLD entities
+    #   "ui_empty":              0.80,  -- 0 entities
+    #   "neutral_with_delta":    1.00,  -- baseline: fresh observation
+    #   "neutral_no_delta":      0.80,  -- baseline: stale observation
+    #   "ENTITY_RICH_THRESHOLD": 10     -- entity count above which ui_rich fires
+    # }
+    #
+    # Calibration guidance:
+    #   Collect a dataset of (observation, true_state) pairs from production
+    #   runs.  For each state category, compute the empirical P(observation|state)
+    #   by counting how often that category was active when the true state
+    #   matched.  Normalize relative to the neutral baseline to produce ratios.
+    _LIKELIHOOD_DEFAULTS: dict = {
+        "app_match_with_delta":  0.95,
+        "app_match_no_delta":    0.75,
+        "ui_rich":               1.50,
+        "ui_sparse":             1.20,
+        "ui_empty":              0.80,
+        "neutral_with_delta":    1.00,
+        "neutral_no_delta":      0.80,
+        "ENTITY_RICH_THRESHOLD": 10,
+    }
+    _likelihood_cfg: dict = dict(_LIKELIHOOD_DEFAULTS)
+    try:
+        import os as _os_lh
+        import json as _json_lh
+        _lh_path = _os_lh.path.join(
+            _os_lh.path.dirname(__file__), "..", "likelihoods.json"
+        )
+        if _os_lh.path.exists(_lh_path):
+            with open(_lh_path, "r", encoding="utf-8") as _lhf:
+                _lh_raw = _json_lh.load(_lhf)
+            if isinstance(_lh_raw, dict):
+                # Validate: all expected keys must be present and numeric
+                _missing = [k for k in _LIKELIHOOD_DEFAULTS if k not in _lh_raw]
+                _bad_type = [
+                    k for k, v in _lh_raw.items()
+                    if k in _LIKELIHOOD_DEFAULTS and not isinstance(v, (int, float))
+                ]
+                if _missing or _bad_type:
+                    raise ValueError(
+                        f"likelihoods.json validation failed — "
+                        f"missing keys: {_missing}, bad types: {_bad_type}"
+                    )
+                _likelihood_cfg.update(_lh_raw)
+                print(
+                    f"[operate_main] Loaded Bayesian likelihood ratios from "
+                    f"likelihoods.json: {_likelihood_cfg}",
+                    file=sys.stderr,
+                )
+            else:
+                raise ValueError("likelihoods.json root must be a JSON object")
+        else:
+            # File absent is normal on first deploy — silently use defaults.
+            print(
+                "[operate_main] likelihoods.json not found — using hardcoded "
+                "default Bayesian likelihood ratios. To calibrate, create "
+                "likelihoods.json alongside policy.yaml. See H2 fix comment "
+                "for the schema and calibration guidance.",
+                file=sys.stderr,
+            )
+    except Exception as _lh_err:
+        print(
+            f"[operate_main] WARNING H2: Failed to load likelihoods.json: "
+            f"{_lh_err}. Using hardcoded defaults.",
+            file=sys.stderr,
+        )
+        _likelihood_cfg = dict(_LIKELIHOOD_DEFAULTS)
+
+
     try:
         accessibility_backend = AccessibilityBackend()
         if observer is not None:
@@ -407,198 +526,239 @@ def _execute_autonomous_loop(
                 except Exception:
                     log_warn("Observer snapshot failed")
 
-            world_snapshot = world_graph.snapshot() if world_graph else {}
+            # P1 RT-C FIX: Try/except wraps the full per-iteration execution body so
+            # transient LLM/screenshot/network failures become stagnation increments
+            # rather than unhandled RuntimeErrors that terminate the process.
+            try:
+                world_snapshot = world_graph.snapshot() if world_graph else {}
 
-            # ------------------------------------------------------------------
-            # World-graph delta & belief update
-            # ------------------------------------------------------------------
-            delta = None
-            if previous_snapshot and world_graph:
-                try:
-                    delta = world_graph.compute_delta(previous_snapshot)
-                    belief.compute_environment_stability(delta)
-                except Exception:
-                    delta = None
+                # ------------------------------------------------------------------
+                # World-graph delta & belief update
+                # ------------------------------------------------------------------
+                delta = None
+                if previous_snapshot and world_graph:
+                    try:
+                        delta = world_graph.compute_delta(previous_snapshot)
+                        belief.compute_environment_stability(delta)
+                    except Exception:
+                        delta = None
 
-            if isinstance(world_snapshot, dict):
-                entities = world_snapshot.get("entities", [])
-                if isinstance(entities, list):
-                    entities = entities[:MAX_PERCEPTION_ENTITIES]
+                if isinstance(world_snapshot, dict):
+                    entities = world_snapshot.get("entities", [])
+                    if isinstance(entities, list):
+                        entities = entities[:MAX_PERCEPTION_ENTITIES]
 
-                bounded = {k: v for k, v in world_snapshot.items() if k != "entities"}
-                bounded["entities"] = entities
+                    bounded = {k: v for k, v in world_snapshot.items() if k != "entities"}
+                    bounded["entities"] = entities
 
-                try:
-                    if len(json.dumps(bounded)) <= MAX_PERCEPTION_JSON_BYTES:
-                        likelihoods: Dict[str, float] = {}
-                        focused_app = bounded.get("focused_app")
-                        entity_count = len(bounded.get("entities", []))
+                    try:
+                        if len(json.dumps(bounded)) <= MAX_PERCEPTION_JSON_BYTES:
+                            likelihoods: Dict[str, float] = {}
+                            focused_app = bounded.get("focused_app")
+                            entity_count = len(bounded.get("entities", []))
 
-                        # MS-1 / IH-1 FIX: Replace hardcoded developer constants
-                        # (0.9, 0.8, 0.7, 0.5) with calibrated delta-sensitive
-                        # likelihood ratios.
-                        #
-                        # ORIGINAL DEFECT: The prior code used fixed scalars that
-                        # were not P(observation|state) ratios — they were constant
-                        # multiplicative weights independent of observation quality.
-                        # After N iterations the dominant state was whichever
-                        # category was activated most frequently, not the true world
-                        # state.  This violated the stated "Bayesian inference"
-                        # contract (audit finding MS-1).
-                        #
-                        # CALIBRATION RATIONALE:
-                        # Likelihoods are now computed as observation-conditional
-                        # ratios relative to the neutral baseline (1.0):
-                        #
-                        # app:{focused_app}:
-                        #   P(focused_app seen | app is correct state) / P(seen | neutral)
-                        #   = 0.95 when world changed (fresh observation), 0.75 when stable
-                        #   (title re-read may be stale).  Rationale: if the expected app
-                        #   is focused and the world just changed, we have strong evidence
-                        #   of a correct state; if the world is stable (no delta), the
-                        #   same observation is weaker because the OS may be reporting
-                        #   a cached value.
-                        #
-                        # ui_rich / ui_sparse / ui_empty:
-                        #   Ratios relative to a flat prior; calibrated so that a
-                        #   UI-rich snapshot is 1.5× more likely under a "productive"
-                        #   state than a sparse or empty one.  Values anchored to
-                        #   empirically observed entity count distributions:
-                        #     > 10 entities  → rich  (1.5)
-                        #     1–10 entities  → sparse (1.2)
-                        #     0 entities     → empty (0.8, slight evidence of wrong state)
-                        #
-                        # neutral:
-                        #   Explicit neutral likelihood set to 1.0 when world changed
-                        #   (observation is fresh, no dampening) and 0.8 when stable
-                        #   (no delta = stale or no activity = mild negative evidence).
-                        #
-                        # NOTE: These ratios are still heuristic estimates, not
-                        # empirically measured conditional probabilities from a
-                        # training distribution.  The update is proportionally correct
-                        # Bayesian inference but the ratio magnitudes are developer
-                        # estimates.  True calibration would require a labeled dataset
-                        # of (observation, true_state) pairs per application.  This
-                        # fix is a significant improvement over fixed constants because
-                        # the ratios are delta-sensitive (observation freshness matters)
-                        # and directionally correct (rich UI → higher state confidence).
+                            # MS-1 / IH-1 FIX: Replace hardcoded developer constants
+                            # (0.9, 0.8, 0.7, 0.5) with calibrated delta-sensitive
+                            # likelihood ratios.
+                            #
+                            # ORIGINAL DEFECT: The prior code used fixed scalars that
+                            # were not P(observation|state) ratios — they were constant
+                            # multiplicative weights independent of observation quality.
+                            # After N iterations the dominant state was whichever
+                            # category was activated most frequently, not the true world
+                            # state.  This violated the stated "Bayesian inference"
+                            # contract (audit finding MS-1).
+                            #
+                            # CALIBRATION RATIONALE:
+                            # Likelihoods are now computed as observation-conditional
+                            # ratios relative to the neutral baseline (1.0):
+                            #
+                            # app:{focused_app}:
+                            #   P(focused_app seen | app is correct state) / P(seen | neutral)
+                            #   = 0.95 when world changed (fresh observation), 0.75 when stable
+                            #   (title re-read may be stale).  Rationale: if the expected app
+                            #   is focused and the world just changed, we have strong evidence
+                            #   of a correct state; if the world is stable (no delta), the
+                            #   same observation is weaker because the OS may be reporting
+                            #   a cached value.
+                            #
+                            # ui_rich / ui_sparse / ui_empty:
+                            #   Ratios relative to a flat prior; calibrated so that a
+                            #   UI-rich snapshot is 1.5× more likely under a "productive"
+                            #   state than a sparse or empty one.  Values anchored to
+                            #   empirically observed entity count distributions:
+                            #     > 10 entities  → rich  (1.5)
+                            #     1–10 entities  → sparse (1.2)
+                            #     0 entities     → empty (0.8, slight evidence of wrong state)
+                            #
+                            # neutral:
+                            #   Explicit neutral likelihood set to 1.0 when world changed
+                            #   (observation is fresh, no dampening) and 0.8 when stable
+                            #   (no delta = stale or no activity = mild negative evidence).
+                            #
+                            # NOTE: These ratios are still heuristic estimates, not
+                            # empirically measured conditional probabilities from a
+                            # training distribution.  The update is proportionally correct
+                            # Bayesian inference but the ratio magnitudes are developer
+                            # estimates.  True calibration would require a labeled dataset
+                            # of (observation, true_state) pairs per application.  This
+                            # fix is a significant improvement over fixed constants because
+                            # the ratios are delta-sensitive (observation freshness matters)
+                            # and directionally correct (rich UI → higher state confidence).
 
-                        has_delta = bool(delta)
+                            has_delta = bool(delta)
 
-                        if isinstance(focused_app, str) and focused_app.strip():
-                            app_state_key = f"app:{focused_app.lower()}"
-                            # Fresher observation (delta present) = stronger evidence
-                            likelihoods[app_state_key] = 0.95 if has_delta else 0.75
+                            # H2 FIX: Use values from _likelihood_cfg (loaded from
+                            # likelihoods.json at startup) instead of hardcoded
+                            # developer constants.  If the file is absent, _likelihood_cfg
+                            # contains the original defaults so behaviour is unchanged.
+                            _entity_rich_thresh = int(
+                                _likelihood_cfg.get("ENTITY_RICH_THRESHOLD", 10)
+                            )
 
-                        if entity_count > 10:
-                            likelihoods["ui_rich"] = 1.5
-                        elif entity_count > 0:
-                            likelihoods["ui_sparse"] = 1.2
-                        else:
-                            likelihoods["ui_empty"] = 0.8
+                            if isinstance(focused_app, str) and focused_app.strip():
+                                app_state_key = f"app:{focused_app.lower()}"
+                                likelihoods[app_state_key] = (
+                                    _likelihood_cfg["app_match_with_delta"] if has_delta
+                                    else _likelihood_cfg["app_match_no_delta"]
+                                )
 
-                        # Neutral: fresh observation = 1.0 (no update to prior),
-                        # stale/no-change observation = 0.8 (mild negative evidence)
-                        likelihoods["neutral"] = 1.0 if has_delta else 0.8
-                        belief.bayesian_update(likelihoods)
-                except Exception:
-                    pass
+                            if entity_count > _entity_rich_thresh:
+                                likelihoods["ui_rich"] = _likelihood_cfg["ui_rich"]
+                            elif entity_count > 0:
+                                likelihoods["ui_sparse"] = _likelihood_cfg["ui_sparse"]
+                            else:
+                                likelihoods["ui_empty"] = _likelihood_cfg["ui_empty"]
 
-            previous_snapshot = world_snapshot
+                            # Neutral baseline
+                            likelihoods["neutral"] = (
+                                _likelihood_cfg["neutral_with_delta"] if has_delta
+                                else _likelihood_cfg["neutral_no_delta"]
+                            )
+                            belief.bayesian_update(likelihoods)
+                    except Exception:
+                        pass
 
-            # ------------------------------------------------------------------
-            # Candidate action selection
-            # ------------------------------------------------------------------
-            raw_actions = current_step.action
-            candidate_actions: List[Dict[str, Any]] = []
+                previous_snapshot = world_snapshot
 
-            if isinstance(raw_actions, dict):
-                candidate_actions.append(raw_actions)
-            elif isinstance(raw_actions, list):
-                candidate_actions.extend(
-                    a for a in raw_actions if isinstance(a, dict)
+                # ------------------------------------------------------------------
+                # Candidate action selection
+                # ------------------------------------------------------------------
+                raw_actions = current_step.action
+                candidate_actions: List[Dict[str, Any]] = []
+
+                if isinstance(raw_actions, dict):
+                    candidate_actions.append(raw_actions)
+                elif isinstance(raw_actions, list):
+                    candidate_actions.extend(
+                        a for a in raw_actions if isinstance(a, dict)
+                    )
+
+                # Fallback: ask ReasoningEngine for dynamic candidates on stagnant steps
+                if not candidate_actions and reasoning_engine is not None:
+                    perception_for_reasoning: Dict[str, Any] = {}
+                    if isinstance(perception_snapshot, dict):
+                        perception_for_reasoning = perception_snapshot
+                    elif isinstance(world_snapshot, dict):
+                        perception_for_reasoning = world_snapshot
+
+                    try:
+                        dynamic_candidates = reasoning_engine.propose_actions(
+                            objective=execution_plan.objective,
+                            belief_summary=belief.summary(),
+                            perception=perception_for_reasoning,
+                            k=MAX_DYNAMIC_CANDIDATES,
+                        )
+                        if dynamic_candidates:
+                            # IH-4: Filter out candidates already tried to prevent
+                            # infinite UCB exploration of perpetually-novel candidates.
+                            fresh_candidates = [
+                                c for c in dynamic_candidates
+                                if action_ranker.action_key(c) not in _visited_action_keys
+                            ]
+                            # Use fresh candidates if available; fall back to all dynamic
+                            # candidates only if every one has been tried (exploration exhausted).
+                            candidate_actions = fresh_candidates or dynamic_candidates
+                            journal.record({
+                                "event": "dynamic_candidates_used",
+                                "step": current_step_index,
+                                "count": len(candidate_actions),
+                                "fresh_count": len(fresh_candidates),
+                            })
+                    except Exception as re_err:
+                        log_warn(f"ReasoningEngine fallback failed: {re_err}")
+
+                if not candidate_actions:
+                    raise RuntimeError("TASK_FAILED:no_candidate_actions")
+
+                # Thompson-UCB-EU composite selection via ActionRanker
+                selected_action = action_ranker.select(
+                    actions=candidate_actions,
+                    belief_state=belief,
+                )
+                action_key = action_ranker.action_key(selected_action)
+
+                # IH-4: Record action key as visited. Evict oldest when full.
+                if len(_visited_action_keys) >= _VISITED_ACTION_MAX:
+                    _oldest = next(iter(_visited_action_keys))
+                    del _visited_action_keys[_oldest]
+                _visited_action_keys[action_key] = True
+
+                # ------------------------------------------------------------------
+                # Policy gate
+                # ------------------------------------------------------------------
+                _focused_app_for_policy = (
+                    world_snapshot.get("focused_app", "__unknown_app__")
+                    if isinstance(world_snapshot, dict)
+                    else "__unknown_app__"
+                )
+                _policy_decision, _policy_reason = policy_engine.validate_action_dict(
+                    selected_action,
+                    focused_app=_focused_app_for_policy,
                 )
 
-            # Fallback: ask ReasoningEngine for dynamic candidates on stagnant steps
-            if not candidate_actions and reasoning_engine is not None:
-                perception_for_reasoning: Dict[str, Any] = {}
-                if isinstance(perception_snapshot, dict):
-                    perception_for_reasoning = perception_snapshot
-                elif isinstance(world_snapshot, dict):
-                    perception_for_reasoning = world_snapshot
+                if _policy_decision == PolicyEngine.DENY:
+                    belief.record_action(action_key, -0.5)
+                    # RT-05 / SI-04 FIX: Cap best_reward at 0.9 to prevent DONE
+                    # sentinel (reward=1.0) from permanently inflating the regret
+                    # reference for all subsequent actions.
+                    best_reward = min(belief.global_best_reward() or 0.0, 0.9)
+                    belief.update_regret(action_key, -0.5, best_reward)
+                    journal.record({
+                        "event": "policy_deny",
+                        "step": current_step_index,
+                        "action_key": action_key,
+                        "reason": _policy_reason,
+                    })
+                    stagnant_iterations += 1
+                    if stagnant_iterations >= stagnant_limit:
+                        raise RuntimeError(REPLAN_SIGNAL)
+                    previous_perception = perception_snapshot
 
-                try:
-                    dynamic_candidates = reasoning_engine.propose_actions(
-                        objective=execution_plan.objective,
-                        belief_summary=belief.summary(),
-                        perception=perception_for_reasoning,
-                        k=MAX_DYNAMIC_CANDIDATES,
-                    )
-                    if dynamic_candidates:
-                        # IH-4: Filter out candidates already tried to prevent
-                        # infinite UCB exploration of perpetually-novel candidates.
-                        fresh_candidates = [
-                            c for c in dynamic_candidates
-                            if action_ranker.action_key(c) not in _visited_action_keys
-                        ]
-                        # Use fresh candidates if available; fall back to all dynamic
-                        # candidates only if every one has been tried (exploration exhausted).
-                        candidate_actions = fresh_candidates or dynamic_candidates
-                        journal.record({
-                            "event": "dynamic_candidates_used",
-                            "step": current_step_index,
-                            "count": len(candidate_actions),
-                            "fresh_count": len(fresh_candidates),
-                        })
-                except Exception as re_err:
-                    log_warn(f"ReasoningEngine fallback failed: {re_err}")
-
-            if not candidate_actions:
-                raise RuntimeError("TASK_FAILED:no_candidate_actions")
-
-            # Thompson-UCB-EU composite selection via ActionRanker
-            selected_action = action_ranker.select(
-                actions=candidate_actions,
-                belief_state=belief,
-            )
-            action_key = action_ranker.action_key(selected_action)
-
-            # IH-4: Record action key as visited. Evict oldest when full.
-            if len(_visited_action_keys) >= _VISITED_ACTION_MAX:
-                _oldest = next(iter(_visited_action_keys))
-                del _visited_action_keys[_oldest]
-            _visited_action_keys[action_key] = True
-
-            # ------------------------------------------------------------------
-            # Policy gate
-            # ------------------------------------------------------------------
-            _focused_app_for_policy = (
-                world_snapshot.get("focused_app", "__unknown_app__")
-                if isinstance(world_snapshot, dict)
-                else "__unknown_app__"
-            )
-            _policy_decision, _policy_reason = policy_engine.validate_action_dict(
-                selected_action,
-                focused_app=_focused_app_for_policy,
-            )
-
-            if _policy_decision == PolicyEngine.DENY:
-                belief.record_action(action_key, -0.5)
-                # RT-05 / SI-04 FIX: Cap best_reward at 0.9 to prevent DONE
-                # sentinel (reward=1.0) from permanently inflating the regret
-                # reference for all subsequent actions.
-                best_reward = min(belief.global_best_reward() or 0.0, 0.9)
-                belief.update_regret(action_key, -0.5, best_reward)
+            except (AuthorityAbortError, RuntimeError):
+                # AuthorityAbortError and REPLAN_SIGNAL must propagate unchanged.
+                raise
+            except Exception as _iter_exc:
+                # P1 RT-C: Transient failure (LLM parse error, corrupt screenshot,
+                # Ollama network timeout) -> stagnation increment, not process crash.
+                log_warn(
+                    f"[operate] Transient per-iteration failure (step "
+                    f"{current_step_index}, iter {iteration}): "
+                    f"{type(_iter_exc).__name__}: {_iter_exc}. "
+                    "Converting to stagnation increment."
+                )
                 journal.record({
-                    "event": "policy_deny",
+                    "event": "per_iteration_transient_failure",
                     "step": current_step_index,
-                    "action_key": action_key,
-                    "reason": _policy_reason,
+                    "iteration": iteration,
+                    "error_type": type(_iter_exc).__name__,
+                    "error": str(_iter_exc),
                 })
                 stagnant_iterations += 1
                 if stagnant_iterations >= stagnant_limit:
                     raise RuntimeError(REPLAN_SIGNAL)
                 previous_perception = perception_snapshot
+                continue
                 continue
 
             if _policy_decision == PolicyEngine.REQUIRE_HUMAN_CONFIRMATION:
