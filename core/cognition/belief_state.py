@@ -703,6 +703,16 @@ class BeliefState:
         self.regret.clear()
         self.progress_score = 0.0
 
+        # H-3 FIX: Clear _zero_variance_count at task boundaries.
+        # Without this, variance collapse counts accumulated in a previous
+        # task continue counting toward ZERO_VARIANCE_WARN_THRESHOLD in the
+        # next task, potentially triggering the WARNING for the wrong task
+        # context and masking genuine exploration suppression events in the
+        # new task.  reset_for_new_task() is the canonical reset point for
+        # all transient monitoring counters.
+        if hasattr(self, "_zero_variance_count"):
+            self._zero_variance_count.clear()
+
         new_identity = (
             hashlib.sha256(intent_hash.encode("utf-8")).hexdigest()
             if intent_hash
