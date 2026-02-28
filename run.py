@@ -270,6 +270,39 @@ def _validate_runtime_dependencies(model_name: str) -> None:
         except Exception:
             pass  # Daemon check already covered above
 
+    # 5b. Text model availability check (Fix 3 / H-9)
+    # When no dedicated text model exists in Ollama (separate from the vision
+    # model), ExecutionPlanner falls back to using the vision model for text-only
+    # planning calls.  This is a degraded-performance mode: vision models are
+    # slower and more memory-intensive than their text-only variants.
+    #
+    # The fallback is now FUNCTIONAL (Fix 1 / RB-1 applied: uses ollama_client.chat()
+    # directly instead of the broken self._llm_call() path), but operators should
+    # be warned so they can pull the text variant for optimal performance.
+    #
+    # Emit WARNING (not fatal) because tasks complete correctly in fallback mode.
+    if _ollama_ok:
+        try:
+            import ollama as _ollama  # noqa: F811
+            _existing = {m.model for m in _ollama.Client().list().models}
+            _text_candidate = model_name.replace("-vl:", ":").replace("-vl", "")
+            _text_base = _text_candidate.split(":")[0]
+            _text_found = any(
+                _text_candidate in m or _text_base in m
+                for m in _existing
+            )
+            _is_vision_model = "-vl" in model_name or "vision" in model_name.lower()
+            if _is_vision_model and not _text_found:
+                warnings.append(
+                    "  [WARNING] No dedicated text model found for '" + model_name + "'.\n"
+                    "    ExecutionPlanner will use the vision model for text-only planning.\n"
+                    "    This works correctly but is slower and uses more VRAM.\n"
+                    "    Fix: ollama pull " + _text_candidate + "\n"
+                    "    Or:  set LLM_TEXT_MODEL env var to an explicit text model name."
+                )
+        except Exception:
+            pass
+
     # 6. pyautogui (required for scroll operations)
     #
     # H-07 FIX: The previous validator did not check for pyautogui.
