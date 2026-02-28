@@ -1,0 +1,37 @@
+{
+  "_comment": "ProjectZeo — Bayesian Likelihood Ratios (H2 Fix)",
+  "_description": [
+    "These ratios are P(observation|state) values relative to a neutral baseline (1.0).",
+    "They are used by operate.py bayesian_update() to update BeliefState each iteration.",
+    "",
+    "CALIBRATION INSTRUCTIONS:",
+    "  1. Collect a labeled dataset of (screen_observation, true_state) pairs from",
+    "     production runs. Log perception snapshots alongside ground-truth state tags.",
+    "  2. For each state category, count how often that category was active when the",
+    "     true world state matched (e.g., app:firefox active when Firefox was focused).",
+    "  3. Normalize each count relative to the neutral baseline frequency to produce",
+    "     P(observation|state) / P(observation|neutral).",
+    "  4. Replace the values below with your empirical ratios.",
+    "  5. Validate: ratios > 1.0 mean 'this observation is MORE likely under this state'.",
+    "     Ratios < 1.0 mean 'this observation is LESS likely under this state'.",
+    "",
+    "DEFAULT VALUES (developer heuristics — replace with empirical measurements):",
+    "  app_match_with_delta=0.95 : App focused + world changed = strong positive evidence",
+    "  app_match_no_delta=0.75   : App focused + world stable  = moderate positive evidence",
+    "  ui_rich=1.50              : Many UI entities            = environment is active/busy",
+    "  ui_sparse=1.20            : Few UI entities             = environment partially busy",
+    "  ui_empty=0.80             : No UI entities              = mild negative evidence",
+    "  neutral_with_delta=1.00   : Fresh observation           = no update to prior",
+    "  neutral_no_delta=0.80     : Stale observation           = mild negative evidence",
+    "  ENTITY_RICH_THRESHOLD=10  : Entity count above which ui_rich fires (integer)"
+  ],
+
+  "app_match_with_delta":  0.95,
+  "app_match_no_delta":    0.75,
+  "ui_rich":               1.50,
+  "ui_sparse":             1.20,
+  "ui_empty":              0.80,
+  "neutral_with_delta":    1.00,
+  "neutral_no_delta":      0.80,
+  "ENTITY_RICH_THRESHOLD": 10
+}
