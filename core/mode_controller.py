@@ -44,7 +44,7 @@ class ArmedTimeoutError(ModeTransitionError):
 
 class ModeController:
 
-    MAX_TRANSITION_HISTORY = 2000
+    MAX_TRANSITION_HISTORY = 1000  # H-4 FIX: reduced from 2000; bounded deque provides LRU eviction
     MAX_PLANNING_SECONDS = 180.0
     MAX_PLAN_ID_LENGTH = 128
 
