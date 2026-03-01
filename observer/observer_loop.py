@@ -123,6 +123,11 @@ class ObserverLoop:
         self._schema_rejection_count: int = 0
         self._ingest_failure_count: int = 0
 
+        # GPU contention management: pause() during EXECUTING mode
+        # so the execution LLM gets the full GPU instead of sharing
+        # with the background vision model
+        self._pause_event = threading.Event()  # set = paused
+
     # ==================================================
     # LIFECYCLE
     # ==================================================
@@ -159,6 +164,14 @@ class ObserverLoop:
         if thread:
             thread.join(timeout=2.0)
 
+    def pause(self) -> None:
+        """Pause vision inference — call when entering EXECUTING to free GPU."""
+        self._pause_event.set()
+
+    def resume(self) -> None:
+        """Resume vision inference — call after RESTORING completes."""
+        self._pause_event.clear()
+
     # ==================================================
     # MAIN LOOP
     # ==================================================
@@ -167,6 +180,11 @@ class ObserverLoop:
         try:
             while not self._stop_event.is_set():
                 start_ts = time.monotonic()
+
+                # GPU contention: skip vision inference while EXECUTING
+                if self._pause_event.is_set():
+                    time.sleep(0.5)
+                    continue
 
                 try:
                     raw_perception: Optional[Dict[str, Any]] = self._vision.get_latest()
