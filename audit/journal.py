@@ -10,15 +10,7 @@ _DEFAULT_JOURNAL_PATH = str(_PROJECT_ROOT / "logs" / "action_audit.jsonl")
 
 
 class ActionJournal:
-    """
-    CRYPTOGRAPHIC EXECUTION LEDGER.
-
-    Guarantees:
-    - Hash-chained, append-only audit log
-    - Intent → Effect integrity
-    - Fail-closed on integrity violations
-    - Never terminates host process on I/O failure
-    """
+    
 
     def __init__(self, path: str = _DEFAULT_JOURNAL_PATH):
         self.path = path
@@ -183,3 +175,26 @@ class ActionJournal:
         }
         self.last_intent_hash = None
         self._record_internal(entry)
+
+    # -------------------------------------------------
+    # QUERY
+    # -------------------------------------------------
+
+    def get_all(self) -> list:
+        
+        entries = []
+        try:
+            if not os.path.exists(self.path):
+                return entries
+            with open(self.path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        entries.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        pass
+        except Exception:
+            pass
+        return entries
