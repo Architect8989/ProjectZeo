@@ -1,0 +1,85 @@
+# ============================================================
+# ProjectZeo Requirements
+# GAP-7 FIX: Three critical version issues resolved:
+#
+# 1. anthropic was UNPINNED — frequent breaking API changes between
+#    minor versions (tool_use schema, messages.create signature changes).
+#    Pinned to >=0.40.0 (stable tool_use API) with <1.0.0 ceiling.
+#
+# 2. google-generativeai==0.3.0 — DEPRECATED. Google replaced this with
+#    the google-genai package in 2024. The old package raises ImportError
+#    on new Python versions. Updated to google-genai>=1.0.0.
+#
+# 3. openai==1.2.3 — TOO OLD for GPT-4o. openai>=1.13.0 is required for
+#    the responses API, GPT-4o support, and tool_choice=required. Updated.
+#
+# 4. playwright added for GAP-1 (Browser DOM automation backend).
+#    playwright>=1.42.0 has stable async API with full Chromium/Firefox support.
+# ============================================================
+
+ollama>=0.4.0
+
+# Core runtime
+annotated-types>=0.6.0
+anyio>=3.7.1
+psutil>=5.9.0
+certifi>=2023.7.22
+charset-normalizer>=3.3.2
+colorama>=0.4.6
+distro>=1.8.0
+EasyProcess>=1.1
+entrypoint2>=1.1
+exceptiongroup>=1.1.3
+h11>=0.14.0
+httpcore>=1.0.2
+httpx>=0.25.2
+idna>=3.4
+importlib-resources>=6.1.1
+mss>=9.0.1
+numpy>=1.26.1
+packaging>=23.2
+Pillow>=10.1.0
+prompt-toolkit>=3.0.39
+PyAutoGUI>=0.9.54
+pydantic>=2.4.2
+pydantic_core>=2.10.1
+PyGetWindow>=0.0.9
+PyMsgBox>=1.0.9
+pyparsing>=3.1.1
+pyperclip>=1.8.2
+PyRect>=0.2.0
+PyScreeze>=0.1.29
+pytweening>=1.0.7
+requests>=2.31.0
+six>=1.16.0
+sniffio>=1.3.0
+tqdm>=4.66.1
+typing_extensions>=4.8.0
+urllib3>=2.0.7
+
+# AI / ML
+# GAP-7 FIX #1: anthropic PINNED (was unpinned — breaking changes between minor versions)
+anthropic>=0.40.0,<1.0.0
+
+# GAP-7 FIX #2: google-generativeai REPLACED with google-genai
+# (old package deprecated by Google; raises ImportError on Python 3.11+)
+google-genai>=1.0.0
+
+# GAP-7 FIX #3: openai UPDATED (1.2.3 too old for GPT-4o; requires >=1.13.0)
+openai>=1.13.0
+
+aiohttp>=3.9.1
+easyocr>=1.7.1
+pyyaml>=6.0
+
+# GAP-1 FIX: Playwright for browser DOM automation backend
+# Enables reliable form fill, SPA navigation, iframe interaction —
+# the #1 missing capability for web-based tasks.
+# After pip install, run: playwright install chromium
+playwright>=1.42.0
+
+# Optional: matplotlib for evaluation/analysis
+matplotlib>=3.8.1
+
+# Optional: ultralytics for YOLO-based UI detection (if used)
+# ultralytics>=8.0.227
