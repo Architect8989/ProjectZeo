@@ -79,12 +79,17 @@ COMMON_INSTALL_COMMANDS: Dict[str, Dict[str, str]] = {
         "Windows": "npm install -g pnpm",
     },
     "bun": {
-        # SI-3 FIX: original "curl -fsSL https://bun.sh/install | bash" matched
-        # the r"\|\s*bash\b" dangerous pattern. Replaced with npm global install
-        # which does not pipe to a shell interpreter.
+        # SI-3 FIX (Linux): curl|bash replaced with npm global install.
+        # AUDIT §2.2 FIX (Darwin): "curl -fsSL https://bun.sh/install | bash"
+        # was left unfixed — it matches DANGEROUS_PATTERNS r"\bcurl\b.*\|\s*(?:ba)?sh\b"
+        # and r"\|\s*bash\b" in ExecutionPlanner and would be silently rejected
+        # from any plan generated on macOS.  Replaced with brew install bun,
+        # which is the canonical macOS bun install path.
+        # AUDIT §2.2 FIX (Windows): irm|iex pattern also triggers DANGEROUS_PATTERNS.
+        # Replaced with npm global install (npm is available via nodejs choco install).
         "Linux":   "npm install -g bun",
-        "Darwin":  "curl -fsSL https://bun.sh/install | bash",
-        "Windows": "powershell -c \"irm bun.sh/install.ps1|iex\"",
+        "Darwin":  _brew("bun"),
+        "Windows": "npm install -g bun",
     },
     "python": {
         "Linux":   _apt("python3 python3-pip python3-venv"),
@@ -176,17 +181,19 @@ COMMON_INSTALL_COMMANDS: Dict[str, Dict[str, str]] = {
         "Windows": _choco("golang"),
     },
     "cargo": {
-        # SI-3 FIX: original "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y"
-        # matched r"\bcurl\b.*\|\s*(?:ba)?sh\b" and r"\|\s*sh\b" dangerous patterns.
-        # Replaced with apt-get install cargo which is available in Ubuntu repos.
+        # SI-3 FIX (Linux): curl|sh replaced with apt-get cargo.
+        # AUDIT §2.2 FIX (Darwin): "curl ... | sh -s -- -y" matches
+        # r"\bcurl\b.*\|\s*(?:ba)?sh\b" and r"\|\s*sh\b" DANGEROUS_PATTERNS.
+        # Replaced with brew install rust which installs cargo without piping to sh.
         "Linux":   "sudo apt-get update -qq && sudo apt-get install -y cargo",
-        "Darwin":  "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y",
+        "Darwin":  _brew("rust"),
         "Windows": _choco("rust"),
     },
     "rustup": {
-        # SI-3 FIX: same as cargo — replaced curl|sh with apt-get rustup.
+        # SI-3 FIX (Linux): replaced curl|sh with apt-get rustup.
+        # AUDIT §2.2 FIX (Darwin): same curl|sh pattern — replaced with brew install rust.
         "Linux":   "sudo apt-get update -qq && sudo apt-get install -y rustup",
-        "Darwin":  "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y",
+        "Darwin":  _brew("rust"),
         "Windows": "winget install Rustlang.Rustup",
     },
     "java": {
@@ -289,7 +296,29 @@ class AutonomousInstaller:
                     f"matches dangerous pattern {pattern.pattern!r}: {cmd!r}"
                 )
 
-    def install_tool(self, tool: Dict[str, Any]) -> None:
+    def install_tool(self, tool: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Install a tool and return a result dict.
+
+        AUDIT §2.1 FIX: The original return type was None.  operate.py's caller
+        checked ``install_result is True`` and ``isinstance(install_result, dict)``
+        — both False for None — so install_ok was always False regardless of
+        whether the tool was actually installed.  Every UI-based install silently
+        reported failure and triggered stagnation → replan.
+
+        Returns
+        -------
+        dict with keys:
+            success : bool   — True when tool is confirmed installed after the attempt.
+            output  : str    — Combined stdout/stderr from terminal install commands,
+                               or a human-readable status message.
+
+        Raises
+        ------
+        InstallationError
+            When the installation attempt itself cannot be executed (observer down,
+            invalid tool schema, dangerous command rejected, etc.).
+        """
         self._validate_tool_schema(tool)
 
         name = tool["name"]
@@ -298,20 +327,67 @@ class AutonomousInstaller:
         self._validate_url(url)
 
         if self._is_already_installed(tool):
-            return
+            return {"success": True, "output": f"{name} is already installed."}
 
         if not self._observer.is_healthy():
             raise InstallationError("Observer unhealthy — aborting install")
 
-        if self._try_terminal_install(tool):
-            if self._is_already_installed(tool):
-                return
+        terminal_output: str = ""
+        terminal_ok, terminal_output = self._try_terminal_install_with_output(tool)
 
-        self._browser_ui_install(tool)
+        if terminal_ok:
+            # Verify the tool is now callable / version-check passes
+            if self._is_already_installed(tool):
+                return {"success": True, "output": terminal_output}
+            # Terminal commands succeeded but tool not detected yet — may need
+            # PATH reload.  Report partial success; caller can retry.
+            return {
+                "success": False,
+                "output": (
+                    terminal_output
+                    + f"\n[INSTALL] WARNING: {name} install commands returned exit 0 "
+                    "but post-install verification failed (version_command not found). "
+                    "PATH may not include the install location. Try opening a new terminal."
+                ),
+            }
+
+        # Terminal install failed or no known command — fall through to UI install
+        try:
+            self._browser_ui_install(tool)
+        except InstallationError as ui_err:
+            return {"success": False, "output": terminal_output + f"\n[UI_INSTALL] {ui_err}"}
+
+        # Verify after UI install
+        if self._is_already_installed(tool):
+            return {"success": True, "output": terminal_output + "\n[UI_INSTALL] Verified OK."}
+
+        return {
+            "success": False,
+            "output": (
+                terminal_output
+                + f"\n[UI_INSTALL] {name} UI install flow completed but "
+                "post-install verification failed."
+            ),
+        }
 
     def _try_terminal_install(self, tool: Dict[str, Any]) -> bool:
+        """Thin wrapper used by legacy callers; delegates to _try_terminal_install_with_output."""
+        ok, _ = self._try_terminal_install_with_output(tool)
+        return ok
+
+    def _try_terminal_install_with_output(
+        self, tool: Dict[str, Any]
+    ) -> "Tuple[bool, str]":
+        """
+        AUDIT §2.1 FIX: New helper that returns (success, combined_output).
+
+        Replaces the original _try_terminal_install() for all internal call sites
+        that now need the command output to surface install diagnostics to the
+        replanner (see _execute_decision install path in operate.py).
+        """
         name = tool["name"]
         os_name = platform.system()
+        combined_output: str = ""
 
         pre_specified = tool.get("install_commands", [])
         if isinstance(pre_specified, list) and pre_specified:
@@ -319,11 +395,18 @@ class AutonomousInstaller:
                 if isinstance(cmd, str) and cmd.strip():
                     try:
                         result = self._os.run_command(cmd.strip())
+                        out = ""
+                        if hasattr(result, "stdout"):
+                            out += (result.stdout or "")
+                        if hasattr(result, "stderr"):
+                            out += (result.stderr or "")
+                        combined_output += out
                         if hasattr(result, "returncode") and result.returncode == 0:
-                            return True
-                    except Exception:
+                            return True, combined_output
+                    except Exception as _cmd_err:
+                        combined_output += f"[CMD ERROR] {_cmd_err}\n"
                         continue
-            return True
+            return True, combined_output  # best-effort: commands ran
 
         name_lower = name.lower().strip()
         known = COMMON_INSTALL_COMMANDS.get(name_lower, {})
@@ -331,11 +414,19 @@ class AutonomousInstaller:
 
         if cmd:
             try:
-                self._os.run_command(cmd)
-                return True
-            except Exception:
-                return False
+                result = self._os.run_command(cmd)
+                out = ""
+                if hasattr(result, "stdout"):
+                    out += (result.stdout or "")
+                if hasattr(result, "stderr"):
+                    out += (result.stderr or "")
+                combined_output += out
+                return True, combined_output
+            except Exception as _e:
+                combined_output += f"[CMD ERROR] {_e}\n"
+                return False, combined_output
 
+        # LLM-generated command fallback
         try:
             import os as _os_mod
             import ollama as _ollama
@@ -388,13 +479,19 @@ class AutonomousInstaller:
 
             if llm_cmd and len(llm_cmd) > 4 and "\n" not in llm_cmd:
                 self._validate_llm_command(llm_cmd)
-                self._os.run_command(llm_cmd)
-                return True
+                result = self._os.run_command(llm_cmd)
+                out = ""
+                if hasattr(result, "stdout"):
+                    out += (result.stdout or "")
+                if hasattr(result, "stderr"):
+                    out += (result.stderr or "")
+                combined_output += out
+                return True, combined_output
 
-        except Exception:
-            pass
+        except Exception as _llm_err:
+            combined_output += f"[LLM_CMD ERROR] {_llm_err}\n"
 
-        return False
+        return False, combined_output
 
     def _browser_ui_install(self, tool: Dict[str, Any]) -> None:
         name = tool["name"]
