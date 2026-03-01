@@ -182,16 +182,13 @@ def _install_signal_handlers() -> None:
         signal.signal(signal.SIGQUIT, _signal_handler)
 
 
-# BUG-10 FIX: Print mode transitions to stdout when --interactive is active.
-# Reads PROJECTZEO_INTERACTIVE env var (set by run.py when --interactive flag
-# is passed).  No-op when not in interactive mode so production deployments
-# that read stderr logs are unaffected.
-_INTERACTIVE_MODE: bool = os.environ.get("PROJECTZEO_INTERACTIVE", "").strip() == "1"
-
-
+# PATCH CRIT-1: _INTERACTIVE_MODE was a module-level boolean frozen at import
+# time.  run.py sets PROJECTZEO_INTERACTIVE AFTER importing main, so the flag
+# was always False regardless of the --interactive CLI flag.  Fix: read the env
+# var live inside _interactive_print() on every call — zero overhead, correct.
 def _interactive_print(msg: str) -> None:
-    """BUG-10 FIX: Print msg to stdout only in interactive mode."""
-    if _INTERACTIVE_MODE:
+    """Print msg to stdout when PROJECTZEO_INTERACTIVE=1; no-op otherwise."""
+    if os.environ.get("PROJECTZEO_INTERACTIVE", "").strip() == "1":
         print(msg, flush=True)
 
 
@@ -236,116 +233,12 @@ def _write_task_result(
 # STARTUP VALIDATION
 # ------------------------------------------------------------------
 
-def _validate_runtime_dependencies() -> list:
-    """
-    Pre-flight dependency check.  Returns a list of (severity, message) tuples.
-
-    Severity values:
-      "FATAL"   — process cannot function; startup will be aborted.
-      "WARNING" — degraded functionality; startup continues with the limitation noted.
-
-    FIX H-6: Missing DISPLAY / WAYLAND_DISPLAY on Linux is now FATAL (was WARNING).
-    Without a display server, every pyautogui call fails with a display connection
-    error.  Escalating to FATAL gives operators a clear root cause immediately
-    rather than an opaque cascade of action failures.
-    """
-    issues = []
-
-    # 1. pyautogui — required for all UI actions
-    try:
-        import pyautogui as _pya
-        _pya.size()  # Also verifies X11/display accessibility
-    except ImportError:
-        issues.append((
-            "FATAL",
-            "pyautogui is not installed. Install with: pip install pyautogui. "
-            "All UI actions (click, type, press, scroll) will fail.",
-        ))
-    except Exception as e:
-        issues.append((
-            "FATAL",
-            f"pyautogui cannot access display: {e}. "
-            "On headless systems set DISPLAY=:99 and start Xvfb: "
-            "Xvfb :99 -screen 0 1920x1080x24 &",
-        ))
-
-    # 2. AT-SPI — optional; fallback to validate_action_dict() is active
-    try:
-        import pyatspi  # noqa: F401
-    except ImportError:
-        issues.append((
-            "WARNING",
-            "pyatspi is not available. AT-SPI-based policy validation is disabled. "
-            "validate_action_dict() (non-AT-SPI path) is active as fallback. "
-            "Install with: pip install pyatspi (Linux only).",
-        ))
-
-    import platform as _platform
-    if _platform.system() == "Linux":
-        import shutil as _shutil
-
-        # 3. xdotool — required for window focus operations
-        if not _shutil.which("xdotool"):
-            issues.append((
-                "WARNING",
-                "xdotool not found. Window focus and geometry operations will fail. "
-                "Install with: sudo apt-get install xdotool",
-            ))
-
-        # 4. wmctrl — required for application activation on Linux
-        if not _shutil.which("wmctrl"):
-            issues.append((
-                "WARNING",
-                "wmctrl not found. Application activation (focus) will fail on Linux. "
-                "Install with: sudo apt-get install wmctrl",
-            ))
-
-        # 5. DISPLAY / WAYLAND_DISPLAY — FIX H-6: FATAL (was WARNING)
-        #    Without a display server, pyautogui.size() already raised above and
-        #    injected a FATAL.  This guard catches the case where pyautogui was
-        #    not installed but the display is also missing.
-        if not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY"):
-            issues.append((
-                "FATAL",
-                "DISPLAY and WAYLAND_DISPLAY are both unset on Linux. "
-                "UI operations will fail — pyautogui requires a running X11 or Wayland display. "
-                "To run headlessly: "
-                "(1) Start Xvfb: Xvfb :99 -screen 0 1920x1080x24 & "
-                "(2) Set DISPLAY: export DISPLAY=:99 "
-                "OR run ProjectZeo from inside a graphical desktop session.",
-            ))
-
-        # BUG-2 FIX: Wayland session detection and warning.
-        # On Ubuntu 22.04+/24.04 with Wayland, xdotool/wmctrl fail silently,
-        # making snapshot/restore a no-op. Detect this and warn operators.
-        _xdg_session = os.environ.get("XDG_SESSION_TYPE", "").lower()
-        _wayland_display = os.environ.get("WAYLAND_DISPLAY", "")
-        if _xdg_session == "wayland" or _wayland_display:
-            import shutil as _shutil_wl
-            _has_ydotool = _shutil_wl.which("ydotool") is not None
-            _has_pyatspi = False
-            try:
-                import pyatspi  # noqa: F401
-                _has_pyatspi = True
-            except ImportError:
-                pass
-            _has_wmctrl = _shutil_wl.which("wmctrl") is not None
-
-            if not _has_ydotool and not _has_pyatspi and not _has_wmctrl:
-                issues.append((
-                    "WARNING",
-                    "Wayland session detected (XDG_SESSION_TYPE=wayland) but no "
-                    "Wayland-compatible window management tool is available. "
-                    "Snapshot/restore will use __wayland_unknown__ sentinel and "
-                    "restoration will be degraded (cursor-only, no window focus). "
-                    "To fix: "
-                    "(1) Install ydotool: sudo apt-get install ydotool && ydotoold & "
-                    "(2) OR enable AT-SPI2: pip install pyatspi and "
-                    "gsettings set org.gnome.desktop.interface toolkit-accessibility true "
-                    "(3) OR switch to GNOME on Xorg session for full X11 support.",
-                ))
-
-    return issues
+# PATCH CRIT-2: _validate_runtime_dependencies() removed from main.py.
+# run.py runs a consolidated, authoritative dependency check (with pyautogui
+# display access, pyyaml, playwright, EasyOCR, Wayland tooling) before calling
+# main().  A second check here produced duplicate stderr output and used
+# different severity levels for the same conditions, causing confusing
+# discrepancies on Wayland sessions.
 
 
 # ------------------------------------------------------------------
@@ -444,21 +337,9 @@ def main(llm_callable: Callable, model_name: str) -> None:
     if not isinstance(model_name, str) or not model_name.strip():
         raise RuntimeError("model_name must be a non-empty string")
 
-    # Pre-flight dependency check
-    _dep_issues = _validate_runtime_dependencies()
-    _has_fatal = False
-    for _severity, _msg in _dep_issues:
-        if _severity == "FATAL":
-            _has_fatal = True
-            print(f"[STARTUP] FATAL: {_msg}", file=sys.stderr)
-        else:
-            print(f"[STARTUP] WARNING: {_msg}", file=sys.stderr)
-
-    if _has_fatal:
-        raise RuntimeError(
-            "Fatal startup dependency missing — see FATAL messages above. "
-            "Fix the listed dependencies before starting ProjectZeo."
-        )
+    # PATCH CRIT-2: dependency validation is done once in run.py before main()
+    # is ever called.  Removed duplicate check here — see run.py's
+    # _validate_runtime_dependencies() for the authoritative pre-flight check.
 
     # ------------------------------------------------------------------
     # Core infrastructure
