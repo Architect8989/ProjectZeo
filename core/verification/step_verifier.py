@@ -246,9 +246,13 @@ class StepVerifier:
         if hasattr(result, "returncode"):
             # subprocess.CompletedProcess path
             returncode = result.returncode
+            stdout = getattr(result, "stdout", None) or ""
+            stderr = getattr(result, "stderr", None) or ""
         elif isinstance(result, dict) and "returncode" in result:
             # dict path (from _execute_decision)
             returncode = result["returncode"]
+            stdout = result.get("output", "") or ""
+            stderr = result.get("stderr", "") or ""
         else:
             return False, "missing command result", {}
 
@@ -259,6 +263,41 @@ class StepVerifier:
             return False, f"unexpected return code: {returncode}", {
                 "returncode": returncode
             }
+
+        # BUG-10 FIX: Semantic output verification.
+        # The original verifier only checked returncode == 0.  A command that
+        # runs cleanly but produces wrong output (wrong repo cloned, wrong npm
+        # version installed, wrong config generated) passed verification and the
+        # system advanced with wrong state.
+        #
+        # Fix: if the plan's verification dict contains "expected_output_patterns"
+        # (a list of regex strings), ALL patterns must match the combined
+        # stdout+stderr.  If "forbidden_output_patterns" is present, NONE may
+        # match.  These are opt-in — existing plans without these keys are
+        # unaffected.
+        combined_output = f"{stdout}\n{stderr}"
+
+        expected_patterns = verification.get("expected_output_patterns", [])
+        if expected_patterns:
+            for pattern in expected_patterns:
+                try:
+                    if not re.search(pattern, combined_output, re.IGNORECASE | re.DOTALL):
+                        return False, (
+                            f"output missing expected pattern: {pattern!r}"
+                        ), {"returncode": returncode, "pattern": pattern}
+                except re.error:
+                    pass  # Malformed pattern — skip rather than crash
+
+        forbidden_patterns = verification.get("forbidden_output_patterns", [])
+        if forbidden_patterns:
+            for pattern in forbidden_patterns:
+                try:
+                    if re.search(pattern, combined_output, re.IGNORECASE | re.DOTALL):
+                        return False, (
+                            f"output matched forbidden pattern: {pattern!r}"
+                        ), {"returncode": returncode, "pattern": pattern}
+                except re.error:
+                    pass
 
         return True, "", {"returncode": returncode}
 
