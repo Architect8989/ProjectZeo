@@ -1,29 +1,3 @@
-"""
-ARCHIVED — operate/legacy/apis.py
-===================================
-GAP-8 FIX: This file is DEAD CODE — not imported by any production path.
-It exists only for historical reference. Do NOT import it in new code.
-
-Root cause of GAP-8:
-    operate.legacy.apis contains old cloud API functions that were used
-    before QwenOllamaAdapter and PureLLMWrapper were built. Nothing in the
-    current execution path imports it. Leaving dead code in a production
-    repo creates maintenance risk:
-      - May be accidentally imported via  from operate import *
-      - Could contain security issues that never get patched
-      - Confuses new contributors reading the codebase
-
-Action taken:
-    1. Added this archive notice to make the status explicit
-    2. The OLLAMA_ONLY guard (below) already prevents accidental activation
-       in local/production mode
-    3. This file will be DELETED in the next major version cleanup
-
-If you need cloud API functions, use:
-    adapters/pure_llm_wrapper.py  (PureLLMWrapper)
-    adapters/factory.py           (build_llm with --allow-cloud)
-"""
-
 import base64
 import io
 import json
