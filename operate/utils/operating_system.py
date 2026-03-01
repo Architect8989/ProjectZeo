@@ -427,6 +427,128 @@ class OperatingSystem:
         raise OSError("Focused window unavailable")
 
     def get_active_application(self) -> Dict[str, str]:
+        """
+        M3 FIX: Return the name of the active application PROCESS, not the
+        window title.
+
+        The previous implementation was:
+            return self.get_focused_window()
+        This caused get_active_application() and get_focused_window() to return
+        identical dicts, making the "application check" in snapshot_provider a
+        no-op (it was comparing the window title against itself).  RestoreVerifier
+        could not distinguish "wrong app focused" from "correct app, different window
+        title", so cross-app restoration failures went silently undetected.
+
+        Platform implementations:
+          Linux:   xdotool getactivewindow getwindowpid → /proc/<pid>/comm
+                   Falls back to get_focused_window() if xdotool or /proc unavailable.
+          macOS:   AppleScript → frontmost process name (already process-level).
+          Windows: win32gui.GetForegroundWindow() → win32process → psutil.Process.name()
+                   Falls back to get_focused_window() if pywin32/psutil unavailable.
+
+        Returns {"title": <process_name>} on success.  The "title" key is kept
+        for backward compatibility with all callers (snapshot_provider, restore_provider,
+        restore_verifier) that expect a {"title": str} dict shape.
+        """
+        system = platform.system()
+
+        try:
+            if system == "Linux":
+                # Step 1: get the active window ID
+                try:
+                    _wid_result = subprocess.run(
+                        ["xdotool", "getactivewindow"],
+                        capture_output=True,
+                        text=True,
+                        timeout=3,
+                    )
+                except FileNotFoundError:
+                    # xdotool not installed — fall back
+                    return self.get_focused_window()
+
+                if _wid_result.returncode != 0 or not _wid_result.stdout.strip():
+                    return self.get_focused_window()
+
+                _wid = _wid_result.stdout.strip()
+
+                # Step 2: get the PID of that window
+                _pid_result = subprocess.run(
+                    ["xdotool", "getwindowpid", _wid],
+                    capture_output=True,
+                    text=True,
+                    timeout=3,
+                )
+                if _pid_result.returncode != 0 or not _pid_result.stdout.strip():
+                    return self.get_focused_window()
+
+                _pid_str = _pid_result.stdout.strip()
+
+                # Step 3: resolve process name from /proc/<pid>/comm (Linux-specific)
+                # /proc/<pid>/comm contains only the executable basename (≤15 chars),
+                # which is what we want — not the full argv[0] path.
+                _comm_path = f"/proc/{_pid_str}/comm"
+                if os.path.exists(_comm_path):
+                    try:
+                        with open(_comm_path, "r", encoding="utf-8") as _f:
+                            _proc_name = _f.read().strip()
+                        if _proc_name:
+                            return {"title": _proc_name}
+                    except OSError:
+                        pass
+
+                # Step 4: psutil fallback (cross-distro, handles kernel threads)
+                try:
+                    import psutil as _psutil  # noqa: PLC0415
+                    _p = _psutil.Process(int(_pid_str))
+                    _proc_name = _p.name()
+                    if _proc_name:
+                        return {"title": _proc_name}
+                except Exception:
+                    pass
+
+                # Fall back to window title if process name unresolvable
+                return self.get_focused_window()
+
+            elif system == "Darwin":
+                # AppleScript returns the process name directly (not window title)
+                _script = (
+                    'tell application "System Events"\n'
+                    '    set frontApp to first application process whose frontmost is true\n'
+                    '    return name of frontApp\n'
+                    'end tell'
+                )
+                _result = subprocess.run(
+                    ["osascript", "-e", _script],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                if _result.returncode == 0 and _result.stdout.strip():
+                    return {"title": _result.stdout.strip()}
+                return self.get_focused_window()
+
+            elif system == "Windows":
+                try:
+                    import win32gui    # noqa: PLC0415
+                    import win32process  # noqa: PLC0415
+                    _hwnd = win32gui.GetForegroundWindow()
+                    _, _pid = win32process.GetWindowThreadProcessId(_hwnd)
+                    try:
+                        import psutil as _psutil  # noqa: PLC0415
+                        _proc_name = _psutil.Process(_pid).name()
+                        if _proc_name:
+                            return {"title": _proc_name}
+                    except Exception:
+                        pass
+                    # psutil unavailable — return window title as fallback
+                    return self.get_focused_window()
+                except ImportError:
+                    return self.get_focused_window()
+
+        except Exception:
+            pass
+
+        # Final fallback: return window title so callers never get an exception
         return self.get_focused_window()
 
     # =================================================
