@@ -643,6 +643,14 @@ def main(llm_callable: Callable, model_name: str) -> None:
 
                 mode.execute()
 
+                # GPU CONTENTION FIX: pause background vision model during
+                # EXECUTING so QwenOllamaAdapter gets the full GPU.
+                # Observer uses cached world graph state during execution.
+                try:
+                    observer_loop.pause()
+                except Exception:
+                    pass
+
                 _task_succeeded = False
                 _belief_state_out: list = []
                 _prior_belief_state: Optional[dict] = _crash_recovery_belief_state
@@ -937,6 +945,12 @@ def main(llm_callable: Callable, model_name: str) -> None:
                     observer.reset_for_new_task()
                     world_graph.reset()
                     _clear_task_start()
+
+                    # GPU CONTENTION FIX: resume observer after task complete
+                    try:
+                        observer_loop.resume()
+                    except Exception:
+                        pass
 
             except ArmedTimeoutError as ate:
                 print(f"[MAIN] {ate}", file=sys.stderr)
