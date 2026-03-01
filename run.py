@@ -265,16 +265,26 @@ def _make_llm_callable(adapter):
 
 def _validate_runtime_dependencies(model_name: str) -> None:
     """
-    FIX P0-1 / P0-2 / P0-4 / H-9:
-    Validate all hard runtime dependencies before entering the main loop.
-    Emits a clear, actionable error and exits with code 1 on failure.
+    Consolidated, authoritative pre-flight dependency check.
 
-    Checks:
-      1. psutil importable                 (process watchdog)
-      2. xdotool present on Linux          (snapshot capture — HARD)
-      3. wmctrl present on Linux           (window restoration — WARNING)
-      4. Ollama daemon reachable           (LLM planning + execution)
-      5. Requested model available locally (prevents silent planning failure)
+    Called once in run.py before any project code is imported.
+    Exits with code 1 on FATAL issues. Prints WARNINGs and continues.
+
+    Checks (in order):
+      1.  Required directories (temp/, memory/, logs/)
+      2.  psutil                     (process watchdog — FATAL)
+      3.  pyautogui + display access (all UI actions — FATAL)
+      4.  pyautogui display check    (X11/Wayland reachable — FATAL)
+      5.  xdotool on Linux           (snapshot/window — FATAL)
+      6.  wmctrl on Linux            (window activation — WARNING)
+      7.  DISPLAY / WAYLAND_DISPLAY  (display server — FATAL)
+      8.  Wayland tooling            (ydotool/AT-SPI — WARNING)
+      9.  pyyaml                     (policy.yaml load — WARNING)
+      10. playwright + chromium      (browser DOM automation — WARNING)
+      11. EasyOCR                    (label-click resolution — WARNING)
+      12. Ollama daemon reachable    (LLM — FATAL)
+      13. Requested model pulled     (LLM — FATAL)
+      14. Text model availability    (planner performance — WARNING)
     """
     import shutil as _shutil
     import platform as _platform
@@ -282,7 +292,23 @@ def _validate_runtime_dependencies(model_name: str) -> None:
     errors = []
     warnings = []
 
-    # 1. psutil
+    # ------------------------------------------------------------------
+    # 0. Create required directories — silent, never fatal
+    # ------------------------------------------------------------------
+    _project_root = os.path.dirname(os.path.abspath(__file__))
+    for _req_dir in ("temp", "memory/snapshots", "memory/playbooks", "logs"):
+        _abs_dir = os.path.join(_project_root, _req_dir)
+        try:
+            os.makedirs(_abs_dir, exist_ok=True)
+        except OSError as _mkdir_err:
+            warnings.append(
+                f"  [WARNING] Could not create required directory {_abs_dir!r}: {_mkdir_err}. "
+                "Snapshot persistence and transition logging will be disabled for this session."
+            )
+
+    # ------------------------------------------------------------------
+    # 1. psutil — required by RuntimeWatchdog
+    # ------------------------------------------------------------------
     try:
         import psutil as _  # noqa: F401
     except ImportError:
@@ -291,8 +317,35 @@ def _validate_runtime_dependencies(model_name: str) -> None:
             "    Fix: pip install psutil"
         )
 
-    # 2. xdotool (Linux, required)
+    # ------------------------------------------------------------------
+    # 2. pyautogui — required for ALL UI actions (click, type, press, scroll)
+    # ------------------------------------------------------------------
+    _pyautogui_ok = False
+    try:
+        import pyautogui as _pya
+        _pya.size()   # also verifies X11/display is reachable
+        _pyautogui_ok = True
+    except ImportError:
+        errors.append(
+            "  [MISSING] pyautogui is not installed.\n"
+            "    Fix: pip install pyautogui\n"
+            "    All UI actions (click, type, press, scroll) will fail without it."
+        )
+    except Exception as _pya_err:
+        errors.append(
+            f"  [DISPLAY] pyautogui cannot access display: {_pya_err}.\n"
+            "    On headless systems start a virtual display first:\n"
+            "      Xvfb :99 -screen 0 1920x1080x24 &\n"
+            "      export DISPLAY=:99\n"
+            "    OR run ProjectZeo from inside a graphical desktop session."
+        )
+
+    # ------------------------------------------------------------------
+    # 3 & 4. Linux-specific: xdotool, wmctrl, DISPLAY, Wayland
+    # ------------------------------------------------------------------
     if _platform.system() == "Linux":
+
+        # xdotool — FATAL: required for window title snapshot on X11
         if _shutil.which("xdotool") is None:
             errors.append(
                 "  [MISSING] xdotool is not installed (required for snapshot capture on Linux).\n"
@@ -301,8 +354,7 @@ def _validate_runtime_dependencies(model_name: str) -> None:
                 "    Fix (Arch):          sudo pacman -S xdotool"
             )
 
-    # 3. wmctrl (Linux, recommended)
-    if _platform.system() == "Linux":
+        # wmctrl — WARNING: best-effort window activation
         if _shutil.which("wmctrl") is None:
             warnings.append(
                 "  [WARNING] wmctrl is not installed. "
@@ -310,7 +362,101 @@ def _validate_runtime_dependencies(model_name: str) -> None:
                 "    Fix: sudo apt-get install wmctrl"
             )
 
-    # 4. Ollama daemon reachability
+        # DISPLAY / WAYLAND_DISPLAY — FATAL if both absent
+        # (pyautogui check above usually catches this, but guard for the
+        # pyautogui-not-installed path where _pya.size() was never called)
+        if not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY"):
+            errors.append(
+                "  [NO DISPLAY] DISPLAY and WAYLAND_DISPLAY are both unset on Linux.\n"
+                "    pyautogui requires a running X11 or Wayland display.\n"
+                "    To run headlessly:\n"
+                "      Xvfb :99 -screen 0 1920x1080x24 &\n"
+                "      export DISPLAY=:99\n"
+                "    OR launch ProjectZeo from inside a graphical desktop session."
+            )
+
+        # Wayland tooling — WARNING when no Wayland-capable tool is present
+        _xdg_session = os.environ.get("XDG_SESSION_TYPE", "").lower()
+        _wayland_disp = os.environ.get("WAYLAND_DISPLAY", "")
+        # Also detect Wayland when XDG_SESSION_TYPE is unset (e.g. launched via
+        # sudo) by checking WAYLAND_DISPLAY directly.
+        _is_wayland = _xdg_session == "wayland" or bool(_wayland_disp)
+        if _is_wayland:
+            _has_ydotool = _shutil.which("ydotool") is not None
+            _has_wmctrl  = _shutil.which("wmctrl") is not None
+            _has_pyatspi = False
+            try:
+                import pyatspi  # noqa: F401
+                _has_pyatspi = True
+            except ImportError:
+                pass
+            if not _has_ydotool and not _has_pyatspi and not _has_wmctrl:
+                warnings.append(
+                    "  [WARNING] Wayland session detected but no Wayland-compatible "
+                    "window management tool found (ydotool / AT-SPI2 / wmctrl).\n"
+                    "    Snapshot/restore will degrade to cursor-only (no window focus).\n"
+                    "    Fix (best):  sudo apt-get install ydotool && ydotoold &\n"
+                    "    Fix (alt):   pip install pyatspi  and\n"
+                    "                 gsettings set org.gnome.desktop.interface "
+                    "toolkit-accessibility true\n"
+                    "    Fix (switch): log into a GNOME-on-Xorg session instead of Wayland."
+                )
+
+    # ------------------------------------------------------------------
+    # 5. pyyaml — WARNING: without it policy.yaml never loads
+    # ------------------------------------------------------------------
+    try:
+        import yaml  # noqa: F401
+    except ImportError:
+        warnings.append(
+            "  [WARNING] pyyaml is not installed — policy.yaml will NOT be loaded.\n"
+            "    PolicyEngine will run with the built-in default allowlist only.\n"
+            "    Fix: pip install pyyaml"
+        )
+
+    # ------------------------------------------------------------------
+    # 6. playwright + chromium binary — WARNING: browser tasks fall back to
+    #    pyautogui coordinate clicks without it (coordinate staleness on SPAs)
+    # ------------------------------------------------------------------
+    try:
+        import playwright  # noqa: F401
+        # playwright Python package present — check for a usable browser binary
+        _chromium_found = (
+            _shutil.which("chromium-browser") is not None
+            or _shutil.which("chromium") is not None
+            or _shutil.which("google-chrome") is not None
+            or _shutil.which("google-chrome-stable") is not None
+        )
+        if not _chromium_found:
+            warnings.append(
+                "  [WARNING] playwright is installed but no Chromium/Chrome binary found.\n"
+                "    Browser DOM automation will fall back to pyautogui coordinate clicks.\n"
+                "    Fix: playwright install chromium\n"
+                "    OR:  sudo apt-get install chromium-browser"
+            )
+    except ImportError:
+        warnings.append(
+            "  [WARNING] playwright is not installed — browser DOM automation disabled.\n"
+            "    Web tasks will use pyautogui coordinate clicks (SPA-unfriendly).\n"
+            "    Fix: pip install playwright && playwright install chromium"
+        )
+
+    # ------------------------------------------------------------------
+    # 7. EasyOCR — WARNING: label-based clicks fail until OCR is warm
+    # ------------------------------------------------------------------
+    try:
+        import easyocr  # noqa: F401
+    except ImportError:
+        warnings.append(
+            "  [WARNING] easyocr is not installed — label-based clicks will fail.\n"
+            "    The agent can only click by pixel coordinates, not by UI label text.\n"
+            "    Fix: pip install easyocr\n"
+            "    Note: first EasyOCR init downloads ~500 MB of model weights (~5-10 min)."
+        )
+
+    # ------------------------------------------------------------------
+    # 8. Ollama daemon reachability — FATAL
+    # ------------------------------------------------------------------
     _ollama_ok = False
     try:
         import ollama as _ollama
@@ -325,7 +471,9 @@ def _validate_runtime_dependencies(model_name: str) -> None:
             "    On Linux/macOS: ollama serve"
         )
 
-    # 5. Model availability (only when Ollama is reachable)
+    # ------------------------------------------------------------------
+    # 9. Model availability — FATAL (only when Ollama is reachable)
+    # ------------------------------------------------------------------
     if _ollama_ok:
         try:
             import ollama as _ollama  # noqa: F811
@@ -343,17 +491,9 @@ def _validate_runtime_dependencies(model_name: str) -> None:
         except Exception:
             pass  # Daemon check already covered above
 
-    # 5b. Text model availability check (Fix 3 / H-9)
-    # When no dedicated text model exists in Ollama (separate from the vision
-    # model), ExecutionPlanner falls back to using the vision model for text-only
-    # planning calls.  This is a degraded-performance mode: vision models are
-    # slower and more memory-intensive than their text-only variants.
-    #
-    # The fallback is now FUNCTIONAL (Fix 1 / RB-1 applied: uses ollama_client.chat()
-    # directly instead of the broken self._llm_call() path), but operators should
-    # be warned so they can pull the text variant for optimal performance.
-    #
-    # Emit WARNING (not fatal) because tasks complete correctly in fallback mode.
+    # ------------------------------------------------------------------
+    # 10. Text model availability — WARNING (performance only)
+    # ------------------------------------------------------------------
     if _ollama_ok:
         try:
             import ollama as _ollama  # noqa: F811
@@ -376,38 +516,14 @@ def _validate_runtime_dependencies(model_name: str) -> None:
         except Exception:
             pass
 
-    # 6. pyautogui (required for scroll operations)
-    #
-    # H-07 FIX: The previous validator did not check for pyautogui.
-    # operate.py deferred `import pyautogui` inside the scroll branch so
-    # a missing pyautogui was only discovered at runtime when a scroll action
-    # was attempted, returning a silent {"success": False, "reward": -0.5}
-    # with no indication that the dependency was absent.  Tasks that rely on
-    # scroll would stagnate for up to MAX_STAGNANT_ITERS_UI=12 iterations
-    # before replanning, consuming 12×(planning + execution) cycles for a
-    # dependency that could have been caught at startup.
-    #
-    # Fix: check for pyautogui at startup.  A missing pyautogui is a WARNING
-    # (not a fatal error) because many tasks do not use scroll; the operator
-    # may intentionally run without it.  If scroll actions appear during
-    # execution, the structured error in operate.py now surfaces the reason
-    # clearly in the journal rather than a bare -0.5.
-    try:
-        import pyautogui as _  # noqa: F401
-    except ImportError:
-        warnings.append(
-            "  [WARNING] pyautogui is not installed. "
-            "Scroll operations will fail with a structured error.\n"
-            "    Fix: pip install pyautogui"
-        )
-
-    # Emit warnings
+    # ------------------------------------------------------------------
+    # Emit results
+    # ------------------------------------------------------------------
     if warnings:
         print("\n[STARTUP] Dependency warnings (non-fatal):", file=sys.stderr)
         for w in warnings:
             print(w, file=sys.stderr)
 
-    # Emit errors and exit
     if errors:
         print(
             "\n[STARTUP] FATAL: Required dependencies are missing or unreachable.\n"
