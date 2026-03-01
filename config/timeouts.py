@@ -24,8 +24,23 @@ Design rules:
 LLM_CALL_TIMEOUT_SECONDS: float = 150.0
 
 # Thread wrapper timeout (used in run.py)
-# Must be strictly greater than LLM_CALL_TIMEOUT_SECONDS.
-LLM_THREAD_TIMEOUT_SECONDS: float = LLM_CALL_TIMEOUT_SECONDS + 15.0
+# Must be strictly greater than the WORST-CASE total time for a full planning
+# cycle including all internal retries.
+#
+# H1 FIX: The previous value was LLM_CALL_TIMEOUT_SECONDS + 15.0 = 165s.
+# This was insufficient for CPU-only deployments.
+#
+# Worst-case CPU planning budget:
+#   _PLAN_MAX_RETRIES = 3 (main.py)
+#   Per-call inference:       3 × 90s = 270s
+#   Exponential back-off:     2^1 + 2^2 = 6s
+#   LLM_CALL_TIMEOUT margin:  150s already baked into planner
+#   Safety headroom:          +150s
+#   Total ceiling:            ~600s
+#
+# On GPU (2–5s/call) this limit is never approached.  On CPU it gives the
+# planner its full 3-attempt budget before the thread is declared hung.
+LLM_THREAD_TIMEOUT_SECONDS: float = 600.0
 
 # Installation command timeout (used by AutonomousInstaller._try_terminal_install)
 # Large downloads (e.g. apt-get install build-essential) can take 5+ minutes.
