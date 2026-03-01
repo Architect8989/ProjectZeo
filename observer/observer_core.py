@@ -23,24 +23,7 @@ class ObserverCore:
 
     MAX_HISTORY = 1000
 
-    # FIX IH-7: STARTUP_GRACE_TICKS = 30 removed. This constant was defined
-    # but never referenced anywhere — the blindness logic uses STARTUP_GRACE_SECONDS
-    # (time-based) and MAX_CONSECUTIVE_MISSES (tick-based), not STARTUP_GRACE_TICKS.
-    # Its presence implied a tick-based grace mechanism that does not exist.
-    # HARD-4 / GAP-4: The single canonical startup grace value follows below.
-    # GAP-4 FIX: On CPU-only hardware, Qwen2.5-VL takes 40–90s per inference.
-    # The VisionRuntime runs at CAPTURE_INTERVAL_SECONDS=0.5 but the actual
-    # frame delivery rate is limited by inference speed (1 frame per 40–90s).
-    # The ObserverLoop ticks at 5Hz (0.20s). At 5Hz, 15 misses = 3 seconds
-    # before the observer declares itself blind — far less than one inference
-    # cycle on CPU hardware. This caused permanent spurious blindness on every
-    # non-GPU machine, preventing any task from ever being executed.
-    #
-    # Fix: raise MAX_CONSECUTIVE_MISSES to 600 (= 120 seconds at 5Hz).
-    # 120 seconds comfortably covers the worst-case 90s CPU inference latency
-    # plus scheduling jitter, while still catching genuine vision failures
-    # (e.g. Ollama crash, display disappearing) within 2 minutes.
-    # STARTUP_GRACE_SECONDS is also raised to 150s for the same reason.
+    
     STARTUP_GRACE_SECONDS = 150.0
     MAX_CONSECUTIVE_MISSES = 600   # was 15; 600 ticks @ 5Hz = 120s grace
     BLIND_RECOVERY_SECONDS = 10.0  # was 5.0; extend to survive slow frames
@@ -151,10 +134,9 @@ class ObserverCore:
 
             # ---- STARTUP GRACE ----
             if self.first_frame_seen is None:
+                
                 grace_ok = (
-                    self.tick_count < self.STARTUP_GRACE_TICKS
-                    or (now - self.start_time)
-                    < self.STARTUP_GRACE_SECONDS
+                    (now - self.start_time) < self.STARTUP_GRACE_SECONDS
                 )
                 if not grace_ok:
                     self._mark_blind(
