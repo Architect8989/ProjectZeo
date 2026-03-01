@@ -4,6 +4,7 @@ import concurrent.futures
 import hashlib
 import os
 import sys
+import tempfile
 import time
 import json
 from typing import Any, Dict, Optional, List
@@ -96,7 +97,11 @@ MAX_DYNAMIC_CANDIDATES = 3
 
 
 
-_SIGNAL_DIR: str = "/tmp"
+# AUDIT §2.3 FIX: was hardcoded "/tmp" — does not exist on Windows, breaking
+# the REQUIRE_HUMAN_CONFIRMATION gate entirely on that platform.  Replace with
+# tempfile.gettempdir() which returns the correct temp directory on all OSes:
+# /tmp on Linux/macOS, %TEMP% / %TMP% on Windows.
+_SIGNAL_DIR: str = tempfile.gettempdir()
 _SIGNAL_PREFIX: str = "projectzeo_approve_"
 
 
@@ -289,10 +294,21 @@ def operate_main(
                     k for k, v in _lh_raw.items()
                     if k in _LIKELIHOOD_DEFAULTS and not isinstance(v, (int, float))
                 ]
-                if _missing or _bad_type:
+                # AUDIT §2.5 FIX: also reject non-positive ratios.  A zero or
+                # negative likelihood ratio forces all Bayesian posteriors to zero
+                # on the first update, permanently collapsing the belief distribution.
+                _bad_range = [
+                    k for k, v in _lh_raw.items()
+                    if k in _LIKELIHOOD_DEFAULTS
+                    and isinstance(v, (int, float))
+                    and v <= 0
+                ]
+                if _missing or _bad_type or _bad_range:
                     raise ValueError(
                         f"likelihoods.json validation failed — "
-                        f"missing keys: {_missing}, bad types: {_bad_type}"
+                        f"missing keys: {_missing}, bad types: {_bad_type}, "
+                        f"non-positive ratios: {_bad_range} "
+                        "(all likelihood ratios must be > 0)"
                     )
                 _likelihood_cfg.update(_lh_raw)
                 print(
@@ -442,6 +458,14 @@ def operate_main(
                 f"[operate_main] H2 WARNING: playbook save failed: {_pb_save_err}.",
                 file=sys.stderr,
             )
+
+        # AUDIT §2.4 FIX: Clear the step checkpoint on successful task completion
+        # so the next task does not accidentally resume from a stale position.
+        try:
+            from core.safety.checkpoint_store import clear_checkpoint as _clear_cp
+            _clear_cp()
+        except Exception:
+            pass  # non-fatal
     finally:
         input_arbitrator.shutdown()
         # FIX RB-A3: Shut down the per-task executor on all exit paths.
@@ -1048,6 +1072,24 @@ def _execute_autonomous_loop(
                         "step": current_step_index - 1,
                         "progress_score": verify_result.progress_score,
                     })
+                    # AUDIT §2.4 FIX: save_checkpoint() was implemented in
+                    # core/safety/checkpoint_store.py but never called anywhere.
+                    # Wire it here after every successful step advance so that
+                    # a crash at hour N of a multi-hour task can resume from the
+                    # last completed step instead of restarting from zero.
+                    try:
+                        from core.safety.checkpoint_store import save_checkpoint as _save_cp
+                        _save_cp({
+                            "intent": terminal_prompt,
+                            "step_index": current_step_index,
+                            "belief_state": belief.to_dict(),
+                            "execution_log": {
+                                str(k): v for k, v in execution_log.items()
+                            },
+                        })
+                    except Exception as _cp_err:
+                        # Non-fatal: checkpoint failure must never block execution.
+                        log_warn(f"[CHECKPOINT] save_checkpoint failed: {_cp_err}")
                 else:
                     stagnant_iterations += 1
             else:
