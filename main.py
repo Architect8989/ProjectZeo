@@ -46,8 +46,17 @@ from core.cognition.belief_state import BeliefState
 # PATCH §1.5: reduced from 2.0s to 0.25s for lower intent-to-task latency
 HEARTBEAT_INTERVAL = 0.25
 
-MAX_TASK_SECONDS = 90 * 60      # 90 minutes per task
-MAX_REPLANS = 3                 # max replan attempts before TASK_FAILED
+MAX_TASK_SECONDS = int(
+    os.environ.get("PROJECTZEO_MAX_TASK_SECONDS", str(90 * 60))
+)   # Default: 90 minutes.  Set to 0 for unlimited (use with caution).
+    # BUG-13 FIX: Hard-coded 90-minute wall killed multi-hour tasks silently.
+    # Override: PROJECTZEO_MAX_TASK_SECONDS=<seconds>  (0 = unlimited)
+
+MAX_REPLANS = int(
+    os.environ.get("PROJECTZEO_MAX_REPLANS", "3")
+)   # Default: 3 replan attempts before TASK_FAILED.
+    # BUG-14 FIX: Hard-coded 3 was too low for iterative/debugging tasks.
+    # Override: PROJECTZEO_MAX_REPLANS=<count>  (0 = unlimited, not recommended)
 
 # FIX-4: Extended from 8s to 150s for CPU inference compat
 WARMUP_TIMEOUT_SECONDS = 150.0
@@ -264,7 +273,8 @@ def _enforce_task_timeout() -> None:
     start = _get_task_start()
     if start is None:
         return
-    if (time.time() - start) > MAX_TASK_SECONDS:
+    # BUG-13 FIX: MAX_TASK_SECONDS == 0 means unlimited (no timeout enforced).
+    if MAX_TASK_SECONDS > 0 and (time.time() - start) > MAX_TASK_SECONDS:
         raise RuntimeError("TASK_FAILED:timeout")
 
 
@@ -665,7 +675,8 @@ def main(llm_callable: Callable, model_name: str) -> None:
                             _prior_belief_state = _safe_belief_snapshot(_belief_state_out) or None
 
                             replan_count += 1
-                            if replan_count > MAX_REPLANS:
+                            # BUG-14 FIX: MAX_REPLANS == 0 means unlimited replans.
+                            if MAX_REPLANS > 0 and replan_count > MAX_REPLANS:
                                 raise RuntimeError("TASK_FAILED:max_replans_exceeded")
                             mode.begin_replan_sequence()
 
