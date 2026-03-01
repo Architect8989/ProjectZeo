@@ -11,7 +11,7 @@ import copy
 import os
 import concurrent.futures
 
-from PIL import Image, ImageGrab
+from PIL import Image
 import ollama
 import httpx
 
@@ -219,14 +219,29 @@ class VisionRuntime:
     # ==================================================
 
     def _capture_frame(self) -> Image.Image:
+        # PRIMARY: mss — works on X11/Wayland/Windows/Mac without scrot
         try:
-            img = ImageGrab.grab(all_screens=True)
+            import mss as _mss
+            with _mss.mss() as sct:
+                monitor = sct.monitors[0]  # index 0 = full virtual desktop
+                raw = sct.grab(monitor)
+                img = Image.frombytes("RGB", raw.size, raw.bgra, "raw", "BGRX")
+                return img
+        except Exception as _mss_err:
+            pass  # fall through to PIL fallback
+
+        # FALLBACK: PIL ImageGrab (requires scrot on Linux)
+        try:
+            from PIL import ImageGrab as _IG
+            img = _IG.grab(all_screens=True)
             if img.mode != "RGB":
                 img = img.convert("RGB")
             return img
         except Exception as e:
             raise VisionUnavailableError(
-                f"Framebuffer capture failed: {e}"
+                f"Screen capture failed (tried mss + PIL.ImageGrab). "
+                f"Last error: {e}. "
+                f"Fix: pip install mss  OR  sudo apt-get install scrot"
             )
 
     def _encode_image(self, img: Image.Image) -> str:
