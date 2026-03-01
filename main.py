@@ -58,6 +58,14 @@ MAX_REPLANS = int(
     # BUG-14 FIX: Hard-coded 3 was too low for iterative/debugging tasks.
     # Override: PROJECTZEO_MAX_REPLANS=<count>  (0 = unlimited, not recommended)
 
+# AUDIT §2.6 FIX: Absolute replan ceiling that fires regardless of MAX_REPLANS.
+# When PROJECTZEO_MAX_REPLANS=0 (unlimited), there is no guard in the outer
+# main() loop — a task whose inner loop always hits max_iterations and raises
+# REPLAN_REQUIRED will replan forever, consuming unbounded LLM inference budget.
+# This ceiling is intentionally NOT configurable via env var; it is a hard safety
+# backstop that should never be needed in correct operation.
+ABSOLUTE_REPLAN_CEILING: int = 50
+
 # FIX-4: Extended from 8s to 150s for CPU inference compat
 WARMUP_TIMEOUT_SECONDS = 150.0
 WARMUP_STABLE_FRAMES = 3
@@ -686,6 +694,16 @@ def main(llm_callable: Callable, model_name: str) -> None:
                             # BUG-14 FIX: MAX_REPLANS == 0 means unlimited replans.
                             if MAX_REPLANS > 0 and replan_count > MAX_REPLANS:
                                 raise RuntimeError("TASK_FAILED:max_replans_exceeded")
+                            # AUDIT §2.6 FIX: Hard safety backstop — fires even
+                            # when MAX_REPLANS=0 (unlimited) to prevent infinite
+                            # LLM consumption on permanently-stagnant tasks.
+                            if replan_count > ABSOLUTE_REPLAN_CEILING:
+                                raise RuntimeError(
+                                    "TASK_FAILED:absolute_replan_ceiling_exceeded "
+                                    f"({ABSOLUTE_REPLAN_CEILING} replans). "
+                                    "Set PROJECTZEO_MAX_REPLANS to a lower value "
+                                    "or investigate why the task cannot make progress."
+                                )
                             mode.begin_replan_sequence()
 
                             try:
