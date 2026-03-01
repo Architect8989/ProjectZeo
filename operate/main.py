@@ -108,10 +108,21 @@ def main_entry(
                     future = _pool.submit(
                         lambda: __import__("asyncio").run(_invoke())
                     )
-                    ops, err = future.result()
+                    result = future.result()
             else:
                 import asyncio as _asyncio_outer
-                ops, err = _asyncio_outer.run(_invoke())
+                result = _asyncio_outer.run(_invoke())
+
+            # BUG-05 FIX: The adapter contract allows EITHER a (ops, err)
+            # 2-tuple OR a plain list.  The original code unconditionally
+            # unpacked as a 2-tuple; a list return raised ValueError: "too
+            # many values to unpack".  Mirror run.py's _make_llm_callable().
+            if isinstance(result, tuple) and len(result) == 2:
+                ops, err = result
+            elif isinstance(result, list):
+                ops, err = result, None
+            else:
+                ops, err = [], f"unexpected adapter return type: {type(result)}"
 
             if err:
                 raise RuntimeError(f"LLM error: {err}")
