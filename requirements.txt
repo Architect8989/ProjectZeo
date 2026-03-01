@@ -57,6 +57,11 @@ tqdm>=4.66.1
 typing_extensions>=4.8.0
 urllib3>=2.0.7
 
+# Windows-only: window management (win32gui, win32process, win32con)
+# Required by OperatingSystem.get_focused_window(), get_active_application(),
+# activate_application() on Windows.  Silently absent on Linux/macOS.
+pywin32>=306 ; sys_platform == "win32"
+
 # AI / ML
 # GAP-7 FIX #1: anthropic PINNED (was unpinned — breaking changes between minor versions)
 anthropic>=0.40.0,<1.0.0
