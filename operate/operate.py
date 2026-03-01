@@ -132,21 +132,22 @@ def _write_approval_signal(action_key: str, action: dict, reason: str) -> str:
             },
             indent=2,
         )
-        with open(path, "w", encoding="utf-8") as fh:
+        # BUG-08 FIX: The original code wrote the file then called
+        # os.chmod(path, 0o600).  There is a race window between close()
+        # and chmod() where the file exists with the default umask mode
+        # (typically 0o644 — world-readable/deletable), allowing any same-UID
+        # process to delete it and trigger an unintended approval.
+        #
+        # Fix: use os.open() with O_CREAT|O_WRONLY|O_EXCL and mode 0o600,
+        # which atomically creates the file with the correct permissions —
+        # no window where the wrong mode is visible to other processes.
+        fd = os.open(path, os.O_CREAT | os.O_WRONLY | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(content)
-        # RT-A7 FIX: Restrict to owner-only immediately after write.
-        # chmod after close ensures the file descriptor is flushed and the
-        # inode mode is updated atomically before any other process can see
-        # the file with the wrong permissions.
-        try:
-            os.chmod(path, 0o600)
-        except OSError as _chmod_err:
-            print(
-                f"[OPERATE] Warning: could not chmod approval signal file "
-                f"{path!r} to 0o600: {_chmod_err}. "
-                "Authority gate may be weaker than intended.",
-                file=sys.stderr,
-            )
+    except FileExistsError:
+        # Another process/thread already created the approval file; this
+        # is a benign race — the gate is still in place.
+        pass
     except OSError as e:
         # /tmp write failure is non-fatal; log and continue to timed-out denial
         print(
@@ -1298,13 +1299,33 @@ def _execute_decision(
                 if not isinstance(tool_spec, dict):
                     tool_spec = {"name": str(tool_spec) if tool_spec else ""}
                 try:
-                    installer.install_tool(tool_spec)
-                    return {"success": True, "reward": 0.8}
+                    install_result = installer.install_tool(tool_spec)
+                    # BUG-09 FIX: Capture install output so the planner can
+                    # see WHY an install failed on a replan.  Previously the
+                    # return dict had no "output" key, leaving the replanner
+                    # blind to version errors, missing dependencies, and
+                    # network failures from the install process.
+                    install_output = ""
+                    if isinstance(install_result, dict):
+                        install_output = install_result.get("output", "") or ""
+                    elif isinstance(install_result, str):
+                        install_output = install_result
+                    install_ok = (
+                        install_result is True
+                        or (isinstance(install_result, dict) and install_result.get("success", True))
+                    )
+                    return {
+                        "success": install_ok,
+                        "reward": 0.8 if install_ok else -0.5,
+                        "output": install_output,
+                        "returncode": 0 if install_ok else 1,
+                    }
                 except Exception as inst_err:
                     return {
                         "success": False,
                         "reward": -0.5,
                         "output": str(inst_err),
+                        "returncode": 1,
                     }
             else:
                 return {
