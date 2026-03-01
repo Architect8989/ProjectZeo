@@ -142,6 +142,8 @@ def load_checkpoint() -> Optional[Dict]:
 def clear_checkpoint() -> None:
     """
     Best-effort deletion with directory sync.
+    Called by operate.py on task completion so the next task does not
+    accidentally resume from a stale checkpoint.
     """
 
     try:
@@ -150,3 +152,26 @@ def clear_checkpoint() -> None:
             _fsync_dir(CHECKPOINT_DIR)
     except Exception:
         pass
+
+
+def checkpoint_exists() -> bool:
+    """Return True if a valid (checksum-verified) checkpoint exists on disk.
+
+    AUDIT §2.4 FIX: New helper used by main.py crash-recovery path to decide
+    whether to attempt step-resume before kicking off a full replan.
+    """
+    return load_checkpoint() is not None
+
+
+def get_checkpoint_step_index() -> Optional[int]:
+    """Return the persisted step_index, or None if no valid checkpoint exists.
+
+    AUDIT §2.4 FIX: Convenience accessor so operate.py can fast-forward
+    current_step_index to the checkpointed position without deserializing
+    the entire state.
+    """
+    state = load_checkpoint()
+    if state is None:
+        return None
+    idx = state.get("step_index")
+    return int(idx) if isinstance(idx, (int, float)) else None
