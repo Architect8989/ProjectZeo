@@ -346,8 +346,6 @@ class QwenOllamaAdapter:
         # H-02 FIX: Use .is_set() on the Event rather than reading the bare bool.
         if _OCR_UNAVAILABLE_EVENT.is_set():           # H-02 FIX: was  if _OCR_UNAVAILABLE:
             system_content = system_content + self._COORD_MANDATE
-
-        history_messages: List[dict] = []
         for msg in messages:
             role = msg.get("role")
             if role == "system":
@@ -388,12 +386,29 @@ class QwenOllamaAdapter:
             # fall back to the original independent capture so we never block
             # on a missing runtime reference.
             img_base64: Optional[str] = None
+            _using_vr_frame: bool = False
             _vr = _SHARED_VISION_RUNTIME
             if _vr is not None:
                 try:
                     img_base64 = _vr.get_latest_frame_jpeg_b64(max_age_seconds=5.0)
+                    if img_base64 is not None:
+                        _using_vr_frame = True
                 except Exception:
                     img_base64 = None
+
+            # H2 FIX: When the VisionRuntime frame is used, no JPEG is written to
+            # disk so screenshot_path=None and _resolve_click_coordinates() will
+            # DROP every text-only click ({"operation":"click","text":"..."}).
+            # Qwen2.5-VL regularly emits text clicks — each dropped click
+            # increments the stagnation counter and eventually triggers REPLAN.
+            #
+            # Fix: inject _COORD_MANDATE into the system prompt when we know
+            # we are taking the VR-frame path.  This tells the LLM to always
+            # emit {"x": ..., "y": ...} coordinate clicks instead of text clicks,
+            # eliminating the drop entirely.  Only injected when OCR isn't
+            # already flagged unavailable (to avoid double-appending the mandate).
+            if _using_vr_frame and not _OCR_UNAVAILABLE_EVENT.is_set():
+                system_content = system_content + self._COORD_MANDATE
 
             if img_base64 is None:
                 # VisionRuntime frame unavailable or stale — fall back to
