@@ -51,8 +51,15 @@ class WorldGraph:
         frame_ts = perception.get("frame_ts")
         elements = perception.get("elements")
 
+        # BUG-07 FIX: The original code returned early when frame_ts was not
+        # an int/float (e.g. None, which ObserverLoop._validate_perception_schema()
+        # can produce when conversion fails).  This silently dropped all entity
+        # ingestion, leaving the world graph permanently stale on CPU-only hardware
+        # where VisionRuntime occasionally emits non-numeric timestamps.
+        # Fix: fall back to wall-clock time rather than discarding the frame.
         if not isinstance(frame_ts, (int, float)):
-            return
+            frame_ts = time.time()
+
         if not isinstance(elements, list):
             return
 
