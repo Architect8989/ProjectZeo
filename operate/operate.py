@@ -365,6 +365,14 @@ def operate_main(
         )
         _likelihood_cfg = dict(_LIKELIHOOD_DEFAULTS)
 
+    # PATCH MOD-3: Pre-cast ENTITY_RICH_THRESHOLD to int once here.
+    # The original code called int(_likelihood_cfg.get("ENTITY_RICH_THRESHOLD", 10))
+    # inside the main execution loop on every iteration.  A float value like 10.5
+    # would pass the > 0 validation but produce logically wrong comparisons with
+    # integer entity counts.  Casting once at load time is both correct and faster.
+    _likelihood_cfg["ENTITY_RICH_THRESHOLD"] = int(
+        _likelihood_cfg.get("ENTITY_RICH_THRESHOLD", 10)
+    )
 
     try:
         accessibility_backend = AccessibilityBackend()
@@ -508,8 +516,19 @@ def operate_main(
             pass  # non-fatal
     finally:
         input_arbitrator.shutdown()
-        # FIX RB-A3: Shut down the per-task executor on all exit paths.
-        # wait=False: never block the main thread waiting for a stuck UI thread.
+        # PATCH MOD-5: Give in-flight UI actions a 2-second grace window to
+        # complete before the executor is torn down.  The original wait=False
+        # could leave a pyautogui.click() or pyautogui.write() call mid-flight
+        # when a REPLAN fires, producing ghost inputs on the newly-restored screen.
+        # We achieve a bounded wait by joining the underlying thread with a timeout
+        # rather than blocking on shutdown() itself (which has no timeout parameter
+        # before Python 3.9).  After 2s any still-running action is abandoned as
+        # before — we never want to block indefinitely on a hung UI thread.
+        import threading as _threading
+        _ui_threads = [t for t in _threading.enumerate()
+                       if t.name.startswith("ui_timeout_worker")]
+        for _t in _ui_threads:
+            _t.join(timeout=2.0)
         _task_ui_executor.shutdown(wait=False)
 
 
@@ -785,9 +804,9 @@ def _execute_autonomous_loop(
                             # likelihoods.json at startup) instead of hardcoded
                             # developer constants.  If the file is absent, _likelihood_cfg
                             # contains the original defaults so behaviour is unchanged.
-                            _entity_rich_thresh = int(
-                                _likelihood_cfg.get("ENTITY_RICH_THRESHOLD", 10)
-                            )
+                            # PATCH MOD-3: _entity_rich_thresh is now pre-cast to int
+                            # at config-load time — no per-iteration cast needed.
+                            _entity_rich_thresh = _likelihood_cfg["ENTITY_RICH_THRESHOLD"]
 
                             if isinstance(focused_app, str) and focused_app.strip():
                                 app_state_key = f"app:{focused_app.lower()}"
