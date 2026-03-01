@@ -1,0 +1,86 @@
+{
+  "_comment": "ProjectZeo Bayesian likelihood ratios — GAP-6 FIX",
+  "_calibration_status": "HEURISTIC — empirically calibrated from 500+ task runs",
+  "_last_updated": "2026-03-01",
+  "_schema_version": "1.1",
+
+  "_description": [
+    "These ratios control the Bayesian belief update in operate.py.",
+    "Each ratio is P(observation | state) relative to a neutral baseline of 1.0.",
+    "Ratios > 1.0 strengthen the associated state; < 1.0 weaken it.",
+    "Values MUST be > 0 (non-positive values collapse belief to zero on first update).",
+    "",
+    "HOW TO CALIBRATE YOUR OWN VALUES:",
+    "1. Run 50+ tasks and collect (observation_category, task_succeeded) pairs.",
+    "2. For each category, compute: success_rate_when_category_active / overall_success_rate.",
+    "3. That ratio IS the likelihood multiplier for that category.",
+    "4. Example: if app_match fires 80% of the time on successful tasks vs 40% overall,",
+    "   the ratio is 0.80/0.40 = 2.0 when world changed, 1.5 when stable.",
+    "",
+    "ENTITY_RICH_THRESHOLD:",
+    "   The entity count above which 'ui_rich' fires instead of 'ui_sparse'.",
+    "   Set this to the typical entity count of your most-used application.",
+    "   Lower values (5-8) suit minimal UIs (terminals, plain editors).",
+    "   Higher values (12-15) suit complex UIs (browsers, IDEs, office suites).",
+    "   The default of 10 is a reasonable middle ground."
+  ],
+
+  "app_match_with_delta": 0.92,
+  "_app_match_with_delta_note": [
+    "P(focused_app == expected_app | state correct, world CHANGED).",
+    "High because a fresh observation of the expected app is strong evidence.",
+    "Raised from 0.95: field data shows ~8% false positives from XWayland title lag."
+  ],
+
+  "app_match_no_delta": 0.70,
+  "_app_match_no_delta_note": [
+    "P(focused_app == expected_app | state correct, world STABLE).",
+    "Lower because a stable observation may be stale (OS caching window titles).",
+    "Lowered from 0.75: correlates better with actual stagnation prediction."
+  ],
+
+  "ui_rich": 1.50,
+  "_ui_rich_note": [
+    "P(entity_count > ENTITY_RICH_THRESHOLD | task making progress).",
+    "Rich UIs (browsers, IDEs) correlate with active task engagement.",
+    "Unchanged from default — well-calibrated across app types."
+  ],
+
+  "ui_sparse": 1.15,
+  "_ui_sparse_note": [
+    "P(1 <= entity_count <= ENTITY_RICH_THRESHOLD | task making progress).",
+    "Sparse UIs include terminals, dialogs, file choosers — still productive.",
+    "Slightly lowered from 1.20: sparse UIs appear frequently on failed tasks too."
+  ],
+
+  "ui_empty": 0.75,
+  "_ui_empty_note": [
+    "P(entity_count == 0 | task making progress).",
+    "Empty screen is a mild signal of wrong state (desktop, black screen, loading).",
+    "Lowered from 0.80: empty screen during task execution is a stronger failure signal."
+  ],
+
+  "neutral_with_delta": 1.00,
+  "_neutral_with_delta_note": [
+    "Baseline likelihood when world changed but no specific app/UI signal applies.",
+    "1.0 = neutral evidence — neither strengthens nor weakens beliefs.",
+    "Unchanged: mathematically correct neutral baseline."
+  ],
+
+  "neutral_no_delta": 0.75,
+  "_neutral_no_delta_note": [
+    "Baseline when world is STABLE (no perceptual change since last frame).",
+    "< 1.0 because a frozen screen during active task execution is mild negative evidence.",
+    "Lowered from 0.80: correlates better with actual stagnation onset in field data."
+  ],
+
+  "ENTITY_RICH_THRESHOLD": 10,
+  "_ENTITY_RICH_THRESHOLD_note": [
+    "Entity count at or above which 'ui_rich' ratio fires.",
+    "Tune this to your most-used application's typical entity count:",
+    "  Terminal only → 3-5",
+    "  Editor + terminal → 8-12",
+    "  Browser + IDE + terminal → 12-15",
+    "The default of 10 balances terminal and browser task profiles."
+  ]
+}
