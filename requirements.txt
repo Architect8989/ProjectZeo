@@ -1,9 +1,3 @@
-# ProjectZeo — Python dependencies
-# ─────────────────────────────────────────────────────────────────────────────
-# BUG-1 FIX: ollama 0.3.0 had a different API (.list() returned dict, not object
-# with .models).  The codebase uses the modern >=0.4.x API throughout:
-#   _existing_models = {m.model for m in _ollama.Client().list().models}
-# Pinning to >=0.4.0 ensures the correct response object shape.
 ollama>=0.4.0
 
 # Core runtime
@@ -60,32 +54,3 @@ ultralytics==8.0.227
 easyocr==1.7.1
 anthropic
 pyyaml==6.0
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Platform-specific dependencies
-# ─────────────────────────────────────────────────────────────────────────────
-
-# Linux-only: X11 bindings for xlib-based operations
-# pyscreenshot and python3-xlib are Linux/X11 specific.
-# On Wayland-only systems these may not be needed; install as optional.
-# pyscreenshot==3.1      # Linux/X11 only — comment out if using mss exclusively
-# python3-xlib==0.15    # Linux/X11 only — comment out on pure Wayland
-
-# BUG-12 FIX: Windows support requires pywin32 (provides win32gui, win32con).
-# Not in the original requirements.txt, causing ImportError on all Windows paths.
-# Install conditionally:
-#   On Windows:  pip install pywin32
-#   On Linux:    (skip — not available/needed)
-# Uncomment the line below if targeting Windows:
-# pywin32>=306   # Windows only
-
-# macOS-only: rubicon-objc is used for macOS-specific Objective-C bridge calls.
-# On Linux/Windows this package is not needed.
-# rubicon-objc==0.4.7   # macOS only — uncomment if running on macOS
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Optional / system tools (install via apt/brew, not pip):
-# ─────────────────────────────────────────────────────────────────────────────
-# sudo apt-get install xdotool wmctrl   # required on Linux/X11
-# sudo apt-get install xvfb             # required for headless mode
-# ollama                                # from https://ollama.com
