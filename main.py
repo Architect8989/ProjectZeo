@@ -901,6 +901,62 @@ def main(llm_callable: Callable, model_name: str) -> None:
                 time.sleep(HEARTBEAT_INTERVAL)
                 continue
 
+            except RuntimeError as e:
+                # BLOCKER #2 FIX: Task-failure RuntimeErrors must NOT kill the agent.
+                # ====================================================================
+                # The original code had a single ``except Exception as e: break``
+                # handler at the bottom of the main loop.  Any RuntimeError raised
+                # during a task (timeout, max replans, replan ceiling, watchdog,
+                # restore failure, etc.) hit this handler and broke out of the loop
+                # permanently — requiring a manual process restart.  On the first
+                # task attempt on a fresh install this meant the agent was dead after
+                # one failure, every time.
+                #
+                # Fix: intercept RuntimeErrors whose message starts with
+                # "TASK_FAILED:" and treat them as recoverable task-level failures.
+                # The agent logs the failure, writes task_result.json, forces itself
+                # back to OBSERVER, resumes the observer loop, clears task timing
+                # state, and continues polling for the next intent.  Only unexpected
+                # RuntimeErrors (programming bugs) propagate to the outer handler.
+                #
+                # RestorationVerificationError is NOT a RuntimeError subclass, so
+                # it still flows to the outer handler and triggers a safe shutdown —
+                # a hard restoration failure is a systemic issue requiring operator
+                # investigation, not a task-level retry.
+                _err_str = str(e)
+                if _err_str.startswith("TASK_FAILED:"):
+                    print(
+                        f"[MAIN] BLOCKER-2: Task failed ({_err_str}) — "
+                        "returning to OBSERVER (agent continues running).",
+                        file=sys.stderr,
+                    )
+                    _write_task_result(
+                        intent=locals().get("intent", "(unknown)"),
+                        success=False,
+                        error=_err_str[:200],
+                    )
+                    try:
+                        mode.force_observer()
+                    except Exception:
+                        pass
+                    try:
+                        observer_loop.resume()
+                    except Exception:
+                        pass
+                    _clear_task_start()
+                    time.sleep(HEARTBEAT_INTERVAL)
+                    continue  # KEEP RUNNING — do not break
+
+                # Unexpected RuntimeError (programming bug): safe-shutdown + break
+                _write_task_result(
+                    intent=locals().get("intent", "(unknown)"),
+                    success=False,
+                    error=_err_str[:200],
+                )
+                _interactive_print(f"[MODE] UNEXPECTED RUNTIME ERROR — {_err_str[:80]}")
+                _force_safe_shutdown(os_backend, auth_state, f"unexpected_runtime_error:{e}")
+                break
+
             except Exception as e:
                 _err_str = str(e)
                 _write_task_result(
