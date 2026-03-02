@@ -26,6 +26,29 @@ class PolicyEngine:
     -------------
     allowed_apps is protected by _apps_lock so allow_app() / allow_apps()
     can be called safely from the AutonomousInstaller background thread.
+
+    GAP #3 FIX — Autonomous package installation
+    =============================================
+    The original ``high_risk_name_patterns`` list contained a ``sudo`` pattern
+    that triggered ``REQUIRE_HUMAN_CONFIRMATION`` for *every* package install.
+    Combined with ``_CONFIRM_TIMEOUT_SECONDS = 60``, any unattended install
+    timed out to DENY.  The operator had to manually delete a signal file for
+    each installation step — completely defeating "autonomously install tools".
+
+    Fix: introduce ``_TRUSTED_INSTALLER_OPS`` — a set of command prefixes
+    (normalised to lowercase) that are pre-approved for autonomous execution.
+    Commands whose stripped text starts with a trusted installer prefix bypass
+    the ``high_risk_name_patterns`` scan and receive ALLOW directly.
+
+    Security: trusted-installer promotion is only applied when:
+      1. The operation is "command" or "install" (not write/type/click).
+      2. The action dict carries the ``_trusted_installer`` flag set by
+         ExecutionPlanner._validate_and_normalise_step() after its own
+         dangerous-pattern scan has passed (see GAP #2 fix).
+    This means the bypass is gated on TWO independent checks — the planner's
+    dangerous-pattern scan and this engine's trusted-prefix check — so an
+    attacker cannot reach the bypass without first clearing the planner's
+    50+ dangerous-pattern regexes.
     """
 
     ALLOW = "ALLOW"
@@ -51,6 +74,65 @@ class PolicyEngine:
         "command",
         "install",
         "file_create",
+    })
+
+    # GAP #3 FIX: Trusted installer command prefixes.
+    # Commands whose stripped text *starts with* one of these prefixes are
+    # pre-approved for autonomous execution and bypass the sudo/delete/format
+    # high_risk_name_patterns check.
+    #
+    # Design principles:
+    #   - Prefix match (not substring) — "apt-get install" is trusted;
+    #     "apt-get purge --allow-remove-essential" is NOT (starts with apt-get
+    #     but the purge verb is not in this list).
+    #   - All prefixes are package-manager install verbs or version commands.
+    #   - Deliberately excludes: remove, purge, uninstall, autoremove, dist-upgrade,
+    #     format, mkfs, dd, shred (all remain subject to human confirmation).
+    #   - The ExecutionPlanner dangerous-pattern scan is a prerequisite — this
+    #     list only promotes commands that have already cleared 50+ regex checks.
+    _TRUSTED_INSTALLER_PREFIXES: FrozenSet[str] = frozenset({
+        # Debian/Ubuntu
+        "apt-get install",
+        "apt install",
+        "apt-get update",
+        "apt update",
+        # Red Hat / Fedora
+        "dnf install",
+        "yum install",
+        # Arch
+        "pacman -s",
+        "pacman -sy",
+        # macOS
+        "brew install",
+        "brew upgrade",
+        # Node
+        "npm install",
+        "npm i",
+        "npx",
+        # Python
+        "pip install",
+        "pip3 install",
+        "pip install --break-system-packages",
+        "pip3 install --break-system-packages",
+        # Version probe commands (safe, read-only)
+        "node --version",
+        "node -v",
+        "npm --version",
+        "npm -v",
+        "python --version",
+        "python3 --version",
+        "pip --version",
+        "pip3 --version",
+        "java -version",
+        "java --version",
+        "go version",
+        "rustc --version",
+        "cargo --version",
+        "git --version",
+        "docker --version",
+        "docker-compose --version",
+        "which ",
+        "command -v ",
     })
 
     # Default application allowlist — covers the most common desktop apps.
@@ -92,11 +174,17 @@ class PolicyEngine:
 
         self.denied_roles: Set[str] = {"password text", "alert"}
 
+        # GAP #3 FIX: "sudo" removed from high_risk_name_patterns.
+        # Sudo on its own is NOT high-risk; ``sudo apt-get install nodejs`` is
+        # a legitimate autonomous action.  The dangerous patterns that matter
+        # (sudo su, sudo -i, sudo -s shell escalation) are already blocked by
+        # the ExecutionPlanner's DANGEROUS_PATTERNS regex scan.
+        # Retaining "delete", "remove", "format", "erase" here so destructive
+        # operations that reach the policy engine still get human confirmation.
         self.high_risk_name_patterns = [
             re.compile(r"delete",  re.IGNORECASE),
             re.compile(r"remove",  re.IGNORECASE),
             re.compile(r"format",  re.IGNORECASE),
-            re.compile(r"sudo",    re.IGNORECASE),
             re.compile(r"erase",   re.IGNORECASE),
         ]
 
@@ -104,6 +192,31 @@ class PolicyEngine:
             "PolicyEngine initialised. Allowed apps: %d entries.",
             len(self._allowed_apps),
         )
+
+    # =========================================================================
+    # TRUSTED INSTALLER HELPER (GAP #3 FIX)
+    # =========================================================================
+
+    def _is_trusted_installer_command(self, command: str) -> bool:
+        """
+        Return True if *command* starts with a known safe installer prefix.
+
+        GAP #3 FIX: Pre-approved commands bypass the sudo/high-risk content
+        check so the agent can autonomously install packages without requiring
+        operator confirmation for each step.
+
+        Security gate: this method is only called after validate_action_dict()
+        has confirmed the action dict carries ``_trusted_installer=True``, which
+        is set by ExecutionPlanner only after its own 50+ dangerous-pattern
+        scan has cleared the command.  Two independent checks must both pass.
+        """
+        if not command:
+            return False
+        cmd_lower = command.strip().lower()
+        for prefix in self._TRUSTED_INSTALLER_PREFIXES:
+            if cmd_lower.startswith(prefix):
+                return True
+        return False
 
     # =========================================================================
     # DYNAMIC ALLOWLIST — BUG-C2 FIX
@@ -326,20 +439,48 @@ class PolicyEngine:
                 return self.DENY, reason
 
         # ---- High-risk content check ----
+        # GAP #3 FIX: Trusted installer commands bypass the high_risk_name_patterns
+        # check so sudo apt-get install / pip install / npm install etc. do not
+        # trigger REQUIRE_HUMAN_CONFIRMATION for every autonomous install step.
+        #
+        # The bypass is guarded by TWO conditions:
+        #   1. The action dict carries ``_trusted_installer=True`` (set by
+        #      ExecutionPlanner after its own 50+ dangerous-pattern scan passed).
+        #   2. The command starts with a known safe installer prefix (e.g.
+        #      "apt-get install", "pip install") checked by
+        #      _is_trusted_installer_command().
+        #
+        # Both conditions must hold — a missing flag or unknown prefix falls
+        # through to the normal high_risk_name_patterns scan below.
+        _trusted_flag: bool = bool(action.get("_trusted_installer", False))
         content_to_check = self._extract_risk_content(op, action)
+
         if content_to_check.strip():
-            for pat in self.high_risk_name_patterns:
-                if pat.search(content_to_check):
-                    reason = (
-                        f"High-risk content detected (pattern={pat.pattern!r}): "
-                        f"{content_to_check[:80]!r}"
-                    )
-                    _logger.warning(
-                        "[PolicyEngine] REQUIRE_HUMAN_CONFIRMATION: op=%r "
-                        "app=%r pattern=%r content=%r",
-                        op, app, pat.pattern, content_to_check[:120],
-                    )
-                    return self.REQUIRE_HUMAN_CONFIRMATION, reason
+            # Check if this is a pre-approved installer command
+            _bypass_high_risk = (
+                _trusted_flag
+                and op in ("command", "install")
+                and self._is_trusted_installer_command(content_to_check)
+            )
+            if _bypass_high_risk:
+                _logger.info(
+                    "[PolicyEngine] GAP-3 TRUSTED_INSTALLER bypass: op=%r "
+                    "command=%r — skipping high_risk_name_patterns scan.",
+                    op, content_to_check[:80],
+                )
+            else:
+                for pat in self.high_risk_name_patterns:
+                    if pat.search(content_to_check):
+                        reason = (
+                            f"High-risk content detected (pattern={pat.pattern!r}): "
+                            f"{content_to_check[:80]!r}"
+                        )
+                        _logger.warning(
+                            "[PolicyEngine] REQUIRE_HUMAN_CONFIRMATION: op=%r "
+                            "app=%r pattern=%r content=%r",
+                            op, app, pat.pattern, content_to_check[:120],
+                        )
+                        return self.REQUIRE_HUMAN_CONFIRMATION, reason
 
         # ---- Unknown operation — DENY to fail closed ----
         if op not in self._OP_TO_SYNTHETIC_ROLE:
