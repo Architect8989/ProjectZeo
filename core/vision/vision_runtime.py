@@ -42,46 +42,18 @@ MAX_FRAME_BYTES = 4 * 1024 * 1024
 MAX_ELEMENTS = 128
 MAX_CONSECUTIVE_FAILURES = 5
 
-# BUG-4 FIX: CAPTURE_INTERVAL_SECONDS was 0.5s but CPU inference takes 40-90s.
-# The old loop did: inference(45s blocking) → sleep(0.5s) → repeat.
-# World graph updated every ~45s, never every 0.5s as documented.
-# During multi-step tasks, the planner saw state that was minutes stale.
-#
-# Fix: CAPTURE_INTERVAL_SECONDS is now the *minimum* sleep between frames only
-# when inference is fast. We track actual inference duration and apply
-# frame-skip logic: if inference took longer than CAPTURE_INTERVAL_SECONDS,
-# skip the sleep entirely (the inference itself was the delay).
-# This means on CPU: we capture as fast as possible without wasting
-# an extra 0.5s sleep on top of a 45s inference.
-# On GPU: we still sleep 0.5s between fast 1-2s inferences (5 Hz target).
+
 CAPTURE_INTERVAL_SECONDS = 0.5
 
-# BUG-4 FIX: If inference takes longer than this multiplier × CAPTURE_INTERVAL,
-# skip the post-inference sleep (the inference already introduced enough delay).
+
 FRAME_SKIP_THRESHOLD_MULTIPLIER = 5.0  # skip sleep if inference > 2.5s
 
-# BUG-3 FIX: Shared inference lock so VisionRuntime background loop and
-# QwenOllamaAdapter (action execution) cannot call the same Ollama model
-# concurrently. On VRAM-limited GPUs this causes OOM; on CPU it doubles
-# already-slow inference time. Both callers acquire this lock before calling
-# the model. The lock is module-level so it is shared across all instances.
+
 INFERENCE_LOCK = threading.Lock()
 
 
 def get_inference_lock() -> threading.Lock:
-    """
-    BUG-3 FIX: Public accessor for the module-level INFERENCE_LOCK.
-
-    QwenOllamaAdapter imports and acquires this lock before calling
-    ollama.Client.chat() so that the background VisionRuntime loop and
-    the synchronous action-decision path never call the same Ollama vision
-    model concurrently.
-
-    Usage in qwen_ollama_adapter.py:
-        from core.vision.vision_runtime import get_inference_lock
-        with get_inference_lock():
-            response = self._client.chat(...)
-    """
+    
     return INFERENCE_LOCK
 
 
@@ -152,20 +124,7 @@ class VisionRuntime:
                     "No display environment detected (headless mode unsupported)"
                 )
 
-    # GAP-3 FIX: Detect multi-monitor setups and emit a startup warning.
-    # mss.monitors[0] is the full combined virtual desktop; mss.monitors[1] is
-    # the primary monitor.  If a user has two or more monitors and we capture
-    # monitors[0], normalized coordinates (0.0–1.0) span the FULL virtual
-    # desktop width.  pyautogui.click() however uses absolute pixel coordinates
-    # within the primary monitor's coordinate space.  This mismatch causes click
-    # targets to land at the wrong position on multi-monitor setups.
-    #
-    # Fix: capture mss.monitors[1] (primary only) so that 0.0–1.0 always maps
-    # to primary-monitor pixels, matching pyautogui's default coordinate space.
-    # If only one monitor is present, monitors[1] == monitors[0] — no change.
-    #
-    # _primary_monitor is set at init time and cached; if the user rearranges
-    # monitors mid-session, a restart is required (acceptable; same as Xrandr).
+    
     def _check_multi_monitor(self) -> None:
         """GAP-3 FIX: Detect multi-monitor setup and select primary monitor."""
         try:
@@ -207,9 +166,13 @@ class VisionRuntime:
             self._thread.start()
 
     def stop(self) -> None:
-        
         with self._lock:
             self._running = False
+            # LOW-6 FIX: Release the raw image from memory when the runtime
+            # stops. _last_raw_image is a PIL Image that can be 5-20 MB on
+            # high-resolution displays. Without this, it persists in memory
+            # indefinitely when VisionRuntime is paused between tasks.
+            self._last_raw_image = None
 
         if self._thread:
             self._thread.join(timeout=3.0)
@@ -225,29 +188,11 @@ class VisionRuntime:
         with self._lock:
             return copy.deepcopy(self._last_output)
 
-    # BUG-8 FIX: Expose the latest captured frame as a JPEG base64 string so
-    # QwenOllamaAdapter can reuse it instead of capturing the screen a second
-    # time independently.  Two separate mss/PIL grabs separated by hundreds of
-    # milliseconds create a race condition where the world graph and the action
-    # decision see different screen states.
-    #
-    # max_age_seconds: if the stored frame is older than this, return None so
-    # the caller falls back to its own capture (avoids serving a very stale frame
-    # when the background loop is paused or running slowly on CPU).
+    
     def get_latest_frame_jpeg_b64(
         self, max_age_seconds: float = 5.0
     ) -> Optional[str]:
-        """
-        BUG-8 FIX: Return the most recent captured frame as a base64 JPEG string.
-
-        Returns None when:
-          - No frame has been captured yet.
-          - The most recent frame is older than max_age_seconds (stale on CPU).
-          - Encoding fails for any reason.
-
-        Callers (QwenOllamaAdapter) should fall back to an independent capture
-        when this returns None.
-        """
+        
         with self._lock:
             frame_ts = self._last_frame_ts
             raw_image = self._last_raw_image  # type: ignore[attr-defined]
@@ -292,8 +237,7 @@ class VisionRuntime:
                         self._consecutive_failures += 1
                         if self._consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
                             self._healthy = False
-                        # Do not update last_output with stale data.
-                        # BUG-4 FIX: Skip sleep if inference already took long enough.
+                        
                         _skip_threshold = CAPTURE_INTERVAL_SECONDS * FRAME_SKIP_THRESHOLD_MULTIPLIER
                         if _inference_elapsed < _skip_threshold:
                             time.sleep(CAPTURE_INTERVAL_SECONDS)
@@ -319,9 +263,7 @@ class VisionRuntime:
                     if self._consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
                         self._healthy = False
 
-            # BUG-4 FIX: Frame-skip sleep — only sleep if inference was faster
-            # than the skip threshold. On CPU (45s+ inference), skip the extra
-            # 0.5s sleep entirely; on GPU (sub-1s inference), sleep normally.
+            
             _skip_threshold = CAPTURE_INTERVAL_SECONDS * FRAME_SKIP_THRESHOLD_MULTIPLIER
             _inference_elapsed = time.monotonic() - _inference_start
             if _inference_elapsed < _skip_threshold:
@@ -363,14 +305,7 @@ class VisionRuntime:
     # ==================================================
 
     def _capture_frame(self) -> Image.Image:
-        # GAP-3 FIX: Use mss.monitors[1] (PRIMARY monitor) instead of
-        # mss.monitors[0] (full virtual desktop).  On multi-monitor setups,
-        # monitors[0] spans all screens, making normalised coordinates
-        # 0.0–1.0 cover the ENTIRE virtual desktop width.  pyautogui clicks
-        # use primary-monitor pixel space, so click targets on multi-monitor
-        # setups land at wrong positions when using the combined desktop frame.
-        # monitors[1] is identical to monitors[0] on single-monitor setups.
-        # PRIMARY: mss — works on X11/Wayland/Windows/Mac without scrot
+        
         try:
             import mss as _mss
             with _mss.mss() as sct:
@@ -446,30 +381,33 @@ class VisionRuntime:
             "No explanation. No markdown."
         )
 
-        # BUG-3 FIX: Acquire the module-level INFERENCE_LOCK before calling Ollama.
-        # QwenOllamaAdapter also acquires this lock via get_inference_lock() before
-        # its own client.chat() call. This prevents both from calling the same
-        # vision model simultaneously (GPU OOM / CPU timeout cascade).
-        # The lock is non-reentrant; if this thread already holds it, we deadlock —
-        # but _call_model is only ever called from _loop (background thread) or
-        # _call_model_with_timeout (executor thread), never recursively.
+        
+        _lock_timeout = max(10.0, MODEL_CALL_TIMEOUT_SECONDS - 10.0)
+        _lock_acquired = INFERENCE_LOCK.acquire(timeout=_lock_timeout)
+        if not _lock_acquired:
+            raise VisionUnavailableError(
+                f"VisionRuntime._call_model(): could not acquire INFERENCE_LOCK "
+                f"within {_lock_timeout:.0f}s — QwenOllamaAdapter likely holds the "
+                "lock for an action-decision call. Aborting to free the executor thread."
+            )
         try:
-            with INFERENCE_LOCK:
-                response = self._ollama_client.chat(
-                    model=self._model_name,
-                    messages=[
-                        {
-                            "role": "user",
-                            "content": prompt,
-                            "images": [image_b64],
-                        }
-                    ],
-                    options={"temperature": 0},
-                )
+            response = self._ollama_client.chat(
+                model=self._model_name,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": prompt,
+                        "images": [image_b64],
+                    }
+                ],
+                options={"temperature": 0},
+            )
         except Exception as e:
             raise VisionUnavailableError(
                 f"Vision model call failed: {e}"
             )
+        finally:
+            INFERENCE_LOCK.release()
 
         # FIX-3: Use compatibility shim.
         content = _extract_vision_content(response)
