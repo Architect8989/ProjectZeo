@@ -184,6 +184,13 @@ class VisionRuntime:
         with self._lock:
             return self._healthy
 
+    def reset_health(self) -> None:
+        
+        with self._lock:
+            if self._thread is not None and self._thread.is_alive():
+                self._consecutive_failures = 0
+                self._healthy = True
+
     def get_latest(self) -> Optional[Dict[str, Any]]:
         with self._lock:
             return copy.deepcopy(self._last_output)
@@ -274,9 +281,7 @@ class VisionRuntime:
                     if self._consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
                         self._healthy = False
 
-            # BUG-4 FIX: Frame-skip sleep — only sleep if inference was faster
-            # than the skip threshold. On CPU (45s+ inference), skip the extra
-            # 0.5s sleep entirely; on GPU (sub-1s inference), sleep normally.
+            
             _skip_threshold = CAPTURE_INTERVAL_SECONDS * FRAME_SKIP_THRESHOLD_MULTIPLIER
             _inference_elapsed = time.monotonic() - _inference_start
             if _inference_elapsed < _skip_threshold:
@@ -381,17 +386,22 @@ class VisionRuntime:
 
     def _call_model(self, image_b64: str) -> Dict[str, Any]:
 
+        
         prompt = (
-            "Return ONLY valid JSON in this schema:\n"
-            "{\n"
-            '  "elements": [{ "type": string, "text": string, '
-            '"x": 0.0-1.0, "y": 0.0-1.0, '
-            '"state": string|null }],\n'
-            '  "dialogs": [],\n'
-            '  "apps": [],\n'
-            '  "focused_app": string|null\n'
-            "}\n"
-            "No explanation. No markdown."
+            "You are a screen-parsing assistant. Analyze this screenshot.\n"
+            "OUTPUT RULES:\n"
+            "  - Return ONLY raw JSON. NO markdown fences. NO backticks. NO explanation.\n"
+            "  - Limit elements to the TOP 10 most interactive UI items visible.\n"
+            "  - Coordinates x,y are 0.0=left/top to 1.0=right/bottom of the PRIMARY monitor.\n"
+            "  - focused_app is the OS process name (e.g. firefox, code, gnome-terminal).\n"
+            "  - If the screen is empty, return the minimal valid object below.\n\n"
+            "REQUIRED OUTPUT SCHEMA (copy structure exactly, fill values):\n"
+            '{"elements":[{"type":"button","text":"OK","x":0.5,"y":0.5,"state":null}],'
+            '"dialogs":[],"apps":[],"focused_app":"firefox"}\n\n'
+            "Valid element types: button link input checkbox select textarea "
+            "slider tab menu menuitem switch combobox label text image other\n"
+            "Valid states: enabled disabled checked unchecked focused null\n"
+            "Identify focused_app from the active window titlebar or taskbar."
         )
 
         
@@ -413,7 +423,11 @@ class VisionRuntime:
                         "images": [image_b64],
                     }
                 ],
-                options={"temperature": 0},
+                options={
+                "temperature": 0,
+                
+                "num_predict": 2048,
+            },
             )
         except Exception as e:
             raise VisionUnavailableError(
