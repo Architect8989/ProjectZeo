@@ -45,12 +45,23 @@ class ArmedTimeoutError(ModeTransitionError):
 class ModeController:
 
     MAX_TRANSITION_HISTORY = 1000  # H-4 FIX: reduced from 2000; bounded deque provides LRU eviction
-    MAX_PLANNING_SECONDS = 180.0
+
+    
+    _DEFAULT_MAX_PLANNING_SECONDS: float = max(
+        _LLM_CALL_TIMEOUT_SECONDS * 5,
+        720.0,
+    )
+    MAX_PLANNING_SECONDS: float = float(
+        os.environ.get("PROJECTZEO_MAX_PLANNING_SECONDS", "0").strip()
+        or _DEFAULT_MAX_PLANNING_SECONDS
+    )
+    if MAX_PLANNING_SECONDS <= 0.0:
+        # 0 or negative → use computed default (env var set to "0" means "use default")
+        MAX_PLANNING_SECONDS = _DEFAULT_MAX_PLANNING_SECONDS
+
     MAX_PLAN_ID_LENGTH = 128
 
-    # §R8 / SI-7 FIX: ARMED mode timeout derived from config at class definition
-    # time so it stays aligned when LLM_CALL_TIMEOUT_SECONDS is tuned.
-    # Formula: LLM_CALL_TIMEOUT_SECONDS + 60s safety margin.
+    
     MAX_ARMED_SECONDS: float = _LLM_CALL_TIMEOUT_SECONDS + 60.0
 
     _MODULE_ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -87,20 +98,7 @@ class ModeController:
             maxlen=self.MAX_TRANSITION_HISTORY
         )
 
-        # FIX SI-1 / RB-A1: Guard the log directory creation against read-only
-        # filesystems (containers, NFS mounts, CI environments).
-        #
-        # Previous code: self.TRANSITION_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        # This raised PermissionError unconditionally on any filesystem where the
-        # process does not have write permission to create <project_root>/logs/.
-        # The exception propagated out of __init__, crashing the process before
-        # any task could ever start — observer_loop, vision_runtime, and
-        # intent_listener were never reached.
-        #
-        # Fix: wrap mkdir in try/except. On failure, set _transition_log_available=False
-        # so _commit_transition() skips all file I/O gracefully. In-memory
-        # _transition_history still accumulates entries for forensic inspection
-        # within the session. Operational correctness is unaffected.
+        
         self._transition_log_available: bool = True
         try:
             self.TRANSITION_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -235,21 +233,7 @@ class ModeController:
     # ==================================================
 
     def arm(self, intent: str) -> None:
-        # FIX-M1 (RB-1 / SI-1): The _replan_in_progress guard was REMOVED from
-        # arm(). Previously, begin_replan_sequence() set _replan_in_progress=True
-        # and then the replan path called arm(), which immediately raised
-        # ModeTransitionError("Replan in progress"). The flag was only cleared in
-        # a finally block AFTER the exception propagated — meaning every replan
-        # attempt triggered a shutdown. MAX_REPLANS=3 was unreachable dead code.
-        #
-        # The concurrent-replan guard is still correctly enforced by
-        # begin_replan_sequence(): if _replan_in_progress is already True it
-        # raises ModeTransitionError("Replan already in progress"). arm() itself
-        # does NOT need to reject the replan path — it must be callable from it.
-        #
-        # Use arm_for_replan() when called from an active replan sequence (it
-        # bypasses the OBSERVER mode requirement since the mode controller will
-        # have been reset to OBSERVER by force_observer() before arm() is needed).
+        
         with self._lock:
             if self._mode is not SystemMode.OBSERVER:
                 raise ModeTransitionError("Cannot arm unless OBSERVER")
@@ -270,23 +254,7 @@ class ModeController:
             self._commit_transition(SystemMode.ARMED, "intent armed", False)
 
     def arm_for_replan(self, intent: str) -> None:
-        """
-        FIX-M1: Arm the system during an active replan sequence.
-
-        Identical to arm() but does NOT require _replan_in_progress=False.
-        Called exclusively from the replan path in main.py after
-        begin_replan_sequence() has set _replan_in_progress=True and
-        force_observer() has reset the mode to OBSERVER.
-
-        Why a separate method rather than modifying arm():
-        - arm() is the normal arming path; it must fail-closed for all other
-          callers.
-        - arm_for_replan() is the replanning arming path; it is explicitly
-          permitted to run while _replan_in_progress=True.
-        - Keeping them separate makes the call site in main.py self-documenting
-          and avoids adding a boolean 'bypass' parameter to arm() which would be
-          invisible at call sites.
-        """
+        
         with self._lock:
             # Replan can only arm from OBSERVER (set by force_observer() earlier
             # in the replan sequence).
@@ -299,16 +267,7 @@ class ModeController:
             if not intent or not intent.strip():
                 raise ModeTransitionError("Intent must be non-empty")
 
-            # HARDEN-MC: Verify that a snapshot was attached between force_observer()
-            # and arm_for_replan(). In the replan sequence (main.py), the sequence is:
-            #   1. force_observer()         — clears _snapshot_id to None
-            #   2. attach_snapshot(new_id)  — sets _snapshot_id
-            #   3. arm_for_replan(intent)   — must find _snapshot_id set
-            #
-            # If step 2 was skipped (snapshot_provider.take_snapshot() failed and
-            # the caller forgot to attach the prior snapshot_id as fallback), this
-            # guard surfaces the error explicitly rather than allowing the system
-            # to arm into EXECUTING mode with no restoration target.
+            
             if not self._snapshot_id:
                 raise ModeTransitionError(
                     "arm_for_replan requires a snapshot to be attached first. "
@@ -504,17 +463,11 @@ class ModeController:
 
         self._transition_history.append(entry)
 
-        # FIX SI-1 / RB-A1: Skip all file I/O when the log directory could not
-        # be created at startup (read-only filesystem). The in-memory history
-        # above still accumulates entries; only the durable JSONL log is absent.
+        
         if not self._transition_log_available:
             return
 
-        # FIX F-03 / RB-08: Always close the file descriptor in a finally block.
-        # Previously, if os.write() or os.fsync() raised (e.g. disk full), the
-        # fd was never closed, leaking a file descriptor on every transition.
-        # Under adversarial disk-full conditions this would exhaust the system fd
-        # limit, silently breaking all further transition logging.
+        
         fd = None
         dir_fd = None
         try:
