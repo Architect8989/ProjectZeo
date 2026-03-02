@@ -43,9 +43,7 @@ except ImportError:
     _PYAUTOGUI_AVAILABLE: bool = False
 
 
-# ------------------------------------------------------------------
-# CONSTANTS
-# ------------------------------------------------------------------
+
 
 MAX_PERCEPTION_ENTITIES = 20
 MAX_PERCEPTION_JSON_BYTES = 10_000
@@ -157,8 +155,7 @@ def operate_main(
 ) -> None:
     
    
-    _CONFIRM_TIMEOUT_LOGGED[0] = False  # reset for this task session
-
+    
     if not _CONFIRM_TIMEOUT_LOGGED[0]:
         _CONFIRM_TIMEOUT_LOGGED[0] = True
         print(
@@ -199,9 +196,7 @@ def operate_main(
             if isinstance(_allowed, list):
                 policy_engine = PolicyEngine(allowed_apps=set(_allowed))
     except ImportError:
-        # FIX RB-3: Log the missing dependency explicitly rather than silently
-        # ignoring the failure.  Operators must know the policy file was not
-        # loaded so they can install pyyaml or accept the default allowlist.
+        
         print(
             "[operate_main] WARNING: pyyaml is not installed — policy.yaml was not loaded. "
             "PolicyEngine is running with the built-in default application allowlist. "
@@ -337,7 +332,7 @@ def operate_main(
             "or have a callable _llm_call attribute."
         )
 
-    # AutonomousInstaller — wired when observer is available
+    
     installer: Optional[AutonomousInstaller] = None
     if observer is not None:
         _shared_client = getattr(planner, "_ollama_client", None)
@@ -346,6 +341,7 @@ def operate_main(
             os_backend=os_backend,
             llm_callable=llm_callable,
             shared_ollama_client=_shared_client,
+            policy_engine=policy_engine,
         )
 
     
@@ -387,9 +383,7 @@ def operate_main(
             prior_step_index=prior_step_index,
             created_files_ledger=_created_files_ledger,
         )
-        # H2 FIX: Save playbook on successful task completion.
-        # Collect actions from the journal (executed steps) and persist them
-        # so future tasks with identical intent can warm-start from this run.
+        
         try:
             _journal_actions = journal.get_all() if hasattr(journal, "get_all") else []
             if _journal_actions:
@@ -485,13 +479,11 @@ def _execute_autonomous_loop(
     else:
         belief = BeliefState(intent_hash=terminal_prompt)
 
-    # MATH-NEW-01: set_plan_horizon() called fresh per operate_main() invocation
-    # so each replan re-tunes regret decay to the new plan's step count
+    
     _plan_real_steps = max(len(execution_plan.steps) - 1, 1)
     belief.set_plan_horizon(_plan_real_steps)
 
-    # MATH-NEW-02: Tune ActionRanker saturation to the plan horizon so that
-    # short plans don't remain exploration-heavy for their entire execution
+    
     action_ranker = ActionRanker()
     action_ranker.set_plan_horizon(_plan_real_steps)
 
@@ -587,11 +579,7 @@ def _execute_autonomous_loop(
                         step_log = execution_log.get(current_step_index)
                         if step_log:
                             perception_snapshot = dict(perception_snapshot)
-                            # MED-1 FIX: execution_log entries are dicts
-                            # {"outputs": [...], "last_output": str}.  Passing
-                            # the whole dict into perception_snapshot bloated
-                            # the LLM prompt with a nested object instead of a
-                            # plain string.  Extract last_output only.
+                            
                             perception_snapshot["last_command_output"] = step_log.get(
                                 "last_output", ""
                             )
@@ -599,15 +587,11 @@ def _execute_autonomous_loop(
                 except Exception:
                     log_warn("Observer snapshot failed")
 
-            # P1 RT-C FIX: Try/except wraps the full per-iteration execution body so
-            # transient LLM/screenshot/network failures become stagnation increments
-            # rather than unhandled RuntimeErrors that terminate the process.
+            
             try:
                 world_snapshot = world_graph.snapshot() if world_graph else {}
 
-                # ------------------------------------------------------------------
-                # World-graph delta & belief update
-                # ------------------------------------------------------------------
+                
                 delta = None
                 if previous_snapshot and world_graph:
                     try:
@@ -706,8 +690,7 @@ def _execute_autonomous_loop(
                             k=MAX_DYNAMIC_CANDIDATES,
                         )
                         if dynamic_candidates:
-                            # IH-4: Filter out candidates already tried to prevent
-                            # infinite UCB exploration of perpetually-novel candidates.
+                            
                             fresh_candidates = [
                                 c for c in dynamic_candidates
                                 if action_ranker.action_key(c) not in _visited_action_keys
@@ -739,15 +722,17 @@ def _execute_autonomous_loop(
                 )
                 action_key = action_ranker.action_key(selected_action)
 
+                
+                _policy_decision: str = PolicyEngine.DENY
+                _policy_reason: str = "not_evaluated"
+
                 # IH-4: Record action key as visited. Evict oldest when full.
                 if len(_visited_action_keys) >= _VISITED_ACTION_MAX:
                     _oldest = next(iter(_visited_action_keys))
                     del _visited_action_keys[_oldest]
                 _visited_action_keys[action_key] = True
 
-                # ------------------------------------------------------------------
-                # Policy gate
-                # ------------------------------------------------------------------
+                
                 _focused_app_for_policy = (
                     world_snapshot.get("focused_app", "__unknown_app__")
                     if isinstance(world_snapshot, dict)
@@ -760,9 +745,7 @@ def _execute_autonomous_loop(
 
                 if _policy_decision == PolicyEngine.DENY:
                     belief.record_action(action_key, -0.5)
-                    # RT-05 / SI-04 FIX: Cap best_reward at 0.9 to prevent DONE
-                    # sentinel (reward=1.0) from permanently inflating the regret
-                    # reference for all subsequent actions.
+                    
                     best_reward = min(belief.global_best_reward() or 0.0, 0.9)
                     belief.update_regret(action_key, -0.5, best_reward)
                     journal.record({
@@ -822,6 +805,37 @@ def _execute_autonomous_loop(
                     f"  Approve: delete the file → {_signal_path}",
                     file=sys.stderr,
                 )
+                # GAP-3 FIX: Send desktop notification so the operator sees the
+                # approval request even when not watching stderr.
+                try:
+                    import subprocess as _sp
+                    _notif_body = (
+                        f"Action: {selected_action.get('operation')}\n"
+                        f"Reason: {_policy_reason}\n"
+                        f"Delete to approve: {_signal_path}"
+                    )
+                    if _sp.run(["which", "notify-send"], capture_output=True).returncode == 0:
+                        _sp.run(
+                            [
+                                "notify-send",
+                                "--urgency=critical",
+                                "--expire-time=30000",
+                                "ProjectZeo: Human Approval Required",
+                                _notif_body,
+                            ],
+                            timeout=5,
+                            capture_output=True,
+                        )
+                    elif _sp.run(["which", "osascript"], capture_output=True).returncode == 0:
+                        # macOS
+                        _sp.run(
+                            ["osascript", "-e",
+                             f'display notification "{_notif_body}" with title "ProjectZeo Approval"'],
+                            timeout=5,
+                            capture_output=True,
+                        )
+                except Exception:
+                    pass  # Notification failure is never fatal
 
                 _phc_wait = 0
                 _phc_approved = False
@@ -845,9 +859,7 @@ def _execute_autonomous_loop(
                         "waited_seconds": _phc_wait * WAIT_RETRY_SECONDS,
                     })
                     belief.record_action(action_key, -0.3)
-                    # RT-05 / SI-04 FIX: Cap best_reward at 0.9 to prevent DONE
-                    # sentinel (reward=1.0) from permanently inflating the regret
-                    # reference for all subsequent actions.
+                    
                     best_reward = min(belief.global_best_reward() or 0.0, 0.9)
                     belief.update_regret(action_key, -0.3, best_reward)
                     stagnant_iterations += 1
@@ -1276,9 +1288,7 @@ def _execute_decision(
             success = (result.returncode == 0)
             reward = 0.8 if success else -0.5
             output = (result.stdout or "") + (result.stderr or "")
-            # FIX RT-B1: Include returncode so StepVerifier._verify_command()
-            # can extract it.  Previously the key was absent, making every
-            # COMMAND_EXECUTION step fail verification unconditionally.
+            
             return {
                 "success": success,
                 "reward": reward,
@@ -1295,10 +1305,7 @@ def _execute_decision(
             if not path:
                 return {"success": False, "reward": -0.5, "reason": "file_create: no path"}
             os_backend.write_file(path, content_str)
-            # GAP-2 FIX: Record in the per-task filesystem ledger so that
-            # replanning context includes already_created_files. This prevents
-            # the LLM from re-creating files that already exist (duplicates,
-            # overwrites, directory re-creation) after a mid-task replan.
+            
             _ledger = action.get("_created_files_ledger")
             if isinstance(_ledger, list):
                 if path not in _ledger:
