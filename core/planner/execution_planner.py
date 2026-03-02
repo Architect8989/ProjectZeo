@@ -326,17 +326,7 @@ class ExecutionPlanner:
             self._environment = new_fingerprint
 
     def set_created_files_ledger(self, ledger: List[str]) -> None:
-        """
-        GAP-2 FIX: Inject the filesystem rollback ledger from a prior execution
-        attempt so _expand_goal() can inject already_created_files into the
-        planning prompt on replan. Called from main.py's replan sequence after
-        extracting the ledger from prior_belief_state["_created_files_ledger"].
-
-        Example call (in main.py replan sequence):
-            _prior_ledger = _prior_belief_state.get("_created_files_ledger", [])
-            if _prior_ledger:
-                planner.set_created_files_ledger(_prior_ledger)
-        """
+        
         if isinstance(ledger, list):
             self._created_files_ledger = [str(p) for p in ledger if p]
 
@@ -438,7 +428,8 @@ class ExecutionPlanner:
                     import ollama
                     import httpx
 
-                    _model = self._model_name
+                    
+                    _model = self._text_model_name
                     client = self._ollama_client
                     if client is None:
                         raise RuntimeError("Ollama client unavailable")
@@ -615,11 +606,7 @@ class ExecutionPlanner:
                     f"_call_llm_text failed after {max_retries + 1} attempts: {exc}"
                 ) from exc
 
-        # BUG-17 FIX: The original code had an unreachable `raise` here because
-        # the for loop always either returns (success) or raises inside (on last
-        # attempt). The dead raise caused confusion during debugging (suggesting
-        # a third exit path that does not exist). Replaced with a defensive
-        # assertion that documents the invariant instead.
+        
         raise PlanningError(
             f"_call_llm_text: control reached post-loop (should be unreachable). "
             f"last_exc={_last_exc!r}"
@@ -639,17 +626,7 @@ class ExecutionPlanner:
         env_block = "\n".join(env_lines) if env_lines else "  (unavailable)"
 
         screen_block = ""
-        # BUG-7 FIX: Capture an actual screenshot and send it to the planning LLM
-        # when the goal involves UI interaction. Previously only text entity labels
-        # were included (blind planning). For tasks like "design a website like this
-        # YouTube video", the planner never saw the screen — it got only entity
-        # text labels, missing all visual layout and design context.
-        #
-        # Fix: if include_screen_context, attempt to capture the current screen
-        # as base64 JPEG and include it in the planning prompt using the same
-        # image format that QwenOllamaAdapter uses ({"images": [b64_str]}).
-        # If screenshot capture fails, fall back to text-only entity labels
-        # (degraded but functional, matching the original behaviour).
+        
         _screenshot_b64: Optional[str] = None
         if include_screen_context:
             try:
@@ -711,12 +688,7 @@ class ExecutionPlanner:
             "No prose. No markdown. No extra keys."
         )
 
-        # GAP-2 FIX: Inject already_created_files into the planning prompt.
-        # On replan, operate_main() passes the filesystem ledger via the
-        # belief_state prior_belief_state["_created_files_ledger"]. The planner
-        # reads this through refresh_environment() → _expand_goal() injection.
-        # This prevents the LLM from re-creating files that already exist,
-        # which causes PermissionError, duplicate content, or overwritten work.
+        
         _existing_files = getattr(self, "_created_files_ledger", None)
         if _existing_files:
             _files_block = "\n".join(f"  - {p}" for p in _existing_files[:50])
@@ -726,9 +698,7 @@ class ExecutionPlanner:
                 + _files_block
             )
 
-        # BUG-7 FIX: If we have a screenshot, include it as an image in the
-        # planning call. This requires calling the vision model (Qwen2.5-VL)
-        # directly with the image, rather than the text-only client.chat() path.
+        
         if _screenshot_b64 is not None and self._ollama_client is not None:
             try:
                 response = self._ollama_client.chat(
