@@ -707,6 +707,11 @@ def main(llm_callable: Callable, model_name: str) -> None:
                                 )
                                 mode.mark_planning_complete()
                                 
+                                # BUG-S3 FIX: Same vision health reset as initial planning path.
+                                try:
+                                    vision_runtime.reset_health()
+                                except AttributeError:
+                                    pass
                                 mode.update_vision_status(vision_runtime.is_healthy())
                                 mode.update_observer_health(observer.is_healthy())
                                 mode.execute()
