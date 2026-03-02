@@ -52,15 +52,50 @@ config = Config()
 _OCR_READER = None
 _OCR_LOCK = threading.Lock()
 
-
 _OCR_WARMUP_TIMEOUT_SECONDS: int = int(
     os.environ.get("PROJECTZEO_OCR_WARMUP_TIMEOUT_SECONDS", "300")
 )
 
-
-_OCR_UNAVAILABLE_EVENT = threading.Event()    # H-02 FIX: was `_OCR_UNAVAILABLE = False`
+_OCR_UNAVAILABLE_EVENT = threading.Event()
 _OCR_LAST_FAILURE_TS: float = 0.0
 _OCR_RETRY_COOLDOWN_SECONDS = 300.0
+
+
+def _ocr_prewarm_background() -> None:
+    """Background thread: initialise EasyOCR so it is ready before first click."""
+    if os.environ.get("PROJECTZEO_OCR_PREWARM", "1").strip() == "0":
+        return
+    try:
+        import easyocr as _easyocr_check  # noqa: F401
+    except ImportError:
+        return  # easyocr not installed — skip pre-warm silently
+    try:
+        print(
+            "[QwenOllamaAdapter] BUG-S2: Pre-warming EasyOCR in background "
+            "(first-time may take 5-10 min on CPU to download ~500 MB weights)...",
+            file=sys.stderr,
+            flush=True,
+        )
+        _get_ocr_reader()
+        print(
+            "[QwenOllamaAdapter] BUG-S2: EasyOCR pre-warm complete — ready for label clicks.",
+            file=sys.stderr,
+            flush=True,
+        )
+    except Exception as _prewarm_err:
+        print(
+            f"[QwenOllamaAdapter] BUG-S2: EasyOCR pre-warm failed: {_prewarm_err}. "
+            "Coordinate-only mode will be used.",
+            file=sys.stderr,
+            flush=True,
+        )
+
+_OCR_PREWARM_THREAD = threading.Thread(
+    target=_ocr_prewarm_background,
+    name="ocr-prewarm",
+    daemon=True,
+)
+_OCR_PREWARM_THREAD.start()
 
 
 def _get_ocr_reader():
@@ -173,15 +208,7 @@ def _extract_response_content(response: Any) -> str:
 # ==========================================================
 
 def _build_text_summary_of_message(msg: dict) -> Optional[dict]:
-    """
-    Convert an older message that may contain image data into a text-only
-    summary suitable for inclusion in the multi-turn history sent to Ollama.
-
-    Images from older turns are dropped to keep the context window bounded.
-    The current turn always carries the live screenshot.
-
-    Returns None if the message should be skipped entirely.
-    """
+    
     role = msg.get("role")
     if role not in ("user", "assistant", "system"):
         return None
@@ -410,15 +437,7 @@ class QwenOllamaAdapter:
         operations: List[dict],
         screenshot_path: Optional[str],
     ) -> None:
-        """
-        Resolve text-based clicks to pixel coordinates via OCR.
-        Falls back to coordinate-only mode if EasyOCR is unavailable.
-        Clicks with neither text nor coordinates are dropped (fail-closed).
-
-        BUG-8 FIX: screenshot_path may be None when the shared VisionRuntime
-        frame was used (no temp JPEG was written to disk).  In that case, OCR
-        text resolution is unavailable and coordinate-only mode is used.
-        """
+        
         if screenshot_path is None:
             # No JPEG on disk — strip text-only clicks; keep coordinate clicks.
             filtered: List[dict] = []
@@ -433,10 +452,7 @@ class QwenOllamaAdapter:
                     op["y"] = float(y)
                     filtered.append(op)
                 else:
-                    # BUG-4 FIX: Explicit warning when text-only click is dropped.
-                    # Previously silent — stagnation counter incremented with no
-                    # log entry, making the root cause invisible in logs.
-                    # Now: operator sees exactly which label was unresolvable and why.
+                    
                     _label = op.get("text") or op.get("label") or "(no label)"
                     print(
                         f"[QwenOllamaAdapter] WARNING BUG-4: text-only click DROPPED "
@@ -460,7 +476,8 @@ class QwenOllamaAdapter:
         reader = _get_ocr_reader()
 
         if reader is None:
-            filtered: List[dict] = []
+            # BUG-S6 FIX: removed duplicate type annotation (shadowed first declaration)
+            filtered = []
             for op in operations:
                 if op.get("operation") != "click":
                     filtered.append(op)
