@@ -124,7 +124,7 @@ class VisionRuntime:
                     "No display environment detected (headless mode unsupported)"
                 )
 
-    
+   
     def _check_multi_monitor(self) -> None:
         """GAP-3 FIX: Detect multi-monitor setup and select primary monitor."""
         try:
@@ -192,7 +192,17 @@ class VisionRuntime:
     def get_latest_frame_jpeg_b64(
         self, max_age_seconds: float = 5.0
     ) -> Optional[str]:
-        
+        """
+        BUG-8 FIX: Return the most recent captured frame as a base64 JPEG string.
+
+        Returns None when:
+          - No frame has been captured yet.
+          - The most recent frame is older than max_age_seconds (stale on CPU).
+          - Encoding fails for any reason.
+
+        Callers (QwenOllamaAdapter) should fall back to an independent capture
+        when this returns None.
+        """
         with self._lock:
             frame_ts = self._last_frame_ts
             raw_image = self._last_raw_image  # type: ignore[attr-defined]
@@ -237,7 +247,8 @@ class VisionRuntime:
                         self._consecutive_failures += 1
                         if self._consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
                             self._healthy = False
-                        
+                        # Do not update last_output with stale data.
+                        # BUG-4 FIX: Skip sleep if inference already took long enough.
                         _skip_threshold = CAPTURE_INTERVAL_SECONDS * FRAME_SKIP_THRESHOLD_MULTIPLIER
                         if _inference_elapsed < _skip_threshold:
                             time.sleep(CAPTURE_INTERVAL_SECONDS)
@@ -263,7 +274,9 @@ class VisionRuntime:
                     if self._consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
                         self._healthy = False
 
-            
+            # BUG-4 FIX: Frame-skip sleep — only sleep if inference was faster
+            # than the skip threshold. On CPU (45s+ inference), skip the extra
+            # 0.5s sleep entirely; on GPU (sub-1s inference), sleep normally.
             _skip_threshold = CAPTURE_INTERVAL_SECONDS * FRAME_SKIP_THRESHOLD_MULTIPLIER
             _inference_elapsed = time.monotonic() - _inference_start
             if _inference_elapsed < _skip_threshold:
@@ -529,3 +542,4 @@ class VisionRuntime:
             )
 
         return parsed
+
