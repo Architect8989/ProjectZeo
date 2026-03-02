@@ -17,20 +17,10 @@ def _early_parse_args() -> bool:
 _allow_cloud_early = _early_parse_args()
 
 if not _allow_cloud_early:
-    # Default: Ollama-only. Set explicitly (don't rely on default in factory.py)
-    # so the freeze always sees "1" when --allow-cloud is absent.
+    
     os.environ["OLLAMA_ONLY"] = "1"
 else:
-    # Explicit --allow-cloud: set OLLAMA_ONLY="0" so factory.py freeze
-    # sees a falsy value and permits cloud routing.
-    #
-    # RB-NEW-02 FIX: The previous code used os.environ.pop("OLLAMA_ONLY", None).
-    # factory.py reads: os.environ.get("OLLAMA_ONLY", "1").strip().lower()
-    # When the key is absent, get() returns the default "1" (cloud-blocked),
-    # making --allow-cloud permanently non-functional (cloud always blocked).
-    #
-    # Fix: set "0" explicitly so the freeze captures the correct value and
-    # _OLLAMA_ONLY_ENFORCEMENT_FROZEN = True (cloud permitted).
+    
     os.environ["OLLAMA_ONLY"] = "0"
     # Warn early so operators see this even if something crashes during import.
     print(
@@ -39,9 +29,7 @@ else:
         file=sys.stderr,
     )
 
-# ===========================================================================
-# Imports — factory.py freeze now captures the correct OLLAMA_ONLY value.
-# ===========================================================================
+
 
 import asyncio
 import threading
@@ -57,21 +45,7 @@ from config.timeouts import LLM_THREAD_TIMEOUT_SECONDS
 # ---------------------------------------------------------------------------
 
 def _parse_args():
-    """
-    Full argument parser. Called after imports.
-
-    Recognised flags:
-        --allow-cloud   Permit cloud model routing (processed pre-import above).
-        --interactive   BUG-10 FIX: Print mode transitions to stdout and accept
-                        intents directly from stdin. Sets PROJECTZEO_INTERACTIVE=1.
-        --status        BUG-10 FIX: Print current system status and exit immediately.
-
-    Positional argument (required unless --status):
-        model_name      First non-flag argument is treated as the model name.
-                        Can also be supplied via LLM_MODEL env var.
-
-    Returns (model_name, allow_cloud, interactive, status_only)
-    """
+    
     args = sys.argv[1:]
     allow_cloud = "--allow-cloud" in args
     interactive = "--interactive" in args
@@ -202,13 +176,7 @@ def _run_coroutine_threadsafe(coro) -> Any:
 # ---------------------------------------------------------------------------
 
 def _make_llm_callable(adapter):
-    """
-    Wrap async adapter into a safe synchronous callable
-    compatible with ExecutionPlanner.
-
-    PATCH §R1: asyncio.get_running_loop() catch only re-routes on
-    the specific RuntimeError from no running loop. Genuine errors propagate.
-    """
+    
 
     if not hasattr(adapter, "get_next_action"):
         raise RuntimeError("Adapter missing get_next_action()")
@@ -264,28 +232,7 @@ def _make_llm_callable(adapter):
 # ---------------------------------------------------------------------------
 
 def _validate_runtime_dependencies(model_name: str) -> None:
-    """
-    Consolidated, authoritative pre-flight dependency check.
-
-    Called once in run.py before any project code is imported.
-    Exits with code 1 on FATAL issues. Prints WARNINGs and continues.
-
-    Checks (in order):
-      1.  Required directories (temp/, memory/, logs/)
-      2.  psutil                     (process watchdog — FATAL)
-      3.  pyautogui + display access (all UI actions — FATAL)
-      4.  pyautogui display check    (X11/Wayland reachable — FATAL)
-      5.  xdotool on Linux           (snapshot/window — FATAL)
-      6.  wmctrl on Linux            (window activation — WARNING)
-      7.  DISPLAY / WAYLAND_DISPLAY  (display server — FATAL)
-      8.  Wayland tooling            (ydotool/AT-SPI — WARNING)
-      9.  pyyaml                     (policy.yaml load — WARNING)
-      10. playwright + chromium      (browser DOM automation — WARNING)
-      11. EasyOCR                    (label-click resolution — WARNING)
-      12. Ollama daemon reachable    (LLM — FATAL)
-      13. Requested model pulled     (LLM — FATAL)
-      14. Text model availability    (planner performance — WARNING)
-    """
+    
     import shutil as _shutil
     import platform as _platform
 
@@ -362,9 +309,7 @@ def _validate_runtime_dependencies(model_name: str) -> None:
                 "    Fix: sudo apt-get install wmctrl"
             )
 
-        # DISPLAY / WAYLAND_DISPLAY — FATAL if both absent
-        # (pyautogui check above usually catches this, but guard for the
-        # pyautogui-not-installed path where _pya.size() was never called)
+        
         if not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY"):
             errors.append(
                 "  [NO DISPLAY] DISPLAY and WAYLAND_DISPLAY are both unset on Linux.\n"
@@ -535,6 +480,41 @@ def _validate_runtime_dependencies(model_name: str) -> None:
         print("", file=sys.stderr)
         sys.exit(1)
 
+    
+    if _ollama_ok:
+        try:
+            import ollama as _ollama_prewarm
+            print(
+                f"[STARTUP] GAP-10: Pre-warming Ollama model {model_name!r} "
+                "(first inference loads weights; may take 1-5 min on cold start)...",
+                file=sys.stderr,
+            )
+            _pw_client = _ollama_prewarm.Client()
+            _pw_response = _pw_client.chat(
+                model=model_name,
+                messages=[{"role": "user", "content": "Hello. Reply with one word."}],
+                options={"temperature": 0, "num_predict": 5},
+            )
+            _pw_content = ""
+            if hasattr(_pw_response, "message") and hasattr(_pw_response.message, "content"):
+                _pw_content = _pw_response.message.content[:40]
+            elif isinstance(_pw_response, dict):
+                _pw_content = (_pw_response.get("message") or {}).get("content", "")[:40]
+            print(
+                f"[STARTUP] GAP-10: Model pre-warm complete (response: {_pw_content!r}). "
+                "VisionRuntime will use warm-start inferences.",
+                file=sys.stderr,
+            )
+        except Exception as _pw_err:
+            # Non-fatal: warmup failures print a warning but do not block startup.
+            # The model may still load during VisionRuntime warmup — just slower.
+            print(
+                f"[STARTUP] GAP-10 WARNING: Model pre-warm failed: {_pw_err}. "
+                "VisionRuntime warmup may take longer than PROJECTZEO_WARMUP_TIMEOUT_SECONDS. "
+                f"Consider increasing: export PROJECTZEO_WARMUP_TIMEOUT_SECONDS=900",
+                file=sys.stderr,
+            )
+
 
 # ---------------------------------------------------------------------------
 # ENTRY POINT
@@ -552,8 +532,7 @@ if __name__ == "__main__":
     # Ollama calls see the operator-specified model.
     os.environ["LLM_MODEL"] = model_name
 
-    # BUG-10 FIX: --interactive mode — signal to main.py to print mode
-    # transitions to stdout and enable the interactive stdin prompt.
+    
     if interactive:
         os.environ["PROJECTZEO_INTERACTIVE"] = "1"
         print(
@@ -563,15 +542,10 @@ if __name__ == "__main__":
             flush=True,
         )
 
-    # FIX P0-1/P0-2/P0-3/P0-4: Validate all hard runtime dependencies before
-    # importing any project code that would crash on missing system tools.
+    
     _validate_runtime_dependencies(model_name)
 
-    # OLLAMA_ONLY was already set/cleared above before factory import.
-    # The factory freeze has already captured the correct value.
-    # Do NOT mutate os.environ["OLLAMA_ONLY"] again here — factory.py's
-    # module-level freeze is immutable; any mutation after import is silently
-    # ignored by the enforcement boundary.
+    
 
     adapter = build_llm(model_name)
     llm_callable = _make_llm_callable(adapter)
