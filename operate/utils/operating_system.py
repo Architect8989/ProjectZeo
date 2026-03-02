@@ -25,23 +25,6 @@ except ImportError:
     _INSTALL_TIMEOUT = 300
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# BUG-2 FIX: Wayland detection helpers
-#
-# On Ubuntu 22.04+ and 24.04, the default session is Wayland. xdotool is
-# X11-only and silently fails (exit code 1, empty output) on Wayland.
-# This causes get_focused_window() to return an empty string, which the
-# snapshot provider falls through to __bare_desktop__, making ALL snapshots
-# useless for restoration. wmctrl -a also fails on pure Wayland without
-# XWayland.
-#
-# Fix:
-#   1. _is_wayland() detects the session type from XDG_SESSION_TYPE.
-#   2. get_focused_window() on Linux: if Wayland, try AT-SPI2 / ydotool
-#      as alternatives before falling back gracefully.
-#   3. Operators are warned at first call so the issue is visible in logs.
-# ─────────────────────────────────────────────────────────────────────────────
-
 def _is_wayland() -> bool:
     """Return True if the current session is a Wayland session."""
     session_type = os.environ.get("XDG_SESSION_TYPE", "").lower()
@@ -54,18 +37,143 @@ def _is_wayland() -> bool:
     return False
 
 
+
+
+def _ydotool_available() -> bool:
+    """Return True if ydotool is on PATH and the ydotoold daemon appears running."""
+    import shutil
+    return bool(shutil.which("ydotool"))
+
+
+def _wayland_click(x_px: int, y_px: int) -> None:
+    """
+    MAJOR-1 FIX: Click at absolute pixel coordinates on Wayland using ydotool.
+    Falls back to xdotool (XWayland) if ydotool is unavailable.
+    Raises RuntimeError if neither backend succeeds.
+    """
+    if _ydotool_available():
+        result = subprocess.run(
+            ["ydotool", "mousemove", "--absolute", "-x", str(x_px), "-y", str(y_px)],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"ydotool mousemove failed (rc={result.returncode}): {result.stderr.strip()}"
+            )
+        result = subprocess.run(
+            ["ydotool", "click", "0xC0"],  # 0xC0 = left button down+up
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"ydotool click failed (rc={result.returncode}): {result.stderr.strip()}"
+            )
+        return
+
+    # xdotool via XWayland fallback
+    import shutil as _shutil
+    if _shutil.which("xdotool"):
+        result = subprocess.run(
+            ["xdotool", "mousemove", "--", str(x_px), str(y_px)],
+            capture_output=True, text=True, timeout=5,
+        )
+        result2 = subprocess.run(
+            ["xdotool", "click", "1"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result2.returncode == 0:
+            return
+
+    raise RuntimeError(
+        "Wayland click failed: neither ydotool nor xdotool (XWayland) succeeded. "
+        "Install ydotool: sudo apt-get install ydotool && sudo ydotoold &  "
+        "OR launch the agent from a GNOME-on-Xorg session (gear at login → Ubuntu on Xorg)."
+    )
+
+
+def _wayland_type(text: str) -> None:
+    """
+    MAJOR-1 FIX: Type text on Wayland using ydotool.
+    Falls back to xdotool (XWayland) if ydotool is unavailable.
+    """
+    if _ydotool_available():
+        result = subprocess.run(
+            ["ydotool", "type", "--", text],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode == 0:
+            return
+        raise RuntimeError(
+            f"ydotool type failed (rc={result.returncode}): {result.stderr.strip()}"
+        )
+
+    import shutil as _shutil
+    if _shutil.which("xdotool"):
+        result = subprocess.run(
+            ["xdotool", "type", "--", text],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode == 0:
+            return
+
+    raise RuntimeError(
+        "Wayland type failed: neither ydotool nor xdotool (XWayland) succeeded."
+    )
+
+
+# Map pyautogui key names → ydotool key names (X11 keysym subset)
+_YDOTOOL_KEY_MAP: Dict[str, str] = {
+    "enter": "Return", "return": "Return",
+    "tab": "Tab", "space": "space",
+    "backspace": "BackSpace", "delete": "Delete",
+    "escape": "Escape", "esc": "Escape",
+    "up": "Up", "down": "Down", "left": "Left", "right": "Right",
+    "home": "Home", "end": "End", "pageup": "Prior", "pagedown": "Next",
+    "f1": "F1", "f2": "F2", "f3": "F3", "f4": "F4", "f5": "F5",
+    "f6": "F6", "f7": "F7", "f8": "F8", "f9": "F9", "f10": "F10",
+    "f11": "F11", "f12": "F12",
+    "ctrl": "ctrl", "control": "ctrl",
+    "alt": "alt", "shift": "shift",
+    "cmd": "super", "command": "super", "win": "super",
+    "l": "l", "c": "c", "v": "v", "x": "x", "z": "z", "a": "a",
+    "t": "t", "w": "w", "r": "r", "n": "n", "s": "s", "q": "q",
+}
+
+
+def _wayland_hotkey(keys: list) -> None:
+    """
+    MAJOR-1 FIX: Send a hotkey combination on Wayland using ydotool.
+    Falls back to xdotool (XWayland) if ydotool is unavailable.
+    """
+    if _ydotool_available():
+        mapped = [_YDOTOOL_KEY_MAP.get(k.lower(), k) for k in keys]
+        combo = "+".join(mapped)
+        result = subprocess.run(
+            ["ydotool", "key", "--", combo],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0:
+            return
+        raise RuntimeError(
+            f"ydotool key failed (rc={result.returncode}): {result.stderr.strip()}"
+        )
+
+    import shutil as _shutil
+    if _shutil.which("xdotool"):
+        result = subprocess.run(
+            ["xdotool", "key", "--", "+".join(keys)],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0:
+            return
+
+    raise RuntimeError(
+        "Wayland hotkey failed: neither ydotool nor xdotool (XWayland) succeeded."
+    )
+
+
 def _get_focused_window_wayland() -> Dict[str, str]:
-    """
-    Best-effort focused window title on Wayland.
-
-    Attempts (in order):
-      1. ydotool getactivewindow (Wayland-native, requires ydotool daemon)
-      2. AT-SPI2 via pyatspi (accessibility bus — works on Wayland when enabled)
-      3. wmctrl -l (works on Wayland + XWayland if XWayland is running)
-      4. Falls back to __wayland_unknown__ sentinel
-
-    Returns {"title": <str>} consistent with X11 path.
-    """
+    
     import shutil
 
     # Attempt 1: ydotool (Wayland-native tool, requires ydotoold daemon)
@@ -125,13 +233,7 @@ class OperatingSystemUnavailableError(RuntimeError):
 
 
 def _require_pyautogui() -> object:
-    """
-    P0-1 FIX: Fail fast with a clear error when pyautogui is unavailable.
-
-    Call this at the top of every method that delegates to pyautogui.
-    Returns the pyautogui module on success. Raises OperatingSystemUnavailableError
-    on failure.
-    """
+   wh00
     if not _PYAUTOGUI_AVAILABLE:
         raise OperatingSystemUnavailableError(
             "pyautogui is not available. "
@@ -257,8 +359,20 @@ class OperatingSystem:
         if not isinstance(content, str):
             raise RuntimeError("write(): content must be string")
 
-        pya = _require_pyautogui()
         content = content.replace("\\n", "\n")
+
+        # MAJOR-1 FIX: Route through Wayland-native backend when applicable.
+        if platform.system() == "Linux" and _is_wayland():
+            with self._automation_lock:
+                self._automation_active = True
+            try:
+                _wayland_type(content)
+            finally:
+                with self._automation_lock:
+                    self._automation_active = False
+            return
+
+        pya = _require_pyautogui()
 
         with self._automation_lock:
             self._automation_active = True
@@ -272,6 +386,17 @@ class OperatingSystem:
     def press(self, keys) -> None:
         if not isinstance(keys, list) or not keys:
             raise RuntimeError("press(): keys must be non-empty list")
+
+        # MAJOR-1 FIX: Route through Wayland-native backend when applicable.
+        if platform.system() == "Linux" and _is_wayland():
+            with self._automation_lock:
+                self._automation_active = True
+            try:
+                _wayland_hotkey(keys)
+            finally:
+                with self._automation_lock:
+                    self._automation_active = False
+            return
 
         pya = _require_pyautogui()
 
@@ -300,6 +425,38 @@ class OperatingSystem:
         self._click_at_percentage(float(x), float(y))
 
     def _click_at_percentage(self, x_pct: float, y_pct: float) -> None:
+        # MAJOR-1 FIX: Route through Wayland-native backend when applicable.
+        # pyautogui uses X11 XTest — silently fails on pure Wayland.
+        if platform.system() == "Linux" and _is_wayland():
+            # Get screen dimensions from mss (works on both X11 and Wayland)
+            try:
+                import mss as _mss
+                with _mss.mss() as _sct:
+                    _mon = _sct.monitors[1] if len(_sct.monitors) > 1 else _sct.monitors[0]
+                    _screen_w = _mon["width"]
+                    _screen_h = _mon["height"]
+            except Exception:
+                # Last-resort fallback: try pyautogui (may work via XWayland)
+                if _PYAUTOGUI_AVAILABLE and _pyautogui_mod is not None:
+                    _screen_w, _screen_h = _pyautogui_mod.size()
+                else:
+                    raise RuntimeError(
+                        "_click_at_percentage(): cannot determine screen size on Wayland "
+                        "— mss not installed and pyautogui unavailable."
+                    )
+
+            x_px = int(_screen_w * x_pct)
+            y_px = int(_screen_h * y_pct)
+
+            with self._automation_lock:
+                self._automation_active = True
+            try:
+                _wayland_click(x_px, y_px)
+            finally:
+                with self._automation_lock:
+                    self._automation_active = False
+            return
+
         pya = _require_pyautogui()
 
         screen_w, screen_h = pya.size()
