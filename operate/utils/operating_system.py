@@ -46,11 +46,7 @@ def _ydotool_available() -> bool:
 
 
 def _wayland_click(x_px: int, y_px: int) -> None:
-    """
-    MAJOR-1 FIX: Click at absolute pixel coordinates on Wayland using ydotool.
-    Falls back to xdotool (XWayland) if ydotool is unavailable.
-    Raises RuntimeError if neither backend succeeds.
-    """
+    
     if _ydotool_available():
         result = subprocess.run(
             ["ydotool", "mousemove", "--absolute", "-x", str(x_px), "-y", str(y_px)],
@@ -92,10 +88,7 @@ def _wayland_click(x_px: int, y_px: int) -> None:
 
 
 def _wayland_type(text: str) -> None:
-    """
-    MAJOR-1 FIX: Type text on Wayland using ydotool.
-    Falls back to xdotool (XWayland) if ydotool is unavailable.
-    """
+    
     if _ydotool_available():
         result = subprocess.run(
             ["ydotool", "type", "--", text],
@@ -141,10 +134,7 @@ _YDOTOOL_KEY_MAP: Dict[str, str] = {
 
 
 def _wayland_hotkey(keys: list) -> None:
-    """
-    MAJOR-1 FIX: Send a hotkey combination on Wayland using ydotool.
-    Falls back to xdotool (XWayland) if ydotool is unavailable.
-    """
+   
     if _ydotool_available():
         mapped = [_YDOTOOL_KEY_MAP.get(k.lower(), k) for k in keys]
         combo = "+".join(mapped)
@@ -233,7 +223,7 @@ class OperatingSystemUnavailableError(RuntimeError):
 
 
 def _require_pyautogui() -> object:
-   wh00
+
     if not _PYAUTOGUI_AVAILABLE:
         raise OperatingSystemUnavailableError(
             "pyautogui is not available. "
@@ -543,11 +533,7 @@ class OperatingSystem:
                 except FileNotFoundError:
                     raise OSError("xdotool not installed")
 
-                # BUG-2 FIX: xdotool on X11 may succeed (rc=0) but return empty
-                # output if no window is focused (bare desktop, screen locked, etc.).
-                # Previously the empty string propagated to snapshot_provider which
-                # fell through to __bare_desktop__ silently. Now we raise OSError
-                # with a clear reason so callers get a diagnostic.
+                
                 if result.returncode != 0:
                     stderr_msg = result.stderr.strip() or "no error output"
                     raise OSError(
@@ -564,8 +550,7 @@ class OperatingSystem:
                 return {"title": title}
 
             elif system == "Windows":
-                # BUG-12 FIX: win32gui is from pywin32 which was missing from
-                # requirements.txt. Import inside try/except to give a clear error.
+                
                 try:
                     import win32gui  # noqa: PLC0415
                 except ImportError:
@@ -584,29 +569,7 @@ class OperatingSystem:
         raise OSError("Focused window unavailable")
 
     def get_active_application(self) -> Dict[str, str]:
-        """
-        M3 FIX: Return the name of the active application PROCESS, not the
-        window title.
-
-        The previous implementation was:
-            return self.get_focused_window()
-        This caused get_active_application() and get_focused_window() to return
-        identical dicts, making the "application check" in snapshot_provider a
-        no-op (it was comparing the window title against itself).  RestoreVerifier
-        could not distinguish "wrong app focused" from "correct app, different window
-        title", so cross-app restoration failures went silently undetected.
-
-        Platform implementations:
-          Linux:   xdotool getactivewindow getwindowpid → /proc/<pid>/comm
-                   Falls back to get_focused_window() if xdotool or /proc unavailable.
-          macOS:   AppleScript → frontmost process name (already process-level).
-          Windows: win32gui.GetForegroundWindow() → win32process → psutil.Process.name()
-                   Falls back to get_focused_window() if pywin32/psutil unavailable.
-
-        Returns {"title": <process_name>} on success.  The "title" key is kept
-        for backward compatibility with all callers (snapshot_provider, restore_provider,
-        restore_verifier) that expect a {"title": str} dict shape.
-        """
+        
         system = platform.system()
 
         try:
@@ -640,9 +603,7 @@ class OperatingSystem:
 
                 _pid_str = _pid_result.stdout.strip()
 
-                # Step 3: resolve process name from /proc/<pid>/comm (Linux-specific)
-                # /proc/<pid>/comm contains only the executable basename (≤15 chars),
-                # which is what we want — not the full argv[0] path.
+                
                 _comm_path = f"/proc/{_pid_str}/comm"
                 if os.path.exists(_comm_path):
                     try:
@@ -713,15 +674,7 @@ class OperatingSystem:
     # =================================================
 
     def get_window_geometry(self, window_id: str) -> Dict[str, int]:
-        """
-        Return geometry dict for a window identified by title.
-
-        RestoreVerifier._verify_window_geometry() calls this when
-        snapshot.metadata["extended"]["window_geometry"] is present.
-
-        Linux: queries xdotool. macOS/Windows: raises OSError (best-effort).
-        Callers (RestoreVerifier) swallow OSError and continue.
-        """
+        
         if not isinstance(window_id, str) or not window_id.strip():
             raise OSError("get_window_geometry(): window_id must be a non-empty string")
 
@@ -809,8 +762,7 @@ class OperatingSystem:
                     raise OSError(result.stderr.strip() or "activation failed")
 
             elif system == "Linux":
-                # BUG-2 FIX: On Wayland, wmctrl -a fails without XWayland.
-                # Route to ydotool or skip wmctrl on pure Wayland sessions.
+                
                 if _is_wayland():
                     import shutil as _shutil
                     # ydotool: Wayland-native xdotool replacement
@@ -990,15 +942,7 @@ class OperatingSystem:
     # =================================================
 
     def is_automation_active(self) -> bool:
-        """
-        P0-2 FIX: Expose automation state for RestoreVerifier._verify_input_released().
-
-        Previously absent. RestoreVerifier checks hasattr(self._os, 'is_automation_active')
-        and silently skips the check when the method is missing — making the
-        'fail-closed verification' claim false. This method makes the check active.
-
-        Thread-safe: reads under _automation_lock.
-        """
+        
         with self._automation_lock:
             return self._automation_active
 
@@ -1035,17 +979,7 @@ class OperatingSystem:
         )
 
     def get_browser_state(self) -> dict:
-        """
-        AUDIT-SI-3 STUB: Return current browser state as {"url": str, "title": str}.
-
-        RestoreVerifier compares against the snapshot value. Raises
-        NotImplementedError until a CDP/Marionette integration is provided
-        (soft-fail in verifier).
-
-        Platform notes:
-          Chrome/Chromium: CDP via websocket on port 9222 (--remote-debugging-port).
-          Firefox:         Marionette protocol.
-        """
+        
         raise NotImplementedError(
             "get_browser_state() is not yet implemented. "
             "A CDP integration (Chrome DevTools Protocol) is required. "
