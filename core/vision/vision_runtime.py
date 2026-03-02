@@ -168,10 +168,7 @@ class VisionRuntime:
     def stop(self) -> None:
         with self._lock:
             self._running = False
-            # LOW-6 FIX: Release the raw image from memory when the runtime
-            # stops. _last_raw_image is a PIL Image that can be 5-20 MB on
-            # high-resolution displays. Without this, it persists in memory
-            # indefinitely when VisionRuntime is paused between tasks.
+            
             self._last_raw_image = None
 
         if self._thread:
@@ -199,17 +196,7 @@ class VisionRuntime:
     def get_latest_frame_jpeg_b64(
         self, max_age_seconds: float = 5.0
     ) -> Optional[str]:
-        """
-        BUG-8 FIX: Return the most recent captured frame as a base64 JPEG string.
-
-        Returns None when:
-          - No frame has been captured yet.
-          - The most recent frame is older than max_age_seconds (stale on CPU).
-          - Encoding fails for any reason.
-
-        Callers (QwenOllamaAdapter) should fall back to an independent capture
-        when this returns None.
-        """
+        
         with self._lock:
             frame_ts = self._last_frame_ts
             raw_image = self._last_raw_image  # type: ignore[attr-defined]
@@ -237,8 +224,7 @@ class VisionRuntime:
                 if not self._running:
                     return
 
-            # BUG-4 FIX: Track inference wall time so we can skip the post-inference
-            # sleep when the model itself was the delay (CPU inference: 40-90s).
+            
             _inference_start = time.monotonic()
 
             try:
@@ -254,8 +240,7 @@ class VisionRuntime:
                         self._consecutive_failures += 1
                         if self._consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
                             self._healthy = False
-                        # Do not update last_output with stale data.
-                        # BUG-4 FIX: Skip sleep if inference already took long enough.
+                        
                         _skip_threshold = CAPTURE_INTERVAL_SECONDS * FRAME_SKIP_THRESHOLD_MULTIPLIER
                         if _inference_elapsed < _skip_threshold:
                             time.sleep(CAPTURE_INTERVAL_SECONDS)
@@ -424,10 +409,11 @@ class VisionRuntime:
                     }
                 ],
                 options={
-                "temperature": 0,
-                
-                "num_predict": 2048,
-            },
+                    "temperature": 0,
+                    # BLOCKER #3 FIX: raised from 2048 to 4096 to prevent
+                    # JSON truncation on complex desktops.
+                    "num_predict": 4096,
+                },
             )
         except Exception as e:
             raise VisionUnavailableError(
@@ -527,7 +513,7 @@ class VisionRuntime:
     def _parse_json(self, raw: str) -> Dict[str, Any]:
         raw = raw.strip()
 
-        
+        # Strip markdown fences if the model wrapped its output
         if raw.startswith("```"):
             # Remove the opening fence marker
             raw = raw[3:]
@@ -543,17 +529,44 @@ class VisionRuntime:
                 raw = raw.rstrip()[:-3]
             raw = raw.strip()
 
+        # --- Primary parse attempt ---
         try:
             parsed = json.loads(raw)
-        except Exception as e:
-            raise VisionDegradedError(
-                f"Invalid JSON from vision model: {e}"
-            )
+            if not isinstance(parsed, dict):
+                raise VisionDegradedError("Vision output must be JSON object")
+            return parsed
+        except json.JSONDecodeError:
+            pass  # fall through to partial-JSON recovery
 
-        if not isinstance(parsed, dict):
-            raise VisionDegradedError(
-                "Vision output must be JSON object"
-            )
+        
+        recovered = None
+        if raw.startswith('{"elements":[') or raw.startswith('{ "elements": ['):
+            try:
+                # Find the last complete element: the last '}' in the elements
+                # array region, followed optionally by ',' then whitespace.
+                last_close = raw.rfind("}")
+                if last_close > 0:
+                    # Truncate to just after the last complete object
+                    truncated = raw[: last_close + 1]
+                    # Close the elements array and the outer object
+                    closed = truncated + '], "dialogs": [], "apps": [], "focused_app": null}'
+                    candidate = json.loads(closed)
+                    if isinstance(candidate, dict):
+                        print(
+                            "[VisionRuntime] BLOCKER-3 partial-JSON recovery: "
+                            f"truncated model output repaired (original len={len(raw)}, "
+                            f"recovered {len(candidate.get('elements', []))} elements).",
+                            file=sys.stderr,
+                        )
+                        recovered = candidate
+            except Exception:
+                pass  # recovery failed — fall through to hard error
 
-        return parsed
+        if recovered is not None:
+            return recovered
+
+        raise VisionDegradedError(
+            f"Invalid JSON from vision model (raw[:200]={raw[:200]!r}). "
+            "If this error is frequent, increase num_predict or reduce prompt complexity."
+        )
 
