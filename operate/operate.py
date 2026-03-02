@@ -213,6 +213,57 @@ def operate_main(
         )
 
     
+    _auto_discovered: list = []
+    try:
+        import psutil as _psutil_ad  # noqa: PLC0415
+        _seen: set = set()
+        for _proc in _psutil_ad.process_iter(["name"]):
+            try:
+                _pname = (_proc.info.get("name") or "").strip()
+                if _pname and _pname not in _seen:
+                    _seen.add(_pname)
+                    policy_engine.allow_app(_pname)
+                    _auto_discovered.append(_pname)
+            except (_psutil_ad.NoSuchProcess, _psutil_ad.AccessDenied):
+                continue
+        if _auto_discovered:
+            print(
+                f"[operate_main] GAP-1: Auto-discovered {len(_auto_discovered)} running "
+                f"processes and added to PolicyEngine allowlist. "
+                f"Sample: {sorted(_auto_discovered)[:8]}",
+                file=sys.stderr,
+            )
+    except ImportError:
+        print(
+            "[operate_main] GAP-1 WARNING: psutil not installed — cannot auto-discover "
+            "running apps.  Actions in non-default applications will be DENY'd. "
+            "Fix: pip install psutil",
+            file=sys.stderr,
+        )
+    except Exception as _disc_err:
+        # Never let discovery failure block task execution
+        print(
+            f"[operate_main] GAP-1 WARNING: process auto-discovery failed: {_disc_err}. "
+            "Proceeding with default allowlist only.",
+            file=sys.stderr,
+        )
+
+    # Also add binaries from the environment fingerprint (tools found on PATH)
+    try:
+        _fp_tools = (
+            (world_graph.snapshot().get("environment", {}) if world_graph else {})
+            or {}
+        )
+        # environment_fingerprint "tools" is a dict {name: bool}
+        _fp_tools_dict = _fp_tools.get("tools", {})
+        if isinstance(_fp_tools_dict, dict):
+            for _tool_name, _present in _fp_tools_dict.items():
+                if _present and isinstance(_tool_name, str):
+                    policy_engine.allow_app(_tool_name)
+    except Exception:
+        pass  # env fingerprint is best-effort
+
+    
     _LIKELIHOOD_DEFAULTS: dict = {
         "app_match_with_delta":  0.95,
         "app_match_no_delta":    0.75,
