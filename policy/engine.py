@@ -15,7 +15,18 @@ class PolicyViolationError(RuntimeError):
 
 
 class PolicyEngine:
-    
+    """
+    Stateless(ish) policy gate.
+
+    validate_action_dict() is the primary entry point for the main execution
+    loop.  validate() is the secondary entry point for AT-SPI node-based checks
+    (used when accessibility metadata is available).
+
+    Thread safety
+    -------------
+    allowed_apps is protected by _apps_lock so allow_app() / allow_apps()
+    can be called safely from the AutonomousInstaller background thread.
+    """
 
     ALLOW = "ALLOW"
     DENY = "DENY"
@@ -105,7 +116,21 @@ class PolicyEngine:
             return frozenset(self._allowed_apps)
 
     def allow_app(self, app_name: str) -> None:
-        
+        """
+        Dynamically add *app_name* to the allowlist.
+
+        BUG-C2 FIX
+        ----------
+        AutonomousInstaller must call this after every successful tool
+        installation so that subsequent actions on the newly installed
+        application (e.g. ``focused_app = "nodejs"``) are permitted.
+
+        Parameters
+        ----------
+        app_name:
+            Process name as it appears in WorldGraph.focused_app.
+            Normalised to lowercase automatically.
+        """
         if not isinstance(app_name, str) or not app_name.strip():
             _logger.warning(
                 "[PolicyEngine] allow_app: ignoring empty or non-string app_name %r.",
@@ -174,7 +199,29 @@ class PolicyEngine:
         )
 
     def check_human_approval(self, action_key: str) -> bool:
-        
+        """
+        Return True if the human has approved the action by deleting its
+        signal file.
+
+        Design: the signal file's *absence* means approved.  The operator
+        workflow is: see stderr notification → delete the file to approve →
+        file absence detected → action proceeds.
+
+        Fail-open: if os.path.exists() raises (e.g. filesystem error), the
+        method returns True so a transient stat error cannot block execution
+        indefinitely.
+
+        Parameters
+        ----------
+        action_key:
+            16-char hex key from ActionRanker.action_key().
+
+        Returns
+        -------
+        bool
+            True  — file absent → approved.
+            False — file present → still pending.
+        """
         path = self.approval_signal_path(action_key)
         try:
             approved = not os.path.exists(path)
@@ -203,7 +250,23 @@ class PolicyEngine:
         *,
         focused_app: str = "__unknown_app__",
     ) -> Tuple[str, Optional[str]]:
-        
+        """
+        Validate *action* dict against the current policy.
+
+        Parameters
+        ----------
+        action:
+            Action dict with at least an ``"operation"`` field.
+        focused_app:
+            Process name of the currently focused application as reported
+            by WorldGraph.  Defaults to ``"__unknown_app__"`` (warmup sentinel).
+
+        Returns
+        -------
+        (decision, reason)
+            decision is one of ALLOW / DENY / REQUIRE_HUMAN_CONFIRMATION.
+            reason is a human-readable explanation string, or None on ALLOW.
+        """
         try:
             return self._validate_action_dict_inner(action, focused_app)
         except Exception as exc:
