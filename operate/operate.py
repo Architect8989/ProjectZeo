@@ -12,7 +12,7 @@ from typing import Any, Dict, Optional, List
 from authority.authority_policy import AuthorityDecision
 from authority.input_arbitrator import InputArbitrator
 
-from core.safety.action_timeout import action_timeout, run_with_timeout
+from core.safety.action_timeout import run_with_timeout
 from core.telemetry.logger import log_warn
 
 from operate.utils.operating_system import OperatingSystem
@@ -55,17 +55,6 @@ REPLAN_SIGNAL: str = "REPLAN_REQUIRED"
 # WAIT should pause and retry, not immediately replan (PATCH §1.11)
 WAIT_RETRY_SECONDS = 0.5
 
-# RT-A FIX (P0): Human confirmation timeout is now configurable via
-# PROJECTZEO_CONFIRM_TIMEOUT_SECONDS environment variable.
-#
-# ORIGINAL DEFECT: MAX_WAIT_RETRIES=10 x 0.5s = 5 seconds total. The
-# human operator must notice the /tmp signal file and delete it within 5
-# seconds, which is operationally unreachable. All REQUIRE_HUMAN_CONFIRMATION
-# actions were effectively auto-denied -> stagnation -> REPLAN -> TASK_FAILED.
-#
-# FIX: Default timeout raised to 60s (120 retries x 0.5s). Configurable
-# via PROJECTZEO_CONFIRM_TIMEOUT_SECONDS for slow-notification environments.
-# H4 HARDENING: Effective timeout logged at startup for operator visibility.
 def _resolve_confirm_timeout() -> int:
     """Read PROJECTZEO_CONFIRM_TIMEOUT_SECONDS env var; default 60s."""
     raw = os.environ.get("PROJECTZEO_CONFIRM_TIMEOUT_SECONDS", "")
@@ -81,13 +70,8 @@ def _resolve_confirm_timeout() -> int:
 _CONFIRM_TIMEOUT_SECONDS: int = _resolve_confirm_timeout()
 MAX_WAIT_RETRIES: int = max(int(_CONFIRM_TIMEOUT_SECONDS / WAIT_RETRY_SECONDS), 1)
 
-# BUG-6 FIX: The confirmation timeout log was a bare module-level print().
-# It fired at import time — before any task ran — polluting startup logs and
-# appearing before the model was even loaded. Moved to operate_main() where
-# it fires exactly once per task (not once per import) so operators see it
-# with proper task context. The flag below prevents duplicate prints across
-# multiple operate_main() calls in the same process.
-_CONFIRM_TIMEOUT_LOGGED: bool = False
+
+_CONFIRM_TIMEOUT_LOGGED: list = [False]  # mutable container — reset per task call
 
 # Max bytes of command output stored per step in execution_log (bounded, not unlimited)
 MAX_COMMAND_OUTPUT_BYTES = 4096
@@ -96,11 +80,6 @@ MAX_COMMAND_OUTPUT_BYTES = 4096
 MAX_DYNAMIC_CANDIDATES = 3
 
 
-
-# AUDIT §2.3 FIX: was hardcoded "/tmp" — does not exist on Windows, breaking
-# the REQUIRE_HUMAN_CONFIRMATION gate entirely on that platform.  Replace with
-# tempfile.gettempdir() which returns the correct temp directory on all OSes:
-# /tmp on Linux/macOS, %TEMP% / %TMP% on Windows.
 _SIGNAL_DIR: str = tempfile.gettempdir()
 _SIGNAL_PREFIX: str = "projectzeo_approve_"
 
@@ -111,17 +90,7 @@ def _approval_signal_path(action_key: str) -> str:
 
 
 def _write_approval_signal(action_key: str, action: dict, reason: str) -> str:
-    """Write the pending-approval signal file and return its path.
-
-    RT-A7 FIX (P4): After writing the signal file, apply os.chmod(path, 0o600)
-    to restrict it to the process owner only.  The original code wrote to /tmp
-    with the default umask-derived mode (typically 0o644 — world-readable,
-    world-deletable on most Linux /tmp mounts with sticky bit off).  Any
-    same-UID process could delete the signal file, triggering an unintended
-    action approval and silently bypassing the human confirmation gate.
-    Owner-only mode (0o600) prevents this without breaking the intended
-    workflow (the human operator deletes the file to approve).
-    """
+    
     path = _approval_signal_path(action_key)
     try:
         content = json.dumps(
@@ -137,15 +106,7 @@ def _write_approval_signal(action_key: str, action: dict, reason: str) -> str:
             },
             indent=2,
         )
-        # BUG-08 FIX: The original code wrote the file then called
-        # os.chmod(path, 0o600).  There is a race window between close()
-        # and chmod() where the file exists with the default umask mode
-        # (typically 0o644 — world-readable/deletable), allowing any same-UID
-        # process to delete it and trigger an unintended approval.
-        #
-        # Fix: use os.open() with O_CREAT|O_WRONLY|O_EXCL and mode 0o600,
-        # which atomically creates the file with the correct permissions —
-        # no window where the wrong mode is visible to other processes.
+        
         fd = os.open(path, os.O_CREAT | os.O_WRONLY | os.O_EXCL, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(content)
@@ -191,20 +152,15 @@ def operate_main(
     watchdog=None,
     prior_belief_state: Optional[dict] = None,
     belief_state_out: Optional[list] = None,
-    # BUG-5 FIX: Accept checkpoint step index for crash recovery fast-forward.
-    # When the process crashes mid-task and restarts, main.py loads this from
-    # checkpoint_store.get_checkpoint_step_index() and passes it here so
-    # _execute_autonomous_loop() can skip already-completed steps instead of
-    # replaying the entire plan from step 0.
+    
     prior_step_index: Optional[int] = None,
 ) -> None:
     
-    # BUG-6 FIX: Log confirmation timeout here (inside operate_main) not at
-    # import time. Fires once per process lifetime using the _CONFIRM_TIMEOUT_LOGGED
-    # flag, so multi-task runs don't repeat it.
-    global _CONFIRM_TIMEOUT_LOGGED
-    if not _CONFIRM_TIMEOUT_LOGGED:
-        _CONFIRM_TIMEOUT_LOGGED = True
+   
+    _CONFIRM_TIMEOUT_LOGGED[0] = False  # reset for this task session
+
+    if not _CONFIRM_TIMEOUT_LOGGED[0]:
+        _CONFIRM_TIMEOUT_LOGGED[0] = True
         print(
             f"[OPERATE] Human confirmation timeout: {_CONFIRM_TIMEOUT_SECONDS}s "
             f"({MAX_WAIT_RETRIES} retries × {WAIT_RETRY_SECONDS}s). "
@@ -215,12 +171,7 @@ def operate_main(
     if not isinstance(execution_plan, ExecutionPlan):
         raise ValueError("execution_plan must be an ExecutionPlan instance")
 
-    # BUG-16 FIX: execution_plan.validate() return value was previously ignored.
-    # In create_plan() the return is checked: `if not plan.validate(): raise PlanningError(...)`.
-    # But here in operate_main() the call was `execution_plan.validate()` with no
-    # check — if it returns False (indicating an invalid plan), the loop continued
-    # on a broken plan producing cryptic downstream errors. Now we check and raise
-    # immediately with a clear error message, consistent with create_plan() behaviour.
+    
     if not execution_plan.validate():
         raise ValueError(
             "ExecutionPlan failed validation on entry to operate_main(). "
@@ -266,37 +217,7 @@ def operate_main(
             file=sys.stderr,
         )
 
-    # ------------------------------------------------------------------
-    # H2 FIX — Load Bayesian likelihood ratios from likelihoods.json
-    # ------------------------------------------------------------------
-    # DEFECT (MS-1 / H2): The likelihood ratios used in bayesian_update()
-    # were hardcoded constants (0.95, 0.75, 1.5, 1.2, 0.8, 1.0) with no
-    # calibration mechanism.  True P(observation|state) ratios depend on
-    # the deployment environment (display resolution, application mix,
-    # task profile) and cannot be calibrated at development time.
-    #
-    # FIX: Load ratios from likelihoods.json at startup.  The file lives
-    # alongside policy.yaml in the project root and uses the same key
-    # structure as the inline code.  If the file is absent or malformed,
-    # the hardcoded defaults below are used and a WARNING is emitted.
-    #
-    # likelihoods.json schema:
-    # {
-    #   "app_match_with_delta":  0.95,  -- P(obs|state) when world changed
-    #   "app_match_no_delta":    0.75,  -- P(obs|state) when world stable
-    #   "ui_rich":               1.50,  -- > ENTITY_RICH_THRESHOLD entities
-    #   "ui_sparse":             1.20,  -- 1 to ENTITY_RICH_THRESHOLD entities
-    #   "ui_empty":              0.80,  -- 0 entities
-    #   "neutral_with_delta":    1.00,  -- baseline: fresh observation
-    #   "neutral_no_delta":      0.80,  -- baseline: stale observation
-    #   "ENTITY_RICH_THRESHOLD": 10     -- entity count above which ui_rich fires
-    # }
-    #
-    # Calibration guidance:
-    #   Collect a dataset of (observation, true_state) pairs from production
-    #   runs.  For each state category, compute the empirical P(observation|state)
-    #   by counting how often that category was active when the true state
-    #   matched.  Normalize relative to the neutral baseline to produce ratios.
+    
     _LIKELIHOOD_DEFAULTS: dict = {
         "app_match_with_delta":  0.95,
         "app_match_no_delta":    0.75,
@@ -365,11 +286,7 @@ def operate_main(
         )
         _likelihood_cfg = dict(_LIKELIHOOD_DEFAULTS)
 
-    # PATCH MOD-3: Pre-cast ENTITY_RICH_THRESHOLD to int once here.
-    # The original code called int(_likelihood_cfg.get("ENTITY_RICH_THRESHOLD", 10))
-    # inside the main execution loop on every iteration.  A float value like 10.5
-    # would pass the > 0 validation but produce logically wrong comparisons with
-    # integer entity counts.  Casting once at load time is both correct and faster.
+    
     _likelihood_cfg["ENTITY_RICH_THRESHOLD"] = int(
         _likelihood_cfg.get("ENTITY_RICH_THRESHOLD", 10)
     )
@@ -389,16 +306,7 @@ def operate_main(
     verifier = StepVerifier()
     progress = ProgressTracker(execution_plan)
 
-    # H2 FIX (SI-5): Load playbook for this intent at task start.
-    # Previously playbook_store.save_playbook() and load_playbook() were
-    # defined with full disk persistence but never called anywhere in the
-    # execution path — the entire long-horizon memory system was dead
-    # infrastructure.  Every task started from zero knowledge regardless
-    # of prior successful executions.
-    #
-    # Fix: load matching prior actions here and inject them as the first
-    # candidates into the ReasoningEngine fallback pool.  On task success,
-    # save the executed actions so future identical/similar tasks warm-start.
+    
     from core.memory.playbook_store import load_playbook as _load_playbook, save_playbook as _save_playbook
     _prior_playbook_actions: list = []
     try:
@@ -440,29 +348,20 @@ def operate_main(
             shared_ollama_client=_shared_client,
         )
 
-    # H5 FIX (SI-3): Pass shared ollama_client so ReasoningEngine uses the
-    # text-only path instead of the vision adapter for abstract reasoning.
+    
     reasoning_engine = ReasoningEngine(
         llm_callable=llm_callable,
         ollama_client=getattr(planner, "_ollama_client", None),
     )
 
-    # FIX RB-A3: Per-task executor — isolates timeout guarantees between tasks.
-    # A module-level singleton executor shares ONE worker thread; a blocking call
-    # in one task starves the next.  Creating per-task gives each task its own
-    # isolated thread pool.
+    
     _task_ui_executor = concurrent.futures.ThreadPoolExecutor(
         max_workers=1,
         thread_name_prefix="ui_timeout_worker",
     )
 
     try:
-        # GAP-2 FIX: Per-task filesystem rollback tracker.
-        # Tracks every file created during this task so that:
-        #   1. On REPLAN, the planner receives already_created_files in context.
-        #   2. Duplicate file_create steps can be skipped (already done).
-        #   3. Post-mortem debugging has a clear record of filesystem side-effects.
-        # The list is passed by reference so _execute_autonomous_loop fills it.
+        
         _created_files_ledger: List[str] = []
 
         _execute_autonomous_loop(
@@ -516,14 +415,7 @@ def operate_main(
             pass  # non-fatal
     finally:
         input_arbitrator.shutdown()
-        # PATCH MOD-5: Give in-flight UI actions a 2-second grace window to
-        # complete before the executor is torn down.  The original wait=False
-        # could leave a pyautogui.click() or pyautogui.write() call mid-flight
-        # when a REPLAN fires, producing ghost inputs on the newly-restored screen.
-        # We achieve a bounded wait by joining the underlying thread with a timeout
-        # rather than blocking on shutdown() itself (which has no timeout parameter
-        # before Python 3.9).  After 2s any still-running action is abandoned as
-        # before — we never want to block indefinitely on a hung UI thread.
+        
         import threading as _threading
         _ui_threads = [t for t in _threading.enumerate()
                        if t.name.startswith("ui_timeout_worker")]
@@ -603,17 +495,9 @@ def _execute_autonomous_loop(
     action_ranker = ActionRanker()
     action_ranker.set_plan_horizon(_plan_real_steps)
 
-    # Bounded command output log fed into world_graph for context enrichment
+    
     execution_log: Dict[int, Dict[str, str]] = {}
 
-    # BUG-13 FIX: _visited_action_keys was a local dict that reset on every
-    # replan (because _execute_autonomous_loop is re-called by main.py on REPLAN).
-    # After a replan, the system forgot all previously tried (failed) actions and
-    # would attempt the same failing actions again, wasting inference budget.
-    #
-    # Fix: persist _visited_action_keys inside prior_belief_state (serializable
-    # as a list of keys) and restore it here on replan entry. On first call
-    # (prior_belief_state is None), start with an empty dict as before.
     _visited_action_keys: dict = {}  # ordered set: {action_key: True}
     if prior_belief_state is not None:
         try:
@@ -635,10 +519,7 @@ def _execute_autonomous_loop(
     previous_snapshot = None
     previous_perception = None
 
-    # BUG-5 FIX: Fast-forward to the checkpointed step on crash recovery.
-    # Without this, every crash restart replayed all completed steps from 0,
-    # wasting compute and risking double-execution of already-completed commands
-    # (e.g. file writes, git commits, API calls, package installs).
+    
     if prior_step_index is not None and prior_step_index > 0:
         _max_valid = max(len(execution_plan.steps) - 1, 0)
         _safe_index = min(int(prior_step_index), _max_valid)
@@ -749,63 +630,11 @@ def _execute_autonomous_loop(
                             focused_app = bounded.get("focused_app")
                             entity_count = len(bounded.get("entities", []))
 
-                            # MS-1 / IH-1 FIX: Replace hardcoded developer constants
-                            # (0.9, 0.8, 0.7, 0.5) with calibrated delta-sensitive
-                            # likelihood ratios.
-                            #
-                            # ORIGINAL DEFECT: The prior code used fixed scalars that
-                            # were not P(observation|state) ratios — they were constant
-                            # multiplicative weights independent of observation quality.
-                            # After N iterations the dominant state was whichever
-                            # category was activated most frequently, not the true world
-                            # state.  This violated the stated "Bayesian inference"
-                            # contract (audit finding MS-1).
-                            #
-                            # CALIBRATION RATIONALE:
-                            # Likelihoods are now computed as observation-conditional
-                            # ratios relative to the neutral baseline (1.0):
-                            #
-                            # app:{focused_app}:
-                            #   P(focused_app seen | app is correct state) / P(seen | neutral)
-                            #   = 0.95 when world changed (fresh observation), 0.75 when stable
-                            #   (title re-read may be stale).  Rationale: if the expected app
-                            #   is focused and the world just changed, we have strong evidence
-                            #   of a correct state; if the world is stable (no delta), the
-                            #   same observation is weaker because the OS may be reporting
-                            #   a cached value.
-                            #
-                            # ui_rich / ui_sparse / ui_empty:
-                            #   Ratios relative to a flat prior; calibrated so that a
-                            #   UI-rich snapshot is 1.5× more likely under a "productive"
-                            #   state than a sparse or empty one.  Values anchored to
-                            #   empirically observed entity count distributions:
-                            #     > 10 entities  → rich  (1.5)
-                            #     1–10 entities  → sparse (1.2)
-                            #     0 entities     → empty (0.8, slight evidence of wrong state)
-                            #
-                            # neutral:
-                            #   Explicit neutral likelihood set to 1.0 when world changed
-                            #   (observation is fresh, no dampening) and 0.8 when stable
-                            #   (no delta = stale or no activity = mild negative evidence).
-                            #
-                            # NOTE: These ratios are still heuristic estimates, not
-                            # empirically measured conditional probabilities from a
-                            # training distribution.  The update is proportionally correct
-                            # Bayesian inference but the ratio magnitudes are developer
-                            # estimates.  True calibration would require a labeled dataset
-                            # of (observation, true_state) pairs per application.  This
-                            # fix is a significant improvement over fixed constants because
-                            # the ratios are delta-sensitive (observation freshness matters)
-                            # and directionally correct (rich UI → higher state confidence).
+                            
 
                             has_delta = bool(delta)
 
-                            # H2 FIX: Use values from _likelihood_cfg (loaded from
-                            # likelihoods.json at startup) instead of hardcoded
-                            # developer constants.  If the file is absent, _likelihood_cfg
-                            # contains the original defaults so behaviour is unchanged.
-                            # PATCH MOD-3: _entity_rich_thresh is now pre-cast to int
-                            # at config-load time — no per-iteration cast needed.
+                        
                             _entity_rich_thresh = _likelihood_cfg["ENTITY_RICH_THRESHOLD"]
 
                             if isinstance(focused_app, str) and focused_app.strip():
@@ -854,10 +683,7 @@ def _execute_autonomous_loop(
                     elif isinstance(world_snapshot, dict):
                         perception_for_reasoning = world_snapshot
 
-                    # H2 FIX (SI-5): Inject prior playbook actions as first candidates
-                    # before asking ReasoningEngine.  On stagnant steps, unvisited playbook
-                    # actions from prior successful runs of the same intent are prepended so
-                    # the agent tries known-good actions before generating new ones.
+                    
                     _playbook_candidates: List[Dict[str, Any]] = []
                     if prior_playbook_actions:
                         _playbook_candidates = [
@@ -949,11 +775,7 @@ def _execute_autonomous_loop(
                     if stagnant_iterations >= stagnant_limit:
                         raise RuntimeError(REPLAN_SIGNAL)
                     previous_perception = perception_snapshot
-                    # C1 FIX (CRITICAL): This continue was missing.
-                    # Without it, execution fell through into the authority
-                    # check and _execute_decision(), meaning every DENY'd
-                    # action was executed anyway — the policy engine was
-                    # completely bypassed on first stagnation cycle.
+                    
                     continue
 
             except (AuthorityAbortError, RuntimeError):
@@ -989,19 +811,7 @@ def _execute_autonomous_loop(
                     "reason": _policy_reason,
                 })
 
-                # RB-LOW-1 FIX: Signal-file human-approval mechanism.
-                #
-                # Previous implementation re-called policy_engine.validate_action_dict()
-                # with identical arguments inside the loop.  The function is
-                # deterministic — given the same action and focused_app it always
-                # returns the same REQUIRE_HUMAN_CONFIRMATION result.  The loop
-                # therefore NEVER reached the ALLOW branch; human approval was
-                # structurally unreachable.
-                #
-                # Fix: write a signal file to /tmp and poll for its ABSENCE.
-                # The user deletes the file to approve.  The policy engine is
-                # NOT re-called inside the loop — only the file-system state is
-                # checked.  This makes the approval path reachable.
+                
                 _signal_path = _write_approval_signal(
                     action_key, selected_action, _policy_reason or ""
                 )
@@ -1102,13 +912,7 @@ def _execute_autonomous_loop(
             if authority == AuthorityDecision.ABORT:
                 raise AuthorityAbortError("Human authority abort — task terminated")
 
-            # ------------------------------------------------------------------
-            # Execute action
-            # ------------------------------------------------------------------
-            # GAP-2 FIX: Inject the filesystem ledger reference into file_create
-            # actions so _execute_decision can record created paths. Use a shallow
-            # copy so the original selected_action dict is not mutated (it may be
-            # referenced by the candidate list and the journal record).
+            
             _dispatch_action = selected_action
             if (
                 created_files_ledger is not None
@@ -1150,14 +954,7 @@ def _execute_autonomous_loop(
                     "error": str(exec_exc),
                 })
 
-            # FIX MF-3: Accumulate command output (success AND failure) per step.
-            # Original: execution_log[current_step_index] was overwritten on each
-            # successful action, so the LLM saw only the LAST successful output when
-            # replanning. On stagnant iterations (all failures), execution_log was
-            # never updated at all — the LLM had no failure context to diagnose the
-            # stagnation. Fix: append to a list per step index, capped at 5 entries.
-            # Both success and failure outputs are recorded so the LLM receives full
-            # stagnation history rather than only the last successful output.
+            
             if "output" in exec_result and exec_result.get("output"):
                 output_text = str(exec_result.get("output", ""))[:MAX_COMMAND_OUTPUT_BYTES]
                 _step_entry = execution_log.setdefault(current_step_index, {"outputs": []})
@@ -1174,9 +971,7 @@ def _execute_autonomous_loop(
 
             # Bandit update
             belief.record_action(action_key, raw_reward)
-            # RT-05 / SI-04 FIX: Cap best_reward at 0.9 to prevent DONE
-            # sentinel (reward=1.0) from permanently inflating the regret
-            # reference for all subsequent actions.
+            
             best_reward = min(belief.global_best_reward() or 0.0, 0.9)
             belief.update_regret(action_key, raw_reward, best_reward)
 
@@ -1210,11 +1005,7 @@ def _execute_autonomous_loop(
                         "step": current_step_index - 1,
                         "progress_score": verify_result.progress_score,
                     })
-                    # AUDIT §2.4 FIX: save_checkpoint() was implemented in
-                    # core/safety/checkpoint_store.py but never called anywhere.
-                    # Wire it here after every successful step advance so that
-                    # a crash at hour N of a multi-hour task can resume from the
-                    # last completed step instead of restarting from zero.
+                    
                     try:
                         from core.safety.checkpoint_store import save_checkpoint as _save_cp
                         _save_cp({
@@ -1263,15 +1054,9 @@ def _execute_autonomous_loop(
             belief_state_out.clear()
             try:
                 _bs_dict = belief.to_dict()
-                # BUG-13 FIX: Serialize _visited_action_keys alongside BeliefState
-                # so the next replan invocation can restore previously-tried actions
-                # and avoid retrying known-failing actions. The list is capped at
-                # _VISITED_ACTION_MAX entries (already enforced during execution).
+                
                 _bs_dict["_visited_action_keys"] = list(_visited_action_keys.keys())
-                # GAP-2 FIX: Persist the filesystem ledger into BeliefState so
-                # the replanning LLM knows which files already exist. On replan,
-                # ExecutionPlanner._expand_goal() injects already_created_files
-                # into the planning prompt so it skips completed file_create steps.
+                
                 if created_files_ledger:
                     _bs_dict["_created_files_ledger"] = list(created_files_ledger)
                 belief_state_out.append(_bs_dict)
@@ -1296,32 +1081,12 @@ def _execute_decision(
     focused_app: str = "",          # GAP-1 FIX: passed from world_snapshot.focused_app
     prefer_playwright: bool = True,  # GAP-1 FIX: from policy.yaml browser.prefer_playwright
 ) -> dict:
-    """
-    Dispatch `action` to the OS backend and return an execution result dict.
-
-    GAP-1 FIX: When the focused_app is a browser AND prefer_playwright=True,
-    click/write/scroll/navigate operations are routed through BrowserBackend
-    (Playwright DOM-aware automation) instead of pyautogui coordinate clicks.
-    This fixes the #1 failure mode for web tasks: React/Angular SPA elements
-    shifting between screenshot and click (coordinate staleness).
-
-    Falls back to pyautogui automatically when:
-      - playwright is not installed
-      - The element cannot be found by DOM selector/text/role
-      - The operation type is not browser-targetable (install, command, file_create)
-    """
+    
     from core.safety.action_timeout import run_with_timeout, ActionTimeout
 
     op = (action.get("operation") or "").lower().strip()
 
-    # BUG-5 FIX: Import FailSafeException at dispatch time (not module level)
-    # so operate.py does not hard-require pyautogui at import time.
-    # FailSafeException is raised when the cursor reaches a screen corner while
-    # pyautogui.FAILSAFE=True (which is always set by OperatingSystem.__init__).
-    # Previously caught by the generic `except Exception` and returned reward=-0.5,
-    # giving the bandit the same signal as a routine action failure.
-    # Fix: catch explicitly and return reward=-1.0 (severe) so the bandit strongly
-    # de-prioritizes corner-bound coordinates for the rest of the task.
+    
     try:
         from pyautogui import FailSafeException as _FailSafeException
     except ImportError:
@@ -1334,21 +1099,7 @@ def _execute_decision(
     if not op:
         return {"success": False, "reward": -0.5, "reason": "empty operation field"}
 
-    # BUG-11 FIX: Apply DANGEROUS_PATTERNS check at dispatch time for every
-    # command/install/file_create operation, not only at plan creation time.
-    #
-    # The original code filtered patterns in ExecutionPlanner._validate_and_normalise_step()
-    # at plan generation time, but:
-    #   1. ReasoningEngine.propose_actions() generates dynamic candidates at runtime
-    #      WITHOUT DANGEROUS_PATTERNS filtering.
-    #   2. AutonomousInstaller generates install commands that go through exec(shell=True).
-    #   3. A hallucinating LLM or adversarial intent could inject dangerous commands
-    #      via the replan path (different code path from create_plan()).
-    #
-    # Fix: for "command", "install", and "file_create" ops, scan the command/content
-    # text against the compiled dangerous patterns immediately before execution.
-    # If a match is found, return a structured failure with reward -1.0 (severe)
-    # so the bandit strongly de-prioritizes this action for the rest of the task.
+    
     if op in ("command", "install", "file_create", "verify"):
         _dangerous_text = ""
         if op == "command":
@@ -1396,13 +1147,7 @@ def _execute_decision(
 
     try:
         # ------------------------------------------------------------------
-        # GAP-1 FIX: Playwright DOM routing for browser-targeted actions
-        # ------------------------------------------------------------------
-        # Before falling through to pyautogui coordinate operations, check
-        # if the focused app is a browser and prefer_playwright is enabled.
-        # If so, route click/write/scroll/navigate through BrowserBackend.
-        # The BrowserBackend uses DOM selectors and text matching instead of
-        # pixel coordinates — no coordinate staleness, SPA-safe, iframe-aware.
+        
         _BROWSER_OPS = {"click", "write", "type", "fill", "scroll", "navigate", "goto"}
         if (
             op in _BROWSER_OPS
@@ -1590,27 +1335,12 @@ def _execute_decision(
                     "output": combined_output,
                 }
             elif installer is not None:
-                # UI-based install fallback via AutonomousInstaller.
-                #
-                # RB-CRIT-2 FIX: The previous code called installer.install(tool_name)
-                # where tool_name is a str.  AutonomousInstaller exposes only
-                # install_tool(tool: Dict) — there is no install(str) method.
-                # Every UI-based install path therefore raised AttributeError.
-                #
-                # Fix: pass the full tool_spec dict (which the caller already has)
-                # to install_tool(), which is the method the class actually defines.
-                # If tool_spec is not a dict (e.g. None or a stray string), we
-                # construct a minimal dict with a 'name' key so install_tool()
-                # always receives a well-formed argument.
+                
                 if not isinstance(tool_spec, dict):
                     tool_spec = {"name": str(tool_spec) if tool_spec else ""}
                 try:
                     install_result = installer.install_tool(tool_spec)
-                    # BUG-09 FIX: Capture install output so the planner can
-                    # see WHY an install failed on a replan.  Previously the
-                    # return dict had no "output" key, leaving the replanner
-                    # blind to version errors, missing dependencies, and
-                    # network failures from the install process.
+                    
                     install_output = ""
                     if isinstance(install_result, dict):
                         install_output = install_result.get("output", "") or ""
@@ -1618,7 +1348,7 @@ def _execute_decision(
                         install_output = install_result
                     install_ok = (
                         install_result is True
-                        or (isinstance(install_result, dict) and install_result.get("success", True))
+                        or (isinstance(install_result, dict) and install_result.get("success", False))
                     )
                     return {
                         "success": install_ok,
@@ -1681,14 +1411,7 @@ def _execute_decision(
         return {"success": False, "reward": -0.5, "reason": f"action_timeout: {toe}"}
 
     except Exception as exc:
-        # BUG-5 FIX: Catch pyautogui FailSafeException before the generic handler.
-        # FailSafeException fires when the cursor reaches a screen corner (0,0),
-        # (W,0), (0,H), or (W,H) while FAILSAFE=True. The agent doesn't know why
-        # the click failed — previously reward=-0.5 gave the same signal as a
-        # routine failure, causing the bandit to retry similar coordinates.
-        # Fix: detect by class name (robust against import failures) and return
-        # reward=-1.0 (severe), giving the bandit a strong de-prioritization signal
-        # for corner-bound coordinates AND a clear reason in the journal.
+        
         _exc_type = type(exc).__name__
         if _exc_type == "FailSafeException" or (
             _FailSafeException is not None and isinstance(exc, _FailSafeException)
