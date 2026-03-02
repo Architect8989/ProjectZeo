@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import threading
 import time
 import traceback
@@ -10,13 +12,8 @@ from core.vision.world_graph import WorldGraph
 
 _logger = logging.getLogger(__name__)
 
-_REQUIRED_PERCEPTION_KEYS: frozenset = frozenset({
-    "available",
-})
+_REQUIRED_PERCEPTION_KEYS: frozenset = frozenset({"available"})
 
-# Keys that VisionRuntime may use interchangeably. If 'elements' is present
-# but 'entities' is absent, we normalize 'elements' → 'entities' so
-# world_graph.ingest() receives the canonical key it expects.
 _ENTITY_KEY_ALIASES: tuple = ("entities", "elements", "nodes", "ui_elements")
 
 
@@ -29,64 +26,53 @@ def _validate_perception_schema(perception: dict) -> "dict | None":
         )
         return None
 
-    # ---- 1. Validate 'available' (required) ----
     if "available" not in perception:
         _logger.warning(
             "[ObserverLoop] Schema validation failed: 'available' key missing. "
-            "VisionRuntime output schema may have changed. "
-            "Keys present: %s",
+            "VisionRuntime output schema may have changed. Keys present: %s",
             sorted(perception.keys()),
         )
         return None
 
-    validated = dict(perception)  # shallow copy — ingest() should not mutate
+    validated = dict(perception)
     validated["available"] = bool(validated["available"])
 
-    # ---- 2. Normalize 'frame_ts' ----
+    # ---- Normalise 'frame_ts' ----
     raw_ts = validated.get("frame_ts")
     if raw_ts is not None:
         try:
             validated["frame_ts"] = float(raw_ts)
         except (TypeError, ValueError):
             _logger.debug(
-                "[ObserverLoop] Schema normalization: 'frame_ts' value %r is not float, "
-                "setting to None.",
-                raw_ts,
+                "[ObserverLoop] Schema: 'frame_ts' %r is not float — setting None.", raw_ts
             )
             validated["frame_ts"] = None
     else:
         validated.setdefault("frame_ts", None)
 
-    # ---- 3. Normalize entity list key ----
-    # If the canonical 'entities' key is absent but an alias is present,
-    # copy the alias value to 'entities' so world_graph.ingest() receives it.
+    # ---- Normalise entity list key ----
     if "entities" not in validated:
-        for alias in _ENTITY_KEY_ALIASES[1:]:  # skip 'entities' itself
+        for alias in _ENTITY_KEY_ALIASES[1:]:
             if alias in validated:
                 _logger.debug(
-                    "[ObserverLoop] Schema normalization: '%s' → 'entities' "
-                    "(VisionRuntime used a non-canonical entity list key).",
-                    alias,
+                    "[ObserverLoop] Schema: '%s' → 'entities' alias normalised.", alias
                 )
                 validated["entities"] = validated[alias]
                 break
         else:
-            # No entity list found — default to empty list (not an error;
-            # the first few frames from VisionRuntime may have no entities yet)
             validated.setdefault("entities", [])
 
-    # Ensure entity list is actually a list
     if not isinstance(validated.get("entities"), list):
         _logger.debug(
-            "[ObserverLoop] Schema normalization: 'entities' is %s, resetting to [].",
+            "[ObserverLoop] Schema: 'entities' is %s — resetting to [].",
             type(validated.get("entities")).__name__,
         )
         validated["entities"] = []
 
-    # ---- 4. Normalize 'focused_app' ----
+    # ---- Normalise 'focused_app' ----
     if "focused_app" in validated and not isinstance(validated["focused_app"], str):
         _logger.debug(
-            "[ObserverLoop] Schema normalization: 'focused_app' is %s (expected str), removing.",
+            "[ObserverLoop] Schema: 'focused_app' is %s (expected str) — removing.",
             type(validated["focused_app"]).__name__,
         )
         del validated["focused_app"]
@@ -97,7 +83,7 @@ def _validate_perception_schema(perception: dict) -> "dict | None":
 class ObserverLoop:
     
 
-    DEFAULT_TICK_INTERVAL = 0.20  # 5 Hz baseline
+    DEFAULT_TICK_INTERVAL: float = 0.20  # 5 Hz baseline
 
     def __init__(
         self,
@@ -106,41 +92,35 @@ class ObserverLoop:
         vision_runtime: VisionRuntime,
         world_graph: Optional[WorldGraph] = None,
         tick_interval: float = DEFAULT_TICK_INTERVAL,
-    ):
+    ) -> None:
         self._observer = observer
         self._vision = vision_runtime
         self._world_graph = world_graph
 
-        self._tick_interval = max(0.05, float(tick_interval))
+        self._tick_interval: float = max(0.05, float(tick_interval))
 
         self._thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
-        self._running = False
+        self._running: bool = False
         self._lock = threading.Lock()
 
-        # Telemetry counters — readable via introspection
+        # Telemetry counters — readable via get_telemetry()
         self._total_frames: int = 0
         self._schema_rejection_count: int = 0
         self._ingest_failure_count: int = 0
 
-        # GPU contention management: pause() during EXECUTING mode
-        # so the execution LLM gets the full GPU instead of sharing
-        # with the background vision model
-        self._pause_event = threading.Event()  # set = paused
+        # GPU contention: pause() sets this; resume() clears it
+        self._pause_event = threading.Event()
 
-    # ==================================================
-    # LIFECYCLE
-    # ==================================================
+    
 
     def start(self) -> None:
+        """Spawn the observer thread.  Safe to call after stop() or restart."""
         with self._lock:
             if self._running:
                 return
 
-            # FIX-RESTART: Clear stop event before starting so a restart after
-            # ObserverBlindnessError (which sets _stop_event) works correctly.
-            # Without this, stop() → start() sequence left _stop_event set,
-            # causing the new thread to exit immediately on first iteration.
+            
             self._stop_event.clear()
             self._running = True
 
@@ -150,8 +130,10 @@ class ObserverLoop:
                 daemon=True,
             )
             self._thread.start()
+            _logger.info("[ObserverLoop] Started (tick_interval=%.3fs).", self._tick_interval)
 
     def stop(self) -> None:
+        """Signal the observer thread to stop and wait up to 2 seconds."""
         with self._lock:
             if not self._running:
                 return
@@ -161,22 +143,31 @@ class ObserverLoop:
             self._thread = None
             self._running = False
 
-        if thread:
+        if thread and thread.is_alive():
             thread.join(timeout=2.0)
+            if thread.is_alive():
+                _logger.warning(
+                    "[ObserverLoop] Thread did not exit within 2 s — proceeding."
+                )
+
+        _logger.info("[ObserverLoop] Stopped.")
 
     def pause(self) -> None:
-        """Pause vision inference — call when entering EXECUTING to free GPU."""
+        """Pause vision inference.  Call when entering EXECUTING to free GPU."""
         self._pause_event.set()
+        _logger.debug("[ObserverLoop] Paused.")
 
     def resume(self) -> None:
-        """Resume vision inference — call after RESTORING completes."""
+        """Resume vision inference.  Call after RESTORING completes."""
         self._pause_event.clear()
+        _logger.debug("[ObserverLoop] Resumed.")
 
-    # ==================================================
+    # =========================================================================
     # MAIN LOOP
-    # ==================================================
+    # =========================================================================
 
     def _run(self) -> None:
+        _logger.info("[ObserverLoop] Thread running.")
         try:
             while not self._stop_event.is_set():
                 start_ts = time.monotonic()
@@ -193,66 +184,51 @@ class ObserverLoop:
                         isinstance(raw_perception, dict)
                         and raw_perception.get("available") is True
                     ):
-                        # P1-SCHEMA FIX: Validate and normalize before any downstream use.
-                        validated_perception = _validate_perception_schema(raw_perception)
+                        validated = _validate_perception_schema(raw_perception)
 
-                        if validated_perception is not None:
+                        if validated is not None:
                             self._total_frames += 1
                             self._observer.attach_perception_state(
                                 {
                                     "available": True,
-                                    "frame_ts": validated_perception.get("frame_ts"),
-                                    "perception": validated_perception,
+                                    "frame_ts": validated.get("frame_ts"),
+                                    "perception": validated,
                                 }
                             )
-
                             if self._world_graph is not None:
                                 try:
-                                    self._world_graph.ingest(validated_perception)
+                                    self._world_graph.ingest(validated)
                                 except Exception as ingest_err:
-                                    # World graph failure must NEVER break observer loop
+                                    # World graph failures must NEVER break the loop
                                     self._ingest_failure_count += 1
                                     _logger.debug(
                                         "[ObserverLoop] world_graph.ingest() failed "
-                                        "(total failures: %d): %s",
+                                        "(total=%d): %s",
                                         self._ingest_failure_count,
                                         ingest_err,
                                     )
                         else:
-                            # Schema validation failed — count rejection and emit
-                            # unavailable state so ObserverCore increments its miss counter
                             self._schema_rejection_count += 1
+                            # Sample: log every 1st, 11th, 21st… to avoid flooding
                             if self._schema_rejection_count % 10 == 1:
-                                # Log every 1st, 11th, 21st... rejection to avoid spam
                                 _logger.warning(
-                                    "[ObserverLoop] VisionRuntime schema rejection "
-                                    "#%d — perception dict does not match expected "
-                                    "schema. Check VisionRuntime output format. "
-                                    "Observer will remain in warmup until schema is corrected.",
+                                    "[ObserverLoop] VisionRuntime schema rejection #%d — "
+                                    "perception dict does not match expected schema. "
+                                    "Check VisionRuntime._call_model() output format.",
                                     self._schema_rejection_count,
                                 )
                             self._observer.attach_perception_state(
-                                {
-                                    "available": False,
-                                    "frame_ts": None,
-                                    "perception": None,
-                                }
+                                {"available": False, "frame_ts": None, "perception": None}
                             )
                     else:
                         self._observer.attach_perception_state(
-                            {
-                                "available": False,
-                                "frame_ts": None,
-                                "perception": None,
-                            }
+                            {"available": False, "frame_ts": None, "perception": None}
                         )
 
-                    # Authoritative tick
+                    # Authoritative heartbeat tick
                     self._observer.tick()
 
                 except ObserverBlindnessError as obe:
-                    # HARDEN-OL-1: Structured telemetry on blindness so operators
-                    # can distinguish genuine failure from slow CPU inference.
                     health = self._observer.get_health_snapshot()
                     _logger.error(
                         "[ObserverLoop] OBSERVER BLIND: %s | "
@@ -264,35 +240,20 @@ class ObserverLoop:
                         self._total_frames,
                         health.get("uptime_seconds", -1.0),
                     )
-                    # FIX-BLIND: Do NOT set _stop_event on blindness — let
-                    # main.py's ObserverBlindnessError handler (which restarts
-                    # vision_runtime then calls observer.reset_for_new_task())
-                    # propagate the recovery. Setting stop_event here meant
-                    # observer_loop.start() on restart silently exited immediately
-                    # because _stop_event was still set.
+                    
                     try:
                         self._observer.attach_perception_state(
-                            {
-                                "available": False,
-                                "frame_ts": None,
-                                "perception": None,
-                            }
+                            {"available": False, "frame_ts": None, "perception": None}
                         )
                     except Exception:
                         pass
-
-                    # Propagate to main.py for restart handling
                     raise
 
                 except Exception:
                     traceback.print_exc()
                     try:
                         self._observer.attach_perception_state(
-                            {
-                                "available": False,
-                                "frame_ts": None,
-                                "perception": None,
-                            }
+                            {"available": False, "frame_ts": None, "perception": None}
                         )
                     except Exception:
                         pass
@@ -305,28 +266,27 @@ class ObserverLoop:
         finally:
             with self._lock:
                 self._running = False
+            _logger.info("[ObserverLoop] Thread exited.")
 
-    # ==================================================
+    # =========================================================================
     # INTROSPECTION
-    # ==================================================
+    # =========================================================================
 
     def is_running(self) -> bool:
+        
         with self._lock:
-            return self._running
+            return (
+                self._running
+                and self._thread is not None
+                and self._thread.is_alive()
+            )
 
     def get_telemetry(self) -> Dict[str, int]:
-        """
-        Return loop telemetry for operator dashboards and health monitoring.
-
-        Returns
-        -------
-        dict with keys:
-          total_valid_frames    — frames that passed schema validation
-          schema_rejection_count — frames rejected by schema validator
-          ingest_failure_count  — frames where world_graph.ingest() raised
-        """
+        
         return {
             "total_valid_frames": self._total_frames,
             "schema_rejection_count": self._schema_rejection_count,
             "ingest_failure_count": self._ingest_failure_count,
+            "is_paused": int(self._pause_event.is_set()),
+            "is_running": int(self.is_running()),
         }
