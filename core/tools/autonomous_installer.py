@@ -79,14 +79,7 @@ COMMON_INSTALL_COMMANDS: Dict[str, Dict[str, str]] = {
         "Windows": "npm install -g pnpm",
     },
     "bun": {
-        # SI-3 FIX (Linux): curl|bash replaced with npm global install.
-        # AUDIT §2.2 FIX (Darwin): "curl -fsSL https://bun.sh/install | bash"
-        # was left unfixed — it matches DANGEROUS_PATTERNS r"\bcurl\b.*\|\s*(?:ba)?sh\b"
-        # and r"\|\s*bash\b" in ExecutionPlanner and would be silently rejected
-        # from any plan generated on macOS.  Replaced with brew install bun,
-        # which is the canonical macOS bun install path.
-        # AUDIT §2.2 FIX (Windows): irm|iex pattern also triggers DANGEROUS_PATTERNS.
-        # Replaced with npm global install (npm is available via nodejs choco install).
+        
         "Linux":   "npm install -g bun",
         "Darwin":  _brew("bun"),
         "Windows": "npm install -g bun",
@@ -112,10 +105,7 @@ COMMON_INSTALL_COMMANDS: Dict[str, Dict[str, str]] = {
         "Windows": _choco("git"),
     },
     "docker": {
-        # SI-3 FIX: original "curl -fsSL https://get.docker.com | sh" matched
-        # both r"\bcurl\b.*\|\s*(?:ba)?sh\b" and r"\|\s*sh\b" dangerous patterns.
-        # Replaced with apt-get install docker.io which is available in Ubuntu
-        # default repositories without piping to a shell interpreter.
+        
         "Linux":   "sudo apt-get update -qq && sudo apt-get install -y docker.io",
         "Darwin":  "brew install --cask docker",
         "Windows": _choco("docker-desktop"),
@@ -181,10 +171,7 @@ COMMON_INSTALL_COMMANDS: Dict[str, Dict[str, str]] = {
         "Windows": _choco("golang"),
     },
     "cargo": {
-        # SI-3 FIX (Linux): curl|sh replaced with apt-get cargo.
-        # AUDIT §2.2 FIX (Darwin): "curl ... | sh -s -- -y" matches
-        # r"\bcurl\b.*\|\s*(?:ba)?sh\b" and r"\|\s*sh\b" DANGEROUS_PATTERNS.
-        # Replaced with brew install rust which installs cargo without piping to sh.
+        
         "Linux":   "sudo apt-get update -qq && sudo apt-get install -y cargo",
         "Darwin":  _brew("rust"),
         "Windows": _choco("rust"),
@@ -212,10 +199,7 @@ COMMON_INSTALL_COMMANDS: Dict[str, Dict[str, str]] = {
         "Windows": _choco("ffmpeg"),
     },
     "gh": {
-        # SI-3 FIX: original command used "sudo dd of=/usr/share/keyrings/..."
-        # which matched the r"\bdd\b" dangerous pattern and was silently dropped.
-        # Replaced with sudo snap install which is available on Ubuntu and does
-        # not trigger any dangerous patterns.
+        
         "Linux":   "sudo snap install gh --classic",
         "Darwin":  _brew("gh"),
         "Windows": _choco("gh"),
@@ -268,6 +252,7 @@ class AutonomousInstaller:
         os_backend: OperatingSystem,
         llm_callable,
         shared_ollama_client=None,
+        policy_engine=None,
     ):
         if not isinstance(observer, ObserverCore):
             raise InstallationError("Observer required")
@@ -283,6 +268,10 @@ class AutonomousInstaller:
         self._llm = llm_callable
         self._verifier = StepVerifier()
         self._shared_ollama_client = shared_ollama_client
+        # BUG-C2 FIX: Accept a PolicyEngine reference so install_tool() can
+        # dynamically allow newly installed applications.  Optional: if not
+        # provided, the allowlist is NOT updated (backward-compatible).
+        self._policy_engine = policy_engine
 
         self._compiled_dangerous = [
             re.compile(p, re.IGNORECASE) for p in self._DANGEROUS_PATTERNS
@@ -297,28 +286,7 @@ class AutonomousInstaller:
                 )
 
     def install_tool(self, tool: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Install a tool and return a result dict.
-
-        AUDIT §2.1 FIX: The original return type was None.  operate.py's caller
-        checked ``install_result is True`` and ``isinstance(install_result, dict)``
-        — both False for None — so install_ok was always False regardless of
-        whether the tool was actually installed.  Every UI-based install silently
-        reported failure and triggered stagnation → replan.
-
-        Returns
-        -------
-        dict with keys:
-            success : bool   — True when tool is confirmed installed after the attempt.
-            output  : str    — Combined stdout/stderr from terminal install commands,
-                               or a human-readable status message.
-
-        Raises
-        ------
-        InstallationError
-            When the installation attempt itself cannot be executed (observer down,
-            invalid tool schema, dangerous command rejected, etc.).
-        """
+        
         self._validate_tool_schema(tool)
 
         name = tool["name"]
@@ -327,6 +295,7 @@ class AutonomousInstaller:
         self._validate_url(url)
 
         if self._is_already_installed(tool):
+            self._notify_policy_engine(name, tool)
             return {"success": True, "output": f"{name} is already installed."}
 
         if not self._observer.is_healthy():
@@ -338,6 +307,7 @@ class AutonomousInstaller:
         if terminal_ok:
             # Verify the tool is now callable / version-check passes
             if self._is_already_installed(tool):
+                self._notify_policy_engine(name, tool)
                 return {"success": True, "output": terminal_output}
             # Terminal commands succeeded but tool not detected yet — may need
             # PATH reload.  Report partial success; caller can retry.
@@ -359,6 +329,7 @@ class AutonomousInstaller:
 
         # Verify after UI install
         if self._is_already_installed(tool):
+            self._notify_policy_engine(name, tool)
             return {"success": True, "output": terminal_output + "\n[UI_INSTALL] Verified OK."}
 
         return {
@@ -369,6 +340,68 @@ class AutonomousInstaller:
                 "post-install verification failed."
             ),
         }
+
+
+    def _notify_policy_engine(
+        self,
+        tool_name: str,
+        tool: Dict[str, Any],
+    ) -> None:
+        """
+        BUG-C2 FIX: Dynamically add newly installed apps to PolicyEngine allowlist.
+
+        After a successful install the focused_app in WorldGraph will become the
+        new tool's process name (e.g. "code" for VS Code, "node" for Node.js).
+        Without this call, every subsequent action on the new app would be
+        DENY-ed by PolicyEngine, making autonomous multi-tool tasks impossible.
+
+        Derives allowable app names from the tool's name, executable_name,
+        and common aliases.  Fail-silent: policy update errors never block
+        the execution loop.
+        """
+        if self._policy_engine is None:
+            return
+
+        try:
+            # Always add the canonical tool name
+            candidates = [tool_name.lower().strip()]
+
+            # Add explicit executable_name if provided in tool spec
+            exe_name = tool.get("executable_name") or tool.get("process_name") or ""
+            if isinstance(exe_name, str) and exe_name.strip():
+                candidates.append(exe_name.strip().lower())
+
+            # Common name→process-name aliases for popular tools
+            _ALIASES: dict = {
+                "node": ["node", "nodejs", "npm", "npx"],
+                "nodejs": ["node", "nodejs", "npm", "npx"],
+                "python": ["python", "python3"],
+                "python3": ["python", "python3"],
+                "vscode": ["code", "code-oss"],
+                "code": ["code", "code-oss"],
+                "docker": ["docker", "dockerd"],
+                "git": ["git"],
+                "postgresql": ["psql", "postgres"],
+                "redis": ["redis-cli", "redis-server"],
+                "go": ["go"],
+                "cargo": ["cargo", "rustc"],
+                "java": ["java", "javac"],
+                "ffmpeg": ["ffmpeg"],
+            }
+            for alias_list in [_ALIASES.get(n, []) for n in candidates[:2]]:
+                candidates.extend(alias_list)
+
+            self._policy_engine.allow_apps(candidates)
+
+        except Exception as _pe_err:
+            import logging as _log
+            _log.getLogger(__name__).warning(
+                "[AutonomousInstaller] _notify_policy_engine failed for %r: %s. "
+                "Newly installed app may be DENY-ed by PolicyEngine until "
+                "allow_app() is called manually.",
+                tool_name,
+                _pe_err,
+            )
 
     def _try_terminal_install(self, tool: Dict[str, Any]) -> bool:
         """Thin wrapper used by legacy callers; delegates to _try_terminal_install_with_output."""
@@ -426,24 +459,7 @@ class AutonomousInstaller:
                 combined_output += f"[CMD ERROR] {_e}\n"
                 return False, combined_output
 
-        # LLM-generated command fallback
-        # GAP-2 FIX: Enhanced LLM install-command generation.
-        #
-        # The previous implementation asked the LLM for a command with minimal
-        # context and no verification.  This worked for common tools but failed
-        # silently for niche software because:
-        #   1. The LLM may hallucinate a package name that does not exist.
-        #   2. The one-liner may still match DANGEROUS_PATTERNS.
-        #   3. There was no apt-cache/snap/flatpak discovery step to ground truth.
-        #
-        # Fix:
-        #   Step 1 — apt-cache search: On Linux, query apt-cache search <name>
-        #     to find the real package name before asking the LLM.  This grounds
-        #     the LLM prompt in actual available packages and prevents hallucination.
-        #   Step 2 — LLM with enriched context: Pass the apt-cache candidates to
-        #     the LLM so it can select the correct package name.
-        #   Step 3 — snap/flatpak fallback: If apt-cache finds nothing, suggest
-        #     snap search as an alternative before falling through to UI install.
+        
         try:
             import os as _os_mod
             import ollama as _ollama
