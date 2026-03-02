@@ -340,7 +340,8 @@ class ExecutionPlanner:
         if isinstance(ledger, list):
             self._created_files_ledger = [str(p) for p in ledger if p]
 
-
+    def create_plan(
+        self,
         objective: str,
         requirements: Dict[str, Any],
         high_level_steps: List[Dict[str, Any]],
