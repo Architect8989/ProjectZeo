@@ -22,36 +22,21 @@ class SnapshotProviderError(RuntimeError):
     pass
 
 
-class SnapshotProvider:
-    """
-    Snapshot provider.
+_GAP1_WARNING_EMITTED: bool = False
 
-    HARD GUARANTEES:
-    - Snapshot only in OBSERVER mode
-    - Observer must be healthy
-    - Vision must be available
-    - OS state captured within bounded window
-    - Deterministic serialization
-    - Instance-isolated LRU registry
-    """
+
+class SnapshotProvider:
+
 
     SNAPSHOT_SCHEMA_VERSION = "2.2"
 
     MAX_SNAPSHOTS = 128
     
     MAX_SNAPSHOT_AGE_SECONDS = 10800
-    # P0-A FIX (RT-01): Raised from 0.5s to 2.0s.  Under OS load, the three
-    # sequential syscalls (cursor + focused_window + active_app) can each take
-    # 200 ms+, totalling >600 ms even without genuine OS hangs.  The previous
-    # 0.5 s window caused SnapshotProviderError → arm_failure.json → infinite
-    # loop, permanently preventing task arming on loaded hosts.  2.0 s remains
-    # conservative enough to detect true OS hangs (kernel freeze, X11 lockup).
-    # Still overridable via PROJECTZEO_ATOMIC_WINDOW_SECONDS env var.
-    ATOMIC_WINDOW_SECONDS = 2.0
+    
+    ATOMIC_WINDOW_SECONDS = 4.0
 
-    # =========================================================
-    # INIT
-    # =========================================================
+    
 
     def __init__(
         self,
@@ -64,15 +49,7 @@ class SnapshotProvider:
         self._os = os_backend
         self._mode = mode_controller
 
-        # FIX-4 (MEDIUM): ATOMIC_WINDOW_SECONDS is now runtime-configurable via
-        # the PROJECTZEO_ATOMIC_WINDOW_SECONDS environment variable so that slow
-        # VMs and disk-saturated hosts can relax the capture deadline without
-        # requiring a code change.  The class constant (0.5s) remains as the
-        # default.  Valid range is clamped to [0.1, 10.0] seconds to prevent
-        # misconfiguration from masking genuine OS hangs.
-        #
-        # Usage:
-        #   export PROJECTZEO_ATOMIC_WINDOW_SECONDS=2.0   # e.g. for slow VMs
+        
         _env_val = os.environ.get("PROJECTZEO_ATOMIC_WINDOW_SECONDS")
         if _env_val is not None:
             try:
@@ -87,10 +64,7 @@ class SnapshotProvider:
         self._snapshots: "OrderedDict[str, RestorationSnapshot]" = OrderedDict()
         self._lock = threading.Lock()
 
-        # H-01 FIX (SI-01): Persist snapshots to disk so post-crash restoration
-        # is possible.  On startup we reload all non-expired snapshots from
-        # memory/snapshot_<id>.json files.  Each store_snapshot() call writes a
-        # new file; each eviction or expiry removes the corresponding file.
+        
         self._snapshot_dir = os.path.join(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
             "memory",
@@ -246,27 +220,7 @@ class SnapshotProvider:
         return snapshot.snapshot_id
 
     def get_snapshot(self, snapshot_id: str) -> Optional[RestorationSnapshot]:
-        """
-        FIX H7: Enforce TTL at retrieval time, not only during store_snapshot().
-
-        Bug: MAX_SNAPSHOT_AGE_SECONDS = 3600 was only applied inside
-        _evict_stale(), which ran during store_snapshot(). get_snapshot()
-        returned any snapshot regardless of age. A snapshot taken before a
-        long planning warmup phase (up to 210s = planning 60s + warmup 150s)
-        could still be retrieved and restored — but more critically, a snapshot
-        taken before a multi-hour idle period could survive in memory and be
-        restored from hours-old workspace state with no diagnostic.
-
-        Fix: check TTL here. If the snapshot has aged past MAX_SNAPSHOT_AGE_SECONDS,
-        evict it from the registry, print a diagnostic, and return None. The
-        caller (main.py) treats None as a missing snapshot and proceeds to safe
-        shutdown / skip restoration — the correct behaviour for expired state.
-
-        The TTL check uses captured_at_wallclock from snapshot.metadata (set at
-        capture time by _capture_snapshot). If the field is missing or unparseable,
-        the snapshot is treated as non-expired (fail-open for the TTL check only;
-        the restoration itself is still guarded by mode and verifier checks).
-        """
+        
         if not isinstance(snapshot_id, str) or not snapshot_id:
             return None
 
@@ -307,39 +261,17 @@ class SnapshotProvider:
     # =========================================================
 
     def take_snapshot(self) -> str:
-        # GAP-1 DOCUMENTATION: What the snapshot captures and does NOT capture.
-        #
-        # CAPTURED (and restored):
-        #   - Cursor XY position (pixel coordinates)
-        #   - Focused window title (fuzzy-matched on restore, Levenshtein ≤5)
-        #   - Active application name
-        #   - Running process names (census for post-restore diff report)
-        #
-        # NOT CAPTURED — will NOT be restored:
-        #   - Browser tab list, active tab, scroll position
-        #   - Media playback position (YouTube timestamp, Spotify track position)
-        #   - Application-internal state (document scroll, cursor position in editor)
-        #   - Clipboard contents
-        #   - Network connections or open sockets
-        #   - In-memory application state (unsaved documents, form contents)
-        #
-        # ARCHITECTURAL LIMITATION (GAP-1):
-        #   Full application-state restoration requires OS-level serialization APIs
-        #   (e.g. CRIU on Linux, application checkpoint protocols) that are not
-        #   generically available.  For media playback tasks, the caller should
-        #   record the media timestamp before arming and seek back after restoration.
-        #   For browser tasks, consider saving the URL before arming via xdotool
-        #   or AT-SPI2 and re-navigating after restoration.
-        #
-        # This warning is printed once per snapshot to stderr so it appears in
-        # log aggregators and is visible to operators reviewing task outcomes.
+        
         import sys as _sys
-        _sys.stderr.write(
-            "[SnapshotProvider] GAP-1: Snapshot captures cursor+window+app ONLY. "
-            "Media playback position, browser tabs/scroll, clipboard, and "
-            "unsaved application state are NOT captured and will NOT be restored. "
-            "For media tasks: record timestamp before arming and seek after restore.\n"
-        )
+        global _GAP1_WARNING_EMITTED
+        if not _GAP1_WARNING_EMITTED:
+            _GAP1_WARNING_EMITTED = True
+            _sys.stderr.write(
+                "[SnapshotProvider] GAP-1: Snapshot captures cursor+window+app ONLY. "
+                "Media playback position, browser tabs/scroll, clipboard, and "
+                "unsaved application state are NOT captured and will NOT be restored. "
+                "For media tasks: record timestamp before arming and seek after restore.\n"
+            )
         snapshot = self._capture_snapshot()
         return self.store_snapshot(snapshot)
 
@@ -496,12 +428,7 @@ class SnapshotProvider:
         except Exception:
             pass
 
-        # IH-1 FIX: Capture window Z-order so RestoreVerifier._verify_window_z_order()
-        # has data to verify. Previously window_z_order was never populated in
-        # metadata["extended"], making _verify_window_z_order() always short-circuit
-        # at "if z is None: return" — the verification was dead code despite being reachable.
-        # Fix: attempt to capture Z-order via xdotool getwindowstackingorder.
-        # Non-fatal: Z-order capture is best-effort (xdotool may be absent).
+        
         try:
             import subprocess as _sp_zo
             _zo_result = _sp_zo.run(
@@ -568,4 +495,5 @@ class SnapshotProvider:
         )
 
         return snapshot
+
 
