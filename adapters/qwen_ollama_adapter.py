@@ -26,13 +26,7 @@ from operate.models.prompts import (
 from operate.utils.ocr import get_text_coordinates, get_text_element
 from operate.utils.screenshot import capture_screen_with_cursor, compress_screenshot
 
-# BUG-3 FIX: Import the shared inference lock from vision_runtime.
-# VisionRuntime background loop and QwenOllamaAdapter both call the same
-# Qwen2.5-VL vision model. On VRAM-limited GPUs this causes OOM; on CPU
-# both requests queue in Ollama causing timeout cascades. The lock ensures
-# only one caller is in the model at any time.
-# Import is lazy-safe: if vision_runtime is not yet initialized, the lock
-# is still the module-level INFERENCE_LOCK (initialized at import time).
+
 try:
     from core.vision.vision_runtime import get_inference_lock as _get_inference_lock
     _INFERENCE_LOCK = _get_inference_lock()
@@ -40,25 +34,12 @@ except ImportError:
     import threading as _threading
     _INFERENCE_LOCK = _threading.Lock()
 
-# BUG-8 FIX: Module-level reference to the active VisionRuntime instance.
-# Populated by set_shared_vision_runtime() called from main.py after
-# VisionRuntime is initialised.  When set, _call_qwen_with_history() reuses
-# the latest frame that VisionRuntime already captured instead of taking a
-# second independent screenshot.  This eliminates the race condition where
-# the world graph and the action decision see different screen states
-# (two captures separated by hundreds of ms on slow hardware).
+
 _SHARED_VISION_RUNTIME = None
 
 
 def set_shared_vision_runtime(runtime) -> None:
-    """
-    BUG-8 FIX: Register the active VisionRuntime so QwenOllamaAdapter can
-    reuse its cached frame instead of capturing the screen independently.
-
-    Called from main.py immediately after VisionRuntime.start():
-        from adapters.qwen_ollama_adapter import set_shared_vision_runtime
-        set_shared_vision_runtime(vision_runtime)
-    """
+    
     global _SHARED_VISION_RUNTIME
     _SHARED_VISION_RUNTIME = runtime
 
@@ -66,55 +47,17 @@ logger = logging.getLogger(__name__)
 config = Config()
 
 
-# ==========================================================
-# THREAD-SAFE OCR READER WITH WARMUP TIMEOUT
-# ==========================================================
+
 
 _OCR_READER = None
 _OCR_LOCK = threading.Lock()
 
-# BUG-4 FIX: _OCR_WARMUP_TIMEOUT_SECONDS raised from 120s to 300s and made
-# env-configurable.
-# Root cause: First-time EasyOCR initialisation downloads ~500 MB of model
-# weights. On a 3 MB/s connection that's ~167 seconds — exceeding the old 120s
-# limit. EasyOCR would be marked unavailable, falling back to coordinate-only
-# mode. Text-based clicks would then be silently dropped, causing stagnation
-# loops (up to MAX_STAGNANT_ITERS_UI=12 wasted LLM cycles) before replanning.
-# FIX: Default 300s handles <2 MB/s connections. On GPU systems with cached
-# models, init takes <5s so the higher limit has no practical cost.
-# Override: PROJECTZEO_OCR_WARMUP_TIMEOUT_SECONDS=<seconds>
+
 _OCR_WARMUP_TIMEOUT_SECONDS: int = int(
     os.environ.get("PROJECTZEO_OCR_WARMUP_TIMEOUT_SECONDS", "300")
 )
 
-# H-02 / D-02 FIX: Replace bare bool _OCR_UNAVAILABLE with threading.Event.
-#
-# Root cause of H-02:
-#   The previous code used a module-level boolean:
-#       _OCR_UNAVAILABLE = False
-#   _get_ocr_reader() wrote this flag under _OCR_LOCK:
-#       _OCR_UNAVAILABLE = True
-#   But _call_qwen_with_history() READ it OUTSIDE any lock:
-#       if _OCR_UNAVAILABLE:
-#   This is a data race: CPython's GIL makes bool reads atomic, but the
-#   read-check-act sequence is not atomic.  On non-CPython runtimes (PyPy,
-#   GraalPy, future no-GIL CPython) a torn read is possible.
-#
-# Fix: replace the bare bool with threading.Event.
-#   - _OCR_UNAVAILABLE_EVENT.set()   replaces  _OCR_UNAVAILABLE = True
-#   - _OCR_UNAVAILABLE_EVENT.clear() replaces  _OCR_UNAVAILABLE = False
-#   - _OCR_UNAVAILABLE_EVENT.is_set() replaces  if _OCR_UNAVAILABLE:
-#
-# threading.Event.is_set() is internally synchronized (uses a Condition /
-# RLock) and is safe to call from any thread without holding an external
-# lock.  This eliminates the data race without requiring callers to acquire
-# _OCR_LOCK for every read.
-#
-# A separate _OCR_LAST_FAILURE_TS float is still needed for the cooldown
-# logic.  It is only written under _OCR_LOCK (inside _get_ocr_reader()), so
-# reads outside the lock are safe on CPython (float assignment is atomic via
-# GIL) and acceptable on other runtimes (worst case: stale read causes one
-# extra retry attempt, not a correctness failure).
+
 _OCR_UNAVAILABLE_EVENT = threading.Event()    # H-02 FIX: was `_OCR_UNAVAILABLE = False`
 _OCR_LAST_FAILURE_TS: float = 0.0
 _OCR_RETRY_COOLDOWN_SECONDS = 300.0
@@ -194,9 +137,7 @@ def _get_ocr_reader():
             return None
 
 
-# ==========================================================
-# OLLAMA RESPONSE SHIM
-# ==========================================================
+
 
 def _extract_response_content(response: Any) -> str:
     """
@@ -333,19 +274,14 @@ class QwenOllamaAdapter:
         messages: List[dict],
         objective: str,
     ) -> List[dict]:
-        """
-        Capture current screen, build multi-turn message list, call Ollama,
-        parse JSON operations.
-
-        H-02 FIX: _OCR_UNAVAILABLE_EVENT.is_set() is used instead of the bare
-        bool read.  threading.Event.is_set() is internally synchronized and safe
-        to call from any thread without an external lock.
-        """
+        
         system_content = get_system_prompt(self.model_name, objective)
 
-        # H-02 FIX: Use .is_set() on the Event rather than reading the bare bool.
-        if _OCR_UNAVAILABLE_EVENT.is_set():           # H-02 FIX: was  if _OCR_UNAVAILABLE:
-            system_content = system_content + self._COORD_MANDATE
+        
+        history_messages: List[Dict[str, Any]] = []
+
+        
+
         for msg in messages:
             role = msg.get("role")
             if role == "system":
@@ -357,34 +293,12 @@ class QwenOllamaAdapter:
         if len(history_messages) > self.MAX_HISTORY_TURNS:
             history_messages = history_messages[-self.MAX_HISTORY_TURNS:]
 
-        # MF-04 FIX: Use ExitStack to guarantee cleanup of both temp files even
-        # if the second NamedTemporaryFile() call itself raises (e.g. /tmp full).
-        # Previously: if _jtf creation raised after _rtf was already created,
-        # raw_tmp_name was set but jpeg_tmp_name remained None, so the finally
-        # block could not clean up raw_tmp_name (it would have been cleaned, but
-        # the symmetric risk exists for disk-full mid-creation scenarios).
-        # ExitStack registers each cleanup the moment the file is created.
+        
         raw_tmp_name = None
         jpeg_tmp_name = None
         _cleanup_stack = contextlib.ExitStack()
         try:
-            # BUG-8 FIX: Attempt to reuse the VisionRuntime's already-captured
-            # frame before falling back to an independent screen capture.
-            #
-            # Root cause of BUG-8:
-            #   VisionRuntime._loop() calls mss.grab() every cycle.
-            #   _call_qwen_with_history() calls capture_screen_with_cursor()
-            #   independently.  On slow hardware these two captures are separated
-            #   by hundreds of milliseconds — the world graph and the action
-            #   decision see DIFFERENT screen states.  This is a race condition
-            #   that causes the LLM to plan against stale world state.
-            #
-            # Fix: request the latest frame from VisionRuntime via
-            #   get_latest_frame_jpeg_b64(max_age_seconds=5.0).
-            # If the frame is fresh enough, skip the independent capture entirely.
-            # If VisionRuntime is not registered, paused, or the frame is stale,
-            # fall back to the original independent capture so we never block
-            # on a missing runtime reference.
+            
             img_base64: Optional[str] = None
             _using_vr_frame: bool = False
             _vr = _SHARED_VISION_RUNTIME
@@ -396,18 +310,12 @@ class QwenOllamaAdapter:
                 except Exception:
                     img_base64 = None
 
-            # H2 FIX: When the VisionRuntime frame is used, no JPEG is written to
-            # disk so screenshot_path=None and _resolve_click_coordinates() will
-            # DROP every text-only click ({"operation":"click","text":"..."}).
-            # Qwen2.5-VL regularly emits text clicks — each dropped click
-            # increments the stagnation counter and eventually triggers REPLAN.
-            #
-            # Fix: inject _COORD_MANDATE into the system prompt when we know
-            # we are taking the VR-frame path.  This tells the LLM to always
-            # emit {"x": ..., "y": ...} coordinate clicks instead of text clicks,
-            # eliminating the drop entirely.  Only injected when OCR isn't
-            # already flagged unavailable (to avoid double-appending the mandate).
-            if _using_vr_frame and not _OCR_UNAVAILABLE_EVENT.is_set():
+            
+            _needs_coord_mandate = (
+                _OCR_UNAVAILABLE_EVENT.is_set()  # OCR explicitly unavailable
+                or _using_vr_frame               # VR frame path: no disk JPEG for OCR
+            )
+            if _needs_coord_mandate:
                 system_content = system_content + self._COORD_MANDATE
 
             if img_base64 is None:
@@ -451,11 +359,7 @@ class QwenOllamaAdapter:
                 {"role": "system", "content": system_content}
             ]
             ollama_messages.extend(history_messages)
-            # FIX-IMG: The ollama Python library uses {"images": [base64_str]}
-            # NOT the OpenAI-style content array {"content": [{"type":"image",...}]}.
-            # The content-array format causes ollama to silently discard the image.
-            # This was the root cause of every vision inference returning empty/wrong
-            # results — the model was answering without seeing the screen.
+            
             ollama_messages.append({
                 "role": "user",
                 "content": user_prompt_text + "\nReturn JSON list of operations.",
@@ -494,11 +398,7 @@ class QwenOllamaAdapter:
             return operations
 
         finally:
-            # ExitStack callbacks handle cleanup of both temp files in LIFO order.
-            # Each callback was registered immediately after the corresponding
-            # NamedTemporaryFile was created, so cleanup fires even if the second
-            # file was never created.  When the shared VisionRuntime frame was used,
-            # no temp files were created and the ExitStack is a no-op.
+            
             _cleanup_stack.close()
 
     # ==========================================================
