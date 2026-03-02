@@ -1,15 +1,9 @@
 import os
 import sys
+import subprocess
 
 def _early_parse_args() -> bool:
-    """
-    Parse --allow-cloud from sys.argv BEFORE any imports execute.
-
-    Returns True if --allow-cloud is present, False otherwise.
-
-    This is intentionally minimal — full argument validation happens in
-    _parse_args() after all imports are complete.
-    """
+    
     return "--allow-cloud" in sys.argv
 
 
@@ -72,10 +66,7 @@ def _parse_args():
 
 
 def _print_status() -> None:
-    """
-    BUG-10 FIX: Read temp/ sidecar files and print human-readable status.
-    Called when --status flag is present.
-    """
+    
     import json as _json
     import pathlib as _pathlib
     import datetime as _dt
@@ -347,9 +338,88 @@ def _validate_runtime_dependencies(model_name: str) -> None:
                     "    Fix (switch): log into a GNOME-on-Xorg session instead of Wayland."
                 )
 
-    # ------------------------------------------------------------------
-    # 5. pyyaml — WARNING: without it policy.yaml never loads
-    # ------------------------------------------------------------------
+            
+            if _has_ydotool:
+                _daemon_ok = False
+                try:
+                    _probe = subprocess.run(
+                        ["ydotool", "mousemove", "--relative", "-x", "0", "-y", "0"],
+                        capture_output=True,
+                        timeout=3,
+                    )
+                    _daemon_ok = (_probe.returncode == 0)
+                except Exception:
+                    _daemon_ok = False
+
+                if not _daemon_ok:
+                    # Optionally attempt auto-start
+                    _auto_start = os.environ.get(
+                        "PROJECTZEO_START_YDOTOOLD", ""
+                    ).strip().lower() in ("1", "true", "yes")
+
+                    if _auto_start:
+                        print(
+                            "[STARTUP] BLOCKER-1: ydotoold daemon not running. "
+                            "PROJECTZEO_START_YDOTOOLD=1 — attempting auto-start: "
+                            "sudo ydotoold &",
+                            file=sys.stderr,
+                        )
+                        try:
+                            subprocess.Popen(
+                                ["sudo", "ydotoold"],
+                                stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL,
+                            )
+                            import time as _time_mod
+                            _time_mod.sleep(2.0)  # allow daemon to bind socket
+                            # Re-probe after auto-start
+                            _probe2 = subprocess.run(
+                                ["ydotool", "mousemove", "--relative",
+                                 "-x", "0", "-y", "0"],
+                                capture_output=True,
+                                timeout=3,
+                            )
+                            if _probe2.returncode == 0:
+                                print(
+                                    "[STARTUP] BLOCKER-1: ydotoold auto-start succeeded.",
+                                    file=sys.stderr,
+                                )
+                                _daemon_ok = True
+                            else:
+                                errors.append(
+                                    "  [FATAL] ydotoold auto-start attempted but daemon "
+                                    "still not responding.\n"
+                                    "    Manual fix: sudo ydotoold &\n"
+                                    "    Or via systemd: "
+                                    "systemctl --user enable --now ydotool.service"
+                                )
+                        except Exception as _as_err:
+                            errors.append(
+                                f"  [FATAL] ydotoold auto-start failed: {_as_err}\n"
+                                "    Manual fix: sudo ydotoold &\n"
+                                "    Or via systemd: "
+                                "systemctl --user enable --now ydotool.service"
+                            )
+                    else:
+                        errors.append(
+                            "  [FATAL] Wayland session: ydotool is installed but the\n"
+                            "    ydotoold daemon is NOT running.  All UI input (click,\n"
+                            "    type, hotkey) will silently fail until the daemon starts.\n"
+                            "\n"
+                            "    Quickest fix:\n"
+                            "      sudo ydotoold &\n"
+                            "\n"
+                            "    Persistent fix (systemd user service):\n"
+                            "      systemctl --user enable --now ydotool.service\n"
+                            "\n"
+                            "    Auto-start on next ProjectZeo launch:\n"
+                            "      export PROJECTZEO_START_YDOTOOLD=1\n"
+                            "\n"
+                            "    Or switch to a GNOME-on-Xorg session (login gear → "
+                            "'Ubuntu on Xorg') to avoid Wayland input limitations."
+                        )
+
+    
     try:
         import yaml  # noqa: F401
     except ImportError:
