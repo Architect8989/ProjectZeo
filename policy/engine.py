@@ -1,48 +1,51 @@
+from __future__ import annotations
+
 import os
 import re
+import threading
 import logging
+from typing import FrozenSet, Optional, Set, Tuple
 
 _logger = logging.getLogger(__name__)
 
 
 class PolicyViolationError(RuntimeError):
-    pass
+    """Raised when a caller attempts an operation that violates policy
+    in a context where exceptions are preferred over return codes."""
 
 
 class PolicyEngine:
+    
 
     ALLOW = "ALLOW"
     DENY = "DENY"
     REQUIRE_HUMAN_CONFIRMATION = "REQUIRE_HUMAN_CONFIRMATION"
 
-    
     _OP_TO_SYNTHETIC_ROLE: dict = {
-        "click":        "push button",
-        "write":        "text",
-        "type":         "text",
-        "press":        "keyboard",
-        "hotkey":       "keyboard",
-        "key":          "keyboard",
-        "command":      "terminal",
-        "install":      "terminal",
-        "file_create":  "file",
-        "scroll":       "scroll",
-        "verify":       "verify",
-        "done":         "done",
+        "click":       "push button",
+        "write":       "text",
+        "type":        "text",
+        "press":       "keyboard",
+        "hotkey":      "keyboard",
+        "key":         "keyboard",
+        "command":     "terminal",
+        "install":     "terminal",
+        "file_create": "file",
+        "scroll":      "scroll",
+        "verify":      "verify",
+        "done":        "done",
     }
 
-    # Operations that carry elevated risk and require confirmed environment
-    # stability before execution. These map to 'high_risk=True' in operate.py's
-    # authority evaluation.
-    _HIGH_RISK_OPERATIONS: frozenset = frozenset({
+    _HIGH_RISK_OPERATIONS: FrozenSet[str] = frozenset({
         "command",
         "install",
         "file_create",
     })
 
-    
-    _DEFAULT_ALLOWED_APPS = frozenset({
-        # Warmup sentinel — permits actions before world-graph has observed focus
+    # Default application allowlist — covers the most common desktop apps.
+    # Operators extend this via policy.yaml allowed_apps list OR allow_app().
+    _DEFAULT_ALLOWED_APPS: FrozenSet[str] = frozenset({
+        # Warmup sentinel: permits actions before world-graph has observed focus
         "__unknown_app__",
         # Browsers
         "google-chrome", "firefox", "chromium", "chromium-browser",
@@ -58,15 +61,25 @@ class PolicyEngine:
         "tilix", "alacritty", "terminal", "iterm", "iterm2", "hyper",
         # File managers
         "nautilus", "thunar", "nemo", "dolphin", "finder", "pcmanfm",
-        # System utilities
+        # Media / utilities
         "evince", "eog", "gpicview", "totem", "vlc",
     })
 
-    def __init__(self, allowed_apps=None):
-        self.denied_roles = {
-            "password text",
-            "alert",
-        }
+    # Approval signal files for REQUIRE_HUMAN_CONFIRMATION flow
+    _APPROVAL_SIGNAL_DIR: str = "/tmp"
+    _APPROVAL_SIGNAL_PREFIX: str = "projectzeo_approve_"
+
+    def __init__(self, allowed_apps: Optional[Set[str]] = None) -> None:
+        # BUG-C2 FIX: Use a mutable set + lock instead of frozenset so that
+        # allow_app() can add entries at runtime after AutonomousInstaller
+        # completes a package installation.
+        self._apps_lock = threading.RLock()
+        if allowed_apps is not None:
+            self._allowed_apps: Set[str] = {str(a).lower() for a in allowed_apps}
+        else:
+            self._allowed_apps = set(self._DEFAULT_ALLOWED_APPS)
+
+        self.denied_roles: Set[str] = {"password text", "alert"}
 
         self.high_risk_name_patterns = [
             re.compile(r"delete",  re.IGNORECASE),
@@ -76,93 +89,112 @@ class PolicyEngine:
             re.compile(r"erase",   re.IGNORECASE),
         ]
 
-        if allowed_apps is not None:
-            self.allowed_apps = frozenset(str(a).lower() for a in allowed_apps)
-        else:
-            self.allowed_apps = self._DEFAULT_ALLOWED_APPS
-
         _logger.info(
-            "PolicyEngine initialized. Allowed apps: %s.",
-            sorted(self.allowed_apps),
+            "PolicyEngine initialised. Allowed apps: %d entries.",
+            len(self._allowed_apps),
         )
 
     # =========================================================================
-    # HUMAN APPROVAL SIGNAL-FILE SUPPORT  (H-7 FIX)
+    # DYNAMIC ALLOWLIST — BUG-C2 FIX
     # =========================================================================
-    #
-    # The REQUIRE_HUMAN_CONFIRMATION return value previously had no real
-    # approval path.  operate.py's retry loop re-called validate_action_dict()
-    # with identical arguments — a deterministic function — so it always
-    # returned REQUIRE_HUMAN_CONFIRMATION again, making the ALLOW branch
-    # structurally unreachable.
-    #
-    # Fix (two parts):
-    #   1. operate.py now writes a signal file and polls its ABSENCE (the user
-    #      deletes the file to approve).
-    #   2. PolicyEngine exposes check_human_approval(action_key) so that the
-    #      confirmation loop has a typed, testable method to query instead of
-    #      directly calling os.path.exists() inline.  This keeps the policy
-    #      boundary clean: all approval logic lives in the policy layer.
-    #
-    # Signal-file location must match the constant in operate.py.
-    _APPROVAL_SIGNAL_DIR: str = "/tmp"
-    _APPROVAL_SIGNAL_PREFIX: str = "projectzeo_approve_"
+
+    @property
+    def allowed_apps(self) -> FrozenSet[str]:
+        """Read-only snapshot of the current allowlist (thread-safe)."""
+        with self._apps_lock:
+            return frozenset(self._allowed_apps)
+
+    def allow_app(self, app_name: str) -> None:
+        
+        if not isinstance(app_name, str) or not app_name.strip():
+            _logger.warning(
+                "[PolicyEngine] allow_app: ignoring empty or non-string app_name %r.",
+                app_name,
+            )
+            return
+
+        normalised = app_name.strip().lower()
+        with self._apps_lock:
+            already = normalised in self._allowed_apps
+            self._allowed_apps.add(normalised)
+
+        if not already:
+            _logger.info(
+                "[PolicyEngine] allow_app: '%s' dynamically added to allowlist "
+                "(total=%d). All future actions in this app will be ALLOW-ed.",
+                normalised,
+                len(self._allowed_apps),
+            )
+        else:
+            _logger.debug(
+                "[PolicyEngine] allow_app: '%s' already in allowlist — no-op.",
+                normalised,
+            )
+
+    def allow_apps(self, app_names) -> None:
+        """
+        Bulk version of allow_app().  Accepts any iterable of app name strings.
+
+        Useful when an installer step adds multiple related executables
+        (e.g. ``["node", "npm", "npx"]`` from a single nodejs install).
+        """
+        for name in app_names:
+            self.allow_app(name)
+
+    def warn_if_unlisted(self, app_name: str) -> None:
+        """
+        Log a warning when *app_name* is not in the allowlist.
+
+        Useful for pre-flight checks: operators can detect app gaps before
+        the first action is denied, rather than only seeing DENY in logs.
+        """
+        if not app_name:
+            return
+        normalised = app_name.lower()
+        with self._apps_lock:
+            listed = normalised in self._allowed_apps
+        if not listed:
+            _logger.warning(
+                "[PolicyEngine] warn_if_unlisted: active application %r is NOT "
+                "in the allowlist.  All autonomous interactions will be DENIED "
+                "until it is added.  Call allow_app(%r) or update policy.yaml.",
+                app_name,
+                app_name,
+            )
+
+    # =========================================================================
+    # HUMAN APPROVAL SIGNAL-FILE SUPPORT
+    # =========================================================================
 
     def approval_signal_path(self, action_key: str) -> str:
-        """Return the path of the pending-approval signal file for action_key."""
+        """Return the filesystem path of the pending-approval signal file."""
         return os.path.join(
             self._APPROVAL_SIGNAL_DIR,
             f"{self._APPROVAL_SIGNAL_PREFIX}{action_key}.signal",
         )
 
     def check_human_approval(self, action_key: str) -> bool:
-        """Return True if the human has approved the action by deleting its signal file.
-
-        This method is the policy layer's typed interface for the confirmation
-        loop in operate.py.  The loop should call this instead of inlining
-        ``os.path.exists()`` directly.
-
-        Parameters
-        ----------
-        action_key : str
-            The 16-char hex action key produced by ActionRanker.action_key().
-
-        Returns
-        -------
-        bool
-            True  — signal file absent → user approved (deleted the file).
-            False — signal file present → still pending (not yet approved).
-
-        Notes
-        -----
-        If the signal file never existed (e.g. the write failed), this method
-        returns True (file absent = no pending veto), which causes the action
-        to be treated as approved.  This is the correct fail-open behaviour:
-        if the system couldn't write the signal file, blocking the action
-        forever would be worse than allowing it with a log warning.
-        """
+        
         path = self.approval_signal_path(action_key)
         try:
             approved = not os.path.exists(path)
-        except OSError as e:
+        except OSError as exc:
             _logger.warning(
-                "PolicyEngine.check_human_approval: could not stat signal file "
-                "%r: %s — treating as approved (fail-open).",
-                path,
-                e,
+                "[PolicyEngine] check_human_approval: could not stat %r: %s "
+                "— treating as approved (fail-open).",
+                path, exc,
             )
-            approved = True  # fail-open: don't block on stat errors
+            return True
 
         if approved:
             _logger.info(
-                "HUMAN_APPROVAL_GRANTED: action_key=%r signal_file=%r",
-                action_key,
-                path,
+                "[PolicyEngine] HUMAN_APPROVAL_GRANTED: action_key=%r signal=%r",
+                action_key, path,
             )
         return approved
 
     # =========================================================================
-    # PRIMARY ENTRY POINT (no AT-SPI required)
+    # PRIMARY ENTRY POINT — dict-based (no AT-SPI required)
     # =========================================================================
 
     def validate_action_dict(
@@ -170,14 +202,22 @@ class PolicyEngine:
         action: dict,
         *,
         focused_app: str = "__unknown_app__",
-    ) -> tuple:
+    ) -> Tuple[str, Optional[str]]:
         
         try:
             return self._validate_action_dict_inner(action, focused_app)
-        except Exception as e:
-            return self.DENY, f"Policy validation error (fail-closed): {e}"
+        except Exception as exc:
+            _logger.error(
+                "[PolicyEngine] validate_action_dict: unexpected error (fail-closed): %s",
+                exc,
+            )
+            return self.DENY, f"Policy validation error (fail-closed): {exc}"
 
-    def _validate_action_dict_inner(self, action: dict, focused_app: str) -> tuple:
+    def _validate_action_dict_inner(
+        self,
+        action: dict,
+        focused_app: str,
+    ) -> Tuple[str, Optional[str]]:
         if not isinstance(action, dict):
             return self.DENY, "Action must be a dict"
 
@@ -185,86 +225,110 @@ class PolicyEngine:
         if not op:
             return self.DENY, "Action has no 'operation' field"
 
-        # DONE is always allowed — it terminates the task cleanly.
+        # DONE always succeeds — it terminates the task cleanly
         if op == "done":
             return self.ALLOW, None
 
         # ---- Application allowlist ----
         app = str(focused_app or "__unknown_app__").lower().strip()
-        if app not in self.allowed_apps:
-            return self.DENY, (
+        with self._apps_lock:
+            app_allowed = app in self._allowed_apps
+        if not app_allowed:
+            reason = (
                 f"Unauthorized application: {app!r}. "
-                f"Allowed: {sorted(self.allowed_apps)}. "
-                "Add to PolicyEngine.allowed_apps or pass allowed_apps= at construction."
+                "Add to PolicyEngine.allowed_apps or call allow_app() "
+                "after installation."
             )
+            _logger.warning(
+                "[PolicyEngine] DENY: op=%r app=%r — %s", op, app, reason
+            )
+            return self.DENY, reason
 
         # ---- Synthetic role check ----
         synthetic_role = self._OP_TO_SYNTHETIC_ROLE.get(op, op)
         if synthetic_role in self.denied_roles:
-            return self.DENY, f"Forbidden operation role: {synthetic_role!r}"
+            reason = f"Forbidden operation role: {synthetic_role!r}"
+            _logger.warning("[PolicyEngine] DENY: %s", reason)
+            return self.DENY, reason
 
-        # ---- Semantic misuse: type into non-text target ----
-        # This check only applies to 'write'/'type' operations.
-        if op in ("write", "type"):
-            target_role = str(action.get("target_role") or "text").lower()
-            if "text" not in target_role and "entry" not in target_role and target_role != "text":
-                # Only block if a target_role was explicitly specified and is non-text.
-                # If target_role is absent, assume text (conservative default).
-                if action.get("target_role"):
-                    return self.DENY, (
-                        f"Semantic violation: type/write into role {target_role!r}. "
-                        "Only 'text' and 'entry' roles are writable."
-                    )
+        # ---- Semantic type/write into non-text target ----
+        if op in ("write", "type") and action.get("target_role"):
+            target_role = str(action["target_role"]).lower()
+            if "text" not in target_role and "entry" not in target_role:
+                reason = (
+                    f"Semantic violation: type/write into role {target_role!r}. "
+                    "Only 'text' and 'entry' roles are writable."
+                )
+                _logger.warning("[PolicyEngine] DENY: %s", reason)
+                return self.DENY, reason
 
         # ---- High-risk content check ----
-        # Inspect the operation's content/command fields for dangerous patterns.
-        content_to_check = ""
-        if op == "command":
-            content_to_check = str(action.get("command") or "")
-        elif op in ("write", "type"):
-            content_to_check = str(action.get("content") or action.get("text") or "")
-        elif op in ("press", "hotkey", "key"):
-            keys = action.get("keys") or action.get("key") or []
-            if isinstance(keys, str):
-                keys = [keys]
-            content_to_check = " ".join(str(k) for k in keys)
-        elif op == "file_create":
-            content_to_check = str(action.get("path") or "")
-
-        for pat in self.high_risk_name_patterns:
-            if pat.search(content_to_check):
-                _logger.warning(
-                    "POLICY_REQUIRES_CONFIRMATION: operation=%r pattern=%r content=%r app=%r",
-                    op, pat.pattern, content_to_check[:120], app,
-                )
-                return (
-                    self.REQUIRE_HUMAN_CONFIRMATION,
-                    f"High-risk content detected (pattern={pat.pattern!r}): {content_to_check[:80]!r}",
-                )
+        content_to_check = self._extract_risk_content(op, action)
+        if content_to_check.strip():
+            for pat in self.high_risk_name_patterns:
+                if pat.search(content_to_check):
+                    reason = (
+                        f"High-risk content detected (pattern={pat.pattern!r}): "
+                        f"{content_to_check[:80]!r}"
+                    )
+                    _logger.warning(
+                        "[PolicyEngine] REQUIRE_HUMAN_CONFIRMATION: op=%r "
+                        "app=%r pattern=%r content=%r",
+                        op, app, pat.pattern, content_to_check[:120],
+                    )
+                    return self.REQUIRE_HUMAN_CONFIRMATION, reason
 
         # ---- Unknown operation — DENY to fail closed ----
         if op not in self._OP_TO_SYNTHETIC_ROLE:
-            return self.DENY, f"Unknown operation: {op!r}"
+            reason = f"Unknown operation: {op!r}"
+            _logger.warning("[PolicyEngine] DENY: %s", reason)
+            return self.DENY, reason
 
         return self.ALLOW, None
 
+    def _extract_risk_content(self, op: str, action: dict) -> str:
+        """Extract the content string to scan for high-risk patterns."""
+        if op == "command":
+            return str(action.get("command") or "")
+        if op in ("write", "type"):
+            return str(action.get("content") or action.get("text") or "")
+        if op in ("press", "hotkey", "key"):
+            keys = action.get("keys") or action.get("key") or []
+            if isinstance(keys, str):
+                keys = [keys]
+            return " ".join(str(k) for k in keys)
+        if op == "file_create":
+            return str(action.get("path") or "")
+        return ""
+
     # =========================================================================
-    # SECONDARY ENTRY POINT (AT-SPI node required)
+    # SECONDARY ENTRY POINT — AT-SPI node-based
     # =========================================================================
 
-    def validate(self, node, action: str) -> tuple:
-        
+    def validate(self, node, action: str) -> Tuple[str, Optional[str]]:
+        """
+        Validate *action* against an AT-SPI accessibility *node*.
 
-        # ---- NODE INTROSPECTION (FAIL-CLOSED, EXPLICIT) ----
+        Parameters
+        ----------
+        node:
+            pyatspi Accessible node.
+        action:
+            Action string (e.g. ``"click"``, ``"type"``).
+
+        Returns
+        -------
+        (decision, reason) — same semantics as validate_action_dict().
+        """
         try:
             role = (node.getRoleName() or "unknown").lower()
-        except Exception as e:
-            return self.DENY, f"Cannot read node role: {e}"
+        except Exception as exc:
+            return self.DENY, f"Cannot read node role: {exc}"
 
         try:
             name = (node.name or "").lower()
-        except Exception as e:
-            return self.DENY, f"Cannot read node name: {e}"
+        except Exception as exc:
+            return self.DENY, f"Cannot read node name: {exc}"
 
         try:
             app_obj = node.getApplication()
@@ -273,19 +337,18 @@ class PolicyEngine:
                 if app_obj and app_obj.name
                 else "unknown"
             )
-        except Exception as e:
-            return self.DENY, f"Cannot read application identity: {e}"
-
-        # ---- POLICY RULES ----
+        except Exception as exc:
+            return self.DENY, f"Cannot read application identity: {exc}"
 
         if app == "unknown":
             return self.DENY, "Application identity unavailable"
 
-        if app not in self.allowed_apps:
+        with self._apps_lock:
+            app_allowed = app in self._allowed_apps
+        if not app_allowed:
             return self.DENY, (
                 f"Unauthorized application: {app!r}. "
-                f"Allowed: {sorted(self.allowed_apps)}. "
-                "Add to PolicyEngine.allowed_apps to permit."
+                "Call allow_app() or update policy.yaml."
             )
 
         if role in self.denied_roles:
@@ -297,7 +360,8 @@ class PolicyEngine:
         for pat in self.high_risk_name_patterns:
             if pat.search(name):
                 _logger.warning(
-                    "POLICY_REQUIRES_CONFIRMATION: role=%r name=%r app=%r pattern=%r",
+                    "[PolicyEngine] REQUIRE_HUMAN_CONFIRMATION (AT-SPI): "
+                    "role=%r name=%r app=%r pattern=%r",
                     role, name, app, pat.pattern,
                 )
                 return (
@@ -306,18 +370,3 @@ class PolicyEngine:
                 )
 
         return self.ALLOW, None
-
-    # =========================================================================
-    # DIAGNOSTICS
-    # =========================================================================
-
-    def warn_if_unlisted(self, app_name: str) -> None:
-        
-        if app_name and app_name.lower() not in self.allowed_apps:
-            _logger.warning(
-                "PolicyEngine: active application %r is NOT in the allowlist %s. "
-                "All autonomous interactions will be DENIED until it is added. "
-                "Update PolicyEngine.allowed_apps or pass allowed_apps= at construction.",
-                app_name,
-                sorted(self.allowed_apps),
-            )
