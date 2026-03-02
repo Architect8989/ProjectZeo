@@ -832,15 +832,23 @@ class ExecutionPlanner:
         cmd_stripped = action.get("command", "").strip()
 
         
+        for pattern in self._compiled_patterns:
+            if pattern.search(command_text):
+                import sys as _sys_ep
+                print(
+                    f"[ExecutionPlanner] GAP-2 SECURITY BLOCK: dangerous pattern "
+                    f"{pattern.pattern!r} matched in step command_text "
+                    f"(first 120 chars): {command_text[:120]!r}. "
+                    "Step discarded.",
+                    file=_sys_ep.stderr,
+                )
+                return None  # blocked — discard entire step
+
+        
         _is_trusted_installer_cmd = (
             cmd_stripped
             and cmd_stripped in self._trusted_installer_commands
         )
-
-        if not _is_trusted_installer_cmd:
-            for pattern in self._compiled_patterns:
-                if pattern.search(command_text):
-                    return None
 
         for v in action.values():
             if isinstance(v, str):
