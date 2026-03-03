@@ -78,13 +78,19 @@ MAX_COMMAND_OUTPUT_BYTES = 4096
 MAX_DYNAMIC_CANDIDATES = 3
 
 
+import os as _os_sig
+import secrets as _secrets_mod
+
 _SIGNAL_DIR: str = tempfile.gettempdir()
 _SIGNAL_PREFIX: str = "projectzeo_approve_"
+_SIGNAL_SECRET: str = _secrets_mod.token_hex(16)
 
 
 def _approval_signal_path(action_key: str) -> str:
-    """Return the path of the approval signal file for this action key."""
-    return os.path.join(_SIGNAL_DIR, f"{_SIGNAL_PREFIX}{action_key}.signal")
+    return _os_sig.path.join(
+        _SIGNAL_DIR,
+        f"{_SIGNAL_PREFIX}{_SIGNAL_SECRET}_{action_key}.signal",
+    )
 
 
 def _write_approval_signal(action_key: str, action: dict, reason: str) -> str:
@@ -214,7 +220,7 @@ def operate_main(
         )
 
     
-    _auto_discovered: list = []
+    _auto_discovered_names: list = []
     try:
         import psutil as _psutil_ad  # noqa: PLC0415
         _seen: set = set()
@@ -223,29 +229,26 @@ def operate_main(
                 _pname = (_proc.info.get("name") or "").strip()
                 if _pname and _pname not in _seen:
                     _seen.add(_pname)
-                    policy_engine.allow_app(_pname)
-                    _auto_discovered.append(_pname)
+                    _auto_discovered_names.append(_pname)
             except (_psutil_ad.NoSuchProcess, _psutil_ad.AccessDenied):
                 continue
-        if _auto_discovered:
+        if _auto_discovered_names:
             print(
-                f"[operate_main] GAP-1: Auto-discovered {len(_auto_discovered)} running "
-                f"processes and added to PolicyEngine allowlist. "
-                f"Sample: {sorted(_auto_discovered)[:8]}",
+                f"[operate_main] Process fingerprint: {len(_auto_discovered_names)} running "
+                f"processes observed at task start (NOT added to allowlist). "
+                f"Sample: {sorted(_auto_discovered_names)[:8]}. "
+                "Add apps explicitly via policy.yaml allowed_apps.",
                 file=sys.stderr,
             )
     except ImportError:
         print(
-            "[operate_main] GAP-1 WARNING: psutil not installed — cannot auto-discover "
-            "running apps.  Actions in non-default applications will be DENY'd. "
-            "Fix: pip install psutil",
+            "[operate_main] WARNING: psutil not installed — cannot fingerprint "
+            "running apps. Fix: pip install psutil",
             file=sys.stderr,
         )
     except Exception as _disc_err:
-        # Never let discovery failure block task execution
         print(
-            f"[operate_main] GAP-1 WARNING: process auto-discovery failed: {_disc_err}. "
-            "Proceeding with default allowlist only.",
+            f"[operate_main] WARNING: process fingerprint failed: {_disc_err}.",
             file=sys.stderr,
         )
 
@@ -453,7 +456,6 @@ def operate_main(
                 file=sys.stderr,
             )
 
-        .
         try:
             from core.safety.checkpoint_store import clear_checkpoint as _clear_cp
             _clear_cp()
@@ -1214,6 +1216,7 @@ def _execute_decision(
         if _dangerous_text.strip():
             try:
                 from core.planner.execution_planner import ExecutionPlanner as _EP  # noqa: PLC0415
+                from core.security.injection_markers import normalize_for_injection_check as _norm_dp  # noqa: PLC0415
                 _compiled = getattr(_EP, "_dispatch_compiled_patterns", None)
                 if _compiled is None:
                     import re as _re_dp
@@ -1221,17 +1224,17 @@ def _execute_decision(
                         _re_dp.compile(p, _re_dp.IGNORECASE) for p in _EP.DANGEROUS_PATTERNS
                     ]
                     _EP._dispatch_compiled_patterns = _compiled
+                _normalized_dangerous = _norm_dp(_dangerous_text)
                 for _pat in _compiled:
-                    if _pat.search(_dangerous_text):
+                    if _pat.search(_normalized_dangerous):
                         log_warn(
                             f"[BUG-11] DANGEROUS_PATTERNS match at DISPATCH time "
                             f"for op={op!r}: pattern={_pat.pattern!r}. "
-                            "Blocking execution. This indicates a plan or dynamic "
-                            "candidate bypass of the planning-time filter."
+                            "Blocking execution."
                         )
                         return {
                             "success": False,
-                            "reward": -1.0,  # severe: strong bandit de-prioritization
+                            "reward": -1.0,
                             "reason": (
                                 f"dangerous_pattern_blocked_at_dispatch: "
                                 f"pattern={_pat.pattern!r} matched in {op!r} operation. "
