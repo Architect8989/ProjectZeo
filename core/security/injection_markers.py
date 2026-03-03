@@ -5,8 +5,10 @@ import re
 def normalize_for_injection_check(text: str) -> str:
     if not isinstance(text, str):
         return ""
-    normalised = unicodedata.normalize("NFKC", text)
-    ascii_bytes = normalised.encode("ascii", errors="ignore")
+    nfkd = unicodedata.normalize("NFKD", text)
+    stripped = "".join(ch for ch in nfkd if unicodedata.category(ch) != "Mn")
+    nfkc = unicodedata.normalize("NFKC", stripped)
+    ascii_bytes = nfkc.encode("ascii", errors="ignore")
     return ascii_bytes.decode("ascii").lower()
 
 
