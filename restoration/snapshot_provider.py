@@ -22,9 +22,6 @@ class SnapshotProviderError(RuntimeError):
     pass
 
 
-_GAP1_WARNING_EMITTED: bool = False
-
-
 class SnapshotProvider:
 
 
@@ -261,17 +258,14 @@ class SnapshotProvider:
     # =========================================================
 
     def take_snapshot(self) -> str:
-        
         import sys as _sys
-        global _GAP1_WARNING_EMITTED
-        if not _GAP1_WARNING_EMITTED:
-            _GAP1_WARNING_EMITTED = True
-            _sys.stderr.write(
-                "[SnapshotProvider] GAP-1: Snapshot captures cursor+window+app ONLY. "
-                "Media playback position, browser tabs/scroll, clipboard, and "
-                "unsaved application state are NOT captured and will NOT be restored. "
-                "For media tasks: record timestamp before arming and seek after restore.\n"
-            )
+        _sys.stderr.write(
+            "[SnapshotProvider] Snapshot captures cursor+window+app ONLY. "
+            "Browser tabs/scroll, clipboard, unsaved application state, and "
+            "background processes started during the task are NOT captured and "
+            "will NOT be restored. For media tasks: record timestamp before "
+            "arming and seek after restore.\n"
+        )
         snapshot = self._capture_snapshot()
         return self.store_snapshot(snapshot)
 
