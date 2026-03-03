@@ -138,13 +138,7 @@ def _signal_handler(signum, frame) -> None:
 
 
 def _install_signal_handlers() -> None:
-    """
-    Register SIGINT, SIGTERM, and SIGQUIT (Unix) to set the shutdown event.
-
-    Previously only SIGINT was handled; SIGTERM from systemd/Kubernetes would
-    kill the process immediately without triggering the atexit sequence or
-    running _force_safe_shutdown().
-    """
+    
     signal.signal(signal.SIGINT, _signal_handler)
     signal.signal(signal.SIGTERM, _signal_handler)
     if hasattr(signal, "SIGQUIT"):
@@ -214,12 +208,7 @@ def _enforce_task_timeout() -> None:
 
 
 def _safe_begin_restoration(mode: ModeController) -> bool:
-    """
-    Attempt to transition mode to RESTORING.  Returns True if restoration should
-    proceed, False if it should be skipped (e.g. task never reached EXECUTING).
-
-    PATCH §1.5: begin_restoration() only accepts EXECUTING mode.
-    """
+    
     current = mode.mode
 
     if current is SystemMode.EXECUTING:
@@ -296,19 +285,25 @@ def main(llm_callable: Callable, model_name: str) -> None:
     
     _crash_recovery_step_index: "int | None" = None
     try:
-        from core.safety.checkpoint_store import get_checkpoint_step_index as _get_cp_idx
+        from core.safety.checkpoint_store import (
+            get_checkpoint_step_index as _get_cp_idx,
+            get_checkpoint_execution_log as _get_cp_log,
+        )
         _crash_recovery_step_index = _get_cp_idx()
+        _crash_recovery_execution_log = _get_cp_log()
         if _crash_recovery_step_index is not None:
             print(
-                f"[MAIN] BUG-5: Crash recovery: restoring from checkpoint step_index="
+                f"[MAIN] BUG-5 / MAJ-1: Crash recovery: restoring from checkpoint step_index="
                 f"{_crash_recovery_step_index}. Steps 0–{_crash_recovery_step_index - 1} "
-                "will be skipped (already completed before crash).",
+                "will be skipped (already completed before crash). "
+                f"Execution log has {len(_crash_recovery_execution_log or {})} step(s).",
                 file=sys.stderr,
             )
     except Exception as _cp_load_err:
+        _crash_recovery_execution_log = None
         print(
-            f"[MAIN] BUG-5: Checkpoint step_index load failed: {_cp_load_err}. "
-            "Starting from step 0 (full replay on crash recovery).",
+            f"[MAIN] BUG-5 / MAJ-1: Checkpoint load failed: {_cp_load_err}. "
+            "Starting from step 0 with empty execution log (full replay on crash recovery).",
             file=sys.stderr,
         )
 
@@ -471,8 +466,7 @@ def main(llm_callable: Callable, model_name: str) -> None:
                 # Task start
                 # --------------------------------------------------------
                 _set_task_start(time.time())
-                # Reset watchdog per-task so the 1-hour wall-clock limit applies
-                # per task, not per process lifetime
+                
                 watchdog.start_time = time.time()
                 replan_count = 0
 
@@ -568,9 +562,7 @@ def main(llm_callable: Callable, model_name: str) -> None:
                 mode.attach_execution_plan(f"plan_{int(time.time())}")
                 mode.mark_planning_complete()
 
-                # BUG-3 FIX: Resume observer_loop briefly after planning so the
-                # world graph gets at least one fresh frame before execution starts.
-                # We immediately re-pause it when entering EXECUTING mode below.
+                
                 try:
                     observer_loop.resume()
                     time.sleep(0.5)  # allow one world graph update
@@ -602,6 +594,9 @@ def main(llm_callable: Callable, model_name: str) -> None:
                 # BUG-5 FIX: Use checkpoint step_index for crash recovery fast-forward.
                 _prior_step_index: Optional[int] = _crash_recovery_step_index
                 _crash_recovery_step_index = None  # consume once
+                # MAJ-1 FIX: Consume crash recovery execution_log (one-shot)
+                _crash_recovery_execution_log_for_task = _crash_recovery_execution_log
+                _crash_recovery_execution_log = None  # consume once
 
                 try:
                     while not _SHUTDOWN_EVENT.is_set():
@@ -626,10 +621,14 @@ def main(llm_callable: Callable, model_name: str) -> None:
                                 prior_belief_state=_prior_belief_state,
                                 belief_state_out=_belief_state_out,
                                 prior_step_index=_prior_step_index,
+                                # MAJ-1 FIX: Restore execution_log from checkpoint so the
+                                # LLM sees all prior step outputs on crash recovery.
+                                prior_execution_log=_crash_recovery_execution_log_for_task,
                             )
                             _task_succeeded = True
                             _interactive_print(f"[MODE] TASK COMPLETED — {intent[:72]}")
-                            _write_task_result(intent=intent, success=True)
+                            # CRIT-3 FIX: _write_task_result(success=True) deliberately
+                            # NOT called here. Deferred to restoration finally block.
                             break
 
                         except RuntimeError as e:
@@ -820,6 +819,15 @@ def main(llm_callable: Callable, model_name: str) -> None:
                                 belief_state_full=_bs if _bs else None,
                             )
 
+                            # CRIT-3 FIX: Write task_result.json ONLY after restoration
+                            # AND verification have both completed successfully.  Writing
+                            # success=True before this point (as the original code did,
+                            # immediately after operate_main() returned) caused the
+                            # --status flag to report false positives when restoration
+                            # or verification subsequently failed.
+                            if _task_succeeded:
+                                _write_task_result(intent=intent, success=True)
+
                         except Exception as cleanup_err:
                             _force_safe_shutdown(
                                 os_backend,
@@ -902,27 +910,7 @@ def main(llm_callable: Callable, model_name: str) -> None:
                 continue
 
             except RuntimeError as e:
-                # BLOCKER #2 FIX: Task-failure RuntimeErrors must NOT kill the agent.
-                # ====================================================================
-                # The original code had a single ``except Exception as e: break``
-                # handler at the bottom of the main loop.  Any RuntimeError raised
-                # during a task (timeout, max replans, replan ceiling, watchdog,
-                # restore failure, etc.) hit this handler and broke out of the loop
-                # permanently — requiring a manual process restart.  On the first
-                # task attempt on a fresh install this meant the agent was dead after
-                # one failure, every time.
-                #
-                # Fix: intercept RuntimeErrors whose message starts with
-                # "TASK_FAILED:" and treat them as recoverable task-level failures.
-                # The agent logs the failure, writes task_result.json, forces itself
-                # back to OBSERVER, resumes the observer loop, clears task timing
-                # state, and continues polling for the next intent.  Only unexpected
-                # RuntimeErrors (programming bugs) propagate to the outer handler.
-                #
-                # RestorationVerificationError is NOT a RuntimeError subclass, so
-                # it still flows to the outer handler and triggers a safe shutdown —
-                # a hard restoration failure is a systemic issue requiring operator
-                # investigation, not a task-level retry.
+                
                 _err_str = str(e)
                 if _err_str.startswith("TASK_FAILED:"):
                     print(
