@@ -323,9 +323,43 @@ class OperatingSystem:
         if not isinstance(cmd, str) or not cmd.strip():
             raise RuntimeError("exec(): invalid command")
 
-        full_cmd = cmd
+        full_cmd = cmd.strip()
         if sudo and hasattr(os, "geteuid") and os.geteuid() != 0:
-            full_cmd = f"sudo {cmd}"
+            full_cmd = f"sudo {full_cmd}"
+
+        # Re-validate against dangerous patterns at execution boundary.
+        # This is a defence-in-depth check: planning-time validation should have
+        # already blocked dangerous commands, but dynamic candidates and installer
+        # code paths may bypass the planner.  Unicode normalization mirrors the
+        # planner's pipeline so homoglyph-obfuscated commands are caught here too.
+        try:
+            from core.planner.execution_planner import ExecutionPlanner as _EP  # noqa: PLC0415
+            from core.security.injection_markers import normalize_for_injection_check as _norm  # noqa: PLC0415
+            _compiled = getattr(_EP, "_exec_compiled_patterns", None)
+            if _compiled is None:
+                import re as _re
+                _compiled = [_re.compile(p, _re.IGNORECASE) for p in _EP.DANGEROUS_PATTERNS]
+                _EP._exec_compiled_patterns = _compiled
+            _normalized_cmd = _norm(full_cmd)
+            for _pat in _compiled:
+                if _pat.search(_normalized_cmd):
+                    raise RuntimeError(
+                        f"exec(): command blocked by dangerous-pattern filter "
+                        f"(pattern={_pat.pattern!r}): {full_cmd[:120]!r}"
+                    )
+        except RuntimeError:
+            raise
+        except Exception:
+            pass  # Validator unavailable — proceed; planning-time filter is primary
+
+        # Build a restricted environment: inherit PATH and common tool vars but
+        # exclude LD_PRELOAD, LD_LIBRARY_PATH, and PYTHONPATH which could be used
+        # to hijack the executed subprocess.
+        _safe_env = {
+            k: v for k, v in os.environ.items()
+            if k not in ("LD_PRELOAD", "LD_LIBRARY_PATH", "PYTHONPATH",
+                         "DYLD_INSERT_LIBRARIES", "DYLD_LIBRARY_PATH")
+        }
 
         try:
             result = subprocess.run(
@@ -334,6 +368,7 @@ class OperatingSystem:
                 capture_output=True,
                 text=True,
                 timeout=timeout,
+                env=_safe_env,
             )
         except subprocess.TimeoutExpired as exc:
             raise RuntimeError(
