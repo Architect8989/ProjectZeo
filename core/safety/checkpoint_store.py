@@ -6,6 +6,7 @@ import tempfile
 import hashlib
 from typing import Optional, Dict, Any
 
+
 import pathlib as _pathlib
 CHECKPOINT_DIR = str(_pathlib.Path(__file__).resolve().parents[2] / "memory")
 del _pathlib
@@ -21,7 +22,9 @@ def _ensure_dir() -> None:
 
 
 def _stable_json_bytes(obj: Any) -> bytes:
-    "
+    """
+    Deterministic JSON serialization.
+    """
     return json.dumps(
         obj,
         sort_keys=True,
@@ -55,7 +58,6 @@ def _fsync_dir(path: str) -> None:
 
 def save_checkpoint(state: Dict) -> None:
     
-
     if not isinstance(state, dict):
         raise TypeError("Checkpoint state must be dict")
 
@@ -90,10 +92,7 @@ def save_checkpoint(state: Dict) -> None:
 
 
 def load_checkpoint() -> Optional[Dict]:
-    """
-    Loads checkpoint only if checksum matches.
-    Fail-closed on corruption.
-    """
+    
 
     if not os.path.exists(CHECKPOINT_FILE):
         return None
@@ -157,3 +156,4 @@ def get_checkpoint_execution_log() -> Optional[Dict[str, Any]]:
         return None
     log = state.get("execution_log")
     return log if isinstance(log, dict) else None
+
