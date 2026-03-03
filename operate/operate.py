@@ -152,10 +152,13 @@ def operate_main(
     belief_state_out: Optional[list] = None,
     
     prior_step_index: Optional[int] = None,
+    prior_execution_log: Optional[dict] = None,  # MAJ-1 FIX: restore from checkpoint
 ) -> None:
     
    
     
+    
+    _CONFIRM_TIMEOUT_LOGGED[0] = False
     if not _CONFIRM_TIMEOUT_LOGGED[0]:
         _CONFIRM_TIMEOUT_LOGGED[0] = True
         print(
@@ -179,9 +182,7 @@ def operate_main(
 
     os_backend = os_backend or OperatingSystem()
 
-    # ------------------------------------------------------------------
-    # PolicyEngine — load allowed apps from policy.yaml if available
-    # ------------------------------------------------------------------
+    
     policy_engine = PolicyEngine()
     try:
         import os as _os_mod
@@ -432,6 +433,7 @@ def operate_main(
             task_ui_executor=_task_ui_executor,
             prior_playbook_actions=_prior_playbook_actions,
             prior_step_index=prior_step_index,
+            prior_execution_log=prior_execution_log,  # MAJ-1 FIX
             created_files_ledger=_created_files_ledger,
         )
         
@@ -451,8 +453,7 @@ def operate_main(
                 file=sys.stderr,
             )
 
-        # AUDIT §2.4 FIX: Clear the step checkpoint on successful task completion
-        # so the next task does not accidentally resume from a stale position.
+        .
         try:
             from core.safety.checkpoint_store import clear_checkpoint as _clear_cp
             _clear_cp()
@@ -494,10 +495,11 @@ def _execute_autonomous_loop(
     belief_state_out: Optional[list] = None,
     task_ui_executor: Optional[concurrent.futures.ThreadPoolExecutor] = None,
     prior_playbook_actions: Optional[List[dict]] = None,
-    # BUG-5 FIX: Accept checkpoint step index for crash-recovery fast-forward.
+    
     prior_step_index: Optional[int] = None,
-    # GAP-2 FIX: Filesystem rollback ledger — collects paths created during
-    # this task so replanning context includes already_created_files.
+    
+    prior_execution_log: Optional[dict] = None,
+    
     created_files_ledger: Optional[List[str]] = None,
 ) -> None:
 
@@ -539,7 +541,26 @@ def _execute_autonomous_loop(
     action_ranker.set_plan_horizon(_plan_real_steps)
 
     
-    execution_log: Dict[int, Dict[str, str]] = {}
+    
+    if prior_execution_log and isinstance(prior_execution_log, dict):
+        try:
+            execution_log: Dict[int, Dict[str, str]] = {
+                int(k): v for k, v in prior_execution_log.items()
+                if isinstance(v, dict)
+            }
+            print(
+                f"[OPERATE] MAJ-1: Restored execution_log from checkpoint with "
+                f"{len(execution_log)} step(s).",
+                file=sys.stderr,
+            )
+        except Exception as _el_err:
+            print(
+                f"[OPERATE] MAJ-1: execution_log restore failed ({_el_err}); "                "starting with empty log.",
+                file=sys.stderr,
+            )
+            execution_log = {}
+    else:
+        execution_log: Dict[int, Dict[str, str]] = {}
 
     _visited_action_keys: dict = {}  # ordered set: {action_key: True}
     if prior_belief_state is not None:
@@ -742,24 +763,37 @@ def _execute_autonomous_loop(
                         )
                         if dynamic_candidates:
                             
+                            try:
+                                from core.security.injection_markers import contains_injection_marker as _cim
+                                _safe_dynamic: list = []
+                                for _dc in dynamic_candidates:
+                                    _dc_cmd = str(_dc.get("command", "")) + " " + str(_dc.get("content", ""))
+                                    if _cim(_dc_cmd):
+                                        log_warn(
+                                            f"[CRIT-6] Dynamic candidate BLOCKED — injection marker "                                            f"detected in command/content: {_dc_cmd[:80]!r}. "                                            "Candidate dropped.")
+                                    else:
+                                        _safe_dynamic.append(_dc)
+                                dynamic_candidates = _safe_dynamic
+                            except ImportError:
+                                pass  # security module unavailable — proceed without this check
+
                             fresh_candidates = [
                                 c for c in dynamic_candidates
                                 if action_ranker.action_key(c) not in _visited_action_keys
                             ]
-                            # Use fresh candidates if available; fall back to all dynamic
-                            # candidates only if every one has been tried (exploration exhausted).
+                            
                             candidate_actions = fresh_candidates or dynamic_candidates
-                            journal.record({
-                                "event": "dynamic_candidates_used",
-                                "step": current_step_index,
-                                "count": len(candidate_actions),
-                                "fresh_count": len(fresh_candidates),
-                            })
+                            if candidate_actions:
+                                journal.record({
+                                    "event": "dynamic_candidates_used",
+                                    "step": current_step_index,
+                                    "count": len(candidate_actions),
+                                    "fresh_count": len(fresh_candidates),
+                                })
                     except Exception as re_err:
                         log_warn(f"ReasoningEngine fallback failed: {re_err}")
 
-                    # Prepend playbook candidates (known-good from prior runs) before
-                    # ReasoningEngine-generated candidates so they are seen by ActionRanker.
+                    
                     if _playbook_candidates:
                         candidate_actions = _playbook_candidates + candidate_actions
 
@@ -856,8 +890,7 @@ def _execute_autonomous_loop(
                     f"  Approve: delete the file → {_signal_path}",
                     file=sys.stderr,
                 )
-                # GAP-3 FIX: Send desktop notification so the operator sees the
-                # approval request even when not watching stderr.
+                
                 try:
                     import subprocess as _sp
                     _notif_body = (
@@ -1374,6 +1407,45 @@ def _execute_decision(
                 else []
             )
             if install_cmds and isinstance(install_cmds, list):
+                
+                _auto_approve_install = (
+                    os.environ.get("PROJECTZEO_AUTO_APPROVE_INSTALL", "").strip().lower()
+                    in ("1", "true", "yes")
+                )
+                if not _auto_approve_install:
+                    _install_preview = "; ".join(str(c) for c in install_cmds[:3])
+                    _ak = f"install_{abs(hash(_install_preview)) % 999999}"
+                    _sig_path = _write_approval_signal(
+                        _ak,
+                        action,
+                        reason=f"MAJ-9: install/sudo requires confirmation: {_install_preview[:120]}",
+                    )
+                    print(
+                        f"[OPERATE] MAJ-9: Install requires human approval. "
+                        f"Commands: {_install_preview!r}. "
+                        f"APPROVE: delete {_sig_path}  |  "
+                        f"Timeout: {_CONFIRM_TIMEOUT_SECONDS}s → auto-denied.",
+                        file=sys.stderr,
+                    )
+                    _waited = 0.0
+                    _approved = False
+                    while _waited < _CONFIRM_TIMEOUT_SECONDS:
+                        time.sleep(WAIT_RETRY_SECONDS)
+                        _waited += WAIT_RETRY_SECONDS
+                        if not os.path.exists(_sig_path):
+                            _approved = True
+                            break
+                    if not _approved:
+                        _remove_approval_signal(_sig_path)
+                        return {
+                            "success": False,
+                            "reward": -1.0,
+                            "reason": (
+                                f"MAJ-9: Install confirmation timed out after "
+                                f"{_CONFIRM_TIMEOUT_SECONDS}s. Commands were: {_install_preview!r}. "
+                                "Set PROJECTZEO_AUTO_APPROVE_INSTALL=1 to bypass confirmation."                            ),
+                        }
+
                 # Terminal-first install path
                 from config.timeouts import INSTALL_COMMAND_TIMEOUT_SECONDS
                 all_ok = True
