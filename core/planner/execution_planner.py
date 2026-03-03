@@ -831,18 +831,18 @@ class ExecutionPlanner:
         command_text = action.get("command", "") + " " + action.get("content", "")
         cmd_stripped = action.get("command", "").strip()
 
-        
+        _normalized_command_text = normalize_for_injection_check(command_text)
         for pattern in self._compiled_patterns:
-            if pattern.search(command_text):
+            if pattern.search(_normalized_command_text):
                 import sys as _sys_ep
                 print(
-                    f"[ExecutionPlanner] GAP-2 SECURITY BLOCK: dangerous pattern "
+                    f"[ExecutionPlanner] SECURITY BLOCK: dangerous pattern "
                     f"{pattern.pattern!r} matched in step command_text "
                     f"(first 120 chars): {command_text[:120]!r}. "
                     "Step discarded.",
                     file=_sys_ep.stderr,
                 )
-                return None  # blocked — discard entire step
+                return None
 
         
         _is_trusted_installer_cmd = (
