@@ -141,7 +141,20 @@ COMMON_INSTALL_COMMANDS: Dict[str, Dict[str, str]] = {
         "Windows": _choco("redis-64"),
     },
     "mongodb": {
-        "Linux":   "curl -fsSL https://www.mongodb.org/static/pgp/server-7.0.asc | sudo gpg -o /usr/share/keyrings/mongodb-server-7.0.gpg --dearmor && echo 'deb [ arch=amd64,arm64 signed-by=/usr/share/keyrings/mongodb-server-7.0.gpg ] https://repo.mongodb.org/apt/ubuntu jammy/mongodb-org/7.0 multiverse' | sudo tee /etc/apt/sources.list.d/mongodb-org-7.0.list && sudo apt-get update && sudo apt-get install -y mongodb-org",
+        "Linux":   (
+            "sudo apt-get update -qq && sudo apt-get install -y gnupg curl && "
+            "curl -fsSL https://www.mongodb.org/static/pgp/server-7.0.asc "
+            "-o /tmp/mongodb-server-7.0.asc && "
+            "sudo gpg --batch --yes --dearmor "
+            "-o /usr/share/keyrings/mongodb-server-7.0.gpg "
+            "/tmp/mongodb-server-7.0.asc && "
+            "rm -f /tmp/mongodb-server-7.0.asc && "
+            "echo 'deb [ arch=amd64,arm64 "
+            "signed-by=/usr/share/keyrings/mongodb-server-7.0.gpg ] "
+            "https://repo.mongodb.org/apt/ubuntu jammy/mongodb-org/7.0 multiverse' "
+            "| sudo tee /etc/apt/sources.list.d/mongodb-org-7.0.list && "
+            "sudo apt-get update && sudo apt-get install -y mongodb-org"
+        ),
         "Darwin":  "brew tap mongodb/brew && brew install mongodb-community",
         "Windows": _choco("mongodb"),
     },
@@ -166,7 +179,14 @@ COMMON_INSTALL_COMMANDS: Dict[str, Dict[str, str]] = {
         "Windows": _choco("jq"),
     },
     "go": {
-        "Linux":   "curl -fsSL https://go.dev/dl/go1.22.0.linux-amd64.tar.gz | sudo tar -C /usr/local -xzf - && echo 'export PATH=$PATH:/usr/local/go/bin' >> ~/.bashrc",
+        "Linux":   (
+            "sudo apt-get update -qq && sudo apt-get install -y golang-go || "
+            "( curl -fsSL https://go.dev/dl/go1.22.0.linux-amd64.tar.gz "
+            "-o /tmp/go1.22.0.linux-amd64.tar.gz && "
+            "sudo tar -C /usr/local -xzf /tmp/go1.22.0.linux-amd64.tar.gz && "
+            "rm -f /tmp/go1.22.0.linux-amd64.tar.gz && "
+            "echo 'export PATH=$PATH:/usr/local/go/bin' >> ~/.bashrc )"
+        ),
         "Darwin":  _brew("go"),
         "Windows": _choco("golang"),
     },
