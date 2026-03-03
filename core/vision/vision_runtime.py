@@ -192,26 +192,27 @@ class VisionRuntime:
         with self._lock:
             return copy.deepcopy(self._last_output)
 
-    
     def get_latest_frame_jpeg_b64(
         self, max_age_seconds: float = 5.0
     ) -> Optional[str]:
         
         with self._lock:
             frame_ts = self._last_frame_ts
-            raw_image = self._last_raw_image  # type: ignore[attr-defined]
+            raw_image = self._last_raw_image
 
-        if frame_ts is None or raw_image is None:
-            return None
+            if frame_ts is None or raw_image is None:
+                return None
 
-        age = time.time() - frame_ts
-        if age > max_age_seconds:
-            return None
+            age = time.time() - frame_ts
+            if age > max_age_seconds:
+                return None
 
-        try:
-            return self._encode_image(raw_image)
-        except Exception:
-            return None
+            # Encode INSIDE the lock so no other thread can replace
+            # self._last_raw_image while we are encoding.
+            try:
+                return self._encode_image(raw_image)
+            except Exception:
+                return None
 
     # ==================================================
     # MAIN LOOP
@@ -279,17 +280,18 @@ class VisionRuntime:
     def _process_frame_internal(self) -> Dict[str, Any]:
         start = time.time()
 
-        frame_ts = time.time()
+        
 
         image = self._capture_frame()
 
-        # BUG-8 FIX: Store raw image under lock so get_latest_frame_jpeg_b64()
-        # can serve it to QwenOllamaAdapter without a second screen capture.
         with self._lock:
-            self._last_raw_image = image
+            self._last_raw_image = image.copy()
 
         encoded = self._encode_image(image)
         perception = self._call_model_with_timeout(encoded)
+
+        # CRIT-4 FIX: Stamp the frame AFTER inference completes.
+        frame_ts = time.time()
 
         latency = time.time() - start
 
@@ -542,8 +544,7 @@ class VisionRuntime:
         recovered = None
         if raw.startswith('{"elements":[') or raw.startswith('{ "elements": ['):
             try:
-                # Find the last complete element: the last '}' in the elements
-                # array region, followed optionally by ',' then whitespace.
+                
                 last_close = raw.rfind("}")
                 if last_close > 0:
                     # Truncate to just after the last complete object
