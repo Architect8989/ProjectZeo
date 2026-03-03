@@ -37,7 +37,9 @@ class ObserverCore:
     # Fix: align grace with WARMUP_TIMEOUT_SECONDS.  Both are 300s by default.
     # Operators who change PROJECTZEO_WARMUP_TIMEOUT_SECONDS should also set
     # PROJECTZEO_STARTUP_GRACE_SECONDS (wired via env var below if needed).
-    STARTUP_GRACE_SECONDS = 300.0
+    STARTUP_GRACE_SECONDS: float = float(
+        __import__("os").environ.get("PROJECTZEO_STARTUP_GRACE_SECONDS", "300.0")
+    )
     MAX_CONSECUTIVE_MISSES = 60    # 60 ticks @ 5Hz = 12s blindness tolerance before unhealthy
     BLIND_RECOVERY_SECONDS = 10.0
 
