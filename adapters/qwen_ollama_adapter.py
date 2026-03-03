@@ -238,12 +238,7 @@ def _build_text_summary_of_message(msg: dict) -> Optional[dict]:
 # ==========================================================
 
 class QwenOllamaAdapter:
-    """
-    Local-only vision LLM adapter via Ollama.
-
-    Provider-agnostic design: the only Ollama-specific call is self._client.chat().
-    The adapter interface (get_next_action) is shared across all adapters.
-    """
+    
 
     MAX_HISTORY_TURNS = 10
 
@@ -292,9 +287,7 @@ class QwenOllamaAdapter:
         except Exception as exc:
             return None, exc
 
-    # ==========================================================
-    # CORE VISION INFERENCE
-    # ==========================================================
+    
 
     async def _call_qwen_with_history(
         self,
@@ -307,7 +300,9 @@ class QwenOllamaAdapter:
         
         history_messages: List[Dict[str, Any]] = []
 
-        
+
+        _CTX_BUDGET = int(os.environ.get("PROJECTZEO_CTX_BUDGET_CHARS", "16000"))
+        _HIST_BUDGET = int(os.environ.get("PROJECTZEO_CTX_HISTORY_CHARS", "12000"))
 
         for msg in messages:
             role = msg.get("role")
@@ -319,6 +314,16 @@ class QwenOllamaAdapter:
 
         if len(history_messages) > self.MAX_HISTORY_TURNS:
             history_messages = history_messages[-self.MAX_HISTORY_TURNS:]
+
+        # Token-budget compression: drop oldest turns first until we fit.
+        _hist_chars = sum(len(m.get("content", "")) for m in history_messages)
+        while history_messages and _hist_chars > _HIST_BUDGET:
+            removed = history_messages.pop(0)
+            _hist_chars -= len(removed.get("content", ""))
+            print(
+                f"[QwenOllamaAdapter] MAJ-3: History budget exceeded "                f"({_hist_chars + len(removed.get('content',''))} > {_HIST_BUDGET} chars). "                "Dropped oldest history turn to fit context window.",
+                file=sys.stderr,
+            )
 
         
         raw_tmp_name = None
@@ -346,8 +351,7 @@ class QwenOllamaAdapter:
                 system_content = system_content + self._COORD_MANDATE
 
             if img_base64 is None:
-                # VisionRuntime frame unavailable or stale — fall back to
-                # independent capture path (original behaviour).
+                
                 _rtf = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
                 raw_tmp_name = _rtf.name
                 _rtf.close()
@@ -396,10 +400,7 @@ class QwenOllamaAdapter:
             loop = asyncio.get_running_loop()
 
             def _blocking_call():
-                # BUG-3 FIX: Acquire the shared INFERENCE_LOCK before calling Ollama.
-                # VisionRuntime's background _loop() also holds this lock during
-                # its model calls. This prevents both from running the same vision
-                # model concurrently (GPU OOM / CPU timeout cascade).
+                
                 with _INFERENCE_LOCK:
                     return self._client.chat(
                         model=self.model_name,
@@ -558,12 +559,7 @@ class QwenOllamaAdapter:
     # ==========================================================
 
     def _parse_and_normalize_json(self, text: str) -> List[dict]:
-        """
-        Parse LLM text output into a list of operation dicts.
-
-        Greedy regex captures full JSON arrays (a non-greedy pattern would
-        truncate multi-operation arrays to only the first element).
-        """
+        
         text = text.strip()
         text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.MULTILINE)
         text = re.sub(r"\s*```$", "", text, flags=re.MULTILINE).strip()
