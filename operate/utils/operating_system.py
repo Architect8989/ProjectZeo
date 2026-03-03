@@ -40,53 +40,7 @@ def _is_wayland() -> bool:
 
 
 def _ydotool_available() -> bool:
-    """
-    Return True if ydotool is on PATH **and** the ydotoold daemon is reachable.
-
-    BLOCKER #1 FIX
-    ==============
-    The original implementation only checked whether the ``ydotool`` binary
-    existed on PATH via ``shutil.which()``.  This is insufficient: every
-    ydotool command (``mousemove``, ``click``, ``type``, ``key``) communicates
-    with the ``ydotoold`` daemon via a Unix-domain socket.  If the daemon is
-    not running the socket does not exist and every command exits with a
-    non-zero return code *without moving the mouse or typing a character*.
-    The failure was swallowed by callers returning ``{success: False}`` and the
-    agent exhausted MAX_REPLANS before dying — every single task failed on a
-    fresh Wayland installation.
-
-    Fix: perform a live probe by asking ydotool to move the cursor to its
-    current position (0-pixel displacement, no visible effect).  A return code
-    of 0 proves the daemon is responsive; any non-zero code or exception means
-    the daemon is absent.
-
-    Why this probe is safe
-    ----------------------
-    ``ydotool mousemove --relative -x 0 -y 0`` issues a REL_X=0 / REL_Y=0
-    input event.  The kernel evdev driver translates this as a zero-distance
-    move — the cursor does not change position.  It has no observable effect
-    on the user's session other than a negligible kernel event.
-
-    Performance
-    -----------
-    The first call is ~5–15 ms (domain socket round-trip).  Subsequent calls
-    within the same process benefit from the warm kernel path (~1–3 ms).
-    ``_ydotool_available()`` is called at most once per UI action so the
-    overhead is negligible compared to the 40–90 s inference budget.
-
-    Operator guidance on failure
-    ----------------------------
-    If this function returns False on a Wayland session, the operator must
-    start the daemon before launching ProjectZeo::
-
-        sudo ydotoold &                     # background daemon (root required)
-        # or via systemd:
-        systemctl --user enable --now ydotool.service
-
-    The daemon can also be started automatically by setting the env var
-    ``PROJECTZEO_START_YDOTOOLD=1``; run.py will then attempt ``sudo ydotoold &``
-    during startup validation (see _validate_runtime_dependencies).
-    """
+    
     import shutil as _shutil
     if not _shutil.which("ydotool"):
         return False  # binary not installed at all
@@ -389,40 +343,7 @@ class OperatingSystem:
         return result
 
     def write_file(self, path: str, content: str) -> None:
-        """
-        Write *content* to *path* atomically.
-
-        GAP #5 FIX — Atomic write
-        =========================
-        The original implementation used a plain ``open(path, "w")`` which is
-        non-atomic: a crash or power failure *during* the write leaves the file
-        partially written.  On crash recovery the checkpoint fast-forward skips
-        any step already marked complete, so a partially written file is never
-        re-created — it persists in the corrupted state permanently.
-
-        Fix: write to a temp file in the same directory (same filesystem), call
-        ``os.fsync()`` to flush OS write-back caches to durable storage, then
-        ``os.replace()`` which is guaranteed to be atomic on POSIX systems
-        (rename(2) is atomic when src and dst are on the same filesystem).
-
-        The same pattern is used in ``checkpoint_store.py`` and
-        ``playbook_store.py`` — it is the project-standard for all durable writes.
-
-        Atomic guarantee
-        ----------------
-        - If the process dies before ``os.replace()``, the temp file is the
-          only artefact; the original file (if any) is unchanged.
-        - If the process dies after ``os.replace()``, the new file is fully
-          written and fsync'd.
-        - The temp file is cleaned up in a ``finally`` block so it is never
-          left on disk after a write failure.
-
-        Cross-platform note
-        -------------------
-        On Windows, ``os.replace()`` is atomic at the NTFS level (it calls
-        ``MoveFileExW`` with ``MOVEFILE_REPLACE_EXISTING``), giving the same
-        crash-safety guarantee.
-        """
+        
         if not isinstance(path, str) or not path:
             raise RuntimeError("write_file(): invalid path")
         if not isinstance(content, str):
@@ -583,6 +504,47 @@ class OperatingSystem:
     # =================================================
 
     def get_cursor_position(self) -> Dict[str, int]:
+        
+        if platform.system() == "Linux" and _is_wayland():
+            import shutil as _shutil
+            if _shutil.which("xdotool"):
+                try:
+                    result = subprocess.run(
+                        ["xdotool", "getmouselocation", "--shell"],
+                        capture_output=True,
+                        text=True,
+                        timeout=3,
+                    )
+                    if result.returncode == 0:
+                        # Output is:
+                        #   X=1234\nY=567\nSCREEN=0\nWINDOW=1234567\n
+                        x_val: Optional[int] = None
+                        y_val: Optional[int] = None
+                        for line in result.stdout.splitlines():
+                            if line.startswith("X="):
+                                try:
+                                    x_val = int(line[2:].strip())
+                                except ValueError:
+                                    pass
+                            elif line.startswith("Y="):
+                                try:
+                                    y_val = int(line[2:].strip())
+                                except ValueError:
+                                    pass
+                        if x_val is not None and y_val is not None:
+                            return {"x": x_val, "y": y_val}
+                except Exception:
+                    pass
+
+            
+            import sys as _sys_cur
+            _sys_cur.stderr.write(
+                "[OperatingSystem] CRIT-2: Wayland cursor query via xdotool failed "
+                "(xdotool not installed or XWayland unavailable). "
+                "Cursor position will be (0,0). Install xdotool for correct "
+                "cursor snapshot/restore on Wayland: sudo apt-get install xdotool\n"
+            )
+
         pya = _require_pyautogui()
         x, y = pya.position()
         return {"x": int(x), "y": int(y)}
@@ -624,10 +586,7 @@ class OperatingSystem:
                     return {"title": result.stdout.strip()}
 
             elif system == "Linux":
-                # BUG-2 FIX: Detect Wayland and route to Wayland-capable backend.
-                # xdotool is X11-only; on Wayland it exits with code 1 and empty
-                # output, causing every snapshot to record __bare_desktop__ and
-                # making all restoration a no-op.
+                
                 if _is_wayland():
                     return _get_focused_window_wayland()
 
@@ -873,29 +832,7 @@ class OperatingSystem:
             elif system == "Linux":
                 if _is_wayland():
                     import shutil as _shutil
-                    # -------------------------------------------------------
-                    # BLOCKER #4 FIX: ydotool has NO window-management commands.
-                    #
-                    # The previous code called ``ydotool search --name <title>``
-                    # and returned immediately if rc==0.  This was a no-op:
-                    # ``ydotool search`` only *lists* matching window IDs — it
-                    # does NOT activate or focus any window.  The ydotool
-                    # project has never implemented window focus (it is a pure
-                    # input-event injector at the kernel evdev layer; window
-                    # management requires a Wayland compositor protocol).
-                    #
-                    # Consequence: on Wayland, activate_application() always
-                    # "succeeded" (no exception) but did nothing, so the
-                    # workspace state after restoration was whatever the agent
-                    # last touched — not what the user had open before the task.
-                    #
-                    # Fix strategy (priority order):
-                    #  1. wmctrl -a <title>   — works via XWayland on Ubuntu/GNOME
-                    #  2. AT-SPI2             — compositor-agnostic accessibility bus
-                    #  3. xdotool via XWayland — last resort on hybrid sessions
-                    # -------------------------------------------------------
-
-                    # Attempt 1: wmctrl -a (XWayland — works on most Ubuntu setups)
+                    
                     if _shutil.which("wmctrl"):
                         try:
                             result = subprocess.run(
