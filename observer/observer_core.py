@@ -38,8 +38,8 @@ class ObserverCore:
     # Operators who change PROJECTZEO_WARMUP_TIMEOUT_SECONDS should also set
     # PROJECTZEO_STARTUP_GRACE_SECONDS (wired via env var below if needed).
     STARTUP_GRACE_SECONDS = 300.0
-    MAX_CONSECUTIVE_MISSES = 600   # was 15; 600 ticks @ 5Hz = 120s grace
-    BLIND_RECOVERY_SECONDS = 10.0  # was 5.0; extend to survive slow frames
+    MAX_CONSECUTIVE_MISSES = 60    # 60 ticks @ 5Hz = 12s blindness tolerance before unhealthy
+    BLIND_RECOVERY_SECONDS = 10.0
 
     # --------------------------------------------------
     # INIT
