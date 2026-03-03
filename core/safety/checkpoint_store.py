@@ -6,10 +6,6 @@ import tempfile
 import hashlib
 from typing import Optional, Dict, Any
 
-# FIX H-18: Absolute path anchored to project root.
-# Bug: "memory" is CWD-relative. Starting the process from different working
-# directories creates diverging checkpoints. Pattern mirrors _RESTORE_LEDGER_PATH
-# in restore_provider.py (already uses absolute anchor).
 import pathlib as _pathlib
 CHECKPOINT_DIR = str(_pathlib.Path(__file__).resolve().parents[2] / "memory")
 del _pathlib
@@ -25,9 +21,7 @@ def _ensure_dir() -> None:
 
 
 def _stable_json_bytes(obj: Any) -> bytes:
-    """
-    Deterministic JSON serialization.
-    """
+    "
     return json.dumps(
         obj,
         sort_keys=True,
@@ -60,15 +54,7 @@ def _fsync_dir(path: str) -> None:
 # -------------------------------------------------
 
 def save_checkpoint(state: Dict) -> None:
-    """
-    Crash-safe, cross-filesystem-safe atomic checkpoint.
-
-    - Deterministic state serialization
-    - Write temp file inside target directory
-    - fsync file
-    - atomic replace
-    - fsync directory
-    """
+    
 
     if not isinstance(state, dict):
         raise TypeError("Checkpoint state must be dict")
@@ -140,11 +126,7 @@ def load_checkpoint() -> Optional[Dict]:
 
 
 def clear_checkpoint() -> None:
-    """
-    Best-effort deletion with directory sync.
-    Called by operate.py on task completion so the next task does not
-    accidentally resume from a stale checkpoint.
-    """
+    
 
     try:
         if os.path.exists(CHECKPOINT_FILE):
@@ -155,23 +137,23 @@ def clear_checkpoint() -> None:
 
 
 def checkpoint_exists() -> bool:
-    """Return True if a valid (checksum-verified) checkpoint exists on disk.
-
-    AUDIT §2.4 FIX: New helper used by main.py crash-recovery path to decide
-    whether to attempt step-resume before kicking off a full replan.
-    """
+    
     return load_checkpoint() is not None
 
 
 def get_checkpoint_step_index() -> Optional[int]:
-    """Return the persisted step_index, or None if no valid checkpoint exists.
-
-    AUDIT §2.4 FIX: Convenience accessor so operate.py can fast-forward
-    current_step_index to the checkpointed position without deserializing
-    the entire state.
-    """
+    
     state = load_checkpoint()
     if state is None:
         return None
     idx = state.get("step_index")
     return int(idx) if isinstance(idx, (int, float)) else None
+
+
+def get_checkpoint_execution_log() -> Optional[Dict[str, Any]]:
+    
+    state = load_checkpoint()
+    if state is None:
+        return None
+    log = state.get("execution_log")
+    return log if isinstance(log, dict) else None
