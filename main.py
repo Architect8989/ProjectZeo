@@ -739,11 +739,29 @@ def main(llm_callable: Callable, model_name: str) -> None:
                             _restore_thread.join(timeout=RESTORE_TIMEOUT_SECONDS)
 
                             if _restore_thread.is_alive():
-                                raise RuntimeError(
-                                    f"restore_snapshot() timed out after "
-                                    f"{RESTORE_TIMEOUT_SECONDS}s — "
-                                    "window manager may be unresponsive"
+                                print(
+                                    f"[MAIN] restore_snapshot() timed out after "
+                                    f"{RESTORE_TIMEOUT_SECONDS}s — window manager may be "
+                                    "unresponsive. Forcing OBSERVER mode and continuing.",
+                                    file=sys.stderr,
                                 )
+                                try:
+                                    mode.force_observer()
+                                except Exception:
+                                    pass
+                                _write_task_result(
+                                    intent=intent,
+                                    success=False,
+                                    error=f"restore_timeout:{RESTORE_TIMEOUT_SECONDS}s",
+                                )
+                                _clear_task_start()
+                                observer.reset_for_new_task()
+                                world_graph.reset()
+                                try:
+                                    observer_loop.resume()
+                                except Exception:
+                                    pass
+                                continue  # return to main loop — agent stays alive
 
                             if _restore_exc:
                                 raise _restore_exc[0]
