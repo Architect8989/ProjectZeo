@@ -639,6 +639,19 @@ def _execute_autonomous_loop(
                 if step_type in (StepType.COMMAND_EXECUTION, StepType.TOOL_INSTALLATION)
                 else MAX_STAGNANT_ITERS_UI
             )
+            # M3: Long-running operations (render, compile, build, download) need
+            # an extended stagnation window. A 7B model rendering a Blender scene
+            # can take 60-300s with no screen change — the default 120-iteration
+            # limit fires mid-render and triggers an unnecessary REPLAN.
+            # Extend by 10× when the step description contains long-running keywords.
+            _LONG_RUNNING_KEYWORDS = frozenset({
+                "render", "compile", "build", "download", "install", "export",
+                "encode", "transcode", "generate", "train", "convert",
+            })
+            if step_type in (StepType.COMMAND_EXECUTION, StepType.TOOL_INSTALLATION):
+                _desc_lower = current_step.description.lower()
+                if any(_kw in _desc_lower for _kw in _LONG_RUNNING_KEYWORDS):
+                    stagnant_limit = stagnant_limit * 10
 
             # ------------------------------------------------------------------
             # Perception snapshot
