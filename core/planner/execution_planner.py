@@ -123,7 +123,18 @@ class ExecutionPlanner:
         r"\bwget\b.*--output-document\s*-\s.*\|\s*(?:ba)?sh\b",
         r"\|\s*sh\b",        # broad: any pipe directly into sh
         r"\|\s*bash\b",      # broad: any pipe directly into bash
-        #
+        # H-02 FIX: Additional shell names omitted from original blocklist.
+        # Attackers can pipe to zsh, fish, dash, ash, busybox sh, ksh, tcsh,
+        # or csh to execute arbitrary code when sh/bash patterns are blocked.
+        r"\|\s*zsh\b",
+        r"\|\s*fish\b",
+        r"\|\s*dash\b",
+        r"\|\s*ash\b",
+        r"\|\s*ksh\b",
+        r"\|\s*tcsh\b",
+        r"\|\s*csh\b",
+        r"\|\s*busybox\s+sh\b",
+        r"\|\s*busybox\b",
         # Reverse shell patterns:
         r"bash\s+-[ic]\s+['\"]?>?&\s*/dev/tcp/",     # bash TCP reverse shell
         r"/dev/tcp/",                                   # any /dev/tcp reference
@@ -856,6 +867,14 @@ class ExecutionPlanner:
                 for marker in INJECTION_MARKERS:
                     if marker in _normalized_v:
                         return None
+
+        # H-03 FIX: Also scan the path field specifically (file_create actions).
+        _path_val = action.get("path", "")
+        if isinstance(_path_val, str) and _path_val:
+            _normalized_path = normalize_for_injection_check(_path_val)
+            for marker in INJECTION_MARKERS:
+                if marker in _normalized_path:
+                    return None
 
         if "command" in action and isinstance(action["command"], str):
             if len(action["command"]) > self.MAX_COMMAND_LENGTH:
