@@ -131,8 +131,11 @@ class PolicyEngine:
         "git --version",
         "docker --version",
         "docker-compose --version",
-        "which ",
-        "command -v ",
+        # H-06 FIX: "which " and "command -v " have been intentionally removed.
+        # A command like "which ; rm -rf ~" starts with "which " and would match
+        # the trusted prefix, bypassing the human confirmation gate entirely.
+        # These probes receive ALLOW from the default policy engine for all app
+        # contexts and do not need a trusted-prefix bypass.
     })
 
     # Default application allowlist — covers the most common desktop apps.
