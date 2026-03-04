@@ -179,8 +179,6 @@ def operate_main(
     
    
     
-    
-    _CONFIRM_TIMEOUT_LOGGED[0] = False
     if not _CONFIRM_TIMEOUT_LOGGED[0]:
         _CONFIRM_TIMEOUT_LOGGED[0] = True
         print(
@@ -983,8 +981,13 @@ def _execute_autonomous_loop(
                     while _phc_wait < MAX_WAIT_RETRIES:
                         time.sleep(WAIT_RETRY_SECONDS)
                         _phc_wait += 1
-                        # Approved when the signal file no longer exists
-                        if not os.path.exists(_signal_path):
+                        try:
+                            _file_present = os.path.exists(_signal_path)
+                        except OSError:
+                            # C-05 FIX: Filesystem error → treat as still pending,
+                            # never auto-approve on transient stat failures.
+                            continue
+                        if not _file_present:
                             _phc_approved = True
                             break
                 finally:
@@ -1488,7 +1491,12 @@ def _execute_decision(
                 while _waited < _CONFIRM_TIMEOUT_SECONDS:
                     time.sleep(WAIT_RETRY_SECONDS)
                     _waited += WAIT_RETRY_SECONDS
-                    if not os.path.exists(_sig_path):
+                    try:
+                        _file_present = os.path.exists(_sig_path)
+                    except OSError:
+                        # C-05 FIX: fail-closed on filesystem error
+                        continue
+                    if not _file_present:
                         _approved = True
                         break
                 if not _approved:
