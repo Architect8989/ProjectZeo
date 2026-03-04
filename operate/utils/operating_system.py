@@ -25,27 +25,100 @@ except ImportError:
     _INSTALL_TIMEOUT = 300
 
 
+# ---------------------------------------------------------------------------
+# C-02 FIX: Writable-root enforcement for write_file().
+#
+# PROJECTZEO_WRITABLE_ROOT (env var, optional):
+#   - If set, every write_file() call resolves the target path to an absolute
+#     path and verifies it is a descendant of this root.
+#   - Paths that escape the root (e.g. via "../", symlinks, or absolute
+#     paths outside the root) raise PermissionError immediately.
+#   - If unset, write_file() falls back to a default set of allowed path
+#     prefixes that excludes critical system directories. This prevents the
+#     most obvious attacks even without an explicit root configuration.
+#
+# Recommended deployment: export PROJECTZEO_WRITABLE_ROOT=/home/$USER/projectzeo_workspace
+# ---------------------------------------------------------------------------
+
+def _get_writable_root() -> Optional[str]:
+    raw = os.environ.get("PROJECTZEO_WRITABLE_ROOT", "").strip()
+    if raw:
+        return os.path.realpath(raw)
+    return None
+
+
+# Absolute path prefixes that are unconditionally rejected when no writable
+# root is configured. These cover the most destructive injection targets.
+_HARDCODED_DENY_PREFIXES: tuple = (
+    "/etc/",
+    "/root/",
+    "/boot/",
+    "/sys/",
+    "/proc/",
+    "/dev/",
+    "/bin/",
+    "/sbin/",
+    "/usr/bin/",
+    "/usr/sbin/",
+    "/lib/",
+    "/lib64/",
+    "/usr/lib/",
+    "/snap/",
+    "/run/",
+    "/var/run/",
+)
+
+
+def _assert_path_allowed(path: str) -> None:
+    """
+    C-02 FIX: Raise PermissionError if path escapes the allowed write root.
+
+    Resolution order:
+    1. If PROJECTZEO_WRITABLE_ROOT is set, the resolved absolute path must
+       be a descendant of that root (os.path.commonpath check).
+    2. Otherwise, reject any path whose resolved absolute path starts with a
+       hardcoded deny prefix covering critical system directories.
+    """
+    resolved = os.path.realpath(os.path.abspath(path))
+    writable_root = _get_writable_root()
+
+    if writable_root is not None:
+        try:
+            common = os.path.commonpath([writable_root, resolved])
+        except ValueError:
+            common = ""
+        if common != writable_root:
+            raise PermissionError(
+                f"write_file(): path {resolved!r} escapes PROJECTZEO_WRITABLE_ROOT "
+                f"({writable_root!r}). Write blocked for safety."
+            )
+        return
+
+    # No writable root configured — apply deny-prefix list.
+    for deny in _HARDCODED_DENY_PREFIXES:
+        if resolved.startswith(deny):
+            raise PermissionError(
+                f"write_file(): path {resolved!r} targets a protected system directory "
+                f"(prefix={deny!r}). Set PROJECTZEO_WRITABLE_ROOT to a safe workspace "
+                "directory, or do not write to system paths."
+            )
+
+
 def _is_wayland() -> bool:
     """Return True if the current session is a Wayland session."""
     session_type = os.environ.get("XDG_SESSION_TYPE", "").lower()
     if session_type == "wayland":
         return True
-    # Also check WAYLAND_DISPLAY — present on Wayland even if XDG_SESSION_TYPE is unset
     if os.environ.get("WAYLAND_DISPLAY"):
         return True
-    # Pure X11 or undetermined
     return False
 
 
-
-
 def _ydotool_available() -> bool:
-    
     import shutil as _shutil
     if not _shutil.which("ydotool"):
-        return False  # binary not installed at all
+        return False
 
-    # Live daemon probe: zero-displacement relative move — no visible effect.
     try:
         result = subprocess.run(
             ["ydotool", "mousemove", "--relative", "-x", "0", "-y", "0"],
@@ -58,7 +131,6 @@ def _ydotool_available() -> bool:
 
 
 def _wayland_click(x_px: int, y_px: int) -> None:
-    
     if _ydotool_available():
         result = subprocess.run(
             ["ydotool", "mousemove", "--absolute", "-x", str(x_px), "-y", str(y_px)],
@@ -69,7 +141,7 @@ def _wayland_click(x_px: int, y_px: int) -> None:
                 f"ydotool mousemove failed (rc={result.returncode}): {result.stderr.strip()}"
             )
         result = subprocess.run(
-            ["ydotool", "click", "0xC0"],  # 0xC0 = left button down+up
+            ["ydotool", "click", "0xC0"],
             capture_output=True, text=True, timeout=5,
         )
         if result.returncode != 0:
@@ -78,7 +150,6 @@ def _wayland_click(x_px: int, y_px: int) -> None:
             )
         return
 
-    # xdotool via XWayland fallback
     import shutil as _shutil
     if _shutil.which("xdotool"):
         result = subprocess.run(
@@ -94,13 +165,12 @@ def _wayland_click(x_px: int, y_px: int) -> None:
 
     raise RuntimeError(
         "Wayland click failed: neither ydotool nor xdotool (XWayland) succeeded. "
-        "Install ydotool: sudo apt-get install ydotool && sudo ydotoold &  "
+        "Install ydotool: sudo apt-get install ydotool && ydotoold &  "
         "OR launch the agent from a GNOME-on-Xorg session (gear at login → Ubuntu on Xorg)."
     )
 
 
 def _wayland_type(text: str) -> None:
-    
     if _ydotool_available():
         result = subprocess.run(
             ["ydotool", "type", "--", text],
@@ -126,7 +196,6 @@ def _wayland_type(text: str) -> None:
     )
 
 
-# Map pyautogui key names → ydotool key names (X11 keysym subset)
 _YDOTOOL_KEY_MAP: Dict[str, str] = {
     "enter": "Return", "return": "Return",
     "tab": "Tab", "space": "space",
@@ -146,7 +215,6 @@ _YDOTOOL_KEY_MAP: Dict[str, str] = {
 
 
 def _wayland_hotkey(keys: list) -> None:
-   
     if _ydotool_available():
         mapped = [_YDOTOOL_KEY_MAP.get(k.lower(), k) for k in keys]
         combo = "+".join(mapped)
@@ -175,10 +243,8 @@ def _wayland_hotkey(keys: list) -> None:
 
 
 def _get_focused_window_wayland() -> Dict[str, str]:
-    
     import shutil
 
-    # Attempt 1: ydotool (Wayland-native tool, requires ydotoold daemon)
     if shutil.which("ydotool"):
         try:
             result = subprocess.run(
@@ -190,7 +256,6 @@ def _get_focused_window_wayland() -> Dict[str, str]:
         except Exception:
             pass
 
-    # Attempt 2: AT-SPI2 accessibility bus
     try:
         import pyatspi  # noqa: PLC0415
         desktop = pyatspi.Registry.getDesktop(0)
@@ -200,7 +265,6 @@ def _get_focused_window_wayland() -> Dict[str, str]:
     except Exception:
         pass
 
-    # Attempt 3: wmctrl with XWayland
     if shutil.which("wmctrl"):
         try:
             result = subprocess.run(
@@ -208,7 +272,6 @@ def _get_focused_window_wayland() -> Dict[str, str]:
                 capture_output=True, text=True, timeout=3,
             )
             if result.returncode == 0:
-                # wmctrl -l output: <wid> <desktop> <hostname> <title>
                 for line in result.stdout.splitlines():
                     parts = line.split(None, 3)
                     if len(parts) >= 4:
@@ -216,10 +279,9 @@ def _get_focused_window_wayland() -> Dict[str, str]:
         except Exception:
             pass
 
-    # All Wayland methods failed — return sentinel so snapshot uses __bare_desktop__
     import sys as _sys
     print(
-        "[OperatingSystem] BUG-2: Wayland session detected but no window-title "
+        "[OperatingSystem] Wayland session detected but no window-title "
         "backend succeeded (ydotool, AT-SPI2, wmctrl all failed or not installed). "
         "Returning __wayland_unknown__ sentinel. "
         "Install ydotool: sudo apt-get install ydotool && ydotoold & "
@@ -235,7 +297,6 @@ class OperatingSystemUnavailableError(RuntimeError):
 
 
 def _require_pyautogui() -> object:
-
     if not _PYAUTOGUI_AVAILABLE:
         raise OperatingSystemUnavailableError(
             "pyautogui is not available. "
@@ -249,7 +310,6 @@ def _require_pyautogui() -> object:
 
 
 class OperatingSystem:
-    
 
     def __init__(self):
         self._automation_active = False
@@ -263,10 +323,6 @@ class OperatingSystem:
 
         self._watchdog_started = False
         self._watchdog_lock = threading.Lock()
-
-    # =================================================
-    # HEARTBEAT
-    # =================================================
 
     def heartbeat(self) -> None:
         with self._heartbeat_lock:
@@ -300,24 +356,10 @@ class OperatingSystem:
             if timed_out:
                 self.force_release_all(reason="heartbeat_timeout")
 
-    # =================================================
-    # SCREEN SIZE
-    # =================================================
-
     def screen_size(self) -> tuple:
-        """
-        Return (width, height) in pixels.
-
-        operate.py:_execute_decision() calls this whenever an OCR-resolved
-        click has absolute pixel coordinates (x > 1.0 or y > 1.0).
-        """
         pya = _require_pyautogui()
         w, h = pya.size()
         return int(w), int(h)
-
-    # =================================================
-    # COMMANDS / FILES
-    # =================================================
 
     def exec(self, cmd: str, *, sudo: bool = False, timeout: Optional[int] = None) -> subprocess.CompletedProcess:
         if not isinstance(cmd, str) or not cmd.strip():
@@ -327,11 +369,6 @@ class OperatingSystem:
         if sudo and hasattr(os, "geteuid") and os.geteuid() != 0:
             full_cmd = f"sudo {full_cmd}"
 
-        # Re-validate against dangerous patterns at execution boundary.
-        # This is a defence-in-depth check: planning-time validation should have
-        # already blocked dangerous commands, but dynamic candidates and installer
-        # code paths may bypass the planner.  Unicode normalization mirrors the
-        # planner's pipeline so homoglyph-obfuscated commands are caught here too.
         try:
             from core.planner.execution_planner import ExecutionPlanner as _EP  # noqa: PLC0415
             from core.security.injection_markers import normalize_for_injection_check as _norm  # noqa: PLC0415
@@ -350,11 +387,8 @@ class OperatingSystem:
         except RuntimeError:
             raise
         except Exception:
-            pass  # Validator unavailable — proceed; planning-time filter is primary
+            pass
 
-        # Build a restricted environment: inherit PATH and common tool vars but
-        # exclude LD_PRELOAD, LD_LIBRARY_PATH, and PYTHONPATH which could be used
-        # to hijack the executed subprocess.
         _safe_env = {
             k: v for k, v in os.environ.items()
             if k not in ("LD_PRELOAD", "LD_LIBRARY_PATH", "PYTHONPATH",
@@ -378,17 +412,28 @@ class OperatingSystem:
         return result
 
     def write_file(self, path: str, content: str) -> None:
-        
+        """
+        C-02 FIX: Write content to path after verifying it does not escape
+        the configured writable root.
+
+        If PROJECTZEO_WRITABLE_ROOT is set, path must resolve to a descendant
+        of that directory. If unset, a hardcoded deny-prefix list blocks writes
+        to critical system directories (/etc/, /root/, /boot/, /proc/, etc.).
+
+        Raises PermissionError on path traversal violation.
+        Raises RuntimeError on invalid arguments.
+        """
         if not isinstance(path, str) or not path:
             raise RuntimeError("write_file(): invalid path")
         if not isinstance(content, str):
             raise RuntimeError("write_file(): content must be string")
 
+        # C-02 FIX: Enforce path restriction before any filesystem operation.
+        _assert_path_allowed(path)
+
         target_dir = os.path.dirname(os.path.abspath(path)) or "."
         os.makedirs(target_dir, exist_ok=True)
 
-        # Write to a temp file in the same directory so os.replace() stays on
-        # the same filesystem (required for POSIX rename(2) atomicity).
         import tempfile as _tempfile
         tmp_fd, tmp_path = _tempfile.mkstemp(dir=target_dir, prefix=".zeo_write_")
         try:
@@ -398,7 +443,6 @@ class OperatingSystem:
                 os.fsync(fh.fileno())
             os.replace(tmp_path, path)
         except Exception:
-            # Best-effort cleanup of the temp file on any failure.
             try:
                 if os.path.exists(tmp_path):
                     os.unlink(tmp_path)
@@ -406,17 +450,12 @@ class OperatingSystem:
                 pass
             raise
 
-    # =================================================
-    # INPUT ACTIONS
-    # =================================================
-
     def write(self, content: str) -> None:
         if not isinstance(content, str):
             raise RuntimeError("write(): content must be string")
 
         content = content.replace("\\n", "\n")
 
-        # MAJOR-1 FIX: Route through Wayland-native backend when applicable.
         if platform.system() == "Linux" and _is_wayland():
             with self._automation_lock:
                 self._automation_active = True
@@ -442,7 +481,6 @@ class OperatingSystem:
         if not isinstance(keys, list) or not keys:
             raise RuntimeError("press(): keys must be non-empty list")
 
-        # MAJOR-1 FIX: Route through Wayland-native backend when applicable.
         if platform.system() == "Linux" and _is_wayland():
             with self._automation_lock:
                 self._automation_active = True
@@ -480,10 +518,7 @@ class OperatingSystem:
         self._click_at_percentage(float(x), float(y))
 
     def _click_at_percentage(self, x_pct: float, y_pct: float) -> None:
-        # MAJOR-1 FIX: Route through Wayland-native backend when applicable.
-        # pyautogui uses X11 XTest — silently fails on pure Wayland.
         if platform.system() == "Linux" and _is_wayland():
-            # Get screen dimensions from mss (works on both X11 and Wayland)
             try:
                 import mss as _mss
                 with _mss.mss() as _sct:
@@ -491,7 +526,6 @@ class OperatingSystem:
                     _screen_w = _mon["width"]
                     _screen_h = _mon["height"]
             except Exception:
-                # Last-resort fallback: try pyautogui (may work via XWayland)
                 if _PYAUTOGUI_AVAILABLE and _pyautogui_mod is not None:
                     _screen_w, _screen_h = _pyautogui_mod.size()
                 else:
@@ -534,12 +568,7 @@ class OperatingSystem:
             with self._automation_lock:
                 self._automation_active = False
 
-    # =================================================
-    # CURSOR STATE
-    # =================================================
-
     def get_cursor_position(self) -> Dict[str, int]:
-        
         if platform.system() == "Linux" and _is_wayland():
             import shutil as _shutil
             if _shutil.which("xdotool"):
@@ -551,8 +580,6 @@ class OperatingSystem:
                         timeout=3,
                     )
                     if result.returncode == 0:
-                        # Output is:
-                        #   X=1234\nY=567\nSCREEN=0\nWINDOW=1234567\n
                         x_val: Optional[int] = None
                         y_val: Optional[int] = None
                         for line in result.stdout.splitlines():
@@ -571,10 +598,9 @@ class OperatingSystem:
                 except Exception:
                     pass
 
-            
             import sys as _sys_cur
             _sys_cur.stderr.write(
-                "[OperatingSystem] CRIT-2: Wayland cursor query via xdotool failed "
+                "[OperatingSystem] Wayland cursor query via xdotool failed "
                 "(xdotool not installed or XWayland unavailable). "
                 "Cursor position will be (0,0). Install xdotool for correct "
                 "cursor snapshot/restore on Wayland: sudo apt-get install xdotool\n"
@@ -597,10 +623,6 @@ class OperatingSystem:
         pya = _require_pyautogui()
         pya.moveTo(x, y, duration=0.05)
 
-    # =================================================
-    # WINDOW / APPLICATION
-    # =================================================
-
     def get_focused_window(self) -> Dict[str, str]:
         system = platform.system()
 
@@ -621,11 +643,9 @@ class OperatingSystem:
                     return {"title": result.stdout.strip()}
 
             elif system == "Linux":
-                
                 if _is_wayland():
                     return _get_focused_window_wayland()
 
-                # X11 path (original behaviour)
                 try:
                     result = subprocess.run(
                         ["xdotool", "getactivewindow", "getwindowname"],
@@ -636,7 +656,6 @@ class OperatingSystem:
                 except FileNotFoundError:
                     raise OSError("xdotool not installed")
 
-                
                 if result.returncode != 0:
                     stderr_msg = result.stderr.strip() or "no error output"
                     raise OSError(
@@ -653,7 +672,6 @@ class OperatingSystem:
                 return {"title": title}
 
             elif system == "Windows":
-                
                 try:
                     import win32gui  # noqa: PLC0415
                 except ImportError:
@@ -672,12 +690,10 @@ class OperatingSystem:
         raise OSError("Focused window unavailable")
 
     def get_active_application(self) -> Dict[str, str]:
-        
         system = platform.system()
 
         try:
             if system == "Linux":
-                # Step 1: get the active window ID
                 try:
                     _wid_result = subprocess.run(
                         ["xdotool", "getactivewindow"],
@@ -686,7 +702,6 @@ class OperatingSystem:
                         timeout=3,
                     )
                 except FileNotFoundError:
-                    # xdotool not installed — fall back
                     return self.get_focused_window()
 
                 if _wid_result.returncode != 0 or not _wid_result.stdout.strip():
@@ -694,7 +709,6 @@ class OperatingSystem:
 
                 _wid = _wid_result.stdout.strip()
 
-                # Step 2: get the PID of that window
                 _pid_result = subprocess.run(
                     ["xdotool", "getwindowpid", _wid],
                     capture_output=True,
@@ -706,7 +720,6 @@ class OperatingSystem:
 
                 _pid_str = _pid_result.stdout.strip()
 
-                
                 _comm_path = f"/proc/{_pid_str}/comm"
                 if os.path.exists(_comm_path):
                     try:
@@ -717,7 +730,6 @@ class OperatingSystem:
                     except OSError:
                         pass
 
-                # Step 4: psutil fallback (cross-distro, handles kernel threads)
                 try:
                     import psutil as _psutil  # noqa: PLC0415
                     _p = _psutil.Process(int(_pid_str))
@@ -727,11 +739,9 @@ class OperatingSystem:
                 except Exception:
                     pass
 
-                # Fall back to window title if process name unresolvable
                 return self.get_focused_window()
 
             elif system == "Darwin":
-                # AppleScript returns the process name directly (not window title)
                 _script = (
                     'tell application "System Events"\n'
                     '    set frontApp to first application process whose frontmost is true\n'
@@ -761,7 +771,6 @@ class OperatingSystem:
                             return {"title": _proc_name}
                     except Exception:
                         pass
-                    # psutil unavailable — return window title as fallback
                     return self.get_focused_window()
                 except ImportError:
                     return self.get_focused_window()
@@ -769,15 +778,9 @@ class OperatingSystem:
         except Exception:
             pass
 
-        # Final fallback: return window title so callers never get an exception
         return self.get_focused_window()
 
-    # =================================================
-    # WINDOW GEOMETRY
-    # =================================================
-
     def get_window_geometry(self, window_id: str) -> Dict[str, int]:
-        
         if not isinstance(window_id, str) or not window_id.strip():
             raise OSError("get_window_geometry(): window_id must be a non-empty string")
 
@@ -834,10 +837,6 @@ class OperatingSystem:
             "RestoreVerifier will treat this as best-effort (soft failure)."
         )
 
-    # =================================================
-    # APPLICATION ACTIVATION
-    # =================================================
-
     def activate_application(self, app_spec: Dict[str, str]) -> None:
         if not isinstance(app_spec, dict):
             raise RuntimeError("activate_application(): invalid app_spec")
@@ -867,7 +866,7 @@ class OperatingSystem:
             elif system == "Linux":
                 if _is_wayland():
                     import shutil as _shutil
-                    
+
                     if _shutil.which("wmctrl"):
                         try:
                             result = subprocess.run(
@@ -879,18 +878,14 @@ class OperatingSystem:
                             if result.returncode == 0:
                                 time.sleep(0.15)
                                 return
-                            # wmctrl returns non-zero if title substring not found;
-                            # fall through to next method rather than raising.
                         except Exception:
-                            pass  # daemon not running or compositor mismatch
+                            pass
 
-                    # Attempt 2: AT-SPI2 accessibility bus (compositor-native)
                     try:
                         import pyatspi  # noqa: PLC0415
                         desktop = pyatspi.Registry.getDesktop(0)
                         for app in desktop:
                             if app and title.lower() in (app.name or "").lower():
-                                # Raise a "activate" action on the first window
                                 for win in app:
                                     if win is not None:
                                         try:
@@ -904,7 +899,6 @@ class OperatingSystem:
                     except Exception:
                         pass
 
-                    # Attempt 3: xdotool via XWayland (hybrid sessions)
                     if _shutil.which("xdotool"):
                         try:
                             result = subprocess.run(
@@ -920,18 +914,16 @@ class OperatingSystem:
                         except Exception:
                             pass
 
-                    # All Wayland activation methods failed — log warning (best-effort)
                     import sys as _sys_mod
                     print(
-                        f"[OperatingSystem] BLOCKER-4: Could not activate window "
+                        f"[OperatingSystem] Could not activate window "
                         f"'{title}' on Wayland — wmctrl, AT-SPI2, and xdotool all "
                         "failed or unavailable.  Install wmctrl for best results: "
                         "sudo apt-get install wmctrl",
                         file=_sys_mod.stderr,
                     )
-                    return  # Best-effort: don't raise so restoration proceeds
+                    return
 
-                # X11 path (original behaviour)
                 try:
                     result = subprocess.run(
                         ["wmctrl", "-a", title],
@@ -982,12 +974,7 @@ class OperatingSystem:
         if title.lower() not in focused.get("title", "").lower():
             raise OSError("activate_application(): verification failed")
 
-    # =================================================
-    # ALIASED / MISSING API SHIMS
-    # =================================================
-
     def click(self, x: float, y: float) -> None:
-        """Click at pixel-absolute coordinates."""
         pya = _require_pyautogui()
         screen_w, screen_h = pya.size()
         if screen_w <= 0 or screen_h <= 0:
@@ -1005,22 +992,15 @@ class OperatingSystem:
         self._click_at_percentage(x_pct, y_pct)
 
     def type_text(self, text: str) -> None:
-        """Alias for write() — required by operate.py."""
         self.write(text)
 
     def press_keys(self, keys) -> None:
-        """Alias for press() — required by operate.py and autonomous_installer.py."""
         self.press(keys)
 
     def run_command(self, command: str, *, timeout: Optional[int] = _INSTALL_TIMEOUT) -> subprocess.CompletedProcess:
-        """
-        Alias for exec() — required by operate.py and autonomous_installer.py.
-        Returns CompletedProcess so callers can inspect stdout/stderr/returncode.
-        """
         return self.exec(command, timeout=timeout)
 
     def open_browser(self) -> None:
-        """Open the system default web browser."""
         system = platform.system()
 
         try:
@@ -1059,7 +1039,6 @@ class OperatingSystem:
         time.sleep(1.5)
 
     def focus_address_bar(self) -> None:
-        """Focus the browser address bar (Ctrl+L / Cmd+L)."""
         system = platform.system()
         if system == "Darwin":
             self.press(["command", "l"])
@@ -1068,10 +1047,6 @@ class OperatingSystem:
         time.sleep(0.2)
 
     def focus_window(self, spec: dict) -> None:
-        """
-        Bring a window to the foreground by title substring.
-        Required by restore_provider.py during the RESTORING phase.
-        """
         if not isinstance(spec, dict):
             raise RuntimeError("focus_window(): spec must be a dict")
 
@@ -1081,12 +1056,7 @@ class OperatingSystem:
 
         self.activate_application({"title": title.strip()})
 
-    # =================================================
-    # RESTORATION / SAFETY
-    # =================================================
-
     def is_automation_active(self) -> bool:
-        
         with self._automation_lock:
             return self._automation_active
 
@@ -1112,18 +1082,13 @@ class OperatingSystem:
                 except Exception:
                     pass
 
-    
-
     def get_window_z_order(self, window_id: str) -> int:
-        
         raise NotImplementedError(
             "get_window_z_order() is not yet implemented for this platform. "
-            "RestoreVerifier will treat this as a soft-fail (verification skipped). "
-            "Implement this method to activate Z-order restoration verification."
+            "RestoreVerifier will treat this as a soft-fail (verification skipped)."
         )
 
     def get_browser_state(self) -> dict:
-        
         raise NotImplementedError(
             "get_browser_state() is not yet implemented. "
             "A CDP integration (Chrome DevTools Protocol) is required. "
@@ -1131,16 +1096,11 @@ class OperatingSystem:
         )
 
     def get_media_playback_position(self) -> float:
-        
         raise NotImplementedError(
             "get_media_playback_position() is not yet implemented. "
             "An MPRIS/osascript/COM integration is required. "
             "RestoreVerifier will treat this as a soft-fail (verification skipped)."
         )
-
-    # =================================================
-    # HELPERS
-    # =================================================
 
     @staticmethod
     def _valid_coord(v) -> bool:
