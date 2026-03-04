@@ -4,6 +4,7 @@ import time
 import threading
 import json
 import os
+import subprocess
 import sys
 from typing import Optional
 
@@ -584,6 +585,9 @@ class RestoreProvider:
 
             if not _skip_term:
                 import signal as _signal
+                import subprocess as _subprocess
+                import shutil as _shutil
+                _sigterm_pids: dict = {}
                 for _name in new_names:
                     if _name in _TERMINATION_WHITELIST:
                         print(
@@ -596,13 +600,14 @@ class RestoreProvider:
                     for _pid in _pids:
                         try:
                             os.kill(_pid, _signal.SIGTERM)
+                            _sigterm_pids.setdefault(_name, []).append(_pid)
                             print(
                                 f"[RestoreProvider] IH-6: SIGTERM sent to "
                                 f"{_name!r} (pid={_pid}).",
                                 file=sys.stderr,
                             )
                         except ProcessLookupError:
-                            pass  # process already exited
+                            pass
                         except PermissionError:
                             print(
                                 f"[RestoreProvider] IH-6: SIGTERM denied for "
@@ -616,6 +621,44 @@ class RestoreProvider:
                                 f"{_name!r} (pid={_pid}): {_sig_err}.",
                                 file=sys.stderr,
                             )
+
+                if _sigterm_pids:
+                    time.sleep(5.0)
+                    for _name, _pids in _sigterm_pids.items():
+                        for _pid in _pids:
+                            try:
+                                os.kill(_pid, 0)
+                                os.kill(_pid, _signal.SIGKILL)
+                                print(
+                                    f"[RestoreProvider] IH-6: SIGKILL sent to "
+                                    f"{_name!r} (pid={_pid}) — still alive after SIGTERM.",
+                                    file=sys.stderr,
+                                )
+                            except (ProcessLookupError, PermissionError):
+                                pass
+                            except Exception as _kill_err:
+                                print(
+                                    f"[RestoreProvider] IH-6: SIGKILL failed for "
+                                    f"{_name!r} (pid={_pid}): {_kill_err}.",
+                                    file=sys.stderr,
+                                )
+
+                if _shutil.which("xclip"):
+                    try:
+                        _subprocess.run(
+                            ["xclip", "-i", "/dev/null", "-selection", "clipboard"],
+                            shell=False, capture_output=True, timeout=3,
+                        )
+                    except Exception:
+                        pass
+                elif _shutil.which("xsel"):
+                    try:
+                        _subprocess.run(
+                            ["xsel", "--clear", "--clipboard"],
+                            shell=False, capture_output=True, timeout=3,
+                        )
+                    except Exception:
+                        pass
             else:
                 print(
                     "[RestoreProvider] IH-6: PROJECTZEO_SKIP_PROCESS_TERM=1 — "
