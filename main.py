@@ -257,7 +257,35 @@ def main(llm_callable: Callable, model_name: str) -> None:
 
     
     os_backend = OperatingSystem()
-    state_path = os.path.join(os.getcwd(), ".authority_state.json")
+
+    # H-07 FIX: Write .authority_state.json to a restricted directory
+    # (~/.projectzeo/) with mode 0o600 instead of os.getcwd().
+    # Writing to cwd risks exposing the belief state (including _visited_action_keys)
+    # to other processes when cwd is world-writable, network-mounted, or shared.
+    _auth_dir = os.path.join(os.path.expanduser("~"), ".projectzeo")
+    try:
+        os.makedirs(_auth_dir, mode=0o700, exist_ok=True)
+        os.chmod(_auth_dir, 0o700)
+    except OSError as _auth_dir_err:
+        # Fallback to cwd with a warning — never block startup over this.
+        print(
+            f"[MAIN] H-07 WARNING: Could not create restricted auth dir {_auth_dir!r}: "
+            f"{_auth_dir_err}. Falling back to cwd for authority state. "
+            "This may expose belief state on shared or world-writable filesystems.",
+            file=sys.stderr,
+        )
+        _auth_dir = os.getcwd()
+
+    state_path = os.path.join(_auth_dir, ".authority_state.json")
+
+    # Harden permissions on an existing state file (may have been written by
+    # a prior run before this fix was applied).
+    try:
+        if os.path.exists(state_path):
+            os.chmod(state_path, 0o600)
+    except OSError:
+        pass
+
     auth_state = AuthorityStateSerializer(state_path)
 
     observer = ObserverCore()
@@ -463,11 +491,12 @@ def main(llm_callable: Callable, model_name: str) -> None:
                     continue
 
                 # --------------------------------------------------------
-                # Task start
+                # Task start — synchronize wall-clock and watchdog timers
+                # atomically so neither can observe a stale start time.
                 # --------------------------------------------------------
-                _set_task_start(time.time())
-                
-                watchdog.start_time = time.time()
+                _task_now = time.time()
+                _set_task_start(_task_now)
+                watchdog.start_time = _task_now
                 replan_count = 0
 
                 snapshot_id = mode.consume_snapshot()
