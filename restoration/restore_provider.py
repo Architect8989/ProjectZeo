@@ -552,17 +552,83 @@ class RestoreProvider:
                 f"[RestoreProvider] WARNING IH-6: {len(new_names)} process name(s) "
                 f"present after restoration that were NOT present at snapshot time: "
                 f"{name_summary}. "
-                "These processes persist on the OS after restoration. "
-                "For full process isolation, run ProjectZeo in a container or VM.",
+                "Attempting SIGTERM on detected processes.",
                 file=sys.stderr,
             )
 
-            
+            # H-04 FIX: Terminate newly-spawned processes instead of only reporting.
+            # Tasks that spawn background processes (servers, downloaders, scheduled
+            # jobs) leave them running indefinitely after restoration unless explicitly
+            # terminated here.
+            #
+            # Termination policy:
+            #   - SIGTERM is sent first (graceful shutdown request).
+            #   - Processes in _TERMINATION_WHITELIST are skipped unconditionally.
+            #   - Termination errors are non-fatal — restoration continues regardless.
+            #   - Container/VM deployments should set PROJECTZEO_SKIP_PROCESS_TERM=1
+            #     and rely on the container runtime for process isolation instead.
+            _TERMINATION_WHITELIST: frozenset = frozenset({
+                # Core OS daemons that must never be killed
+                "systemd", "init", "kernel", "kthreadd", "dbus-daemon",
+                "NetworkManager", "pulseaudio", "pipewire",
+                # Session components the desktop depends on
+                "gnome-shell", "xorg", "x11", "wayland", "weston",
+                # The agent's own supporting processes
+                "ollama", "ydotoold",
+            })
+
+            _skip_term = (
+                os.environ.get("PROJECTZEO_SKIP_PROCESS_TERM", "").strip().lower()
+                in ("1", "true", "yes")
+            )
+
+            if not _skip_term:
+                import signal as _signal
+                for _name in new_names:
+                    if _name in _TERMINATION_WHITELIST:
+                        print(
+                            f"[RestoreProvider] IH-6: Skipping SIGTERM for "
+                            f"{_name!r} (in termination whitelist).",
+                            file=sys.stderr,
+                        )
+                        continue
+                    _pids = name_pids.get(_name, [])
+                    for _pid in _pids:
+                        try:
+                            os.kill(_pid, _signal.SIGTERM)
+                            print(
+                                f"[RestoreProvider] IH-6: SIGTERM sent to "
+                                f"{_name!r} (pid={_pid}).",
+                                file=sys.stderr,
+                            )
+                        except ProcessLookupError:
+                            pass  # process already exited
+                        except PermissionError:
+                            print(
+                                f"[RestoreProvider] IH-6: SIGTERM denied for "
+                                f"{_name!r} (pid={_pid}) — insufficient permission. "
+                                "Process persists.",
+                                file=sys.stderr,
+                            )
+                        except Exception as _sig_err:
+                            print(
+                                f"[RestoreProvider] IH-6: SIGTERM failed for "
+                                f"{_name!r} (pid={_pid}): {_sig_err}.",
+                                file=sys.stderr,
+                            )
+            else:
+                print(
+                    "[RestoreProvider] IH-6: PROJECTZEO_SKIP_PROCESS_TERM=1 — "
+                    "process termination skipped. "
+                    f"Unrestored processes: {name_summary}",
+                    file=sys.stderr,
+                )
+
             try:
                 snapshot.metadata["unrestored_process_names"] = new_names
                 snapshot.metadata["unrestored_process_name_pids"] = name_pids
             except Exception:
-                pass  # metadata dict may be immutable in some configurations
+                pass
 
         except Exception as _diff_err:
             print(
