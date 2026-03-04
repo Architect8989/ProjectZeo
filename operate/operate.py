@@ -81,15 +81,31 @@ MAX_DYNAMIC_CANDIDATES = 3
 import os as _os_sig
 import secrets as _secrets_mod
 
-_SIGNAL_DIR: str = tempfile.gettempdir()
-_SIGNAL_PREFIX: str = "projectzeo_approve_"
-_SIGNAL_SECRET: str = _secrets_mod.token_hex(16)
+# H-08 FIX: Use a per-session directory with mode 0o700 instead of world-readable
+# /tmp. Any process running as the same user can enumerate /tmp/projectzeo_approve_*
+# and delete signal files to approve actions. A per-session directory with 0o700
+# permissions prevents enumeration by sibling processes of the same user.
+_SESSION_TOKEN: str = _secrets_mod.token_hex(16)
+_SIGNAL_DIR_BASE: str = tempfile.gettempdir()
+_SIGNAL_DIR: str = _os_sig.path.join(
+    _SIGNAL_DIR_BASE,
+    f"projectzeo_{_SESSION_TOKEN}",
+)
+try:
+    _os_sig.makedirs(_SIGNAL_DIR, mode=0o700, exist_ok=True)
+    # Enforce mode even if directory already existed.
+    _os_sig.chmod(_SIGNAL_DIR, 0o700)
+except OSError:
+    # Fallback to /tmp with session-secret prefix — still better than no secret.
+    _SIGNAL_DIR = _SIGNAL_DIR_BASE
+
+_SIGNAL_PREFIX: str = "approve_"
 
 
 def _approval_signal_path(action_key: str) -> str:
     return _os_sig.path.join(
         _SIGNAL_DIR,
-        f"{_SIGNAL_PREFIX}{_SIGNAL_SECRET}_{action_key}.signal",
+        f"{_SIGNAL_PREFIX}{action_key}.signal",
     )
 
 
@@ -745,6 +761,31 @@ def _execute_autonomous_loop(
                     candidate_actions.extend(
                         a for a in raw_actions if isinstance(a, dict)
                     )
+
+                # H-03 FIX: Apply injection marker check to ALL plan-step action
+                # fields (command, content, path) — not only dynamic candidates.
+                # Plan steps originate from LLM output and can contain injected
+                # commands that bypass the dynamic-candidate injection filter.
+                if candidate_actions:
+                    try:
+                        from core.security.injection_markers import contains_injection_marker as _cim_plan
+                        _safe_plan = []
+                        for _pa in candidate_actions:
+                            _pa_text = " ".join(
+                                str(_pa.get(f, ""))
+                                for f in ("command", "content", "path")
+                            )
+                            if _cim_plan(_pa_text):
+                                log_warn(
+                                    f"[H-03] Plan-step action BLOCKED — injection marker "
+                                    f"detected in command/content/path: {_pa_text[:80]!r}. "
+                                    "Step dropped."
+                                )
+                            else:
+                                _safe_plan.append(_pa)
+                        candidate_actions = _safe_plan
+                    except ImportError:
+                        pass
 
                 # Fallback: ask ReasoningEngine for dynamic candidates on stagnant steps
                 if not candidate_actions and reasoning_engine is not None:
@@ -1423,44 +1464,43 @@ def _execute_decision(
                 else []
             )
             if install_cmds and isinstance(install_cmds, list):
-                
-                _auto_approve_install = (
-                    os.environ.get("PROJECTZEO_AUTO_APPROVE_INSTALL", "").strip().lower()
-                    in ("1", "true", "yes")
+                # C-04 FIX: PROJECTZEO_AUTO_APPROVE_INSTALL has been removed.
+                # Auto-approving install/sudo via an environment variable is
+                # trivially bypassable and allows a compromised plan step to
+                # silently install malicious packages with root privileges.
+                # Human confirmation is always required for install operations.
+                _install_preview = "; ".join(str(c) for c in install_cmds[:3])
+                _ak = f"install_{abs(hash(_install_preview)) % 999999}"
+                _sig_path = _write_approval_signal(
+                    _ak,
+                    action,
+                    reason=f"Install/sudo requires confirmation: {_install_preview[:120]}",
                 )
-                if not _auto_approve_install:
-                    _install_preview = "; ".join(str(c) for c in install_cmds[:3])
-                    _ak = f"install_{abs(hash(_install_preview)) % 999999}"
-                    _sig_path = _write_approval_signal(
-                        _ak,
-                        action,
-                        reason=f"MAJ-9: install/sudo requires confirmation: {_install_preview[:120]}",
-                    )
-                    print(
-                        f"[OPERATE] MAJ-9: Install requires human approval. "
-                        f"Commands: {_install_preview!r}. "
-                        f"APPROVE: delete {_sig_path}  |  "
-                        f"Timeout: {_CONFIRM_TIMEOUT_SECONDS}s → auto-denied.",
-                        file=sys.stderr,
-                    )
-                    _waited = 0.0
-                    _approved = False
-                    while _waited < _CONFIRM_TIMEOUT_SECONDS:
-                        time.sleep(WAIT_RETRY_SECONDS)
-                        _waited += WAIT_RETRY_SECONDS
-                        if not os.path.exists(_sig_path):
-                            _approved = True
-                            break
-                    if not _approved:
-                        _remove_approval_signal(_sig_path)
-                        return {
-                            "success": False,
-                            "reward": -1.0,
-                            "reason": (
-                                f"MAJ-9: Install confirmation timed out after "
-                                f"{_CONFIRM_TIMEOUT_SECONDS}s. Commands were: {_install_preview!r}. "
-                                "Set PROJECTZEO_AUTO_APPROVE_INSTALL=1 to bypass confirmation."                            ),
-                        }
+                print(
+                    f"[OPERATE] Install requires human approval. "
+                    f"Commands: {_install_preview!r}. "
+                    f"APPROVE: delete {_sig_path}  |  "
+                    f"Timeout: {_CONFIRM_TIMEOUT_SECONDS}s → auto-denied.",
+                    file=sys.stderr,
+                )
+                _waited = 0.0
+                _approved = False
+                while _waited < _CONFIRM_TIMEOUT_SECONDS:
+                    time.sleep(WAIT_RETRY_SECONDS)
+                    _waited += WAIT_RETRY_SECONDS
+                    if not os.path.exists(_sig_path):
+                        _approved = True
+                        break
+                if not _approved:
+                    _remove_approval_signal(_sig_path)
+                    return {
+                        "success": False,
+                        "reward": -1.0,
+                        "reason": (
+                            f"Install confirmation timed out after "
+                            f"{_CONFIRM_TIMEOUT_SECONDS}s. Commands were: {_install_preview!r}."
+                        ),
+                    }
 
                 # Terminal-first install path
                 from config.timeouts import INSTALL_COMMAND_TIMEOUT_SECONDS
@@ -1527,6 +1567,66 @@ def _execute_decision(
             if method == "command":
                 cmd = str(action.get("command") or "").strip()
                 if cmd:
+                    # H-01 FIX: Restrict verify commands to a strict allowlist of
+                    # safe, read-only probes. The verify operation's command field
+                    # is LLM-generated and must not reach exec() unrestricted.
+                    # Destructive commands disguised as verification steps are
+                    # blocked here regardless of DANGEROUS_PATTERNS coverage.
+                    _VERIFY_SAFE_PREFIXES: frozenset = frozenset({
+                        "which ",
+                        "command -v ",
+                        "test -f ",
+                        "test -d ",
+                        "test -e ",
+                        "test -x ",
+                        "stat ",
+                        "ls ",
+                        "echo ",
+                        "cat /proc/version",
+                        "python --version",
+                        "python3 --version",
+                        "python -c \"import ",
+                        "python3 -c \"import ",
+                        "node --version",
+                        "node -v",
+                        "npm --version",
+                        "npm -v",
+                        "git --version",
+                        "git -v",
+                        "java -version",
+                        "java --version",
+                        "go version",
+                        "rustc --version",
+                        "cargo --version",
+                        "docker --version",
+                        "pip --version",
+                        "pip3 --version",
+                        "pip show ",
+                        "dpkg -l ",
+                        "rpm -q ",
+                        "brew list ",
+                        "type ",
+                    })
+                    cmd_lower = cmd.lower().lstrip()
+                    _verify_allowed = any(
+                        cmd_lower.startswith(prefix)
+                        for prefix in _VERIFY_SAFE_PREFIXES
+                    )
+                    if not _verify_allowed:
+                        log_warn(
+                            f"[H-01] verify command BLOCKED — not in safe read-only "
+                            f"allowlist: {cmd[:120]!r}. Use method='screenshot' for "
+                            "non-probe verification."
+                        )
+                        return {
+                            "success": False,
+                            "reward": -1.0,
+                            "reason": (
+                                f"verify command blocked: {cmd[:80]!r} is not in the "
+                                "safe verify-command allowlist. Verify commands must be "
+                                "read-only probes (which, test, stat, --version, etc.)."
+                            ),
+                        }
                     r = os_backend.exec(cmd, timeout=30)
                     return {
                         "success": r.returncode == 0,
