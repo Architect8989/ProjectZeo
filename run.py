@@ -3,26 +3,20 @@ import sys
 import subprocess
 
 def _early_parse_args() -> bool:
-    
     return "--allow-cloud" in sys.argv
 
 
-# Resolve the operator's cloud intent at the earliest possible moment.
 _allow_cloud_early = _early_parse_args()
 
 if not _allow_cloud_early:
-    
     os.environ["OLLAMA_ONLY"] = "1"
 else:
-    
     os.environ["OLLAMA_ONLY"] = "0"
-    # Warn early so operators see this even if something crashes during import.
     print(
         "[run.py] WARNING: --allow-cloud is set. Cloud API routing is ENABLED. "
         "Ensure API keys are intentionally configured.",
         file=sys.stderr,
     )
-
 
 
 import asyncio
@@ -34,12 +28,7 @@ from main import main
 from config.timeouts import LLM_THREAD_TIMEOUT_SECONDS
 
 
-# ---------------------------------------------------------------------------
-# CLI ARGUMENT PARSING (full)
-# ---------------------------------------------------------------------------
-
 def _parse_args():
-    
     args = sys.argv[1:]
     allow_cloud = "--allow-cloud" in args
     interactive = "--interactive" in args
@@ -66,7 +55,6 @@ def _parse_args():
 
 
 def _print_status() -> None:
-    
     import json as _json
     import pathlib as _pathlib
     import datetime as _dt
@@ -129,15 +117,7 @@ def _print_status() -> None:
     print("Tip: write intent to arm_system.intent  OR  run with --interactive")
 
 
-# ---------------------------------------------------------------------------
-# THREAD-SAFE COROUTINE EXECUTOR
-# ---------------------------------------------------------------------------
-
 def _run_coroutine_threadsafe(coro) -> Any:
-    """
-    Execute coroutine in a fresh event loop inside a dedicated thread.
-    Enforces hard timeout derived from shared config.
-    """
     result_container: dict = {}
     error_container: dict = {}
 
@@ -162,18 +142,11 @@ def _run_coroutine_threadsafe(coro) -> Any:
     return result_container.get("result")
 
 
-# ---------------------------------------------------------------------------
-# LLM CALLABLE FACTORY
-# ---------------------------------------------------------------------------
-
 def _make_llm_callable(adapter):
-    
-
     if not hasattr(adapter, "get_next_action"):
         raise RuntimeError("Adapter missing get_next_action()")
 
     def _call(messages, objective=None, session_id=None):
-
         async def _invoke():
             return await adapter.get_next_action(
                 messages=messages,
@@ -197,7 +170,6 @@ def _make_llm_callable(adapter):
         except Exception as e:
             raise RuntimeError(f"LLM adapter invocation failed: {e}") from e
 
-        # PATCH §R2: explicit contract enforcement
         if isinstance(result, tuple) and len(result) == 2:
             ops, err = result
             if err:
@@ -218,21 +190,13 @@ def _make_llm_callable(adapter):
     return _call
 
 
-# ---------------------------------------------------------------------------
-# STARTUP DEPENDENCY VALIDATOR
-# ---------------------------------------------------------------------------
-
 def _validate_runtime_dependencies(model_name: str) -> None:
-    
     import shutil as _shutil
     import platform as _platform
 
     errors = []
     warnings = []
 
-    # ------------------------------------------------------------------
-    # 0. Create required directories — silent, never fatal
-    # ------------------------------------------------------------------
     _project_root = os.path.dirname(os.path.abspath(__file__))
     for _req_dir in ("temp", "memory/snapshots", "memory/playbooks", "logs"):
         _abs_dir = os.path.join(_project_root, _req_dir)
@@ -244,9 +208,6 @@ def _validate_runtime_dependencies(model_name: str) -> None:
                 "Snapshot persistence and transition logging will be disabled for this session."
             )
 
-    # ------------------------------------------------------------------
-    # 1. psutil — required by RuntimeWatchdog
-    # ------------------------------------------------------------------
     try:
         import psutil as _  # noqa: F401
     except ImportError:
@@ -255,13 +216,10 @@ def _validate_runtime_dependencies(model_name: str) -> None:
             "    Fix: pip install psutil"
         )
 
-    # ------------------------------------------------------------------
-    # 2. pyautogui — required for ALL UI actions (click, type, press, scroll)
-    # ------------------------------------------------------------------
     _pyautogui_ok = False
     try:
         import pyautogui as _pya
-        _pya.size()   # also verifies X11/display is reachable
+        _pya.size()
         _pyautogui_ok = True
     except ImportError:
         errors.append(
@@ -278,12 +236,7 @@ def _validate_runtime_dependencies(model_name: str) -> None:
             "    OR run ProjectZeo from inside a graphical desktop session."
         )
 
-    # ------------------------------------------------------------------
-    # 3 & 4. Linux-specific: xdotool, wmctrl, DISPLAY, Wayland
-    # ------------------------------------------------------------------
     if _platform.system() == "Linux":
-
-        # xdotool — FATAL: required for window title snapshot on X11
         if _shutil.which("xdotool") is None:
             errors.append(
                 "  [MISSING] xdotool is not installed (required for snapshot capture on Linux).\n"
@@ -292,7 +245,6 @@ def _validate_runtime_dependencies(model_name: str) -> None:
                 "    Fix (Arch):          sudo pacman -S xdotool"
             )
 
-        # wmctrl — WARNING: best-effort window activation
         if _shutil.which("wmctrl") is None:
             warnings.append(
                 "  [WARNING] wmctrl is not installed. "
@@ -300,7 +252,6 @@ def _validate_runtime_dependencies(model_name: str) -> None:
                 "    Fix: sudo apt-get install wmctrl"
             )
 
-        
         if not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY"):
             errors.append(
                 "  [NO DISPLAY] DISPLAY and WAYLAND_DISPLAY are both unset on Linux.\n"
@@ -311,15 +262,12 @@ def _validate_runtime_dependencies(model_name: str) -> None:
                 "    OR launch ProjectZeo from inside a graphical desktop session."
             )
 
-        # Wayland tooling — WARNING when no Wayland-capable tool is present
         _xdg_session = os.environ.get("XDG_SESSION_TYPE", "").lower()
         _wayland_disp = os.environ.get("WAYLAND_DISPLAY", "")
-        # Also detect Wayland when XDG_SESSION_TYPE is unset (e.g. launched via
-        # sudo) by checking WAYLAND_DISPLAY directly.
         _is_wayland = _xdg_session == "wayland" or bool(_wayland_disp)
         if _is_wayland:
             _has_ydotool = _shutil.which("ydotool") is not None
-            _has_wmctrl  = _shutil.which("wmctrl") is not None
+            _has_wmctrl = _shutil.which("wmctrl") is not None
             _has_pyatspi = False
             try:
                 import pyatspi  # noqa: F401
@@ -331,14 +279,15 @@ def _validate_runtime_dependencies(model_name: str) -> None:
                     "  [WARNING] Wayland session detected but no Wayland-compatible "
                     "window management tool found (ydotool / AT-SPI2 / wmctrl).\n"
                     "    Snapshot/restore will degrade to cursor-only (no window focus).\n"
-                    "    Fix (best):  sudo apt-get install ydotool && ydotoold &\n"
+                    "    Fix (best):  sudo apt-get install ydotool\n"
+                    "                 Then configure as systemd user service:\n"
+                    "                 systemctl --user enable --now ydotool.service\n"
                     "    Fix (alt):   pip install pyatspi  and\n"
                     "                 gsettings set org.gnome.desktop.interface "
                     "toolkit-accessibility true\n"
                     "    Fix (switch): log into a GNOME-on-Xorg session instead of Wayland."
                 )
 
-            
             if _has_ydotool:
                 _daemon_ok = False
                 try:
@@ -352,74 +301,30 @@ def _validate_runtime_dependencies(model_name: str) -> None:
                     _daemon_ok = False
 
                 if not _daemon_ok:
-                    # Optionally attempt auto-start
-                    _auto_start = os.environ.get(
-                        "PROJECTZEO_START_YDOTOOLD", ""
-                    ).strip().lower() in ("1", "true", "yes")
+                    # H-05 FIX: Never auto-start ydotoold via sudo from application
+                    # startup code. A sudo invocation before any task is received
+                    # establishes a root-owned daemon from untrusted input, and any
+                    # vulnerability in ydotoold becomes a root exploit surface.
+                    # Operators must pre-configure ydotoold as a systemd user service.
+                    errors.append(
+                        "  [FATAL] Wayland session: ydotool is installed but the\n"
+                        "    ydotoold daemon is NOT running.  All UI input (click,\n"
+                        "    type, hotkey) will silently fail until the daemon starts.\n"
+                        "\n"
+                        "    Quickest fix (one-time manual start):\n"
+                        "      ydotoold &\n"
+                        "\n"
+                        "    Persistent fix (systemd user service — recommended):\n"
+                        "      systemctl --user enable --now ydotool.service\n"
+                        "\n"
+                        "    Or switch to a GNOME-on-Xorg session (login gear →\n"
+                        "    'Ubuntu on Xorg') to avoid Wayland input limitations.\n"
+                        "\n"
+                        "    NOTE: Auto-start via sudo has been removed for security.\n"
+                        "    The daemon must be started by the operator before launching\n"
+                        "    ProjectZeo. See docs/ for systemd service configuration."
+                    )
 
-                    if _auto_start:
-                        print(
-                            "[STARTUP] BLOCKER-1: ydotoold daemon not running. "
-                            "PROJECTZEO_START_YDOTOOLD=1 — attempting auto-start: "
-                            "sudo ydotoold &",
-                            file=sys.stderr,
-                        )
-                        try:
-                            subprocess.Popen(
-                                ["sudo", "ydotoold"],
-                                stdout=subprocess.DEVNULL,
-                                stderr=subprocess.DEVNULL,
-                            )
-                            import time as _time_mod
-                            _time_mod.sleep(2.0)  # allow daemon to bind socket
-                            # Re-probe after auto-start
-                            _probe2 = subprocess.run(
-                                ["ydotool", "mousemove", "--relative",
-                                 "-x", "0", "-y", "0"],
-                                capture_output=True,
-                                timeout=3,
-                            )
-                            if _probe2.returncode == 0:
-                                print(
-                                    "[STARTUP] BLOCKER-1: ydotoold auto-start succeeded.",
-                                    file=sys.stderr,
-                                )
-                                _daemon_ok = True
-                            else:
-                                errors.append(
-                                    "  [FATAL] ydotoold auto-start attempted but daemon "
-                                    "still not responding.\n"
-                                    "    Manual fix: sudo ydotoold &\n"
-                                    "    Or via systemd: "
-                                    "systemctl --user enable --now ydotool.service"
-                                )
-                        except Exception as _as_err:
-                            errors.append(
-                                f"  [FATAL] ydotoold auto-start failed: {_as_err}\n"
-                                "    Manual fix: sudo ydotoold &\n"
-                                "    Or via systemd: "
-                                "systemctl --user enable --now ydotool.service"
-                            )
-                    else:
-                        errors.append(
-                            "  [FATAL] Wayland session: ydotool is installed but the\n"
-                            "    ydotoold daemon is NOT running.  All UI input (click,\n"
-                            "    type, hotkey) will silently fail until the daemon starts.\n"
-                            "\n"
-                            "    Quickest fix:\n"
-                            "      sudo ydotoold &\n"
-                            "\n"
-                            "    Persistent fix (systemd user service):\n"
-                            "      systemctl --user enable --now ydotool.service\n"
-                            "\n"
-                            "    Auto-start on next ProjectZeo launch:\n"
-                            "      export PROJECTZEO_START_YDOTOOLD=1\n"
-                            "\n"
-                            "    Or switch to a GNOME-on-Xorg session (login gear → "
-                            "'Ubuntu on Xorg') to avoid Wayland input limitations."
-                        )
-
-    
     try:
         import yaml  # noqa: F401
     except ImportError:
@@ -429,13 +334,8 @@ def _validate_runtime_dependencies(model_name: str) -> None:
             "    Fix: pip install pyyaml"
         )
 
-    # ------------------------------------------------------------------
-    # 6. playwright + chromium binary — WARNING: browser tasks fall back to
-    #    pyautogui coordinate clicks without it (coordinate staleness on SPAs)
-    # ------------------------------------------------------------------
     try:
         import playwright  # noqa: F401
-        # playwright Python package present — check for a usable browser binary
         _chromium_found = (
             _shutil.which("chromium-browser") is not None
             or _shutil.which("chromium") is not None
@@ -456,9 +356,6 @@ def _validate_runtime_dependencies(model_name: str) -> None:
             "    Fix: pip install playwright && playwright install chromium"
         )
 
-    # ------------------------------------------------------------------
-    # 7. EasyOCR — WARNING: label-based clicks fail until OCR is warm
-    # ------------------------------------------------------------------
     try:
         import easyocr  # noqa: F401
     except ImportError:
@@ -469,9 +366,6 @@ def _validate_runtime_dependencies(model_name: str) -> None:
             "    Note: first EasyOCR init downloads ~500 MB of model weights (~5-10 min)."
         )
 
-    # ------------------------------------------------------------------
-    # 8. Ollama daemon reachability — FATAL
-    # ------------------------------------------------------------------
     _ollama_ok = False
     try:
         import ollama as _ollama
@@ -486,9 +380,6 @@ def _validate_runtime_dependencies(model_name: str) -> None:
             "    On Linux/macOS: ollama serve"
         )
 
-    # ------------------------------------------------------------------
-    # 9. Model availability — FATAL (only when Ollama is reachable)
-    # ------------------------------------------------------------------
     if _ollama_ok:
         try:
             import ollama as _ollama  # noqa: F811
@@ -504,11 +395,8 @@ def _validate_runtime_dependencies(model_name: str) -> None:
                     "    Fix: ollama pull " + model_name
                 )
         except Exception:
-            pass  # Daemon check already covered above
+            pass
 
-    # ------------------------------------------------------------------
-    # 10. Text model availability — WARNING (performance only)
-    # ------------------------------------------------------------------
     if _ollama_ok:
         try:
             import ollama as _ollama  # noqa: F811
@@ -531,9 +419,6 @@ def _validate_runtime_dependencies(model_name: str) -> None:
         except Exception:
             pass
 
-    # ------------------------------------------------------------------
-    # Emit results
-    # ------------------------------------------------------------------
     if warnings:
         print("\n[STARTUP] Dependency warnings (non-fatal):", file=sys.stderr)
         for w in warnings:
@@ -550,12 +435,11 @@ def _validate_runtime_dependencies(model_name: str) -> None:
         print("", file=sys.stderr)
         sys.exit(1)
 
-    
     if _ollama_ok:
         try:
             import ollama as _ollama_prewarm
             print(
-                f"[STARTUP] GAP-10: Pre-warming Ollama model {model_name!r} "
+                f"[STARTUP] Pre-warming Ollama model {model_name!r} "
                 "(first inference loads weights; may take 1-5 min on cold start)...",
                 file=sys.stderr,
             )
@@ -571,38 +455,28 @@ def _validate_runtime_dependencies(model_name: str) -> None:
             elif isinstance(_pw_response, dict):
                 _pw_content = (_pw_response.get("message") or {}).get("content", "")[:40]
             print(
-                f"[STARTUP] GAP-10: Model pre-warm complete (response: {_pw_content!r}). "
+                f"[STARTUP] Model pre-warm complete (response: {_pw_content!r}). "
                 "VisionRuntime will use warm-start inferences.",
                 file=sys.stderr,
             )
         except Exception as _pw_err:
-            # Non-fatal: warmup failures print a warning but do not block startup.
-            # The model may still load during VisionRuntime warmup — just slower.
             print(
-                f"[STARTUP] GAP-10 WARNING: Model pre-warm failed: {_pw_err}. "
+                f"[STARTUP] WARNING: Model pre-warm failed: {_pw_err}. "
                 "VisionRuntime warmup may take longer than PROJECTZEO_WARMUP_TIMEOUT_SECONDS. "
                 f"Consider increasing: export PROJECTZEO_WARMUP_TIMEOUT_SECONDS=900",
                 file=sys.stderr,
             )
 
 
-# ---------------------------------------------------------------------------
-# ENTRY POINT
-# ---------------------------------------------------------------------------
-
 if __name__ == "__main__":
     model_name, allow_cloud, interactive, status_only = _parse_args()
 
-    # BUG-10 FIX: --status flag — print status from temp/ sidecars and exit.
     if status_only:
         _print_status()
         sys.exit(0)
 
-    # FIX F-02: Persist the resolved model name so all downstream text-only
-    # Ollama calls see the operator-specified model.
     os.environ["LLM_MODEL"] = model_name
 
-    
     if interactive:
         os.environ["PROJECTZEO_INTERACTIVE"] = "1"
         print(
@@ -612,17 +486,12 @@ if __name__ == "__main__":
             flush=True,
         )
 
-    
     _validate_runtime_dependencies(model_name)
-
-    
 
     adapter = build_llm(model_name)
     llm_callable = _make_llm_callable(adapter)
     main(llm_callable, model_name=model_name)
 
-    # GAP-5 FIX: After main() returns, print the task result so the operator
-    # can see the outcome without digging through JSONL log files.
     import json as _json, pathlib as _pathlib
     _result_path = _pathlib.Path(__file__).resolve().parent / "temp" / "task_result.json"
     if _result_path.exists():
