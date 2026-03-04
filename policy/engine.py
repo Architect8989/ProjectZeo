@@ -159,6 +159,16 @@ class PolicyEngine:
         "nautilus", "thunar", "nemo", "dolphin", "finder", "pcmanfm",
         # Media / utilities
         "evince", "eog", "gpicview", "totem", "vlc",
+        # 3D / creative tools (Blender test scenario)
+        "blender",
+        # Image editors
+        "gimp",
+        # Spreadsheet / data tools
+        "gnumeric", "libreoffice-calc",
+        # Additional terminals
+        "bash", "sh", "zsh", "fish",
+        # System tools
+        "nautilus", "files",
     })
 
     # Approval signal files for REQUIRE_HUMAN_CONFIRMATION flow
@@ -344,10 +354,10 @@ class PolicyEngine:
         except OSError as exc:
             _logger.warning(
                 "[PolicyEngine] check_human_approval: could not stat %r: %s "
-                "— treating as approved (fail-open).",
+                "— treating as NOT approved (fail-closed).",
                 path, exc,
             )
-            return True
+            return False  # C-05 FIX: fail-closed on filesystem error
 
         if approved:
             _logger.info(
