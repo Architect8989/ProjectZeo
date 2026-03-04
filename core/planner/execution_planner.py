@@ -197,6 +197,28 @@ class ExecutionPlanner:
         # Exfiltration via DNS / HTTP — data leak
         r"\bcurl\b.*\b(?:pastebin|ngrok|webhook\.site|requestbin)\b",
         r"\bwget\b.*\b(?:pastebin|ngrok)\b",
+
+        # M-06 FIX: Patterns that were missing from the original blocklist.
+
+        # Recursive delete without -f flag (rm -r /path or rm -rR /path)
+        r"\brm\s+(?:-[a-zA-Z]*r[a-zA-Z]*\s+/|(?:-[a-zA-Z]*\s+)*-[rR]\b)",
+
+        # find -delete / find -exec rm (mass deletion via find)
+        r"\bfind\b.*\s-delete\b",
+        r"\bfind\b.*-exec\b.*\brm\b",
+
+        # truncate command (zero out or shrink files without rm)
+        r"\btruncate\b",
+
+        # Shell redirect truncation targeting critical system paths
+        r">\s*/etc/(?:passwd|shadow|sudoers|crontab|hosts|fstab|group)",
+        r">\s*/boot/",
+        r">\s*/sys/",
+        r">\s*~/\.",           # overwrite hidden dotfiles in home
+
+        # Wipe entire disk with dd to /dev/null or zero (data destruction)
+        r"\bdd\b.*\bof=/dev/",
+        r"\bdd\b.*\bif=/dev/zero\b",
     ]
 
     def __init__(
@@ -839,6 +861,11 @@ class ExecutionPlanner:
         if not isinstance(action, dict):
             action = {"operation": raw_type}
 
+        # Strip any LLM-provided _trusted_installer flag before processing.
+        # This field must be set ONLY by deterministic planner code below,
+        # never from raw LLM-generated JSON (C-02 fix).
+        action.pop("_trusted_installer", None)
+
         command_text = action.get("command", "") + " " + action.get("content", "")
         cmd_stripped = action.get("command", "").strip()
 
@@ -855,11 +882,14 @@ class ExecutionPlanner:
                 )
                 return None
 
-        
         _is_trusted_installer_cmd = (
             cmd_stripped
             and cmd_stripped in self._trusted_installer_commands
         )
+        # C-02 FIX: Set _trusted_installer deterministically based on planner's
+        # own allowlist check — never from LLM-supplied JSON.
+        if _is_trusted_installer_cmd:
+            action["_trusted_installer"] = True
 
         for v in action.values():
             if isinstance(v, str):
