@@ -9,6 +9,33 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Optional, Dict, Any
 
+# ---------------------------------------------------------------------------
+# AUDIT-HIGH-8 FIX: RestoreScope enum — restoration outcome clarity
+# ---------------------------------------------------------------------------
+import enum as _enum
+
+
+class RestoreScope(str, _enum.Enum):
+    """Enumeration of restoration verification outcomes."""
+    VERIFIED = "VERIFIED"       # All captured fields confirmed restored
+    PARTIAL = "PARTIAL"         # Some fields restored; see unverified_fields
+    ATTEMPTED = "ATTEMPTED"     # Commands ran but not verified
+    NOT_REQUIRED = "NOT_REQUIRED"  # No state changes during task
+    FAILED = "FAILED"           # Critical fields could not be restored
+
+
+# Fields that may appear in unverified_fields
+RESTORABLE_FIELDS = frozenset({
+    "cursor_position",
+    "focused_window",
+    "active_application",
+    # Out of scope (explicitly documented here):
+    # browser_tabs, clipboard, unsaved_document, terminal_session,
+    # background_processes, window_geometry
+})
+
+
+
 
 # ----------------------------
 # Core State Primitives
