@@ -11,27 +11,32 @@ _logger = logging.getLogger(__name__)
 
 
 class PolicyViolationError(RuntimeError):
-    pass
+    """Raised when a caller attempts an operation that violates policy."""
 
 
+# ---------------------------------------------------------------------------
+# Shell metacharacter detection (SEC-NEW)
+# Checked AFTER trusted-installer prefix match to block suffix injection.
+# ---------------------------------------------------------------------------
 _SHELL_METACHAR_RE = re.compile(
     r"""
     (?:
-      ;
-    | \|\|
-    | &&
-    | \|(?!\|)
-    | `[^`]*`
-    | \$\(
-    | >[>]?
-    | <\(
-    | \beval\b
-    | \bexec\s
+      ;                        # command separator
+    | \|\|                     # OR-chain
+    | &&                       # AND-chain
+    | \|(?!\|)                 # pipe (not ||)
+    | `[^`]*`                  # backtick subshell
+    | \$\(                     # $() subshell
+    | >[>]?                    # output redirect
+    | <\(                      # process substitution
+    | \beval\b                 # eval keyword
+    | \bexec\s                 # exec command
     )
     """,
     re.VERBOSE,
 )
 
+# Paths that are ALWAYS denied for file_create regardless of policy.yaml
 _HARDCODED_DENIED_PATHS: FrozenSet[str] = frozenset({
     "/etc/cron.d", "/etc/cron.hourly", "/etc/cron.daily",
     "/etc/cron.weekly", "/etc/cron.monthly", "/etc/crontab",
@@ -47,6 +52,15 @@ _HARDCODED_DENIED_PATHS: FrozenSet[str] = frozenset({
 
 
 class PolicyEngine:
+    """
+    Stateful policy gate with ALL policy sections enforced.
+
+    Entrypoints:
+      validate_action_dict()  — primary (dict-based, no AT-SPI)
+      validate()              — secondary (AT-SPI node-based)
+
+    Thread safety: all mutable state protected by _apps_lock.
+    """
 
     ALLOW = "ALLOW"
     DENY = "DENY"
@@ -127,6 +141,7 @@ class PolicyEngine:
             else set(self._DEFAULT_ALLOWED_APPS)
         )
 
+        # M2 FIX
         self._denied_apps: FrozenSet[str] = frozenset(
             str(a).lower() for a in (denied_apps or [])
         )
@@ -134,6 +149,7 @@ class PolicyEngine:
             str(a).lower() for a in (high_risk_apps or [])
         )
 
+        # M1 FIX
         self._allowed_write_paths: Optional[List[str]] = (
             [str(p).rstrip("/") for p in allowed_write_paths]
             if allowed_write_paths else None
@@ -162,8 +178,16 @@ class PolicyEngine:
             len(self._denied_write_paths),
         )
 
+    # =========================================================================
+    # CLASS METHOD: from policy.yaml (M1 + M2 wired in one call)
+    # =========================================================================
+
     @classmethod
     def from_policy_yaml(cls, policy_cfg: dict) -> "PolicyEngine":
+        """
+        M1 + M2 FIX: Construct PolicyEngine from parsed policy.yaml dict,
+        loading all policy sections that were previously ignored.
+        """
         if not isinstance(policy_cfg, dict):
             _logger.warning("[PolicyEngine.from_policy_yaml] Not a dict — using defaults.")
             return cls()
@@ -171,6 +195,7 @@ class PolicyEngine:
         allowed_apps_raw = policy_cfg.get("allowed_apps")
         allowed_apps = set(allowed_apps_raw) if isinstance(allowed_apps_raw, list) else None
 
+        # M2: denied_apps
         denied_raw = policy_cfg.get("denied_apps")
         denied_apps = (
             {str(a) for a in denied_raw if a} if isinstance(denied_raw, list) else None
@@ -178,6 +203,7 @@ class PolicyEngine:
         if denied_apps:
             _logger.info("[PolicyEngine] M2: denied_apps=%s", sorted(denied_apps))
 
+        # M2: high_risk_apps
         hr_raw = policy_cfg.get("high_risk_apps")
         high_risk_apps = (
             {str(a) for a in hr_raw if a} if isinstance(hr_raw, list) else None
@@ -185,6 +211,7 @@ class PolicyEngine:
         if high_risk_apps:
             _logger.info("[PolicyEngine] M2: high_risk_apps=%s", sorted(high_risk_apps))
 
+        # M1: filesystem policy
         fs_cfg = policy_cfg.get("filesystem", {}) or {}
         aw_raw = fs_cfg.get("allowed_write_paths")
         allowed_write_paths = (
@@ -207,7 +234,12 @@ class PolicyEngine:
             denied_write_paths=denied_write_paths,
         )
 
+    # =========================================================================
+    # M1 FIX — FILESYSTEM PATH ENFORCEMENT
+    # =========================================================================
+
     def _validate_file_path(self, path: str) -> Tuple[str, Optional[str]]:
+        """M1 FIX: Enforce allowed/denied write paths for file_create."""
         if not path:
             return self.DENY, "file_create: empty path"
 
@@ -240,6 +272,7 @@ class PolicyEngine:
         return self.ALLOW, None
 
     def _validate_command_redirect(self, command: str) -> Tuple[str, Optional[str]]:
+        """M1 FIX: Block command redirects writing to denied paths."""
         if not command:
             return self.ALLOW, None
         redirect_targets = re.findall(r">>?\s*([^\s;&|]+)", command)
@@ -258,24 +291,30 @@ class PolicyEngine:
         return self.ALLOW, None
 
     def _validate_file_content(self, content: str) -> Tuple[str, Optional[str]]:
+        """M3 FIX: Scan file_create content for dangerous patterns."""
         if not content:
             return self.ALLOW, None
         for pat in self.high_risk_name_patterns:
             if pat.search(content):
                 reason = (
                     f"file_create content BLOCKED: dangerous pattern "
-                    f"{pat.pattern!r} detected."
+                    f"{pat.pattern!r} detected. Prevents script-injection bypass."
                 )
                 _logger.warning("[PolicyEngine] M3 DENY: %s", reason)
                 return self.REQUIRE_HUMAN_CONFIRMATION, reason
+        # Executable script (shebang) requires confirmation
         if re.search(r"^#!\s*/", content, re.MULTILINE):
             reason = (
                 "file_create content requires confirmation: "
-                "file contains a shebang."
+                "file contains a shebang (executable script)."
             )
             _logger.warning("[PolicyEngine] M3 CONFIRM: %s", reason)
             return self.REQUIRE_HUMAN_CONFIRMATION, reason
         return self.ALLOW, None
+
+    # =========================================================================
+    # TRUSTED INSTALLER (GAP-3 + SEC-NEW metacharacter check)
+    # =========================================================================
 
     def _is_trusted_installer_command(self, command: str) -> bool:
         if not command:
@@ -293,6 +332,10 @@ class PolicyEngine:
                 return True
         return False
 
+    # =========================================================================
+    # DYNAMIC ALLOWLIST
+    # =========================================================================
+
     @property
     def allowed_apps(self) -> FrozenSet[str]:
         with self._apps_lock:
@@ -302,6 +345,7 @@ class PolicyEngine:
         if not isinstance(app_name, str) or not app_name.strip():
             return
         normalised = app_name.strip().lower()
+        # M2 FIX: denied_apps cannot be un-denied via allow_app()
         if normalised in self._denied_apps:
             _logger.warning(
                 "[PolicyEngine] allow_app: BLOCKED — %r is in denied_apps.", normalised
@@ -330,8 +374,16 @@ class PolicyEngine:
                 "all autonomous interactions will be DENIED.", app_name,
             )
 
+    # =========================================================================
+    # HUMAN APPROVAL SIGNAL-FILE SUPPORT
+    # =========================================================================
+
     @staticmethod
     def generate_action_key() -> str:
+        """
+        M4 FIX: Cryptographically secure 16-byte hex action key.
+        Replaces abs(hash(cmd)) % 999999 — eliminates collision TOCTOU race.
+        """
         return secrets.token_hex(16)
 
     def approval_signal_path(self, action_key: str) -> str:
@@ -341,6 +393,11 @@ class PolicyEngine:
         )
 
     def check_human_approval(self, action_key: str) -> bool:
+        """
+        C-05 FIX: FAIL-CLOSED on filesystem error.
+        Returns True only when signal file is confirmed absent.
+        Returns False on OSError (previously returned True — security hole).
+        """
         path = self.approval_signal_path(action_key)
         try:
             approved = not os.path.exists(path)
@@ -349,13 +406,17 @@ class PolicyEngine:
                 "[PolicyEngine] check_human_approval: stat %r failed: %s "
                 "— FAIL-CLOSED: NOT approved.", path, exc,
             )
-            return False
+            return False  # C-05 FIX: fail-closed
         if approved:
             _logger.info(
                 "[PolicyEngine] HUMAN_APPROVAL_GRANTED: key=%r path=%r",
                 action_key, path,
             )
         return approved
+
+    # =========================================================================
+    # PRIMARY ENTRY POINT — dict-based
+    # =========================================================================
 
     def validate_action_dict(
         self,
@@ -384,6 +445,7 @@ class PolicyEngine:
         if op == "done":
             return self.ALLOW, None
 
+        # M2 FIX: denied_apps — checked BEFORE allowlist
         app = str(focused_app or "__unknown_app__").lower().strip()
         if app in self._denied_apps:
             reason = (
@@ -393,6 +455,7 @@ class PolicyEngine:
             _logger.warning("[PolicyEngine] M2 DENY (denied_apps): op=%r app=%r", op, app)
             return self.DENY, reason
 
+        # Allowlist check
         with self._apps_lock:
             app_allowed = app in self._allowed_apps
         if not app_allowed:
@@ -403,6 +466,7 @@ class PolicyEngine:
             _logger.warning("[PolicyEngine] DENY: op=%r app=%r — %s", op, app, reason)
             return self.DENY, reason
 
+        # M2 FIX: high_risk_apps — require human confirmation
         if app in self._high_risk_apps:
             reason = (
                 f"Application {app!r} is in high_risk_apps — "
@@ -414,12 +478,14 @@ class PolicyEngine:
             )
             return self.REQUIRE_HUMAN_CONFIRMATION, reason
 
+        # Synthetic role check
         synthetic_role = self._OP_TO_SYNTHETIC_ROLE.get(op, op)
         if synthetic_role in self.denied_roles:
             reason = f"Forbidden operation role: {synthetic_role!r}"
             _logger.warning("[PolicyEngine] DENY: %s", reason)
             return self.DENY, reason
 
+        # Semantic type/write into non-text target
         if op in ("write", "type") and action.get("target_role"):
             target_role = str(action["target_role"]).lower()
             if "text" not in target_role and "entry" not in target_role:
@@ -430,22 +496,26 @@ class PolicyEngine:
                 _logger.warning("[PolicyEngine] DENY: %s", reason)
                 return self.DENY, reason
 
+        # M1 FIX: Filesystem policy for file_create
         if op == "file_create":
             path = str(action.get("path") or "").strip()
             path_verdict, path_reason = self._validate_file_path(path)
             if path_verdict != self.ALLOW:
                 return path_verdict, path_reason
+            # M3 FIX: Scan content
             content = str(action.get("content") or "")
             content_verdict, content_reason = self._validate_file_content(content)
             if content_verdict != self.ALLOW:
                 return content_verdict, content_reason
 
+        # M1 FIX: Block command redirect to denied paths
         if op == "command":
             cmd_str = str(action.get("command") or "")
             redirect_verdict, redirect_reason = self._validate_command_redirect(cmd_str)
             if redirect_verdict != self.ALLOW:
                 return redirect_verdict, redirect_reason
 
+        # High-risk content check (GAP-3 trusted-installer bypass preserved)
         _trusted_flag: bool = bool(action.get("_trusted_installer", False))
         content_to_check = self._extract_risk_content(op, action)
 
@@ -473,6 +543,7 @@ class PolicyEngine:
                         )
                         return self.REQUIRE_HUMAN_CONFIRMATION, reason
 
+        # Unknown operation — fail closed
         if op not in self._OP_TO_SYNTHETIC_ROLE:
             reason = f"Unknown operation: {op!r}"
             _logger.warning("[PolicyEngine] DENY: %s", reason)
@@ -491,10 +562,15 @@ class PolicyEngine:
                 keys = [keys]
             return " ".join(str(k) for k in keys)
         if op == "file_create":
+            # M3 FIX: include content in risk scan
             path = str(action.get("path") or "")
             content = str(action.get("content") or "")
             return f"{path} {content}"
         return ""
+
+    # =========================================================================
+    # SECONDARY ENTRY POINT — AT-SPI node-based
+    # =========================================================================
 
     def validate(self, node, action: str) -> Tuple[str, Optional[str]]:
         try:
@@ -514,6 +590,7 @@ class PolicyEngine:
         if app == "unknown":
             return self.DENY, "Application identity unavailable"
 
+        # M2 FIX in AT-SPI path
         if app in self._denied_apps:
             return self.DENY, f"Application {app!r} is in denied_apps."
 
