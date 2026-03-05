@@ -376,6 +376,55 @@ class BeliefState:
 
         return decayed
 
+
+    # ==========================================================
+    # SEMANTIC LOOP DETECTION (NEW)
+    # ==========================================================
+
+    _SEMANTIC_LOOP_WINDOW: int = 6      # look back N actions
+    _SEMANTIC_LOOP_MIN_CYCLE: int = 2   # minimum cycle length to detect
+
+    def detect_semantic_loop(self) -> bool:
+        """
+        NEW FIX: Detect action-level loops where each step succeeds individually
+        but no net progress is made (A→B→A→B pattern).
+
+        Stagnation counters only catch cases where no action succeeds. This
+        catches the more subtle case where actions alternate without advancing
+        the task — e.g. clicking to open a menu, then clicking outside to close
+        it, then clicking to open it again.
+
+        Returns True if a repeating action cycle is detected in the recent
+        action history, False otherwise.
+        """
+        history = getattr(self, "_recent_action_key_history", [])
+        if len(history) < self._SEMANTIC_LOOP_WINDOW:
+            return False
+
+        window = history[-self._SEMANTIC_LOOP_WINDOW:]
+
+        # Detect repeating prefix: [A, B, A, B] or [A, B, C, A, B, C]
+        for cycle_len in range(
+            self._SEMANTIC_LOOP_MIN_CYCLE,
+            len(window) // 2 + 1,
+        ):
+            pattern = window[-cycle_len:]
+            preceding = window[-cycle_len * 2:-cycle_len]
+            if len(preceding) == cycle_len and preceding == pattern:
+                return True
+
+        return False
+
+    def record_action_key_for_loop_detection(self, action_key: str) -> None:
+        """Record an action key for semantic loop detection."""
+        if not hasattr(self, "_recent_action_key_history"):
+            self._recent_action_key_history = []
+        self._recent_action_key_history.append(action_key)
+        # Bound to 2× window size
+        max_size = self._SEMANTIC_LOOP_WINDOW * 2
+        if len(self._recent_action_key_history) > max_size:
+            self._recent_action_key_history = self._recent_action_key_history[-max_size:]
+
     def set_plan_horizon(self, total_steps: int, iters_per_step: int = 13) -> None:
         """
         Tune regret decay so that 5 % residual remains at plan end.
