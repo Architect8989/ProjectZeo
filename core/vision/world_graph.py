@@ -15,7 +15,28 @@ class WorldGraphError(RuntimeError):
 
 MAX_ENTITIES = 5000
 MAX_HISTORY = 2000
-ENTITY_STALE_SECONDS = 30.0
+# AUDIT-MEDIUM-1 FIX: Reduce stale entity timeout from 30s to 5s.
+#
+# Root cause: with observer_loop.pause() (old behaviour), entities that
+# disappeared from the screen (closed dialogs, dismissed popups, navigated
+# pages) remained in the world graph for 30 seconds. This caused the planner
+# to target non-existent UI elements and produced spurious click actions on
+# ghost entities.
+#
+# Fix: default stale threshold reduced to 5s (configurable via env var for
+# operators who need a longer window).  At 5 Hz full inference rate, an entity
+# must be absent from 25 consecutive frames before being evicted — sufficient
+# to handle brief occlusions without holding stale state for 30s.
+#
+# In lightweight mode (1 Hz screenshot-only, no entity extraction), the
+# stale timer is artificially extended by the calling code to avoid mass
+# eviction during execution phases where the VL model is not running.
+ENTITY_STALE_SECONDS: float = float(
+    __import__("os").environ.get("PROJECTZEO_ENTITY_STALE_SECONDS", "5.0")
+)
+ENTITY_STALE_SECONDS_LIGHTWEIGHT: float = float(
+    __import__("os").environ.get("PROJECTZEO_ENTITY_STALE_SECONDS_LIGHTWEIGHT", "120.0")
+)
 COORD_QUANT = 0.0001
 SPATIAL_MATCH_THRESHOLD = 0.01
 
@@ -81,7 +102,16 @@ class WorldGraph:
             focused = perception.get("focused_app")
             self._focused_app = focused if isinstance(focused, str) else None
 
-            cutoff = now - ENTITY_STALE_SECONDS
+            # AUDIT-MEDIUM-1 FIX: Use extended stale window in lightweight mode
+            # (observer running screenshot-only with no entity extraction).
+            # Without this, all entities would be evicted within 5s when the
+            # VL model is suspended during execution, losing all world model state.
+            _is_lightweight = bool(perception.get("_lightweight", False))
+            _stale_threshold = (
+                ENTITY_STALE_SECONDS_LIGHTWEIGHT if _is_lightweight
+                else ENTITY_STALE_SECONDS
+            )
+            cutoff = now - _stale_threshold
             updated_entities: Dict[str, Dict[str, Any]] = {}
 
             for el in elements:
@@ -324,4 +354,34 @@ class WorldGraph:
                 "entity_count": len(self._entities),
                 "focused_app": self._focused_app,
             }
+        )
+
+    def proactive_cleanup(self) -> int:
+        """
+        AUDIT-MEDIUM-1: Force-evict entities that have exceeded the stale
+        threshold based on wall-clock time.  Call periodically (e.g. every
+        10s) when VL inference is running at reduced rate or after task
+        completion to ensure no ghost entities survive into the next task.
+
+        Returns the number of entities evicted.
+        """
+        now = time.monotonic()
+        cutoff = now - ENTITY_STALE_SECONDS
+
+        with self._lock:
+            before = len(self._entities)
+            self._entities = {
+                eid: ent
+                for eid, ent in self._entities.items()
+                if ent["last_seen"] >= cutoff
+            }
+            evicted = before - len(self._entities)
+
+        if evicted > 0:
+            import logging as _log
+            _log.getLogger(__name__).debug(
+                "[WorldGraph] proactive_cleanup: evicted %d stale entities "
+                "(threshold=%.1fs).", evicted, ENTITY_STALE_SECONDS,
             )
+
+        return evicted
