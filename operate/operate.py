@@ -485,6 +485,7 @@ def operate_main(
             prior_step_index=prior_step_index,
             prior_execution_log=prior_execution_log,  # MAJ-1 FIX
             created_files_ledger=_created_files_ledger,
+            gii_controller=gii_controller,
         )
         
         try:
@@ -550,6 +551,7 @@ def _execute_autonomous_loop(
     prior_execution_log: Optional[dict] = None,
     
     created_files_ledger: Optional[List[str]] = None,
+    gii_controller=None,   # D-3 FIX: GIIController as primary action source
 ) -> None:
 
     start_ts = time.time()
@@ -782,16 +784,56 @@ def _execute_autonomous_loop(
 
                 # ------------------------------------------------------------------
                 # Candidate action selection
+                # D-3 FIX: GIIController.decide_next_action() is the PRIMARY source.
+                # Plan-step actions are used as fallback only when GII is disabled
+                # or returns no action, preserving scripted-mode compatibility.
                 # ------------------------------------------------------------------
+                _gii_action: Optional[Dict[str, Any]] = None
+                _gii_reason: str = ""
+                if gii_controller is not None and gii_controller.enabled:
+                    _ws_for_gii = world_snapshot if isinstance(world_snapshot, dict) else {}
+                    _gii_action, _gii_reason = gii_controller.decide_next_action(
+                        _ws_for_gii,
+                        perception=perception_snapshot if isinstance(perception_snapshot, dict) else None,
+                    )
+                    # D-12 FIX: Scan the GII reasoning output (thought field + action
+                    # fields) for injection markers before accepting the action.
+                    # The VL model sees raw screen content and can be manipulated by
+                    # adversarial on-screen text.  Filtering only entity text (as the
+                    # original code did) leaves the reasoner output unchecked.
+                    if _gii_action is not None:
+                        _gii_text_to_scan = " ".join(
+                            str(_gii_action.get(f, ""))
+                            for f in ("thought", "command", "content", "path", "summary")
+                        )
+                        try:
+                            from core.security.injection_markers import contains_injection_marker as _cim_gii
+                            if _cim_gii(_gii_text_to_scan):
+                                log_warn(
+                                    "[D-12] GII action BLOCKED — injection marker in "
+                                    f"VL model reasoning output: {_gii_text_to_scan[:120]!r}. "
+                                    "Falling back to plan-step candidates."
+                                )
+                                _gii_action = None
+                        except ImportError:
+                            _lower_gii = _gii_text_to_scan.lower()
+                            if "ignore previous instructions" in _lower_gii or                                "ignore all previous" in _lower_gii:
+                                log_warn("[D-12] GII action BLOCKED — injection marker (inline check).")
+                                _gii_action = None
+
                 raw_actions = current_step.action
                 candidate_actions: List[Dict[str, Any]] = []
 
-                if isinstance(raw_actions, dict):
-                    candidate_actions.append(raw_actions)
-                elif isinstance(raw_actions, list):
-                    candidate_actions.extend(
-                        a for a in raw_actions if isinstance(a, dict)
-                    )
+                # GII action is primary; plan-step is fallback.
+                if _gii_action is not None:
+                    candidate_actions.append(_gii_action)
+                else:
+                    if isinstance(raw_actions, dict):
+                        candidate_actions.append(raw_actions)
+                    elif isinstance(raw_actions, list):
+                        candidate_actions.extend(
+                            a for a in raw_actions if isinstance(a, dict)
+                        )
 
                 # H-03 FIX: Apply injection marker check to ALL plan-step action
                 # fields (command, content, path) — not only dynamic candidates.
@@ -1177,6 +1219,17 @@ def _execute_autonomous_loop(
                     _step_entry["outputs"] = _step_outputs
                     _step_entry["last_output"] = output_text  # convenience alias
                     execution_log[current_step_index] = _step_entry
+
+            # D-3 FIX: Record outcome to GIIController for reasoning history.
+            if gii_controller is not None and gii_controller.enabled:
+                try:
+                    gii_controller.record_outcome(
+                        selected_action,
+                        success=action_success,
+                        output=str(exec_result.get("output", ""))[:500],
+                    )
+                except Exception:
+                    pass
 
             # Bandit update
             belief.record_action(action_key, raw_reward)
