@@ -2,19 +2,41 @@ import os
 import sys
 import subprocess
 
-def _early_parse_args() -> bool:
-    return "--allow-cloud" in sys.argv
+
+def _early_parse_args() -> tuple:
+    """
+    Pre-import scan of sys.argv for flags that must be set before module imports.
+    Returns (allow_cloud: bool, model_name_or_none: str|None).
+    """
+    allow_cloud = "--allow-cloud" in sys.argv
+
+    # Also treat any anthropic:* or openai:* model as cloud-allowed.
+    for arg in sys.argv[1:]:
+        if not arg.startswith("--"):
+            if arg.startswith("anthropic:") or arg.startswith("openai:"):
+                allow_cloud = True
+            break
+
+    # Support --model <name> flag in addition to positional arg.
+    model = None
+    for i, arg in enumerate(sys.argv[1:], 1):
+        if arg in ("--model", "-m") and i < len(sys.argv):
+            model = sys.argv[i + 1] if i < len(sys.argv) else None
+            if model and (model.startswith("anthropic:") or model.startswith("openai:")):
+                allow_cloud = True
+
+    return allow_cloud, model
 
 
-_allow_cloud_early = _early_parse_args()
+_allow_cloud_early, _model_early = _early_parse_args()
 
 if not _allow_cloud_early:
     os.environ["OLLAMA_ONLY"] = "1"
 else:
     os.environ["OLLAMA_ONLY"] = "0"
     print(
-        "[run.py] WARNING: --allow-cloud is set. Cloud API routing is ENABLED. "
-        "Ensure API keys are intentionally configured.",
+        "[run.py] WARNING: --allow-cloud is set (or a cloud model prefix was detected). "
+        "Cloud API routing is ENABLED. Ensure API keys are intentionally configured.",
         file=sys.stderr,
     )
 
@@ -24,6 +46,7 @@ import threading
 from typing import Any
 
 from adapters.factory import build_llm
+from adapters.cloud_adapter import is_cloud_model
 from main import main
 from config.timeouts import LLM_THREAD_TIMEOUT_SECONDS
 
@@ -33,10 +56,18 @@ def _parse_args():
     allow_cloud = "--allow-cloud" in args
     interactive = "--interactive" in args
     status_only = "--status" in args
+
     positional = [a for a in args if not a.startswith("--")]
 
     model: str | None = None
-    if positional:
+
+    # --model <name> flag takes precedence over positional arg
+    for i, arg in enumerate(args):
+        if arg in ("--model", "-m") and i + 1 < len(args):
+            model = args[i + 1].strip() or None
+            break
+
+    if not model and positional:
         model = positional[0].strip() or None
 
     if not model:
@@ -44,12 +75,24 @@ def _parse_args():
 
     if not status_only and not model:
         raise RuntimeError(
-            "No model specified. "
-            "Pass model as CLI argument or set LLM_MODEL environment variable.\n"
-            "Example: python run.py qwen2.5-vl:7b-instruct\n"
-            "         LLM_MODEL=qwen2.5-vl:7b-instruct python run.py\n"
-            "         python run.py --status  (check current system status)"
+            "No model specified.\n"
+            "Pass model as CLI argument, --model flag, or LLM_MODEL env var.\n"
+            "\n"
+            "Local (Ollama):\n"
+            "  python run.py qwen2.5-vl:7b-instruct\n"
+            "\n"
+            "Cloud (Anthropic — requires ANTHROPIC_API_KEY):\n"
+            "  python run.py anthropic:claude-sonnet-4-20250514\n"
+            "\n"
+            "Cloud (OpenAI — requires OPENAI_API_KEY):\n"
+            "  python run.py openai:gpt-4o\n"
+            "\n"
+            "Status check:\n"
+            "  python run.py --status"
         )
+
+    if model and (model.startswith("anthropic:") or model.startswith("openai:")):
+        allow_cloud = True
 
     return model, allow_cloud, interactive, status_only
 
@@ -61,6 +104,12 @@ def _print_status() -> None:
 
     _root = _pathlib.Path(__file__).resolve().parent
     _temp = _root / "temp"
+
+    # D-7 FIX: Intent file now lives in ~/.projectzeo/
+    from core.intent_listener import IntentListener as _IL
+    _intent_file = _pathlib.Path(_IL.INTENT_FILE)
+    _arm_success = _pathlib.Path(_IL._SIDECAR_DIR) / "arm_success.json"
+    _arm_failure = _pathlib.Path(_IL._SIDECAR_DIR) / "arm_failure.json"
 
     print("ProjectZeo — System Status")
     print("=" * 42)
@@ -83,19 +132,17 @@ def _print_status() -> None:
     else:
         print("Last task   : No completed task on record")
 
-    _success_path = _temp / "arm_success.json"
-    _failure_path = _temp / "arm_failure.json"
-    if _success_path.exists():
+    if _arm_success.exists():
         try:
-            with open(_success_path) as f:
+            with open(_arm_success) as f:
                 s = _json.load(f)
             ts = _dt.datetime.fromtimestamp(s.get("timestamp", 0)).strftime("%Y-%m-%d %H:%M:%S")
             print(f"Last arm    : SUCCESS at {ts}")
         except Exception:
             print("Last arm    : SUCCESS (timestamp unreadable)")
-    elif _failure_path.exists():
+    elif _arm_failure.exists():
         try:
-            with open(_failure_path) as f:
+            with open(_arm_failure) as f:
                 s = _json.load(f)
             print(f"Last arm    : FAILED — {s.get('reason', '?')}")
         except Exception:
@@ -103,10 +150,9 @@ def _print_status() -> None:
     else:
         print("Last arm    : No arm event recorded")
 
-    _intent_path = _root / "arm_system.intent"
-    if _intent_path.exists():
+    if _intent_file.exists():
         try:
-            content = _intent_path.read_text(encoding="utf-8").strip()[:72]
+            content = _intent_file.read_text(encoding="utf-8").strip()[:72]
             print(f"Pending     : {content!r}")
         except Exception:
             print("Pending     : (unreadable)")
@@ -114,7 +160,8 @@ def _print_status() -> None:
         print("Pending     : None")
 
     print("=" * 42)
-    print("Tip: write intent to arm_system.intent  OR  run with --interactive")
+    print(f"Intent file : {_intent_file}")
+    print("Tip: write intent to the intent file above  OR  run with --interactive")
 
 
 def _run_coroutine_threadsafe(coro) -> Any:
@@ -142,11 +189,48 @@ def _run_coroutine_threadsafe(coro) -> Any:
     return result_container.get("result")
 
 
-def _make_llm_callable(adapter):
-    if not hasattr(adapter, "get_next_action"):
-        raise RuntimeError("Adapter missing get_next_action()")
+def _make_llm_callable(adapter, model_name: str):
+    """
+    Build the llm_callable that is passed to main().
 
-    def _call(messages, objective=None, session_id=None):
+    Cloud adapters (AnthropicCloudAdapter, OpenAICloudAdapter via _CloudCallable)
+    implement __call__(messages, objective, session_id) directly and do NOT have
+    an async get_next_action() method.  For these, call __call__ directly without
+    going through the async thread bounce.
+
+    Local Ollama adapters require the async get_next_action() + thread path.
+    """
+
+    # Cloud path: direct synchronous call.
+    if is_cloud_model(model_name):
+        def _cloud_call(messages, objective=None, session_id=None):
+            try:
+                result = adapter(messages, objective=objective, session_id=session_id)
+            except Exception as e:
+                raise RuntimeError(f"Cloud LLM adapter invocation failed: {e}") from e
+
+            # Cloud adapters return a string; wrap in the list format expected by
+            # operate.py / plan parsing code that expects a list of operations.
+            # The per_step_reasoner and planner both handle str responses natively
+            # through their _parse_action / _parse_step_array methods.
+            if isinstance(result, str):
+                return result
+            if isinstance(result, list):
+                return result
+            if isinstance(result, dict):
+                return [result]
+            return str(result)
+
+        return _cloud_call
+
+    # Local Ollama path: async get_next_action() via thread.
+    if not hasattr(adapter, "get_next_action"):
+        raise RuntimeError(
+            f"Adapter for model {model_name!r} is missing get_next_action(). "
+            "Ensure the adapter class implements the llm_callable contract."
+        )
+
+    def _ollama_call(messages, objective=None, session_id=None):
         async def _invoke():
             return await adapter.get_next_action(
                 messages=messages,
@@ -187,7 +271,7 @@ def _make_llm_callable(adapter):
 
         return ops
 
-    return _call
+    return _ollama_call
 
 
 def _validate_runtime_dependencies(model_name: str) -> None:
@@ -205,16 +289,20 @@ def _validate_runtime_dependencies(model_name: str) -> None:
         except OSError as _mkdir_err:
             warnings.append(
                 f"  [WARNING] Could not create required directory {_abs_dir!r}: {_mkdir_err}. "
-                "Snapshot persistence and transition logging will be disabled for this session."
+                "Snapshot persistence and transition logging will be disabled."
             )
 
-    try:
-        import psutil as _  # noqa: F401
-    except ImportError:
-        errors.append(
-            "  [MISSING] psutil is not installed.\n"
-            "    Fix: pip install psutil"
-        )
+    # Cloud models do not require Ollama; skip local Ollama checks entirely.
+    _is_cloud = is_cloud_model(model_name)
+
+    if not _is_cloud:
+        try:
+            import psutil as _  # noqa: F401
+        except ImportError:
+            errors.append(
+                "  [MISSING] psutil is not installed.\n"
+                "    Fix: pip install psutil"
+            )
 
     _pyautogui_ok = False
     try:
@@ -232,34 +320,28 @@ def _validate_runtime_dependencies(model_name: str) -> None:
             f"  [DISPLAY] pyautogui cannot access display: {_pya_err}.\n"
             "    On headless systems start a virtual display first:\n"
             "      Xvfb :99 -screen 0 1920x1080x24 &\n"
-            "      export DISPLAY=:99\n"
-            "    OR run ProjectZeo from inside a graphical desktop session."
+            "      export DISPLAY=:99"
         )
 
     if _platform.system() == "Linux":
         if _shutil.which("xdotool") is None:
             errors.append(
                 "  [MISSING] xdotool is not installed (required for snapshot capture on Linux).\n"
-                "    Fix (Debian/Ubuntu): sudo apt-get install xdotool\n"
-                "    Fix (Fedora/RHEL):   sudo dnf install xdotool\n"
-                "    Fix (Arch):          sudo pacman -S xdotool"
+                "    Fix (Debian/Ubuntu): sudo apt-get install xdotool"
             )
 
         if _shutil.which("wmctrl") is None:
             warnings.append(
-                "  [WARNING] wmctrl is not installed. "
-                "Window-focus restoration will be best-effort only.\n"
-                "    Fix: sudo apt-get install wmctrl"
+                "  [WARNING] wmctrl is not installed. Window-focus restoration will be "
+                "best-effort only.\n    Fix: sudo apt-get install wmctrl"
             )
 
         if not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY"):
             errors.append(
                 "  [NO DISPLAY] DISPLAY and WAYLAND_DISPLAY are both unset on Linux.\n"
                 "    pyautogui requires a running X11 or Wayland display.\n"
-                "    To run headlessly:\n"
                 "      Xvfb :99 -screen 0 1920x1080x24 &\n"
-                "      export DISPLAY=:99\n"
-                "    OR launch ProjectZeo from inside a graphical desktop session."
+                "      export DISPLAY=:99"
             )
 
         _xdg_session = os.environ.get("XDG_SESSION_TYPE", "").lower()
@@ -267,25 +349,19 @@ def _validate_runtime_dependencies(model_name: str) -> None:
         _is_wayland = _xdg_session == "wayland" or bool(_wayland_disp)
         if _is_wayland:
             _has_ydotool = _shutil.which("ydotool") is not None
-            _has_wmctrl = _shutil.which("wmctrl") is not None
             _has_pyatspi = False
             try:
                 import pyatspi  # noqa: F401
                 _has_pyatspi = True
             except ImportError:
                 pass
+            _has_wmctrl = _shutil.which("wmctrl") is not None
             if not _has_ydotool and not _has_pyatspi and not _has_wmctrl:
                 warnings.append(
                     "  [WARNING] Wayland session detected but no Wayland-compatible "
-                    "window management tool found (ydotool / AT-SPI2 / wmctrl).\n"
-                    "    Snapshot/restore will degrade to cursor-only (no window focus).\n"
-                    "    Fix (best):  sudo apt-get install ydotool\n"
-                    "                 Then configure as systemd user service:\n"
-                    "                 systemctl --user enable --now ydotool.service\n"
-                    "    Fix (alt):   pip install pyatspi  and\n"
-                    "                 gsettings set org.gnome.desktop.interface "
-                    "toolkit-accessibility true\n"
-                    "    Fix (switch): log into a GNOME-on-Xorg session instead of Wayland."
+                    "input tool found.\n"
+                    "    Fix: sudo apt-get install ydotool && "
+                    "systemctl --user enable --now ydotool.service"
                 )
 
             if _has_ydotool:
@@ -301,28 +377,12 @@ def _validate_runtime_dependencies(model_name: str) -> None:
                     _daemon_ok = False
 
                 if not _daemon_ok:
-                    # H-05 FIX: Never auto-start ydotoold via sudo from application
-                    # startup code. A sudo invocation before any task is received
-                    # establishes a root-owned daemon from untrusted input, and any
-                    # vulnerability in ydotoold becomes a root exploit surface.
-                    # Operators must pre-configure ydotoold as a systemd user service.
                     errors.append(
                         "  [FATAL] Wayland session: ydotool is installed but the\n"
-                        "    ydotoold daemon is NOT running.  All UI input (click,\n"
-                        "    type, hotkey) will silently fail until the daemon starts.\n"
+                        "    ydotoold daemon is NOT running. All UI input will fail.\n"
                         "\n"
-                        "    Quickest fix (one-time manual start):\n"
-                        "      ydotoold &\n"
-                        "\n"
-                        "    Persistent fix (systemd user service — recommended):\n"
-                        "      systemctl --user enable --now ydotool.service\n"
-                        "\n"
-                        "    Or switch to a GNOME-on-Xorg session (login gear →\n"
-                        "    'Ubuntu on Xorg') to avoid Wayland input limitations.\n"
-                        "\n"
-                        "    NOTE: Auto-start via sudo has been removed for security.\n"
-                        "    The daemon must be started by the operator before launching\n"
-                        "    ProjectZeo. See docs/ for systemd service configuration."
+                        "    Quick fix (manual):  ydotoold &\n"
+                        "    Persistent fix:      systemctl --user enable --now ydotool.service"
                     )
 
     try:
@@ -330,94 +390,134 @@ def _validate_runtime_dependencies(model_name: str) -> None:
     except ImportError:
         warnings.append(
             "  [WARNING] pyyaml is not installed — policy.yaml will NOT be loaded.\n"
-            "    PolicyEngine will run with the built-in default allowlist only.\n"
             "    Fix: pip install pyyaml"
         )
 
     try:
         import playwright  # noqa: F401
-        _chromium_found = (
-            _shutil.which("chromium-browser") is not None
-            or _shutil.which("chromium") is not None
-            or _shutil.which("google-chrome") is not None
-            or _shutil.which("google-chrome-stable") is not None
+        _chromium_found = any(
+            _shutil.which(b) is not None
+            for b in ("chromium-browser", "chromium", "google-chrome", "google-chrome-stable")
         )
         if not _chromium_found:
             warnings.append(
-                "  [WARNING] playwright is installed but no Chromium/Chrome binary found.\n"
-                "    Browser DOM automation will fall back to pyautogui coordinate clicks.\n"
-                "    Fix: playwright install chromium\n"
-                "    OR:  sudo apt-get install chromium-browser"
+                "  [WARNING] playwright installed but no Chromium binary found.\n"
+                "    Fix: playwright install chromium"
             )
     except ImportError:
         warnings.append(
             "  [WARNING] playwright is not installed — browser DOM automation disabled.\n"
-            "    Web tasks will use pyautogui coordinate clicks (SPA-unfriendly).\n"
             "    Fix: pip install playwright && playwright install chromium"
         )
 
-    try:
-        import easyocr  # noqa: F401
-    except ImportError:
-        warnings.append(
-            "  [WARNING] easyocr is not installed — label-based clicks will fail.\n"
-            "    The agent can only click by pixel coordinates, not by UI label text.\n"
-            "    Fix: pip install easyocr\n"
-            "    Note: first EasyOCR init downloads ~500 MB of model weights (~5-10 min)."
-        )
-
-    _ollama_ok = False
-    try:
-        import ollama as _ollama
-        _ollama.Client().list()
-        _ollama_ok = True
-    except Exception as _ollama_err:
-        errors.append(
-            "  [UNREACHABLE] Ollama daemon is not running or not installed: "
-            + str(_ollama_err) + "\n"
-            "    Fix: install Ollama from https://ollama.com "
-            "and ensure the daemon is running.\n"
-            "    On Linux/macOS: ollama serve"
-        )
-
-    if _ollama_ok:
-        try:
-            import ollama as _ollama  # noqa: F811
-            _existing_models = {m.model for m in _ollama.Client().list().models}
-            _base = model_name.split(":")[0]
-            _found = any(
-                model_name in m or _base in m
-                for m in _existing_models
-            )
-            if not _found:
+    # Cloud adapter dependency checks
+    if _is_cloud:
+        if model_name.startswith("anthropic:"):
+            try:
+                import anthropic  # noqa: F401
+            except ImportError:
                 errors.append(
-                    "  [NOT PULLED] Model '" + model_name + "' is not available locally.\n"
-                    "    Fix: ollama pull " + model_name
+                    "  [MISSING] anthropic package not installed.\n"
+                    "    Fix: pip install anthropic"
                 )
-        except Exception:
-            pass
-
-    if _ollama_ok:
+            if not os.environ.get("ANTHROPIC_API_KEY", "").strip():
+                errors.append(
+                    "  [MISSING] ANTHROPIC_API_KEY environment variable is not set.\n"
+                    "    Fix: export ANTHROPIC_API_KEY=sk-ant-..."
+                )
+        elif model_name.startswith("openai:"):
+            try:
+                import openai  # noqa: F401
+            except ImportError:
+                errors.append(
+                    "  [MISSING] openai package not installed.\n"
+                    "    Fix: pip install openai"
+                )
+            if not os.environ.get("OPENAI_API_KEY", "").strip():
+                errors.append(
+                    "  [MISSING] OPENAI_API_KEY environment variable is not set.\n"
+                    "    Fix: export OPENAI_API_KEY=sk-..."
+                )
+    else:
+        # Ollama checks
+        _ollama_ok = False
         try:
-            import ollama as _ollama  # noqa: F811
-            _existing = {m.model for m in _ollama.Client().list().models}
-            _text_candidate = model_name.replace("-vl:", ":").replace("-vl", "")
-            _text_base = _text_candidate.split(":")[0]
-            _text_found = any(
-                _text_candidate in m or _text_base in m
-                for m in _existing
+            import ollama as _ollama
+            _ollama.Client().list()
+            _ollama_ok = True
+        except Exception as _ollama_err:
+            errors.append(
+                "  [UNREACHABLE] Ollama daemon is not running or not installed: "
+                + str(_ollama_err) + "\n"
+                "    Fix: install Ollama from https://ollama.com and run: ollama serve"
             )
-            _is_vision_model = "-vl" in model_name or "vision" in model_name.lower()
-            if _is_vision_model and not _text_found:
-                warnings.append(
-                    "  [WARNING] No dedicated text model found for '" + model_name + "'.\n"
-                    "    ExecutionPlanner will use the vision model for text-only planning.\n"
-                    "    This works correctly but is slower and uses more VRAM.\n"
-                    "    Fix: ollama pull " + _text_candidate + "\n"
-                    "    Or:  set LLM_TEXT_MODEL env var to an explicit text model name."
+
+        if _ollama_ok:
+            try:
+                import ollama as _ollama  # noqa: F811
+                _existing_models = {m.model for m in _ollama.Client().list().models}
+                _base = model_name.split(":")[0]
+                _found = any(
+                    model_name in m or _base in m
+                    for m in _existing_models
                 )
-        except Exception:
-            pass
+                if not _found:
+                    errors.append(
+                        f"  [NOT PULLED] Model '{model_name}' is not available locally.\n"
+                        f"    Fix: ollama pull {model_name}"
+                    )
+            except Exception:
+                pass
+
+        if _ollama_ok:
+            try:
+                import ollama as _ollama  # noqa: F811
+                _existing = {m.model for m in _ollama.Client().list().models}
+                _text_candidate = model_name.replace("-vl:", ":").replace("-vl", "")
+                _text_base = _text_candidate.split(":")[0]
+                _text_found = any(
+                    _text_candidate in m or _text_base in m
+                    for m in _existing
+                )
+                _is_vision_model = "-vl" in model_name or "vision" in model_name.lower()
+                if _is_vision_model and not _text_found:
+                    warnings.append(
+                        f"  [WARNING] No dedicated text model found for '{model_name}'.\n"
+                        "    ExecutionPlanner will use the vision model for text-only planning.\n"
+                        f"    Fix: ollama pull {_text_candidate}"
+                    )
+            except Exception:
+                pass
+
+        if _ollama_ok:
+            try:
+                import ollama as _ollama_prewarm
+                print(
+                    f"[STARTUP] Pre-warming Ollama model {model_name!r} "
+                    "(first inference loads weights; may take 1-5 min on cold start)...",
+                    file=sys.stderr,
+                )
+                _pw_client = _ollama_prewarm.Client()
+                _pw_response = _pw_client.chat(
+                    model=model_name,
+                    messages=[{"role": "user", "content": "Hello. Reply with one word."}],
+                    options={"temperature": 0, "num_predict": 5},
+                )
+                _pw_content = ""
+                if hasattr(_pw_response, "message") and hasattr(_pw_response.message, "content"):
+                    _pw_content = _pw_response.message.content[:40]
+                elif isinstance(_pw_response, dict):
+                    _pw_content = (_pw_response.get("message") or {}).get("content", "")[:40]
+                print(
+                    f"[STARTUP] Model pre-warm complete (response: {_pw_content!r}).",
+                    file=sys.stderr,
+                )
+            except Exception as _pw_err:
+                print(
+                    f"[STARTUP] WARNING: Model pre-warm failed: {_pw_err}. "
+                    "VisionRuntime warmup may take longer.",
+                    file=sys.stderr,
+                )
 
     if warnings:
         print("\n[STARTUP] Dependency warnings (non-fatal):", file=sys.stderr)
@@ -434,38 +534,6 @@ def _validate_runtime_dependencies(model_name: str) -> None:
             print(e, file=sys.stderr)
         print("", file=sys.stderr)
         sys.exit(1)
-
-    if _ollama_ok:
-        try:
-            import ollama as _ollama_prewarm
-            print(
-                f"[STARTUP] Pre-warming Ollama model {model_name!r} "
-                "(first inference loads weights; may take 1-5 min on cold start)...",
-                file=sys.stderr,
-            )
-            _pw_client = _ollama_prewarm.Client()
-            _pw_response = _pw_client.chat(
-                model=model_name,
-                messages=[{"role": "user", "content": "Hello. Reply with one word."}],
-                options={"temperature": 0, "num_predict": 5},
-            )
-            _pw_content = ""
-            if hasattr(_pw_response, "message") and hasattr(_pw_response.message, "content"):
-                _pw_content = _pw_response.message.content[:40]
-            elif isinstance(_pw_response, dict):
-                _pw_content = (_pw_response.get("message") or {}).get("content", "")[:40]
-            print(
-                f"[STARTUP] Model pre-warm complete (response: {_pw_content!r}). "
-                "VisionRuntime will use warm-start inferences.",
-                file=sys.stderr,
-            )
-        except Exception as _pw_err:
-            print(
-                f"[STARTUP] WARNING: Model pre-warm failed: {_pw_err}. "
-                "VisionRuntime warmup may take longer than PROJECTZEO_WARMUP_TIMEOUT_SECONDS. "
-                f"Consider increasing: export PROJECTZEO_WARMUP_TIMEOUT_SECONDS=900",
-                file=sys.stderr,
-            )
 
 
 if __name__ == "__main__":
@@ -489,7 +557,7 @@ if __name__ == "__main__":
     _validate_runtime_dependencies(model_name)
 
     adapter = build_llm(model_name)
-    llm_callable = _make_llm_callable(adapter)
+    llm_callable = _make_llm_callable(adapter, model_name)
     main(llm_callable, model_name=model_name)
 
     import json as _json, pathlib as _pathlib
