@@ -869,7 +869,16 @@ class ExecutionPlanner:
         command_text = action.get("command", "") + " " + action.get("content", "")
         cmd_stripped = action.get("command", "").strip()
 
+        # M5 FIX: Apply Unicode normalization before DANGEROUS_PATTERNS matching.
+        # Without this, Unicode lookalike characters (ｒｍ -ｒｆ) evade the regex.
+        # normalize_for_injection_check() maps homoglyphs to ASCII equivalents.
         _normalized_command_text = normalize_for_injection_check(command_text)
+        # Also normalize via NFKC (decomposes Unicode lookalikes to base chars)
+        try:
+            import unicodedata as _ud
+            _normalized_command_text = _ud.normalize("NFKC", _normalized_command_text)
+        except Exception:
+            pass
         for pattern in self._compiled_patterns:
             if pattern.search(_normalized_command_text):
                 import sys as _sys_ep
@@ -898,12 +907,29 @@ class ExecutionPlanner:
                     if marker in _normalized_v:
                         return None
 
-        # H-03 FIX: Also scan the path field specifically (file_create actions).
+        # H-03 FIX: Scan path field for injection markers.
         _path_val = action.get("path", "")
         if isinstance(_path_val, str) and _path_val:
             _normalized_path = normalize_for_injection_check(_path_val)
             for marker in INJECTION_MARKERS:
                 if marker in _normalized_path:
+                    return None
+
+        # M3 FIX: Scan file_create content field for dangerous patterns.
+        # Prevents two-step script injection: file_create a shell script in /tmp
+        # (path check passes), then command to execute it.
+        _content_val = action.get("content", "")
+        if isinstance(_content_val, str) and _content_val and raw_type == "file_creation":
+            import unicodedata as _ud3
+            _norm_content = _ud3.normalize("NFKC", normalize_for_injection_check(_content_val))
+            for _dp_pat in self._compiled_patterns:
+                if _dp_pat.search(_norm_content):
+                    import sys as _sys_m3
+                    print(
+                        f"[ExecutionPlanner] M3 SECURITY BLOCK: dangerous pattern "
+                        f"{_dp_pat.pattern!r} matched in file_create content. Step discarded.",
+                        file=_sys_m3.stderr,
+                    )
                     return None
 
         if "command" in action and isinstance(action["command"], str):
