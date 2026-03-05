@@ -13,13 +13,7 @@ from typing import Optional, Deque
 
 
 def atomic_write_intent(intent_text: str, intent_file: str = None) -> None:
-    """
-    Write intent text atomically to the intent file.
-
-    Uses os.O_CREAT | os.O_WRONLY | os.O_EXCL with mode 0o600 for the temp
-    file, then os.replace() for atomic promotion.  os.chmod() is called
-    BEFORE os.replace() so the file is never visible with the wrong mode.
-    """
+    
     if intent_file is None:
         intent_file = IntentListener.INTENT_FILE
 
@@ -62,15 +56,11 @@ class IntentListener:
     POLL_INTERVAL = 0.1
     INTENT_MAX_BYTES = 4096
 
-    # D-7 FIX: Move intent file from project root to ~/.projectzeo/.
-    # Writing to the project root allows any local process with filesystem
-    # access to forge an intent and arm the agent.  ~/.projectzeo/ with
-    # mode 0700 restricts read/write to the owning user.
+    
     _SECURE_DIR: str = os.path.join(os.path.expanduser("~"), ".projectzeo")
     INTENT_FILE: str = os.path.join(_SECURE_DIR, "arm_system.intent")
 
-    # Sidecar files (arm_failure.json, arm_success.json) always in the
-    # secure directory alongside the intent file.
+    
     _SIDECAR_DIR: str = _SECURE_DIR
 
     _ARM_PREFIX = "ARM:"
@@ -235,10 +225,7 @@ class IntentListener:
     # ==================================================
 
     def _peek_intent(self) -> tuple:
-        """
-        Read the intent file without deleting it.  Returns (intent_text, path)
-        or (None, None).  Validates ownership, mode, and scans for injection.
-        """
+        
         if sys.stdin and sys.stdin.isatty():
             try:
                 ready, _, _ = select.select([sys.stdin], [], [], 0.0)
