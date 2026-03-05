@@ -109,8 +109,11 @@ class ObserverLoop:
         self._schema_rejection_count: int = 0
         self._ingest_failure_count: int = 0
 
-        # GPU contention: pause() sets this; resume() clears it
+        
         self._pause_event = threading.Event()
+        self._lightweight_mode_event = threading.Event()
+        self._lightweight_tick_interval: float = 1.0  # 1 Hz in lightweight mode
+        self._full_tick_interval: float = self._tick_interval  # preserve original
 
     
 
@@ -153,14 +156,39 @@ class ObserverLoop:
         _logger.info("[ObserverLoop] Stopped.")
 
     def pause(self) -> None:
-        """Pause vision inference.  Call when entering EXECUTING to free GPU."""
-        self._pause_event.set()
-        _logger.debug("[ObserverLoop] Paused.")
+        
+        self.set_lightweight_mode(True)
+        _logger.debug("[ObserverLoop] pause() → set_lightweight_mode(True)")
 
     def resume(self) -> None:
-        """Resume vision inference.  Call after RESTORING completes."""
-        self._pause_event.clear()
-        _logger.debug("[ObserverLoop] Resumed.")
+        """
+        DEPRECATED — use set_lightweight_mode(False) instead.
+
+        Retained for backward compatibility.
+        """
+        self.set_lightweight_mode(False)
+        _logger.debug("[ObserverLoop] resume() → set_lightweight_mode(False)")
+
+    def set_lightweight_mode(self, enabled: bool) -> None:
+        
+        if enabled:
+            self._lightweight_mode_event.set()
+            self._pause_event.clear()  # ensure old flag is cleared
+            _logger.info(
+                "[ObserverLoop] Lightweight mode ENABLED (1 Hz screenshot-only; "
+                "GPU freed for execution). World state tracking continues."
+            )
+        else:
+            self._lightweight_mode_event.clear()
+            self._pause_event.clear()
+            _logger.info(
+                "[ObserverLoop] Lightweight mode DISABLED (%.1f Hz full VL inference resumed).",
+                self._full_tick_interval,
+            )
+
+    def is_lightweight(self) -> bool:
+        """Return True if currently in lightweight mode."""
+        return self._lightweight_mode_event.is_set()
 
     # =========================================================================
     # MAIN LOOP
@@ -172,9 +200,27 @@ class ObserverLoop:
             while not self._stop_event.is_set():
                 start_ts = time.monotonic()
 
-                # GPU contention: skip vision inference while EXECUTING
-                if self._pause_event.is_set():
-                    time.sleep(0.5)
+                
+                _in_lightweight = self._lightweight_mode_event.is_set()
+                if _in_lightweight:
+                    time.sleep(self._lightweight_tick_interval)
+                    
+                    try:
+                        _stub = {
+                            "available": True,
+                            "frame_ts": time.time(),
+                            "entities": [],   # empty — VL skipped
+                            "focused_app": None,
+                            "_lightweight": True,
+                        }
+                        self._observer.attach_perception_state({
+                            "available": True,
+                            "frame_ts": _stub["frame_ts"],
+                            "perception": _stub,
+                        })
+                        self._observer.tick()
+                    except Exception:
+                        pass
                     continue
 
                 try:
@@ -282,24 +328,18 @@ class ObserverLoop:
             )
 
     def get_telemetry(self) -> Dict[str, int]:
-        
+        """Return telemetry counters for monitoring and diagnostics."""
         return {
             "total_valid_frames": self._total_frames,
             "schema_rejection_count": self._schema_rejection_count,
             "ingest_failure_count": self._ingest_failure_count,
             "is_paused": int(self._pause_event.is_set()),
+            "is_lightweight_mode": int(self._lightweight_mode_event.is_set()),
             "is_running": int(self.is_running()),
         }
 
     def frame_age_seconds(self):
-        """
-        MEDIUM FIX: Return age of latest vision frame in seconds.
         
-        During long EXECUTING phases when observer_loop.pause() is called,
-        VisionRuntime continues but outputs stop reaching WorldGraph.
-        Callers can use this to detect stale perception (age > 10s).
-        Returns None if no frame has been captured.
-        """
         import time as _time_fa
         with self._lock:
             vr = getattr(self, "_vision_runtime", None)
