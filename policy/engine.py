@@ -1,5 +1,12 @@
 from __future__ import annotations
 
+try:
+    from core.network.policy_enforcer import NetworkPolicyEnforcer as _NetworkPolicyEnforcer
+    _NETWORK_ENFORCER_AVAILABLE = True
+except ImportError:
+    _NetworkPolicyEnforcer = None  # type: ignore
+    _NETWORK_ENFORCER_AVAILABLE = False
+
 import os
 import re
 import threading
@@ -178,6 +185,9 @@ class PolicyEngine:
             len(self._denied_write_paths),
         )
 
+        # AUDIT-CRIT-1 FIX: Network policy enforcer (set via from_policy_yaml)
+        self._network_policy = None  # type: Optional[_NetworkPolicyEnforcer]
+
     # =========================================================================
     # CLASS METHOD: from policy.yaml (M1 + M2 wired in one call)
     # =========================================================================
@@ -226,13 +236,38 @@ class PolicyEngine:
         if denied_write_paths:
             _logger.info("[PolicyEngine] M1: denied_write_paths=%s", denied_write_paths)
 
-        return cls(
+        instance = cls(
             allowed_apps=allowed_apps,
             denied_apps=denied_apps,
             high_risk_apps=high_risk_apps,
             allowed_write_paths=allowed_write_paths,
             denied_write_paths=denied_write_paths,
         )
+
+        # AUDIT-CRIT-1 FIX: Wire network policy enforcement
+        # Previously the `network` key was silently discarded — zero enforcement.
+        # Now NetworkPolicyEnforcer is instantiated and stored so that
+        # validate_action_dict() can check commands against it.
+        network_cfg = policy_cfg.get("network")
+        if isinstance(network_cfg, dict) and _NETWORK_ENFORCER_AVAILABLE:
+            try:
+                instance._network_policy = _NetworkPolicyEnforcer.from_network_cfg(network_cfg)
+                _logger.info(
+                    "[PolicyEngine] AUDIT-CRIT-1: NetworkPolicyEnforcer wired from policy.yaml. "
+                    "network=%s", sorted(network_cfg.keys()),
+                )
+            except Exception as net_err:
+                _logger.error(
+                    "[PolicyEngine] AUDIT-CRIT-1: NetworkPolicyEnforcer init failed: %s "
+                    "— network policy NOT enforced.", net_err,
+                )
+        elif network_cfg is not None and not _NETWORK_ENFORCER_AVAILABLE:
+            _logger.warning(
+                "[PolicyEngine] AUDIT-CRIT-1: network section present in policy.yaml "
+                "but NetworkPolicyEnforcer module not available — network policy NOT enforced."
+            )
+
+        return instance
 
     # =========================================================================
     # M1 FIX — FILESYSTEM PATH ENFORCEMENT
@@ -514,6 +549,24 @@ class PolicyEngine:
             redirect_verdict, redirect_reason = self._validate_command_redirect(cmd_str)
             if redirect_verdict != self.ALLOW:
                 return redirect_verdict, redirect_reason
+
+        # AUDIT-CRIT-1 FIX: Network policy enforcement for command/install ops
+        # Previously the network section of policy.yaml was NEVER enforced.
+        # Now every command is checked against denied_domains, SSH policy, HTTP policy.
+        if op in ("command", "install") and self._network_policy is not None:
+            _net_cmd = str(action.get("command") or action.get("tool", {}).get("name", "") or "")
+            if _net_cmd:
+                _net_decision = self._network_policy.validate_command(_net_cmd)
+                if _net_decision.verdict != "ALLOW":
+                    _net_reason = (
+                        f"Network policy violation: {_net_decision.reason} "
+                        f"(rule={_net_decision.matched_rule!r})"
+                    )
+                    _logger.warning(
+                        "[PolicyEngine] AUDIT-CRIT-1 DENY: op=%r net_reason=%r cmd=%r",
+                        op, _net_decision.reason, _net_cmd[:80],
+                    )
+                    return self.DENY, _net_reason
 
         # High-risk content check (GAP-3 trusted-installer bypass preserved)
         _trusted_flag: bool = bool(action.get("_trusted_installer", False))
