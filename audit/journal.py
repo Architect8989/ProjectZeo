@@ -57,11 +57,52 @@ class ActionJournal:
             serialized.encode("utf-8")
         ).hexdigest()
 
+
+    import re as _re_cred_journal
+    _CREDENTIAL_RE = _re_cred_journal.compile(
+        r"(?:password|passwd|secret|token|api.?key|auth.?token"
+        r"|bearer|private.?key|aws.?secret|access.?key)"
+        r"\s*[:=]\s*\S+",
+        _re_cred_journal.IGNORECASE,
+    )
+
+    def _scrub_text(self, text: str) -> str:
+        """CRIT-NEW: Redact credentials from command output before journal write."""
+        if not isinstance(text, str):
+            return text
+        return self._CREDENTIAL_RE.sub(
+            lambda m: m.group(0).split(":")[0].split("=")[0] + "=<REDACTED>",
+            text,
+        )
+
+    def _scrub_payload(self, payload: dict) -> dict:
+        """Recursively scrub credential values from a journal entry dict."""
+        if not isinstance(payload, dict):
+            return payload
+        out = {}
+        for k, v in payload.items():
+            if isinstance(v, str):
+                out[k] = self._scrub_text(v)
+            elif isinstance(v, dict):
+                out[k] = self._scrub_payload(v)
+            elif isinstance(v, list):
+                out[k] = [
+                    self._scrub_text(i) if isinstance(i, str)
+                    else self._scrub_payload(i) if isinstance(i, dict)
+                    else i
+                    for i in v
+                ]
+            else:
+                out[k] = v
+        return out
+
     def _persist(self, payload: dict) -> None:
         """
         Best-effort durability.
         Journal failure does NOT kill the process.
         """
+        # CRIT-NEW: Scrub credentials before persisting to plaintext audit log
+        payload = self._scrub_payload(payload)
         try:
             with open(self.path, "a", encoding="utf-8") as f:
                 f.write(
