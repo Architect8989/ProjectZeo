@@ -74,6 +74,38 @@ _CONFIRM_TIMEOUT_LOGGED: list = [False]  # mutable container — reset per task 
 # Max bytes of command output stored per step in execution_log (bounded, not unlimited)
 MAX_COMMAND_OUTPUT_BYTES = 4096
 
+# AUDIT-HIGH-6 FIX: Credential scrubbing regex moved to MODULE LEVEL.
+# Previously compiled inside the hot execution loop on every action (every
+# 0.25s iteration × hundreds of iterations = thousands of unnecessary
+# re.compile() calls per task).  Module-level compilation happens once at
+# import time and is shared across all calls.
+#
+# Pattern covers common credential key names in: .env files, shell output,
+# API responses, SSH key echoes, cloud credential files, git configs.
+import re as _re_module
+_CRED_SCRUB_RE = _re_module.compile(
+    r"(?:password|passwd|secret|token|api[_\-]?key|auth[_\-]?token"
+    r"|bearer|private[_\-]?key|aws[_\-]?secret|access[_\-]?key"
+    r"|database[_\-]?url|db[_\-]?password|connection[_\-]?string"
+    r"|encryption[_\-]?key|signing[_\-]?key|client[_\-]?secret"
+    r"|x[_\-]?api[_\-]?key|authorization"
+    r")\s*[:=]\s*\S+",
+    _re_module.IGNORECASE,
+)
+
+
+def _scrub_credentials(text: str) -> str:
+    """
+    Replace credential values with <REDACTED> in command output.
+    Uses the module-level compiled regex for efficiency.
+    """
+    if not isinstance(text, str) or not text:
+        return text
+    return _CRED_SCRUB_RE.sub(
+        lambda m: m.group(0).split(":")[0].split("=")[0] + "=<REDACTED>",
+        text,
+    )
+
 # Maximum dynamic candidates from ReasoningEngine on stagnant steps (H-03 fix)
 MAX_DYNAMIC_CANDIDATES = 3
 
@@ -172,9 +204,9 @@ def operate_main(
     watchdog=None,
     prior_belief_state: Optional[dict] = None,
     belief_state_out: Optional[list] = None,
-    
     prior_step_index: Optional[int] = None,
     prior_execution_log: Optional[dict] = None,  # MAJ-1 FIX: restore from checkpoint
+    gii_controller=None,   # GII: optional GIIController instance for per-step reasoning
 ) -> None:
     
    
@@ -1131,19 +1163,9 @@ def _execute_autonomous_loop(
             
             if "output" in exec_result and exec_result.get("output"):
                 _raw_output = str(exec_result.get("output", ""))[:MAX_COMMAND_OUTPUT_BYTES]
-                # CRIT-NEW: Scrub potential credentials from command output
-                # before storing in execution_log/checkpoint (cat .env attack).
-                import re as _re_cred
-                _CRED_RE = _re_cred.compile(
-                    r"(?:password|passwd|secret|token|api[_\-]?key|auth[_\-]?token"
-                    r"|bearer|private[_\-]?key|aws[_\-]?secret|access[_\-]?key"
-                    r")\s*[:=]\s*\S+",
-                    _re_cred.IGNORECASE,
-                )
-                output_text = _CRED_RE.sub(
-                    lambda m: m.group(0).split(":")[0].split("=")[0] + "=<REDACTED>",
-                    _raw_output,
-                )
+                # AUDIT-HIGH-6 FIX: Use module-level _scrub_credentials() —
+                # regex compiled once at import, not on every iteration.
+                output_text = _scrub_credentials(_raw_output)
                 _step_entry = execution_log.setdefault(current_step_index, {"outputs": []})
                 _step_outputs = _step_entry.get("outputs", [])
                 if len(_step_outputs) < 5:  # cap at 5 entries to bound context size
