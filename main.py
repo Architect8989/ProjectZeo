@@ -42,9 +42,18 @@ from core.cognition.belief_state import BeliefState
 
 HEARTBEAT_INTERVAL = 0.25
 
-MAX_TASK_SECONDS = int(
+_RAW_TASK_SECONDS = int(
     os.environ.get("PROJECTZEO_MAX_TASK_SECONDS", str(90 * 60))
-)   
+)
+# M7 FIX: Zero or negative "unlimited" mode enforces 24h hard ceiling.
+# A zero timeout permanently disables the time-limit check — runaway tasks
+# can then consume resources indefinitely. 24h covers any legitimate use case.
+_MIN_EFFECTIVE_TASK_SECONDS = 86_400  # 24 hours
+MAX_TASK_SECONDS = (
+    _RAW_TASK_SECONDS
+    if _RAW_TASK_SECONDS > 0
+    else _MIN_EFFECTIVE_TASK_SECONDS
+)
 
 MAX_REPLANS = int(
     os.environ.get("PROJECTZEO_MAX_REPLANS", "3")
