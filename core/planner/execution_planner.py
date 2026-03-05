@@ -116,16 +116,12 @@ class ExecutionPlanner:
         r"\|\s*ruby\b",
         r"\|\s*node\b",
         r"\|\s*python[23]?\b",
-
         r"\bcurl\b.*\|\s*(?:ba)?sh\b",
         r"\bcurl\b.*\|\s*bash\b",
         r"\bwget\b.*-[Oo]-?\s.*\|\s*(?:ba)?sh\b",
         r"\bwget\b.*--output-document\s*-\s.*\|\s*(?:ba)?sh\b",
-        r"\|\s*sh\b",        # broad: any pipe directly into sh
-        r"\|\s*bash\b",      # broad: any pipe directly into bash
-        # H-02 FIX: Additional shell names omitted from original blocklist.
-        # Attackers can pipe to zsh, fish, dash, ash, busybox sh, ksh, tcsh,
-        # or csh to execute arbitrary code when sh/bash patterns are blocked.
+        r"\|\s*sh\b",
+        r"\|\s*bash\b",
         r"\|\s*zsh\b",
         r"\|\s*fish\b",
         r"\|\s*dash\b",
@@ -135,90 +131,78 @@ class ExecutionPlanner:
         r"\|\s*csh\b",
         r"\|\s*busybox\s+sh\b",
         r"\|\s*busybox\b",
-        # Reverse shell patterns:
-        r"bash\s+-[ic]\s+['\"]?>?&\s*/dev/tcp/",     # bash TCP reverse shell
-        r"/dev/tcp/",                                   # any /dev/tcp reference
-        r"/dev/udp/",                                   # any /dev/udp reference
-        r"(?:nc|ncat|socat)\b.*-[el]\b",              # netcat/socat listener
-        r"\bsocat\b.*EXEC:",                            # socat exec binding
-        #
-        # Python/exec base64 double-encoding bypass:
+        r"bash\s+-[ic]\s+['\"]?>?&\s*/dev/tcp/",
+        r"/dev/tcp/",
+        r"/dev/udp/",
+        r"(?:nc|ncat|socat)\b.*-[el]\b",
+        r"\bsocat\b.*EXEC:",
         r"exec\s*\(\s*(?:__import__\s*\(\s*['\"]base64['\"]|base64)\b",
-        r"python[23]?\s+-c\s+['\"].*exec\s*\(",       # python -c 'exec(...)'
-        r"\bexec\s*\(.*decode\s*\(",                   # exec(b64.decode())
-        #
-        # Privilege escalation shortcuts:
+        r"python[23]?\s+-c\s+['\"].*exec\s*\(",
+        r"\bexec\s*\(.*decode\s*\(",
         r"\bsudo\s+su\b",
-        r"\bsudo\s+-[isS]\b",                          # sudo -i / -s / -S shell
-        r"\bsu\s+-[cl]\b",                             # su -c 'cmd' or su -l
-
+        r"\bsudo\s+-[isS]\b",
+        r"\bsu\s+-[cl]\b",
         r"base64\s+--decode\b",
-        r"base64\s+-D\b",     # macOS base64 -D flag
-
-        # GAP-4 FIX: Additional critical dangerous patterns that were missing.
-        # Each poses a distinct high-risk attack surface not covered above.
-
-        # Secure file deletion — bypasses trash/recovery, data destruction
+        r"base64\s+-D\b",
         r"\bshred\b",
-
-        # Overwrite critical system authentication files — privilege escalation
         r">\s*/etc/passwd",
         r">\s*/etc/shadow",
         r">\s*/etc/sudoers",
         r">>\s*/etc/passwd",
         r">>\s*/etc/shadow",
         r">>\s*/etc/sudoers",
-
-        # Kill all processes for a user — DoS / session destruction
         r"\bpkill\s+.*-[uU]\b",
         r"\bkillall\s+-u\b",
-
-        # Clear shell history — cover-tracks pattern (malware indicator)
         r"\bhistory\s+-[cdw]\b",
         r"\bhistory\s+--?\s*clear\b",
         r">\s*/root/\.bash_history",
         r">\s~/\.bash_history",
         r">\s*/home/[^/]+/\.bash_history",
-
-        # Swap manipulation — kernel panic / data corruption
         r"\bmkswap\b",
         r"\bswapoff\b",
         r"\bswapon\b.*-a\b",
-
-        # Fork bomb — process exhaustion DoS
-        r":\s*\(\s*\)\s*\{.*:\s*\|.*:\s*&\s*\}",   # :(){:|:&};: classic
+        r":\s*\(\s*\)\s*\{.*:\s*\|.*:\s*&\s*\}",
         r"\bfork\s*bomb\b",
-
-        # Writing to kernel/device pseudo-files — system crash
-        r">\s*/dev/(?:sda|nvme|hda|vda|xvda)",      # raw disk write
-        r">\s*/proc/sys/",                            # kernel parameter override
-        r">\s*/sys/",                                 # sysfs write
-
-        # Exfiltration via DNS / HTTP — data leak
+        r">\s*/dev/(?:sda|nvme|hda|vda|xvda)",
+        r">\s*/proc/sys/",
+        r">\s*/sys/",
         r"\bcurl\b.*\b(?:pastebin|ngrok|webhook\.site|requestbin)\b",
         r"\bwget\b.*\b(?:pastebin|ngrok)\b",
-
-        # M-06 FIX: Patterns that were missing from the original blocklist.
-
-        # Recursive delete without -f flag (rm -r /path or rm -rR /path)
         r"\brm\s+(?:-[a-zA-Z]*r[a-zA-Z]*\s+/|(?:-[a-zA-Z]*\s+)*-[rR]\b)",
-
-        # find -delete / find -exec rm (mass deletion via find)
         r"\bfind\b.*\s-delete\b",
         r"\bfind\b.*-exec\b.*\brm\b",
-
-        # truncate command (zero out or shrink files without rm)
         r"\btruncate\b",
-
-        # Shell redirect truncation targeting critical system paths
         r">\s*/etc/(?:passwd|shadow|sudoers|crontab|hosts|fstab|group)",
         r">\s*/boot/",
         r">\s*/sys/",
-        r">\s*~/\.",           # overwrite hidden dotfiles in home
-
-        # Wipe entire disk with dd to /dev/null or zero (data destruction)
+        r">\s*~/\.",
         r"\bdd\b.*\bof=/dev/",
         r"\bdd\b.*\bif=/dev/zero\b",
+
+        # D-8 FIX: Missing privilege escalation and namespace escape patterns.
+
+        # sudo -n (non-interactive sudo): bypasses the password prompt check,
+        # silently succeeds if NOPASSWD is configured — key pivot technique.
+        r"\bsudo\s+-n\b",
+
+        # Pipe through tee to write to protected directories:
+        # cmd | tee /etc/sudoers.d/evil  →  bypasses > redirect block via tee
+        r"\|\s*tee\s+/etc/",
+        r"\|\s*tee\s+/root/",
+        r"\btee\s+/etc/",
+        r"\btee\s+/root/",
+
+        # Namespace/container escape primitives:
+        # nsenter --all -t 1 /bin/bash  →  enters host namespaces from container
+        r"\bnsenter\b",
+        # unshare --pid --mount-proc  →  creates isolated namespace for privilege abuse
+        r"\bunshare\b",
+        # chroot /new/root /bin/bash  →  bypasses filesystem restrictions
+        r"\bchroot\b",
+
+        # install with SUID/SGID/sticky bits set (install -m 4755, -m 6755, etc.):
+        # sets executable files as SUID root — permanent privilege escalation
+        r"\binstall\b.*-m\s*[0-7]*[4-7][0-7][0-7]",
     ]
 
     def __init__(
