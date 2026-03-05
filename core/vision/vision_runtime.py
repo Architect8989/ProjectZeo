@@ -31,16 +31,16 @@ def _shutdown_executor_compat(executor, wait: bool = False) -> None:
 
 
 MAX_ALLOWED_LATENCY_SECONDS = 180.0
-NETWORK_CONNECT_TIMEOUT = 5.0
-NETWORK_READ_TIMEOUT = 180.0
-MODEL_CALL_TIMEOUT_SECONDS = 200.0
+NETWORK_CONNECT_TIMEOUT     = 5.0
+NETWORK_READ_TIMEOUT        = 180.0
+MODEL_CALL_TIMEOUT_SECONDS  = 200.0
 
-MAX_FRAME_BYTES = 4 * 1024 * 1024
-MAX_ELEMENTS = 128
+MAX_FRAME_BYTES        = 4 * 1024 * 1024
+MAX_ELEMENTS           = 128
 MAX_CONSECUTIVE_FAILURES = 5
 
-CAPTURE_INTERVAL_SECONDS = 0.5
-FRAME_SKIP_THRESHOLD_MULTIPLIER = 5.0
+CAPTURE_INTERVAL_SECONDS          = 0.5
+FRAME_SKIP_THRESHOLD_MULTIPLIER   = 5.0
 
 INFERENCE_LOCK = threading.Lock()
 
@@ -49,6 +49,9 @@ def get_inference_lock() -> threading.Lock:
     return INFERENCE_LOCK
 
 
+# ---------------------------------------------------------------------------
+# M6 FIX: Injection marker detection for VL model output elements
+# ---------------------------------------------------------------------------
 _INJECTION_TYPE_RE = re.compile(
     r"injection[_\-]?attempt|prompt[_\-]?injection|ignore[_\-]?previous",
     re.IGNORECASE,
@@ -67,18 +70,22 @@ _INJECTION_TEXT_MARKERS: List[str] = [
 
 
 def _element_is_injection(element: Dict[str, Any]) -> bool:
+    
     if not isinstance(element, dict):
         return False
 
+    # Check type field
     elem_type = str(element.get("type") or "")
     if _INJECTION_TYPE_RE.search(elem_type):
         return True
 
+    # Check text field
     elem_text = str(element.get("text") or "").lower()
     for marker in _INJECTION_TEXT_MARKERS:
         if marker in elem_text:
             return True
 
+    # Check all string values for the word "injection"
     for val in element.values():
         if isinstance(val, str) and "injection" in val.lower():
             return True
@@ -91,6 +98,7 @@ def _filter_injection_elements(
     *,
     source: str = "unknown",
 ) -> List[Dict[str, Any]]:
+    
     clean: List[Dict[str, Any]] = []
     blocked = 0
     for elem in elements:
@@ -147,7 +155,7 @@ class VisionRuntime:
 
         self._lock = threading.Lock()
         self._last_output: Optional[Dict[str, Any]] = None
-        self._last_good_output: Optional[Dict[str, Any]] = None
+        self._last_good_output: Optional[Dict[str, Any]] = None  # M6: fallback
         self._last_frame_ts: Optional[float] = None
         self._last_raw_image: Optional[Any] = None
         self._consecutive_failures: int = 0
@@ -269,6 +277,7 @@ class VisionRuntime:
 
                 inference_start = time.monotonic()
 
+                # M6 FIX: INFERENCE_LOCK held only for the model call itself
                 with INFERENCE_LOCK:
                     raw_output = self._call_model(frame_b64)
 
@@ -283,6 +292,7 @@ class VisionRuntime:
 
                 normalized = self._normalize_output(raw_output)
 
+                # M6 FIX: Apply post-parse injection filter
                 if isinstance(normalized, dict):
                     elements_raw = normalized.get("elements") or normalized.get("entities") or []
                     if isinstance(elements_raw, list):
@@ -290,9 +300,11 @@ class VisionRuntime:
                         filtered = _filter_injection_elements(
                             elements_raw, source=frame_label
                         )
+                        # Store both keys so downstream consumers work
                         normalized["elements"] = filtered
                         normalized["entities"] = filtered
 
+                    # M6 FIX: fallback — if filter removed all entities, use last good output
                     final_entities = normalized.get("entities") or []
                     if not final_entities and self._last_good_output is not None:
                         print(
@@ -300,11 +312,13 @@ class VisionRuntime:
                             "injection filter — retaining last known-good output.",
                             file=sys.stderr,
                         )
+                        # Merge: keep new frame_ts/focused_app but restore entities
                         merged = dict(self._last_good_output)
                         merged["frame_ts"] = normalized.get("frame_ts", merged.get("frame_ts"))
                         merged["focused_app"] = normalized.get("focused_app", merged.get("focused_app"))
                         normalized = merged
                     elif final_entities:
+                        # Update last-good only when we have real entities
                         self._last_good_output = copy.deepcopy(normalized)
 
                 with self._lock:
@@ -386,14 +400,17 @@ class VisionRuntime:
         return _extract_vision_content(response)
 
     def _normalize_output(self, raw: str) -> Dict[str, Any]:
+        """Parse and normalize VL model JSON output."""
         if not isinstance(raw, str) or not raw.strip():
             return {"elements": [], "entities": [], "focused_app": None, "frame_ts": time.time()}
 
+        # Strip markdown fences
         text = re.sub(r"```(?:json)?", "", raw).strip()
 
         try:
             parsed = json.loads(text)
         except json.JSONDecodeError:
+            # Try to extract JSON object
             match = re.search(r"\{.*\}", text, re.DOTALL)
             if match:
                 try:
@@ -410,6 +427,7 @@ class VisionRuntime:
         if not isinstance(elements, list):
             elements = []
 
+        # Validate and clamp each element
         clean_elements = []
         for el in elements[:MAX_ELEMENTS]:
             if not isinstance(el, dict):
