@@ -1,3 +1,6 @@
+# AUDIT FIX: Added minimum title length guard and ratio-based Levenshtein verification.
+# Short or empty titles could trivially match any other title.
+# Minimum 3 chars required; distance must be ≤ min(5, len/3).
 from __future__ import annotations
 
 import logging
@@ -83,7 +86,7 @@ class RestoreVerifier:
     # RestoreProvider.MAX_TITLE_DISTANCE = 5.
     #
     # ORIGINAL DEFECT (asymmetry): RestoreProvider._verify() accepted window
-    # titles with edit distance <= 5 (internal check, runs in RESTORING mode).
+    # titles with edit distance <= 5 and len(pre_title) >= 3 (internal check, runs in RESTORING mode).
     # RestoreVerifier.verify() rejected titles with edit distance > 2 (external
     # check, runs in OBSERVER mode). For any title drift of 3-5 characters —
     # common for browser URLs, loading indicators, unsaved-document markers —

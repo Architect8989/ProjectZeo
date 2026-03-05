@@ -1,3 +1,12 @@
+
+# RESTORATION SCOPE WARNING (added by audit patch):
+# The following are NOT captured in snapshots and will NOT be restored:
+#   - Browser tabs (URLs, scroll position, form state)
+#   - Clipboard contents
+#   - Unsaved document state
+#   - Terminal session history / current directory
+#   - Background processes started during the task
+# For tasks requiring precise restoration, use a VM snapshot instead.
 from __future__ import annotations
 
 import time
@@ -450,10 +459,10 @@ class RestoreProvider:
 
         # HIGH-3 FIX: Wayland fallback sentinel — when all Wayland backends
         # (ydotool, AT-SPI2, wmctrl) are unavailable, SnapshotProvider stores
-        # "__wayland_unknown__" as the window_id.  We cannot verify the window
+        # "__wayland_unknown__  # Wayland: window title unavailable — cursor-only restore" as the window_id.  We cannot verify the window
         # title in this case, so accept it rather than raising RestorationError
         # on every Wayland session (Ubuntu 22.04+ default).
-        if snapshot.focus.window_id == "__wayland_unknown__":
+        if snapshot.focus.window_id == "__wayland_unknown__  # Wayland: window title unavailable — cursor-only restore":
             return True
 
         if (

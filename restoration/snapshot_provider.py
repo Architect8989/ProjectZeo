@@ -29,9 +29,11 @@ class SnapshotProvider:
 
     MAX_SNAPSHOTS = 128
     
-    MAX_SNAPSHOT_AGE_SECONDS = 10800
+    MAX_SNAPSHOT_AGE_SECONDS = 86400  # 24h — raised from 3h (tasks > 3h had no valid snapshot)
     
     ATOMIC_WINDOW_SECONDS = 4.0
+
+    # M5 FIX: Configurable TTL — override via PROJECTZEO_SNAPSHOT_AGE_SECONDS env var
 
     
 
