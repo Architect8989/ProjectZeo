@@ -81,10 +81,7 @@ MAX_DYNAMIC_CANDIDATES = 3
 import os as _os_sig
 import secrets as _secrets_mod
 
-# H-08 FIX: Use a per-session directory with mode 0o700 instead of world-readable
-# /tmp. Any process running as the same user can enumerate /tmp/projectzeo_approve_*
-# and delete signal files to approve actions. A per-session directory with 0o700
-# permissions prevents enumeration by sibling processes of the same user.
+
 _SESSION_TOKEN: str = _secrets_mod.token_hex(16)
 _SIGNAL_DIR_BASE: str = tempfile.gettempdir()
 _SIGNAL_DIR: str = _os_sig.path.join(
@@ -214,8 +211,9 @@ def operate_main(
             with open(_policy_path, "r", encoding="utf-8") as _pf:
                 _pcfg = _yaml.safe_load(_pf) or {}
             _allowed = _pcfg.get("allowed_apps")
-            if isinstance(_allowed, list):
-                policy_engine = PolicyEngine(allowed_apps=set(_allowed))
+            # M1+M2 FIX: Use from_policy_yaml() to load ALL policy sections
+            # (denied_apps, high_risk_apps, filesystem.allowed_write_paths, etc.)
+            policy_engine = PolicyEngine.from_policy_yaml(_pcfg)
     except ImportError:
         
         print(
@@ -309,9 +307,7 @@ def operate_main(
                     k for k, v in _lh_raw.items()
                     if k in _LIKELIHOOD_DEFAULTS and not isinstance(v, (int, float))
                 ]
-                # AUDIT §2.5 FIX: also reject non-positive ratios.  A zero or
-                # negative likelihood ratio forces all Bayesian posteriors to zero
-                # on the first update, permanently collapsing the belief distribution.
+                
                 _bad_range = [
                     k for k, v in _lh_raw.items()
                     if k in _LIKELIHOOD_DEFAULTS
@@ -653,11 +649,7 @@ def _execute_autonomous_loop(
                 if step_type in (StepType.COMMAND_EXECUTION, StepType.TOOL_INSTALLATION)
                 else MAX_STAGNANT_ITERS_UI
             )
-            # M3: Long-running operations (render, compile, build, download) need
-            # an extended stagnation window. A 7B model rendering a Blender scene
-            # can take 60-300s with no screen change — the default 120-iteration
-            # limit fires mid-render and triggers an unnecessary REPLAN.
-            # Extend by 10× when the step description contains long-running keywords.
+            
             _LONG_RUNNING_KEYWORDS = frozenset({
                 "render", "compile", "build", "download", "install", "export",
                 "encode", "transcode", "generate", "train", "convert",
@@ -760,10 +752,7 @@ def _execute_autonomous_loop(
                         a for a in raw_actions if isinstance(a, dict)
                     )
 
-                # H-03 FIX: Apply injection marker check to ALL plan-step action
-                # fields (command, content, path) — not only dynamic candidates.
-                # Plan steps originate from LLM output and can contain injected
-                # commands that bypass the dynamic-candidate injection filter.
+               
                 if candidate_actions:
                     try:
                         from core.security.injection_markers import contains_injection_marker as _cim_plan
@@ -870,6 +859,24 @@ def _execute_autonomous_loop(
                     _oldest = next(iter(_visited_action_keys))
                     del _visited_action_keys[_oldest]
                 _visited_action_keys[action_key] = True
+
+                # NEW: Semantic loop detection (A→B→A cycle)
+                if hasattr(belief, "record_action_key_for_loop_detection"):
+                    belief.record_action_key_for_loop_detection(action_key)
+                if (
+                    hasattr(belief, "detect_semantic_loop")
+                    and belief.detect_semantic_loop()
+                ):
+                    journal.record({
+                        "event": "semantic_loop_detected",
+                        "step": current_step_index,
+                        "action_key": action_key,
+                    })
+                    log_warn(
+                        f"[OPERATE] Semantic loop detected (A→B→A cycle) at "
+                        f"step {current_step_index}. Triggering replan."
+                    )
+                    raise RuntimeError(REPLAN_SIGNAL)
 
                 
                 _focused_app_for_policy = (
@@ -1111,7 +1118,20 @@ def _execute_autonomous_loop(
 
             
             if "output" in exec_result and exec_result.get("output"):
-                output_text = str(exec_result.get("output", ""))[:MAX_COMMAND_OUTPUT_BYTES]
+                _raw_output = str(exec_result.get("output", ""))[:MAX_COMMAND_OUTPUT_BYTES]
+                # CRIT-NEW: Scrub potential credentials from command output
+                # before storing in execution_log/checkpoint (cat .env attack).
+                import re as _re_cred
+                _CRED_RE = _re_cred.compile(
+                    r"(?:password|passwd|secret|token|api[_\-]?key|auth[_\-]?token"
+                    r"|bearer|private[_\-]?key|aws[_\-]?secret|access[_\-]?key"
+                    r")\s*[:=]\s*\S+",
+                    _re_cred.IGNORECASE,
+                )
+                output_text = _CRED_RE.sub(
+                    lambda m: m.group(0).split(":")[0].split("=")[0] + "=<REDACTED>",
+                    _raw_output,
+                )
                 _step_entry = execution_log.setdefault(current_step_index, {"outputs": []})
                 _step_outputs = _step_entry.get("outputs", [])
                 if len(_step_outputs) < 5:  # cap at 5 entries to bound context size
@@ -1467,13 +1487,10 @@ def _execute_decision(
                 else []
             )
             if install_cmds and isinstance(install_cmds, list):
-                # C-04 FIX: PROJECTZEO_AUTO_APPROVE_INSTALL has been removed.
-                # Auto-approving install/sudo via an environment variable is
-                # trivially bypassable and allows a compromised plan step to
-                # silently install malicious packages with root privileges.
-                # Human confirmation is always required for install operations.
+                
                 _install_preview = "; ".join(str(c) for c in install_cmds[:3])
-                _ak = f"install_{abs(hash(_install_preview)) % 999999}"
+                import secrets as _secrets_install
+                _ak = _secrets_install.token_hex(16)  # M4 FIX: secure key
                 _sig_path = _write_approval_signal(
                     _ak,
                     action,
@@ -1575,11 +1592,7 @@ def _execute_decision(
             if method == "command":
                 cmd = str(action.get("command") or "").strip()
                 if cmd:
-                    # H-01 FIX: Restrict verify commands to a strict allowlist of
-                    # safe, read-only probes. The verify operation's command field
-                    # is LLM-generated and must not reach exec() unrestricted.
-                    # Destructive commands disguised as verification steps are
-                    # blocked here regardless of DANGEROUS_PATTERNS coverage.
+                    
                     _VERIFY_SAFE_PREFIXES: frozenset = frozenset({
                         "which ",
                         "command -v ",
@@ -1691,3 +1704,4 @@ def _execute_decision(
             "reward": -0.5,
             "reason": f"unexpected_error: {exc}",
         }
+
