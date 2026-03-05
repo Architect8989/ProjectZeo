@@ -14,18 +14,24 @@ _logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 class GIIMode:
-    """Enum-like GII mode constants."""
     DISABLED = 0    # Legacy scripted execution
-    BASIC = 1       # Per-step reasoning only
+    BASIC = 1       # Per-step reasoning + memory
     FULL = 2        # Per-step reasoning + consequence safety + memory
 
 
 def get_gii_mode() -> int:
-    """Read GII mode from environment variable. Default: DISABLED."""
+    """
+    Read GII mode from environment variable.
+
+    Default changed from DISABLED (0) to BASIC (1) so that per-step reasoning
+    and memory tiers are active without requiring explicit operator configuration.
+    Set PROJECTZEO_GII_MODE=0 to revert to legacy scripted execution.
+    Set PROJECTZEO_GII_MODE=2 for full consequence-grounded safety.
+    """
     try:
-        return int(os.environ.get("PROJECTZEO_GII_MODE", "0"))
+        return int(os.environ.get("PROJECTZEO_GII_MODE", str(GIIMode.BASIC)))
     except (ValueError, TypeError):
-        return GIIMode.DISABLED
+        return GIIMode.BASIC
 
 
 # ---------------------------------------------------------------------------
@@ -33,7 +39,6 @@ def get_gii_mode() -> int:
 # ---------------------------------------------------------------------------
 
 class GIIController:
-    
 
     def __init__(
         self,
@@ -41,7 +46,7 @@ class GIIController:
         llm_callable: Callable,
         objective: str,
         scaffold_steps: Optional[List[Any]] = None,
-        gii_mode: int = GIIMode.DISABLED,
+        gii_mode: int = GIIMode.BASIC,
         memory_dir: Optional[str] = None,
     ) -> None:
         self._llm = llm_callable
@@ -74,7 +79,6 @@ class GIIController:
         scaffold_steps: Optional[List[Any]] = None,
         memory_dir: Optional[str] = None,
     ) -> "GIIController":
-        
         gii_mode = get_gii_mode()
         return cls(
             llm_callable=llm_callable,
@@ -90,7 +94,6 @@ class GIIController:
 
     @property
     def enabled(self) -> bool:
-        """True if GII mode is active (mode ≥ BASIC)."""
         return self._enabled
 
     @property
@@ -102,23 +105,18 @@ class GIIController:
     # =========================================================================
 
     def _initialise_components(self, memory_dir: Optional[str]) -> None:
-        """Initialise GII components. Fails gracefully on import errors."""
-
-        # Semantic memory (always in BASIC mode)
         try:
             from core.memory.semantic_memory import SemanticMemory
             self._semantic_memory = SemanticMemory(memory_dir=memory_dir)
         except Exception as exc:
             _logger.warning("[GIIController] SemanticMemory init failed: %s", exc)
 
-        # Application memory (always in BASIC mode)
         try:
             from core.memory.application_memory import ApplicationMemory
             self._application_memory = ApplicationMemory(memory_dir=memory_dir)
         except Exception as exc:
             _logger.warning("[GIIController] ApplicationMemory init failed: %s", exc)
 
-        # Consequence reasoner (FULL mode only)
         if self._gii_mode >= GIIMode.FULL:
             try:
                 from core.safety.consequence_reasoner import ConsequenceReasoner
@@ -130,11 +128,9 @@ class GIIController:
             except Exception as exc:
                 _logger.warning("[GIIController] ConsequenceReasoner init failed: %s", exc)
 
-        # Per-step reasoner (BASIC + FULL modes)
         try:
             from core.cognition.per_step_reasoner import PerStepReasoner
 
-            # Convert ExecutionStep objects to plain dicts for scaffold
             scaffold_dicts = []
             for step in self._scaffold_steps:
                 if isinstance(step, dict):
@@ -167,7 +163,6 @@ class GIIController:
         *,
         perception: Optional[Dict[str, Any]] = None,
     ) -> Tuple[Optional[Dict[str, Any]], str]:
-        
         if not self._enabled or self._per_step_reasoner is None:
             return None, "GII disabled"
 
@@ -186,7 +181,6 @@ class GIIController:
         success: bool,
         output: str = "",
     ) -> None:
-        """Record the outcome of a dispatched action for history tracking."""
         if self._per_step_reasoner is not None:
             try:
                 self._per_step_reasoner.record_outcome(
@@ -196,13 +190,11 @@ class GIIController:
                 pass
 
     def get_planning_context(self, focused_app: Optional[str] = None) -> str:
-        
         if not self._enabled:
             return ""
 
         parts = []
 
-        # Application memory
         if self._application_memory and focused_app:
             try:
                 app_context = self._application_memory.format_profile_for_prompt(focused_app)
@@ -211,7 +203,6 @@ class GIIController:
             except Exception:
                 pass
 
-        # Semantic memory
         if self._semantic_memory:
             try:
                 facts = self._semantic_memory.query(self._objective, max_results=8)
@@ -230,25 +221,21 @@ class GIIController:
         focused_app: Optional[str] = None,
         execution_log: Optional[Dict[str, Any]] = None,
     ) -> None:
-        
         if not self._enabled:
             return
 
-        # Update application task count
         if self._application_memory and focused_app:
             try:
                 self._application_memory.increment_task_count(focused_app)
             except Exception:
                 pass
 
-        # Extract semantic facts from execution log
         if self._semantic_memory and execution_log:
             try:
                 self._extract_semantic_facts_from_log(execution_log, focused_app)
             except Exception as exc:
                 _logger.debug("[GIIController] Fact extraction error: %s", exc)
 
-        # Persist memories
         if self._semantic_memory:
             try:
                 self._semantic_memory.save()
@@ -275,7 +262,6 @@ class GIIController:
         execution_log: Dict[str, Any],
         focused_app: Optional[str],
     ) -> None:
-        
         import re as _re
 
         install_success_re = _re.compile(
@@ -293,7 +279,6 @@ class GIIController:
                 if not output_text:
                     continue
 
-                # Successful install
                 if install_success_re.search(output_text) and focused_app:
                     self._semantic_memory.store(
                         subject=focused_app,
@@ -304,7 +289,6 @@ class GIIController:
                         source="observed",
                     )
 
-                # Version strings
                 for m in version_re.finditer(output_text):
                     tool = m.group(1).lower()
                     version = m.group(2)
@@ -318,13 +302,10 @@ class GIIController:
                             source="observed",
                         )
 
-                # Errors in failed steps
                 if not output_entry.get("success", True):
                     for m in error_re.finditer(output_text):
                         error_snippet = m.group(1).strip()[:100]
                         if focused_app:
-                            # Store error without solution for now — operator can
-                            # later confirm solutions via record_error_solution()
                             self._semantic_memory.store(
                                 subject=focused_app,
                                 predicate="known_error",
