@@ -36,6 +36,9 @@ from restoration.restore_verifier import RestoreVerifier, RestorationVerificatio
 from core.planner.execution_planner import ExecutionPlanner
 from core.safety.runtime_watchdog import RuntimeWatchdog, WatchdogViolation
 
+# D-1 FIX: apply_patches was imported as uninstall_patches only; _apply_safety_patches
+# was called in main() but never defined, causing a silent NameError every run.
+from adapters.apis_safety_layer import apply_patches as _apply_safety_patches
 from adapters.apis_safety_layer import uninstall_patches
 from core.cognition.belief_state import BeliefState
 
@@ -45,9 +48,6 @@ HEARTBEAT_INTERVAL = 0.25
 _RAW_TASK_SECONDS = int(
     os.environ.get("PROJECTZEO_MAX_TASK_SECONDS", str(90 * 60))
 )
-# M7 FIX: Zero or negative "unlimited" mode enforces 24h hard ceiling.
-# A zero timeout permanently disables the time-limit check — runaway tasks
-# can then consume resources indefinitely. 24h covers any legitimate use case.
 _MIN_EFFECTIVE_TASK_SECONDS = 86_400  # 24 hours
 MAX_TASK_SECONDS = (
     _RAW_TASK_SECONDS
@@ -57,10 +57,9 @@ MAX_TASK_SECONDS = (
 
 MAX_REPLANS = int(
     os.environ.get("PROJECTZEO_MAX_REPLANS", "3")
-)   
+)
 
 ABSOLUTE_REPLAN_CEILING: int = 50
-
 
 WARMUP_TIMEOUT_SECONDS: float = float(
     os.environ.get("PROJECTZEO_WARMUP_TIMEOUT_SECONDS", "300")
@@ -69,14 +68,9 @@ WARMUP_STABLE_FRAMES: int = int(
     os.environ.get("PROJECTZEO_WARMUP_STABLE_FRAMES", "3")
 )
 
-# Hard timeout for the restoration phase (thread-enforced)
 RESTORE_TIMEOUT_SECONDS = 60.0
-
-# Max retries for transient vision/observer health failures at task start
 HEALTH_RETRY_MAX = 5
 HEALTH_RETRY_INTERVAL = 1.0
-
-# Vision restart grace period after ObserverBlindnessError
 VISION_RESTART_GRACE_SECONDS = 5.0
 
 
@@ -110,12 +104,7 @@ def _get_task_start() -> Optional[float]:
         return _TASK_START
 
 
-# ------------------------------------------------------------------
-# BELIEF STATE HELPER (FIX RB-6)
-# ------------------------------------------------------------------
-
 def _safe_belief_snapshot(belief_state_out: list) -> dict:
-    
     try:
         return belief_state_out[0] if belief_state_out else {}
     except Exception:
@@ -127,10 +116,6 @@ def _safe_belief_snapshot(belief_state_out: list) -> dict:
 # ------------------------------------------------------------------
 
 def _force_safe_shutdown(os_backend, auth_state, reason: str) -> None:
-    """
-    Emergency failsafe: release all automated input and mark auth state safe.
-    Best-effort — never raises.
-    """
     try:
         os_backend.force_release_all(reason=reason)
     except Exception:
@@ -147,7 +132,6 @@ def _signal_handler(signum, frame) -> None:
 
 
 def _install_signal_handlers() -> None:
-    
     signal.signal(signal.SIGINT, _signal_handler)
     signal.signal(signal.SIGTERM, _signal_handler)
     if hasattr(signal, "SIGQUIT"):
@@ -155,9 +139,9 @@ def _install_signal_handlers() -> None:
 
 
 def _interactive_print(msg: str) -> None:
-    """Print msg to stdout when PROJECTZEO_INTERACTIVE=1; no-op otherwise."""
     if os.environ.get("PROJECTZEO_INTERACTIVE", "").strip() == "1":
         print(msg, flush=True)
+
 
 def _write_task_result(
     *,
@@ -166,7 +150,6 @@ def _write_task_result(
     error: Optional[str] = None,
     steps_completed: Optional[int] = None,
 ) -> None:
-    """GAP-5 FIX: Persist task outcome to temp/task_result.json."""
     import json as _json
     import datetime as _dt
 
@@ -189,11 +172,10 @@ def _write_task_result(
             _json.dump(payload, f, indent=2)
         os.replace(_tmp, _path)
     except Exception as _e:
-        print(f"[MAIN] GAP-5: Could not write task_result.json: {_e}", file=sys.stderr)
+        print(f"[MAIN] Could not write task_result.json: {_e}", file=sys.stderr)
 
 
 def _ingest_latest_perception(observer, world_graph) -> bool:
-    """Pull the latest observer snapshot into the world graph. Returns True on success."""
     snap = observer.snapshot()
     if not isinstance(snap, dict):
         return False
@@ -207,17 +189,14 @@ def _ingest_latest_perception(observer, world_graph) -> bool:
 
 
 def _enforce_task_timeout() -> None:
-    """Raise RuntimeError if the current task has exceeded MAX_TASK_SECONDS."""
     start = _get_task_start()
     if start is None:
         return
-    # BUG-13 FIX: MAX_TASK_SECONDS == 0 means unlimited (no timeout enforced).
     if MAX_TASK_SECONDS > 0 and (time.time() - start) > MAX_TASK_SECONDS:
         raise RuntimeError("TASK_FAILED:timeout")
 
 
 def _safe_begin_restoration(mode: ModeController) -> bool:
-    
     current = mode.mode
 
     if current is SystemMode.EXECUTING:
@@ -228,28 +207,55 @@ def _safe_begin_restoration(mode: ModeController) -> bool:
             return False
 
     if current is SystemMode.RESTORING:
-        return True  # Already in RESTORING — proceed
+        return True
 
     if current in (SystemMode.PLANNING, SystemMode.ARMED, SystemMode.OBSERVER):
         try:
             mode.force_observer()
         except Exception:
             pass
-        return False  # Task never started executing — skip restoration
+        return False
 
     return False
 
 
 def _shutdown_executor(executor, wait: bool = False) -> None:
-    """
-    Python 3.8-compatible ThreadPoolExecutor shutdown.
-
-    Python ≥3.9 supports cancel_futures=True; earlier versions do not.
-    """
     if sys.version_info >= (3, 9):
         executor.shutdown(wait=wait, cancel_futures=True)
     else:
         executor.shutdown(wait=wait)
+
+
+def _pause_observer_lightweight(observer_loop) -> None:
+    """
+    D-11 FIX: Replace full observer pause with lightweight mode during EXECUTING.
+    Falls back to full pause if the observer_loop doesn't support lightweight mode.
+    """
+    if hasattr(observer_loop, "set_lightweight"):
+        try:
+            observer_loop.set_lightweight(True)
+            return
+        except Exception:
+            pass
+    # Fallback: full pause (original behaviour)
+    try:
+        observer_loop.pause()
+    except Exception:
+        pass
+
+
+def _resume_observer_from_lightweight(observer_loop) -> None:
+    """Undo lightweight mode or full pause, whichever was applied."""
+    if hasattr(observer_loop, "set_lightweight"):
+        try:
+            observer_loop.set_lightweight(False)
+            return
+        except Exception:
+            pass
+    try:
+        observer_loop.resume()
+    except Exception:
+        pass
 
 
 # ------------------------------------------------------------------
@@ -257,54 +263,38 @@ def _shutdown_executor(executor, wait: bool = False) -> None:
 # ------------------------------------------------------------------
 
 def main(llm_callable: Callable, model_name: str) -> None:
-    
     if not callable(llm_callable):
         raise RuntimeError("llm_callable must be a callable")
 
     if not isinstance(model_name, str) or not model_name.strip():
         raise RuntimeError("model_name must be a non-empty string")
 
-    # -------------------------------------------------------------------------
-    # AUDIT-HIGH-7 FIX: Apply safety patches at process startup.
-    # apply_patches() was defined and implemented in adapters/apis_safety_layer.py
-    # but was NEVER called from main() or run.py. This left both the screenshot
-    # write guard (RT-03) and cloud API safety wrapping (SI-03) inactive for
-    # the entire lifetime of the process on every real deployment.
-    # Fix: call unconditionally here, before any LLM or vision operations begin.
+    # D-1 FIX: apply_patches now correctly imported above; always call on startup.
     try:
         _apply_safety_patches()
     except Exception as _patch_err:
-        import sys as _sys_patch
         print(
             f"[main] WARNING: _apply_safety_patches() failed: {_patch_err}. "
             "Continuing without safety patches — this reduces security posture.",
-            file=_sys_patch.stderr,
+            file=sys.stderr,
         )
 
     os_backend = OperatingSystem()
 
-    # H-07 FIX: Write .authority_state.json to a restricted directory
-    # (~/.projectzeo/) with mode 0o600 instead of os.getcwd().
-    # Writing to cwd risks exposing the belief state (including _visited_action_keys)
-    # to other processes when cwd is world-writable, network-mounted, or shared.
     _auth_dir = os.path.join(os.path.expanduser("~"), ".projectzeo")
     try:
         os.makedirs(_auth_dir, mode=0o700, exist_ok=True)
         os.chmod(_auth_dir, 0o700)
     except OSError as _auth_dir_err:
-        # Fallback to cwd with a warning — never block startup over this.
         print(
-            f"[MAIN] H-07 WARNING: Could not create restricted auth dir {_auth_dir!r}: "
-            f"{_auth_dir_err}. Falling back to cwd for authority state. "
-            "This may expose belief state on shared or world-writable filesystems.",
+            f"[MAIN] WARNING: Could not create restricted auth dir {_auth_dir!r}: "
+            f"{_auth_dir_err}. Falling back to cwd for authority state.",
             file=sys.stderr,
         )
         _auth_dir = os.getcwd()
 
     state_path = os.path.join(_auth_dir, ".authority_state.json")
 
-    # Harden permissions on an existing state file (may have been written by
-    # a prior run before this fix was applied).
     try:
         if os.path.exists(state_path):
             os.chmod(state_path, 0o600)
@@ -333,9 +323,7 @@ def main(llm_callable: Callable, model_name: str) -> None:
     env_fingerprint = collect_environment_fingerprint()
     persisted = auth_state.load()
 
-    
     _crash_recovery_belief_state: "dict | None" = persisted.get("belief_state_full")
-    
     _crash_recovery_step_index: "int | None" = None
     try:
         from core.safety.checkpoint_store import (
@@ -346,7 +334,7 @@ def main(llm_callable: Callable, model_name: str) -> None:
         _crash_recovery_execution_log = _get_cp_log()
         if _crash_recovery_step_index is not None:
             print(
-                f"[MAIN] BUG-5 / MAJ-1: Crash recovery: restoring from checkpoint step_index="
+                f"[MAIN] Crash recovery: restoring from checkpoint step_index="
                 f"{_crash_recovery_step_index}. Steps 0–{_crash_recovery_step_index - 1} "
                 "will be skipped (already completed before crash). "
                 f"Execution log has {len(_crash_recovery_execution_log or {})} step(s).",
@@ -355,8 +343,8 @@ def main(llm_callable: Callable, model_name: str) -> None:
     except Exception as _cp_load_err:
         _crash_recovery_execution_log = None
         print(
-            f"[MAIN] BUG-5 / MAJ-1: Checkpoint load failed: {_cp_load_err}. "
-            "Starting from step 0 with empty execution log (full replay on crash recovery).",
+            f"[MAIN] Checkpoint load failed: {_cp_load_err}. "
+            "Starting from step 0 (full replay on crash recovery).",
             file=sys.stderr,
         )
 
@@ -371,18 +359,16 @@ def main(llm_callable: Callable, model_name: str) -> None:
     vision_runtime.start()
     observer_loop.start()
 
-
     try:
         from adapters.qwen_ollama_adapter import set_shared_vision_runtime as _svr
         _svr(vision_runtime)
     except Exception as _svr_err:
         print(
-            f"[MAIN] BUG-8: Could not register VisionRuntime with adapter: {_svr_err}. "
-            "Falling back to independent capture (no frame sharing).",
+            f"[MAIN] Could not register VisionRuntime with adapter: {_svr_err}. "
+            "Falling back to independent capture.",
             file=sys.stderr,
         )
 
-    
     stable_frames = 0
     entity_warm = False
     warmup_deadline = time.time() + WARMUP_TIMEOUT_SECONDS
@@ -402,7 +388,6 @@ def main(llm_callable: Callable, model_name: str) -> None:
         time.sleep(0.1)
 
     if not _warmup_achieved:
-        # Include observer/vision health state in the warning for diagnostics
         _obs_healthy = observer.is_healthy()
         _vis_healthy = vision_runtime.is_healthy()
         print(
@@ -410,9 +395,7 @@ def main(llm_callable: Callable, model_name: str) -> None:
             f"within {WARMUP_TIMEOUT_SECONDS:.0f}s. "
             f"observer_healthy={_obs_healthy}, vision_healthy={_vis_healthy}, "
             f"entity_count={world_graph.entity_count()}, stable_frames={stable_frames}. "
-            "Proceeding with degraded world model. "
-            "If running on a bare desktop, ensure at least one application window is "
-            "visible before arming, or increase WARMUP_TIMEOUT_SECONDS.",
+            "Proceeding with degraded world model.",
             file=sys.stderr,
         )
         try:
@@ -429,16 +412,12 @@ def main(llm_callable: Callable, model_name: str) -> None:
         except Exception:
             pass
     elif not entity_warm:
-        # Vision/observer healthy but no UI entities seen — bare desktop.
-        # Task will proceed but planner starts with an empty world model.
         print(
-            "[WARMUP] INFO: warmup succeeded (observer+vision healthy) but no UI "
-            "entities were detected (bare desktop). Planning proceeds with empty world "
-            "model. Open application windows before submitting tasks for best results.",
+            "[WARMUP] INFO: warmup succeeded but no UI entities detected (bare desktop). "
+            "Planning proceeds with empty world model.",
             file=sys.stderr,
         )
 
-    
     snapshot_provider = SnapshotProvider(
         observer=observer,
         os_backend=os_backend,
@@ -448,9 +427,8 @@ def main(llm_callable: Callable, model_name: str) -> None:
         os_backend=os_backend,
         mode_controller=mode,
         snapshot_provider=snapshot_provider,
-        authority_state=auth_state,  # HIGH-7 FIX: enables duplicate-restore warning flag
+        authority_state=auth_state,
     )
-    
     restore_verifier = RestoreVerifier(
         os_backend=os_backend,
         mode_controller=mode,
@@ -471,7 +449,6 @@ def main(llm_callable: Callable, model_name: str) -> None:
             try:
                 _enforce_task_timeout()
 
-                # Watchdog check
                 try:
                     watchdog.check()
                 except WatchdogViolation as wv:
@@ -482,11 +459,9 @@ def main(llm_callable: Callable, model_name: str) -> None:
                 mode.update_observer_health(observer.is_healthy())
                 mode.update_vision_status(vision_runtime.is_healthy())
 
-                
                 if not observer_loop.is_running() and vision_runtime.is_healthy():
                     print(
-                        "[MAIN] MAJOR-3: observer_loop stopped unexpectedly — "
-                        "triggering vision restart from main thread heartbeat.",
+                        "[MAIN] observer_loop stopped unexpectedly — triggering vision restart.",
                         file=sys.stderr,
                     )
                     try:
@@ -497,11 +472,9 @@ def main(llm_callable: Callable, model_name: str) -> None:
                         observer_loop.start()
                         time.sleep(VISION_RESTART_GRACE_SECONDS)
                         observer.reset_for_new_task()
-                        
                     except Exception as _restart_err:
                         print(
-                            f"[MAIN] MAJOR-3: Vision restart failed: {_restart_err} "
-                            "— shutting down.",
+                            f"[MAIN] Vision restart failed: {_restart_err} — shutting down.",
                             file=sys.stderr,
                         )
                         break
@@ -515,10 +488,6 @@ def main(llm_callable: Callable, model_name: str) -> None:
                     time.sleep(HEARTBEAT_INTERVAL)
                     continue
 
-                # --------------------------------------------------------
-                # Task start — synchronize wall-clock and watchdog timers
-                # atomically so neither can observe a stale start time.
-                # --------------------------------------------------------
                 _task_now = time.time()
                 _set_task_start(_task_now)
                 watchdog.start_time = _task_now
@@ -534,7 +503,6 @@ def main(llm_callable: Callable, model_name: str) -> None:
                 if not intent or not intent.strip():
                     raise RuntimeError("Invalid intent")
 
-                # Shut down previous planner's executor to avoid thread leaks
                 if _current_planner is not None:
                     try:
                         _shutdown_executor(_current_planner._executor, wait=False)
@@ -548,7 +516,6 @@ def main(llm_callable: Callable, model_name: str) -> None:
                 )
                 _current_planner = planner
 
-                
                 try:
                     observer_loop.pause()
                 except Exception:
@@ -574,7 +541,6 @@ def main(llm_callable: Callable, model_name: str) -> None:
                         mode.update_observer_health(observer.is_healthy())
                         mode.update_vision_status(vision_runtime.is_healthy())
 
-                
                 _PLAN_MAX_RETRIES = 3
                 _plan_attempt = 0
                 while True:
@@ -589,7 +555,7 @@ def main(llm_callable: Callable, model_name: str) -> None:
                             },
                             high_level_steps=[{"goal": intent}],
                         )
-                        break  # success — exit retry loop
+                        break
                     except Exception as _plan_err:
                         watchdog.resume_cpu()
                         if _plan_attempt >= _PLAN_MAX_RETRIES:
@@ -598,8 +564,8 @@ def main(llm_callable: Callable, model_name: str) -> None:
                                 f"attempt(s): {_plan_err}. Propagating error.",
                                 file=sys.stderr,
                             )
-                            raise  # exhaust retries — let outer handler deal with it
-                        _plan_delay = min(2.0 ** _plan_attempt, 30.0)  # exp backoff, cap 30s
+                            raise
+                        _plan_delay = min(2.0 ** _plan_attempt, 30.0)
                         print(
                             f"[MAIN] Planning attempt {_plan_attempt}/{_PLAN_MAX_RETRIES} "
                             f"failed: {type(_plan_err).__name__}: {_plan_err}. "
@@ -616,11 +582,34 @@ def main(llm_callable: Callable, model_name: str) -> None:
                 mode.attach_execution_plan(f"plan_{int(time.time())}")
                 mode.mark_planning_complete()
 
-                
+                # D-2 FIX: Create GIIController immediately after plan creation.
+                # Previously never instantiated; gii_controller=None in every run.
+                gii_controller = None
+                try:
+                    from core.gii.gii_controller import GIIController
+                    gii_controller = GIIController.create(
+                        llm_callable=mode.get_llm_callable(),
+                        objective=intent,
+                        scaffold_steps=execution_plan.steps,
+                        memory_dir=_auth_dir,
+                    )
+                    print(
+                        f"[MAIN] GIIController created. mode={gii_controller.gii_mode} "
+                        f"enabled={gii_controller.enabled}",
+                        file=sys.stderr,
+                    )
+                except Exception as _gii_err:
+                    print(
+                        f"[MAIN] GIIController init failed: {_gii_err}. "
+                        "Falling back to scripted execution.",
+                        file=sys.stderr,
+                    )
+
                 try:
                     observer_loop.resume()
-                    time.sleep(0.5)  # allow one world graph update
-                    observer_loop.pause()  # pause again for GPU during EXECUTING
+                    time.sleep(0.5)
+                    # D-11 FIX: Lightweight mode instead of full pause during EXECUTING.
+                    _pause_observer_lightweight(observer_loop)
                 except Exception:
                     pass
 
@@ -634,35 +623,28 @@ def main(llm_callable: Callable, model_name: str) -> None:
 
                 mode.execute()
                 _interactive_print(f"[MODE] EXECUTING — intent: {intent[:72]}")
-                # EXECUTING so QwenOllamaAdapter gets the full GPU.
-                # Observer uses cached world graph state during execution.
-                try:
-                    observer_loop.pause()
-                except Exception:
-                    pass
+                _pause_observer_lightweight(observer_loop)
 
                 _task_succeeded = False
                 _belief_state_out: list = []
                 _prior_belief_state: Optional[dict] = _crash_recovery_belief_state
-                _crash_recovery_belief_state = None  # consume once
-                # BUG-5 FIX: Use checkpoint step_index for crash recovery fast-forward.
+                _crash_recovery_belief_state = None
                 _prior_step_index: Optional[int] = _crash_recovery_step_index
-                _crash_recovery_step_index = None  # consume once
-                # MAJ-1 FIX: Consume crash recovery execution_log (one-shot)
+                _crash_recovery_step_index = None
                 _crash_recovery_execution_log_for_task = _crash_recovery_execution_log
-                _crash_recovery_execution_log = None  # consume once
+                _crash_recovery_execution_log = None
 
                 try:
                     while not _SHUTDOWN_EVENT.is_set():
                         _enforce_task_timeout()
 
                         try:
-                            
                             _inner_wallclock = (
                                 MAX_TASK_SECONDS
                                 if MAX_TASK_SECONDS > 0
                                 else (90 * 60)
                             )
+                            # D-2 FIX: Pass gii_controller to operate_main().
                             operate_main(
                                 terminal_prompt=intent,
                                 execution_plan=execution_plan,
@@ -675,36 +657,43 @@ def main(llm_callable: Callable, model_name: str) -> None:
                                 prior_belief_state=_prior_belief_state,
                                 belief_state_out=_belief_state_out,
                                 prior_step_index=_prior_step_index,
-                                # MAJ-1 FIX: Restore execution_log from checkpoint so the
-                                # LLM sees all prior step outputs on crash recovery.
                                 prior_execution_log=_crash_recovery_execution_log_for_task,
+                                gii_controller=gii_controller,
                             )
                             _task_succeeded = True
                             _interactive_print(f"[MODE] TASK COMPLETED — {intent[:72]}")
-                            # CRIT-3 FIX: _write_task_result(success=True) deliberately
-                            # NOT called here. Deferred to restoration finally block.
+
+                            # Notify GIIController of completion for memory persistence.
+                            if gii_controller is not None:
+                                try:
+                                    _focused = (
+                                        world_graph.snapshot().get("focused_app")
+                                        if world_graph else None
+                                    )
+                                    gii_controller.on_task_complete(
+                                        success=True,
+                                        focused_app=_focused,
+                                        execution_log=_belief_state_out[0].get(
+                                            "_execution_log", {}
+                                        ) if _belief_state_out else {},
+                                    )
+                                except Exception:
+                                    pass
                             break
 
                         except RuntimeError as e:
                             if str(e) != "REPLAN_REQUIRED":
                                 raise
 
-                            # FIX RB-6: Use _safe_belief_snapshot() — never access [0] directly
                             _prior_belief_state = _safe_belief_snapshot(_belief_state_out) or None
 
                             replan_count += 1
-                            # BUG-14 FIX: MAX_REPLANS == 0 means unlimited replans.
                             if MAX_REPLANS > 0 and replan_count > MAX_REPLANS:
                                 raise RuntimeError("TASK_FAILED:max_replans_exceeded")
-                            # AUDIT §2.6 FIX: Hard safety backstop — fires even
-                            # when MAX_REPLANS=0 (unlimited) to prevent infinite
-                            # LLM consumption on permanently-stagnant tasks.
                             if replan_count > ABSOLUTE_REPLAN_CEILING:
                                 raise RuntimeError(
                                     "TASK_FAILED:absolute_replan_ceiling_exceeded "
-                                    f"({ABSOLUTE_REPLAN_CEILING} replans). "
-                                    "Set PROJECTZEO_MAX_REPLANS to a lower value "
-                                    "or investigate why the task cannot make progress."
+                                    f"({ABSOLUTE_REPLAN_CEILING} replans)."
                                 )
                             mode.begin_replan_sequence()
 
@@ -720,15 +709,10 @@ def main(llm_callable: Callable, model_name: str) -> None:
                                     )
                                     new_snapshot_id = snapshot_id
 
-                                
                                 if new_snapshot_id == snapshot_id:
                                     print(
                                         "[MAIN] WARNING RESTORATION_SKIPPED: replan_snapshot_fallback — "
-                                        f"new_snapshot_id == snapshot_id == {snapshot_id!r}. "
-                                        "The replan snapshot failed; the prior snapshot ID will be "
-                                        "used for restoration.  The ledger may treat this as "
-                                        "'already completed' and perform no restoration.  "
-                                        "Verify environment state manually after task completion.",
+                                        f"new_snapshot_id == snapshot_id == {snapshot_id!r}.",
                                         file=sys.stderr,
                                     )
 
@@ -759,8 +743,25 @@ def main(llm_callable: Callable, model_name: str) -> None:
                                     f"plan_replan_{replan_count}_{int(time.time())}"
                                 )
                                 mode.mark_planning_complete()
-                                
-                                # BUG-S3 FIX: Same vision health reset as initial planning path.
+
+                                # Rebuild GIIController with updated scaffold on replan.
+                                if gii_controller is not None:
+                                    try:
+                                        from core.gii.gii_controller import GIIController
+                                        gii_controller = GIIController.create(
+                                            llm_callable=mode.get_llm_callable(),
+                                            objective=intent,
+                                            scaffold_steps=execution_plan.steps,
+                                            memory_dir=_auth_dir,
+                                        )
+                                    except Exception as _gii_replan_err:
+                                        print(
+                                            f"[MAIN] GIIController replan rebuild failed: "
+                                            f"{_gii_replan_err}.",
+                                            file=sys.stderr,
+                                        )
+                                        gii_controller = None
+
                                 try:
                                     vision_runtime.reset_health()
                                 except AttributeError:
@@ -775,6 +776,13 @@ def main(llm_callable: Callable, model_name: str) -> None:
 
                 finally:
                     should_restore = _safe_begin_restoration(mode)
+
+                    # Notify GIIController of failure if task didn't succeed.
+                    if not _task_succeeded and gii_controller is not None:
+                        try:
+                            gii_controller.on_task_complete(success=False)
+                        except Exception:
+                            pass
 
                     if should_restore:
                         try:
@@ -795,8 +803,7 @@ def main(llm_callable: Callable, model_name: str) -> None:
                             if _restore_thread.is_alive():
                                 print(
                                     f"[MAIN] restore_snapshot() timed out after "
-                                    f"{RESTORE_TIMEOUT_SECONDS}s — window manager may be "
-                                    "unresponsive. Forcing OBSERVER mode and continuing.",
+                                    f"{RESTORE_TIMEOUT_SECONDS}s — forcing OBSERVER.",
                                     file=sys.stderr,
                                 )
                                 try:
@@ -811,16 +818,12 @@ def main(llm_callable: Callable, model_name: str) -> None:
                                 _clear_task_start()
                                 observer.reset_for_new_task()
                                 world_graph.reset()
-                                try:
-                                    observer_loop.resume()
-                                except Exception:
-                                    pass
-                                continue  # return to main loop — agent stays alive
+                                _resume_observer_from_lightweight(observer_loop)
+                                continue
 
                             if _restore_exc:
                                 raise _restore_exc[0]
 
-                            
                             mode.complete_execution()
 
                             snap_obj = snapshot_provider.get_snapshot(snapshot_id)
@@ -836,26 +839,18 @@ def main(llm_callable: Callable, model_name: str) -> None:
                                         f"Post-restore verification failed: {rve}"
                                     )
                             else:
-                                
                                 print(
-                                    f"[MAIN] WARNING RT-D: Snapshot {snapshot_id!r} "
-                                    "has expired (TTL elapsed between capture and "
-                                    "retrieval). Post-restore verification was SKIPPED. "
-                                    "The system reports clean restoration but the "
-                                    "restoration was NOT independently verified. "
-                                    "Consider reducing task duration or increasing "
-                                    "PROJECTZEO_SNAPSHOT_TTL_SECONDS.",
+                                    f"[MAIN] WARNING: Snapshot {snapshot_id!r} expired. "
+                                    "Post-restore verification SKIPPED.",
                                     file=sys.stderr,
                                 )
                                 try:
                                     auth_state.verification_warning = True
                                 except Exception:
-                                    pass  # auth_state may not support this attribute
+                                    pass
 
-                            
                             _verification_performed = snap_obj is not None
 
-                            
                             if _task_succeeded and _belief_state_out:
                                 try:
                                     _bs_obj = BeliefState.from_dict(
@@ -864,16 +859,12 @@ def main(llm_callable: Callable, model_name: str) -> None:
                                     _bs_obj.flush_regret_on_success()
                                     _belief_state_out[0] = _bs_obj.to_dict()
                                 except Exception:
-                                    pass  # Non-fatal: flush failure must not block auth persist
+                                    pass
 
-                            # FIX RB-6: Use _safe_belief_snapshot() — never index directly
                             _bs = _safe_belief_snapshot(_belief_state_out)
                             auth_state.persist(
                                 execution_mode="OBSERVER",
                                 automation_active=False,
-                                # IH-05 FIX: Only claim clean restoration when
-                                # verification actually ran.  Expired TTL → skip
-                                # → restore_required=True so next run re-verifies.
                                 restore_required=not _verification_performed,
                                 last_snapshot_id=None,
                                 dirty=False,
@@ -891,12 +882,6 @@ def main(llm_callable: Callable, model_name: str) -> None:
                                 belief_state_full=_bs if _bs else None,
                             )
 
-                            # CRIT-3 FIX: Write task_result.json ONLY after restoration
-                            # AND verification have both completed successfully.  Writing
-                            # success=True before this point (as the original code did,
-                            # immediately after operate_main() returned) caused the
-                            # --status flag to report false positives when restoration
-                            # or verification subsequently failed.
                             if _task_succeeded:
                                 _write_task_result(intent=intent, success=True)
 
@@ -909,7 +894,6 @@ def main(llm_callable: Callable, model_name: str) -> None:
                             raise
                     else:
                         try:
-                            # FIX RB-6: Use _safe_belief_snapshot() here too
                             _bs = _safe_belief_snapshot(_belief_state_out)
                             auth_state.persist(
                                 execution_mode="OBSERVER",
@@ -933,7 +917,6 @@ def main(llm_callable: Callable, model_name: str) -> None:
                         except Exception:
                             pass
 
-                    # Environment re-fingerprint after successful task
                     if _task_succeeded:
                         try:
                             env_fingerprint = collect_environment_fingerprint()
@@ -943,12 +926,7 @@ def main(llm_callable: Callable, model_name: str) -> None:
                     observer.reset_for_new_task()
                     world_graph.reset()
                     _clear_task_start()
-
-                    # GPU CONTENTION FIX: resume observer after task complete
-                    try:
-                        observer_loop.resume()
-                    except Exception:
-                        pass
+                    _resume_observer_from_lightweight(observer_loop)
 
             except ArmedTimeoutError as ate:
                 print(f"[MAIN] {ate}", file=sys.stderr)
@@ -958,10 +936,9 @@ def main(llm_callable: Callable, model_name: str) -> None:
                 continue
 
             except PlanningTimeoutError as pte:
-                
                 print(
-                    f"[MAIN] PlanningTimeoutError: {pte} — aborting current task, "
-                    "returning to OBSERVER. No process restart required.",
+                    f"[MAIN] PlanningTimeoutError: {pte} — aborting task, "
+                    "returning to OBSERVER.",
                     file=sys.stderr,
                 )
                 _write_task_result(
@@ -973,21 +950,16 @@ def main(llm_callable: Callable, model_name: str) -> None:
                     mode.force_observer()
                 except Exception:
                     pass
-                try:
-                    observer_loop.resume()
-                except Exception:
-                    pass
+                _resume_observer_from_lightweight(observer_loop)
                 _clear_task_start()
                 time.sleep(HEARTBEAT_INTERVAL)
                 continue
 
             except RuntimeError as e:
-                
                 _err_str = str(e)
                 if _err_str.startswith("TASK_FAILED:"):
                     print(
-                        f"[MAIN] BLOCKER-2: Task failed ({_err_str}) — "
-                        "returning to OBSERVER (agent continues running).",
+                        f"[MAIN] Task failed ({_err_str}) — returning to OBSERVER.",
                         file=sys.stderr,
                     )
                     _write_task_result(
@@ -999,15 +971,11 @@ def main(llm_callable: Callable, model_name: str) -> None:
                         mode.force_observer()
                     except Exception:
                         pass
-                    try:
-                        observer_loop.resume()
-                    except Exception:
-                        pass
+                    _resume_observer_from_lightweight(observer_loop)
                     _clear_task_start()
                     time.sleep(HEARTBEAT_INTERVAL)
-                    continue  # KEEP RUNNING — do not break
+                    continue
 
-                # Unexpected RuntimeError (programming bug): safe-shutdown + break
                 _write_task_result(
                     intent=locals().get("intent", "(unknown)"),
                     success=False,
@@ -1031,7 +999,6 @@ def main(llm_callable: Callable, model_name: str) -> None:
             time.sleep(HEARTBEAT_INTERVAL)
 
     finally:
-        # Shut down last active planner executor to avoid thread leaks
         if _current_planner is not None:
             try:
                 _shutdown_executor(_current_planner._executor, wait=False)
@@ -1051,7 +1018,6 @@ def main(llm_callable: Callable, model_name: str) -> None:
                     file=sys.stderr,
                 )
 
-        # Restore builtins.open — best-effort, non-fatal on shutdown path
         try:
             uninstall_patches()
         except Exception:
