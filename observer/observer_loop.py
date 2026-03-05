@@ -290,3 +290,29 @@ class ObserverLoop:
             "is_paused": int(self._pause_event.is_set()),
             "is_running": int(self.is_running()),
         }
+
+    def frame_age_seconds(self):
+        """
+        MEDIUM FIX: Return age of latest vision frame in seconds.
+        
+        During long EXECUTING phases when observer_loop.pause() is called,
+        VisionRuntime continues but outputs stop reaching WorldGraph.
+        Callers can use this to detect stale perception (age > 10s).
+        Returns None if no frame has been captured.
+        """
+        import time as _time_fa
+        with self._lock:
+            vr = getattr(self, "_vision_runtime", None)
+        if vr is None:
+            return None
+        latest = vr.get_latest()
+        if latest is None:
+            return None
+        frame_ts = latest.get("frame_ts")
+        if frame_ts is None:
+            return None
+        try:
+            return _time_fa.time() - float(frame_ts)
+        except Exception:
+            return None
+
