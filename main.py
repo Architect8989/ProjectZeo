@@ -264,7 +264,23 @@ def main(llm_callable: Callable, model_name: str) -> None:
     if not isinstance(model_name, str) or not model_name.strip():
         raise RuntimeError("model_name must be a non-empty string")
 
-    
+    # -------------------------------------------------------------------------
+    # AUDIT-HIGH-7 FIX: Apply safety patches at process startup.
+    # apply_patches() was defined and implemented in adapters/apis_safety_layer.py
+    # but was NEVER called from main() or run.py. This left both the screenshot
+    # write guard (RT-03) and cloud API safety wrapping (SI-03) inactive for
+    # the entire lifetime of the process on every real deployment.
+    # Fix: call unconditionally here, before any LLM or vision operations begin.
+    try:
+        _apply_safety_patches()
+    except Exception as _patch_err:
+        import sys as _sys_patch
+        print(
+            f"[main] WARNING: _apply_safety_patches() failed: {_patch_err}. "
+            "Continuing without safety patches — this reduces security posture.",
+            file=_sys_patch.stderr,
+        )
+
     os_backend = OperatingSystem()
 
     # H-07 FIX: Write .authority_state.json to a restricted directory
