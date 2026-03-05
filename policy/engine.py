@@ -4,52 +4,49 @@ import os
 import re
 import threading
 import logging
-from typing import FrozenSet, Optional, Set, Tuple
+import secrets
+from typing import FrozenSet, Optional, Set, Tuple, List
 
 _logger = logging.getLogger(__name__)
 
 
 class PolicyViolationError(RuntimeError):
-    """Raised when a caller attempts an operation that violates policy
-    in a context where exceptions are preferred over return codes."""
+    pass
+
+
+_SHELL_METACHAR_RE = re.compile(
+    r"""
+    (?:
+      ;
+    | \|\|
+    | &&
+    | \|(?!\|)
+    | `[^`]*`
+    | \$\(
+    | >[>]?
+    | <\(
+    | \beval\b
+    | \bexec\s
+    )
+    """,
+    re.VERBOSE,
+)
+
+_HARDCODED_DENIED_PATHS: FrozenSet[str] = frozenset({
+    "/etc/cron.d", "/etc/cron.hourly", "/etc/cron.daily",
+    "/etc/cron.weekly", "/etc/cron.monthly", "/etc/crontab",
+    "/etc/passwd", "/etc/shadow", "/etc/sudoers", "/etc/sudoers.d",
+    "/etc/hosts", "/etc/hostname", "/etc/fstab",
+    "/etc/systemd", "/etc/init.d",
+    "/etc/profile", "/etc/profile.d", "/etc/environment",
+    "/etc/bash.bashrc", "/etc/ssh",
+    "/root", "/boot", "/proc", "/sys", "/dev",
+    "/bin", "/sbin", "/usr/bin", "/usr/sbin",
+    "/usr/lib", "/lib", "/lib64",
+})
 
 
 class PolicyEngine:
-    """
-    Stateless(ish) policy gate.
-
-    validate_action_dict() is the primary entry point for the main execution
-    loop.  validate() is the secondary entry point for AT-SPI node-based checks
-    (used when accessibility metadata is available).
-
-    Thread safety
-    -------------
-    allowed_apps is protected by _apps_lock so allow_app() / allow_apps()
-    can be called safely from the AutonomousInstaller background thread.
-
-    GAP #3 FIX — Autonomous package installation
-    =============================================
-    The original ``high_risk_name_patterns`` list contained a ``sudo`` pattern
-    that triggered ``REQUIRE_HUMAN_CONFIRMATION`` for *every* package install.
-    Combined with ``_CONFIRM_TIMEOUT_SECONDS = 60``, any unattended install
-    timed out to DENY.  The operator had to manually delete a signal file for
-    each installation step — completely defeating "autonomously install tools".
-
-    Fix: introduce ``_TRUSTED_INSTALLER_OPS`` — a set of command prefixes
-    (normalised to lowercase) that are pre-approved for autonomous execution.
-    Commands whose stripped text starts with a trusted installer prefix bypass
-    the ``high_risk_name_patterns`` scan and receive ALLOW directly.
-
-    Security: trusted-installer promotion is only applied when:
-      1. The operation is "command" or "install" (not write/type/click).
-      2. The action dict carries the ``_trusted_installer`` flag set by
-         ExecutionPlanner._validate_and_normalise_step() after its own
-         dangerous-pattern scan has passed (see GAP #2 fix).
-    This means the bypass is gated on TWO independent checks — the planner's
-    dangerous-pattern scan and this engine's trusted-prefix check — so an
-    attacker cannot reach the bypass without first clearing the planner's
-    50+ dangerous-pattern regexes.
-    """
 
     ALLOW = "ALLOW"
     DENY = "DENY"
@@ -71,129 +68,84 @@ class PolicyEngine:
     }
 
     _HIGH_RISK_OPERATIONS: FrozenSet[str] = frozenset({
-        "command",
-        "install",
-        "file_create",
+        "command", "install", "file_create",
     })
 
-    # GAP #3 FIX: Trusted installer command prefixes.
-    # Commands whose stripped text *starts with* one of these prefixes are
-    # pre-approved for autonomous execution and bypass the sudo/delete/format
-    # high_risk_name_patterns check.
-    #
-    # Design principles:
-    #   - Prefix match (not substring) — "apt-get install" is trusted;
-    #     "apt-get purge --allow-remove-essential" is NOT (starts with apt-get
-    #     but the purge verb is not in this list).
-    #   - All prefixes are package-manager install verbs or version commands.
-    #   - Deliberately excludes: remove, purge, uninstall, autoremove, dist-upgrade,
-    #     format, mkfs, dd, shred (all remain subject to human confirmation).
-    #   - The ExecutionPlanner dangerous-pattern scan is a prerequisite — this
-    #     list only promotes commands that have already cleared 50+ regex checks.
     _TRUSTED_INSTALLER_PREFIXES: FrozenSet[str] = frozenset({
-        # Debian/Ubuntu
-        "apt-get install",
-        "apt install",
-        "apt-get update",
-        "apt update",
-        # Red Hat / Fedora
-        "dnf install",
-        "yum install",
-        # Arch
-        "pacman -s",
-        "pacman -sy",
-        # macOS
-        "brew install",
-        "brew upgrade",
-        # Node
-        "npm install",
-        "npm i",
-        "npx",
-        # Python
-        "pip install",
-        "pip3 install",
+        "apt-get install", "apt install", "apt-get update", "apt update",
+        "dnf install", "yum install",
+        "pacman -s", "pacman -sy",
+        "brew install", "brew upgrade",
+        "npm install", "npm i", "npx",
+        "pip install", "pip3 install",
         "pip install --break-system-packages",
         "pip3 install --break-system-packages",
-        # Version probe commands (safe, read-only)
-        "node --version",
-        "node -v",
-        "npm --version",
-        "npm -v",
-        "python --version",
-        "python3 --version",
-        "pip --version",
-        "pip3 --version",
-        "java -version",
-        "java --version",
-        "go version",
-        "rustc --version",
-        "cargo --version",
-        "git --version",
-        "docker --version",
-        "docker-compose --version",
-        # H-06 FIX: "which " and "command -v " have been intentionally removed.
-        # A command like "which ; rm -rf ~" starts with "which " and would match
-        # the trusted prefix, bypassing the human confirmation gate entirely.
-        # These probes receive ALLOW from the default policy engine for all app
-        # contexts and do not need a trusted-prefix bypass.
+        "node --version", "node -v",
+        "npm --version", "npm -v",
+        "python --version", "python3 --version",
+        "pip --version", "pip3 --version",
+        "java -version", "java --version",
+        "go version", "rustc --version", "cargo --version",
+        "git --version", "docker --version", "docker-compose --version",
     })
 
-    # Default application allowlist — covers the most common desktop apps.
-    # Operators extend this via policy.yaml allowed_apps list OR allow_app().
     _DEFAULT_ALLOWED_APPS: FrozenSet[str] = frozenset({
-        # Warmup sentinel: permits actions before world-graph has observed focus
         "__unknown_app__",
-        # Browsers
         "google-chrome", "firefox", "chromium", "chromium-browser",
         "brave-browser", "microsoft-edge",
-        # Office / document editors
-        "libreoffice", "soffice", "libreoffice-writer", "libreoffice-calc",
-        "libreoffice-impress",
-        # Text / code editors
+        "libreoffice", "soffice", "libreoffice-writer",
+        "libreoffice-calc", "libreoffice-impress",
         "gedit", "kate", "code", "code-oss", "sublime_text", "atom",
         "mousepad", "pluma",
-        # Terminal emulators
-        "gnome-terminal", "xterm", "konsole", "xfce4-terminal", "mate-terminal",
-        "tilix", "alacritty", "terminal", "iterm", "iterm2", "hyper",
-        # File managers
+        "gnome-terminal", "xterm", "konsole", "xfce4-terminal",
+        "mate-terminal", "tilix", "alacritty", "terminal",
+        "iterm", "iterm2", "hyper",
         "nautilus", "thunar", "nemo", "dolphin", "finder", "pcmanfm",
-        # Media / utilities
         "evince", "eog", "gpicview", "totem", "vlc",
-        # 3D / creative tools (Blender test scenario)
-        "blender",
-        # Image editors
-        "gimp",
-        # Spreadsheet / data tools
-        "gnumeric", "libreoffice-calc",
-        # Additional terminals
+        "blender", "gimp", "gnumeric",
         "bash", "sh", "zsh", "fish",
-        # System tools
-        "nautilus", "files",
+        "files",
     })
 
-    # Approval signal files for REQUIRE_HUMAN_CONFIRMATION flow
     _APPROVAL_SIGNAL_DIR: str = "/tmp"
     _APPROVAL_SIGNAL_PREFIX: str = "projectzeo_approve_"
 
-    def __init__(self, allowed_apps: Optional[Set[str]] = None) -> None:
-        # BUG-C2 FIX: Use a mutable set + lock instead of frozenset so that
-        # allow_app() can add entries at runtime after AutonomousInstaller
-        # completes a package installation.
+    def __init__(
+        self,
+        allowed_apps: Optional[Set[str]] = None,
+        *,
+        denied_apps: Optional[Set[str]] = None,
+        high_risk_apps: Optional[Set[str]] = None,
+        allowed_write_paths: Optional[List[str]] = None,
+        denied_write_paths: Optional[List[str]] = None,
+    ) -> None:
         self._apps_lock = threading.RLock()
-        if allowed_apps is not None:
-            self._allowed_apps: Set[str] = {str(a).lower() for a in allowed_apps}
-        else:
-            self._allowed_apps = set(self._DEFAULT_ALLOWED_APPS)
+
+        self._allowed_apps: Set[str] = (
+            {str(a).lower() for a in allowed_apps}
+            if allowed_apps is not None
+            else set(self._DEFAULT_ALLOWED_APPS)
+        )
+
+        self._denied_apps: FrozenSet[str] = frozenset(
+            str(a).lower() for a in (denied_apps or [])
+        )
+        self._high_risk_apps: FrozenSet[str] = frozenset(
+            str(a).lower() for a in (high_risk_apps or [])
+        )
+
+        self._allowed_write_paths: Optional[List[str]] = (
+            [str(p).rstrip("/") for p in allowed_write_paths]
+            if allowed_write_paths else None
+        )
+        _policy_denied = frozenset(
+            str(p).rstrip("/") for p in (denied_write_paths or [])
+        )
+        self._denied_write_paths: FrozenSet[str] = (
+            _HARDCODED_DENIED_PATHS | _policy_denied
+        )
 
         self.denied_roles: Set[str] = {"password text", "alert"}
-
-        # GAP #3 FIX: "sudo" removed from high_risk_name_patterns.
-        # Sudo on its own is NOT high-risk; ``sudo apt-get install nodejs`` is
-        # a legitimate autonomous action.  The dangerous patterns that matter
-        # (sudo su, sudo -i, sudo -s shell escalation) are already blocked by
-        # the ExecutionPlanner's DANGEROUS_PATTERNS regex scan.
-        # Retaining "delete", "remove", "format", "erase" here so destructive
-        # operations that reach the policy engine still get human confirmation.
         self.high_risk_name_patterns = [
             re.compile(r"delete",  re.IGNORECASE),
             re.compile(r"remove",  re.IGNORECASE),
@@ -202,103 +154,171 @@ class PolicyEngine:
         ]
 
         _logger.info(
-            "PolicyEngine initialised. Allowed apps: %d entries.",
-            len(self._allowed_apps),
+            "PolicyEngine initialised. allowed=%d denied=%d high_risk=%d "
+            "write_allowlist=%s denied_paths=%d",
+            len(self._allowed_apps), len(self._denied_apps),
+            len(self._high_risk_apps),
+            self._allowed_write_paths is not None,
+            len(self._denied_write_paths),
         )
 
-    # =========================================================================
-    # TRUSTED INSTALLER HELPER (GAP #3 FIX)
-    # =========================================================================
+    @classmethod
+    def from_policy_yaml(cls, policy_cfg: dict) -> "PolicyEngine":
+        if not isinstance(policy_cfg, dict):
+            _logger.warning("[PolicyEngine.from_policy_yaml] Not a dict — using defaults.")
+            return cls()
+
+        allowed_apps_raw = policy_cfg.get("allowed_apps")
+        allowed_apps = set(allowed_apps_raw) if isinstance(allowed_apps_raw, list) else None
+
+        denied_raw = policy_cfg.get("denied_apps")
+        denied_apps = (
+            {str(a) for a in denied_raw if a} if isinstance(denied_raw, list) else None
+        )
+        if denied_apps:
+            _logger.info("[PolicyEngine] M2: denied_apps=%s", sorted(denied_apps))
+
+        hr_raw = policy_cfg.get("high_risk_apps")
+        high_risk_apps = (
+            {str(a) for a in hr_raw if a} if isinstance(hr_raw, list) else None
+        )
+        if high_risk_apps:
+            _logger.info("[PolicyEngine] M2: high_risk_apps=%s", sorted(high_risk_apps))
+
+        fs_cfg = policy_cfg.get("filesystem", {}) or {}
+        aw_raw = fs_cfg.get("allowed_write_paths")
+        allowed_write_paths = (
+            [str(p) for p in aw_raw if p] if isinstance(aw_raw, list) else None
+        )
+        dw_raw = fs_cfg.get("denied_write_paths")
+        denied_write_paths = (
+            [str(p) for p in dw_raw if p] if isinstance(dw_raw, list) else None
+        )
+        if allowed_write_paths:
+            _logger.info("[PolicyEngine] M1: allowed_write_paths=%s", allowed_write_paths)
+        if denied_write_paths:
+            _logger.info("[PolicyEngine] M1: denied_write_paths=%s", denied_write_paths)
+
+        return cls(
+            allowed_apps=allowed_apps,
+            denied_apps=denied_apps,
+            high_risk_apps=high_risk_apps,
+            allowed_write_paths=allowed_write_paths,
+            denied_write_paths=denied_write_paths,
+        )
+
+    def _validate_file_path(self, path: str) -> Tuple[str, Optional[str]]:
+        if not path:
+            return self.DENY, "file_create: empty path"
+
+        norm_path = os.path.normpath(os.path.expanduser(path))
+
+        for denied in self._denied_write_paths:
+            denied_norm = os.path.normpath(denied)
+            if norm_path == denied_norm or norm_path.startswith(denied_norm + os.sep):
+                reason = (
+                    f"file_create DENIED: path {path!r} is in a protected "
+                    f"directory ({denied!r}). System paths are always forbidden."
+                )
+                _logger.warning("[PolicyEngine] M1 DENY: %s", reason)
+                return self.DENY, reason
+
+        if self._allowed_write_paths is not None:
+            allowed = any(
+                norm_path == os.path.normpath(os.path.expanduser(p)) or
+                norm_path.startswith(os.path.normpath(os.path.expanduser(p)) + os.sep)
+                for p in self._allowed_write_paths
+            )
+            if not allowed:
+                reason = (
+                    f"file_create DENIED: path {path!r} not under any "
+                    f"allowed_write_path. Permitted: {self._allowed_write_paths}."
+                )
+                _logger.warning("[PolicyEngine] M1 DENY: %s", reason)
+                return self.DENY, reason
+
+        return self.ALLOW, None
+
+    def _validate_command_redirect(self, command: str) -> Tuple[str, Optional[str]]:
+        if not command:
+            return self.ALLOW, None
+        redirect_targets = re.findall(r">>?\s*([^\s;&|]+)", command)
+        for target in redirect_targets:
+            target = target.strip()
+            if not target:
+                continue
+            verdict, reason = self._validate_file_path(target)
+            if verdict == self.DENY:
+                full_reason = (
+                    f"command DENIED: shell redirect to protected path "
+                    f"{target!r} in command: {command[:80]!r}."
+                )
+                _logger.warning("[PolicyEngine] M1 REDIRECT-DENY: %s", full_reason)
+                return self.DENY, full_reason
+        return self.ALLOW, None
+
+    def _validate_file_content(self, content: str) -> Tuple[str, Optional[str]]:
+        if not content:
+            return self.ALLOW, None
+        for pat in self.high_risk_name_patterns:
+            if pat.search(content):
+                reason = (
+                    f"file_create content BLOCKED: dangerous pattern "
+                    f"{pat.pattern!r} detected."
+                )
+                _logger.warning("[PolicyEngine] M3 DENY: %s", reason)
+                return self.REQUIRE_HUMAN_CONFIRMATION, reason
+        if re.search(r"^#!\s*/", content, re.MULTILINE):
+            reason = (
+                "file_create content requires confirmation: "
+                "file contains a shebang."
+            )
+            _logger.warning("[PolicyEngine] M3 CONFIRM: %s", reason)
+            return self.REQUIRE_HUMAN_CONFIRMATION, reason
+        return self.ALLOW, None
 
     def _is_trusted_installer_command(self, command: str) -> bool:
-        """
-        Return True if *command* starts with a known safe installer prefix.
-
-        GAP #3 FIX: Pre-approved commands bypass the sudo/high-risk content
-        check so the agent can autonomously install packages without requiring
-        operator confirmation for each step.
-
-        Security gate: this method is only called after validate_action_dict()
-        has confirmed the action dict carries ``_trusted_installer=True``, which
-        is set by ExecutionPlanner only after its own 50+ dangerous-pattern
-        scan has cleared the command.  Two independent checks must both pass.
-        """
         if not command:
             return False
         cmd_lower = command.strip().lower()
         for prefix in self._TRUSTED_INSTALLER_PREFIXES:
             if cmd_lower.startswith(prefix):
+                suffix = cmd_lower[len(prefix):]
+                if _SHELL_METACHAR_RE.search(suffix):
+                    _logger.warning(
+                        "[PolicyEngine] TRUSTED_INSTALLER rejected — "
+                        "shell metacharacters in suffix: %r", command[:120],
+                    )
+                    return False
                 return True
         return False
 
-    # =========================================================================
-    # DYNAMIC ALLOWLIST — BUG-C2 FIX
-    # =========================================================================
-
     @property
     def allowed_apps(self) -> FrozenSet[str]:
-        """Read-only snapshot of the current allowlist (thread-safe)."""
         with self._apps_lock:
             return frozenset(self._allowed_apps)
 
     def allow_app(self, app_name: str) -> None:
-        """
-        Dynamically add *app_name* to the allowlist.
-
-        BUG-C2 FIX
-        ----------
-        AutonomousInstaller must call this after every successful tool
-        installation so that subsequent actions on the newly installed
-        application (e.g. ``focused_app = "nodejs"``) are permitted.
-
-        Parameters
-        ----------
-        app_name:
-            Process name as it appears in WorldGraph.focused_app.
-            Normalised to lowercase automatically.
-        """
         if not isinstance(app_name, str) or not app_name.strip():
+            return
+        normalised = app_name.strip().lower()
+        if normalised in self._denied_apps:
             _logger.warning(
-                "[PolicyEngine] allow_app: ignoring empty or non-string app_name %r.",
-                app_name,
+                "[PolicyEngine] allow_app: BLOCKED — %r is in denied_apps.", normalised
             )
             return
-
-        normalised = app_name.strip().lower()
         with self._apps_lock:
             already = normalised in self._allowed_apps
             self._allowed_apps.add(normalised)
-
         if not already:
-            _logger.info(
-                "[PolicyEngine] allow_app: '%s' dynamically added to allowlist "
-                "(total=%d). All future actions in this app will be ALLOW-ed.",
-                normalised,
-                len(self._allowed_apps),
-            )
-        else:
-            _logger.debug(
-                "[PolicyEngine] allow_app: '%s' already in allowlist — no-op.",
-                normalised,
-            )
+            _logger.info("[PolicyEngine] allow_app: %r added (total=%d).",
+                         normalised, len(self._allowed_apps))
 
     def allow_apps(self, app_names) -> None:
-        """
-        Bulk version of allow_app().  Accepts any iterable of app name strings.
-
-        Useful when an installer step adds multiple related executables
-        (e.g. ``["node", "npm", "npx"]`` from a single nodejs install).
-        """
         for name in app_names:
             self.allow_app(name)
 
     def warn_if_unlisted(self, app_name: str) -> None:
-        """
-        Log a warning when *app_name* is not in the allowlist.
-
-        Useful for pre-flight checks: operators can detect app gaps before
-        the first action is denied, rather than only seeing DENY in logs.
-        """
         if not app_name:
             return
         normalised = app_name.lower()
@@ -306,69 +326,36 @@ class PolicyEngine:
             listed = normalised in self._allowed_apps
         if not listed:
             _logger.warning(
-                "[PolicyEngine] warn_if_unlisted: active application %r is NOT "
-                "in the allowlist.  All autonomous interactions will be DENIED "
-                "until it is added.  Call allow_app(%r) or update policy.yaml.",
-                app_name,
-                app_name,
+                "[PolicyEngine] warn_if_unlisted: %r NOT in allowlist — "
+                "all autonomous interactions will be DENIED.", app_name,
             )
 
-    # =========================================================================
-    # HUMAN APPROVAL SIGNAL-FILE SUPPORT
-    # =========================================================================
+    @staticmethod
+    def generate_action_key() -> str:
+        return secrets.token_hex(16)
 
     def approval_signal_path(self, action_key: str) -> str:
-        """Return the filesystem path of the pending-approval signal file."""
         return os.path.join(
             self._APPROVAL_SIGNAL_DIR,
             f"{self._APPROVAL_SIGNAL_PREFIX}{action_key}.signal",
         )
 
     def check_human_approval(self, action_key: str) -> bool:
-        """
-        Return True if the human has approved the action by deleting its
-        signal file.
-
-        Design: the signal file's *absence* means approved.  The operator
-        workflow is: see stderr notification → delete the file to approve →
-        file absence detected → action proceeds.
-
-        Fail-open: if os.path.exists() raises (e.g. filesystem error), the
-        method returns True so a transient stat error cannot block execution
-        indefinitely.
-
-        Parameters
-        ----------
-        action_key:
-            16-char hex key from ActionRanker.action_key().
-
-        Returns
-        -------
-        bool
-            True  — file absent → approved.
-            False — file present → still pending.
-        """
         path = self.approval_signal_path(action_key)
         try:
             approved = not os.path.exists(path)
         except OSError as exc:
             _logger.warning(
-                "[PolicyEngine] check_human_approval: could not stat %r: %s "
-                "— treating as NOT approved (fail-closed).",
-                path, exc,
+                "[PolicyEngine] check_human_approval: stat %r failed: %s "
+                "— FAIL-CLOSED: NOT approved.", path, exc,
             )
-            return False  # C-05 FIX: fail-closed on filesystem error
-
+            return False
         if approved:
             _logger.info(
-                "[PolicyEngine] HUMAN_APPROVAL_GRANTED: action_key=%r signal=%r",
+                "[PolicyEngine] HUMAN_APPROVAL_GRANTED: key=%r path=%r",
                 action_key, path,
             )
         return approved
-
-    # =========================================================================
-    # PRIMARY ENTRY POINT — dict-based (no AT-SPI required)
-    # =========================================================================
 
     def validate_action_dict(
         self,
@@ -376,36 +363,16 @@ class PolicyEngine:
         *,
         focused_app: str = "__unknown_app__",
     ) -> Tuple[str, Optional[str]]:
-        """
-        Validate *action* dict against the current policy.
-
-        Parameters
-        ----------
-        action:
-            Action dict with at least an ``"operation"`` field.
-        focused_app:
-            Process name of the currently focused application as reported
-            by WorldGraph.  Defaults to ``"__unknown_app__"`` (warmup sentinel).
-
-        Returns
-        -------
-        (decision, reason)
-            decision is one of ALLOW / DENY / REQUIRE_HUMAN_CONFIRMATION.
-            reason is a human-readable explanation string, or None on ALLOW.
-        """
         try:
             return self._validate_action_dict_inner(action, focused_app)
         except Exception as exc:
             _logger.error(
-                "[PolicyEngine] validate_action_dict: unexpected error (fail-closed): %s",
-                exc,
+                "[PolicyEngine] validate_action_dict: unexpected error (fail-closed): %s", exc
             )
             return self.DENY, f"Policy validation error (fail-closed): {exc}"
 
     def _validate_action_dict_inner(
-        self,
-        action: dict,
-        focused_app: str,
+        self, action: dict, focused_app: str,
     ) -> Tuple[str, Optional[str]]:
         if not isinstance(action, dict):
             return self.DENY, "Action must be a dict"
@@ -414,33 +381,45 @@ class PolicyEngine:
         if not op:
             return self.DENY, "Action has no 'operation' field"
 
-        # DONE always succeeds — it terminates the task cleanly
         if op == "done":
             return self.ALLOW, None
 
-        # ---- Application allowlist ----
         app = str(focused_app or "__unknown_app__").lower().strip()
+        if app in self._denied_apps:
+            reason = (
+                f"Application {app!r} is in denied_apps — permanently forbidden. "
+                "Remove from denied_apps in policy.yaml to permit."
+            )
+            _logger.warning("[PolicyEngine] M2 DENY (denied_apps): op=%r app=%r", op, app)
+            return self.DENY, reason
+
         with self._apps_lock:
             app_allowed = app in self._allowed_apps
         if not app_allowed:
             reason = (
                 f"Unauthorized application: {app!r}. "
-                "Add to PolicyEngine.allowed_apps or call allow_app() "
-                "after installation."
+                "Add to allowed_apps or call allow_app() after installation."
             )
-            _logger.warning(
-                "[PolicyEngine] DENY: op=%r app=%r — %s", op, app, reason
-            )
+            _logger.warning("[PolicyEngine] DENY: op=%r app=%r — %s", op, app, reason)
             return self.DENY, reason
 
-        # ---- Synthetic role check ----
+        if app in self._high_risk_apps:
+            reason = (
+                f"Application {app!r} is in high_risk_apps — "
+                "all interactions require human confirmation."
+            )
+            _logger.warning(
+                "[PolicyEngine] M2 REQUIRE_HUMAN_CONFIRMATION (high_risk_apps): "
+                "op=%r app=%r", op, app,
+            )
+            return self.REQUIRE_HUMAN_CONFIRMATION, reason
+
         synthetic_role = self._OP_TO_SYNTHETIC_ROLE.get(op, op)
         if synthetic_role in self.denied_roles:
             reason = f"Forbidden operation role: {synthetic_role!r}"
             _logger.warning("[PolicyEngine] DENY: %s", reason)
             return self.DENY, reason
 
-        # ---- Semantic type/write into non-text target ----
         if op in ("write", "type") and action.get("target_role"):
             target_role = str(action["target_role"]).lower()
             if "text" not in target_role and "entry" not in target_role:
@@ -451,51 +430,49 @@ class PolicyEngine:
                 _logger.warning("[PolicyEngine] DENY: %s", reason)
                 return self.DENY, reason
 
-        # ---- High-risk content check ----
-        # GAP #3 FIX: Trusted installer commands bypass the high_risk_name_patterns
-        # check so sudo apt-get install / pip install / npm install etc. do not
-        # trigger REQUIRE_HUMAN_CONFIRMATION for every autonomous install step.
-        #
-        # The bypass is guarded by TWO conditions:
-        #   1. The action dict carries ``_trusted_installer=True`` (set by
-        #      ExecutionPlanner after its own 50+ dangerous-pattern scan passed).
-        #   2. The command starts with a known safe installer prefix (e.g.
-        #      "apt-get install", "pip install") checked by
-        #      _is_trusted_installer_command().
-        #
-        # Both conditions must hold — a missing flag or unknown prefix falls
-        # through to the normal high_risk_name_patterns scan below.
+        if op == "file_create":
+            path = str(action.get("path") or "").strip()
+            path_verdict, path_reason = self._validate_file_path(path)
+            if path_verdict != self.ALLOW:
+                return path_verdict, path_reason
+            content = str(action.get("content") or "")
+            content_verdict, content_reason = self._validate_file_content(content)
+            if content_verdict != self.ALLOW:
+                return content_verdict, content_reason
+
+        if op == "command":
+            cmd_str = str(action.get("command") or "")
+            redirect_verdict, redirect_reason = self._validate_command_redirect(cmd_str)
+            if redirect_verdict != self.ALLOW:
+                return redirect_verdict, redirect_reason
+
         _trusted_flag: bool = bool(action.get("_trusted_installer", False))
         content_to_check = self._extract_risk_content(op, action)
 
         if content_to_check.strip():
-            # Check if this is a pre-approved installer command
-            _bypass_high_risk = (
+            _bypass = (
                 _trusted_flag
                 and op in ("command", "install")
                 and self._is_trusted_installer_command(content_to_check)
             )
-            if _bypass_high_risk:
+            if _bypass:
                 _logger.info(
-                    "[PolicyEngine] GAP-3 TRUSTED_INSTALLER bypass: op=%r "
-                    "command=%r — skipping high_risk_name_patterns scan.",
+                    "[PolicyEngine] GAP-3 TRUSTED_INSTALLER bypass: op=%r cmd=%r",
                     op, content_to_check[:80],
                 )
             else:
                 for pat in self.high_risk_name_patterns:
                     if pat.search(content_to_check):
                         reason = (
-                            f"High-risk content detected (pattern={pat.pattern!r}): "
+                            f"High-risk content (pattern={pat.pattern!r}): "
                             f"{content_to_check[:80]!r}"
                         )
                         _logger.warning(
-                            "[PolicyEngine] REQUIRE_HUMAN_CONFIRMATION: op=%r "
-                            "app=%r pattern=%r content=%r",
-                            op, app, pat.pattern, content_to_check[:120],
+                            "[PolicyEngine] REQUIRE_HUMAN_CONFIRMATION: "
+                            "op=%r app=%r pattern=%r", op, app, pat.pattern,
                         )
                         return self.REQUIRE_HUMAN_CONFIRMATION, reason
 
-        # ---- Unknown operation — DENY to fail closed ----
         if op not in self._OP_TO_SYNTHETIC_ROLE:
             reason = f"Unknown operation: {op!r}"
             _logger.warning("[PolicyEngine] DENY: %s", reason)
@@ -504,7 +481,6 @@ class PolicyEngine:
         return self.ALLOW, None
 
     def _extract_risk_content(self, op: str, action: dict) -> str:
-        """Extract the content string to scan for high-risk patterns."""
         if op == "command":
             return str(action.get("command") or "")
         if op in ("write", "type"):
@@ -515,75 +491,56 @@ class PolicyEngine:
                 keys = [keys]
             return " ".join(str(k) for k in keys)
         if op == "file_create":
-            return str(action.get("path") or "")
+            path = str(action.get("path") or "")
+            content = str(action.get("content") or "")
+            return f"{path} {content}"
         return ""
 
-    # =========================================================================
-    # SECONDARY ENTRY POINT — AT-SPI node-based
-    # =========================================================================
-
     def validate(self, node, action: str) -> Tuple[str, Optional[str]]:
-        """
-        Validate *action* against an AT-SPI accessibility *node*.
-
-        Parameters
-        ----------
-        node:
-            pyatspi Accessible node.
-        action:
-            Action string (e.g. ``"click"``, ``"type"``).
-
-        Returns
-        -------
-        (decision, reason) — same semantics as validate_action_dict().
-        """
         try:
             role = (node.getRoleName() or "unknown").lower()
         except Exception as exc:
             return self.DENY, f"Cannot read node role: {exc}"
-
         try:
             name = (node.name or "").lower()
         except Exception as exc:
             return self.DENY, f"Cannot read node name: {exc}"
-
         try:
             app_obj = node.getApplication()
-            app = (
-                app_obj.name.lower()
-                if app_obj and app_obj.name
-                else "unknown"
-            )
+            app = app_obj.name.lower() if app_obj and app_obj.name else "unknown"
         except Exception as exc:
             return self.DENY, f"Cannot read application identity: {exc}"
 
         if app == "unknown":
             return self.DENY, "Application identity unavailable"
 
+        if app in self._denied_apps:
+            return self.DENY, f"Application {app!r} is in denied_apps."
+
         with self._apps_lock:
             app_allowed = app in self._allowed_apps
         if not app_allowed:
-            return self.DENY, (
-                f"Unauthorized application: {app!r}. "
-                "Call allow_app() or update policy.yaml."
+            return self.DENY, f"Unauthorized application: {app!r}."
+
+        if app in self._high_risk_apps:
+            return self.REQUIRE_HUMAN_CONFIRMATION, (
+                f"Application {app!r} is in high_risk_apps — confirmation required."
             )
 
         if role in self.denied_roles:
             return self.DENY, f"Forbidden role: {role}"
 
-        if action == "type" and ("text" not in role and "entry" not in role):
+        if action == "type" and "text" not in role and "entry" not in role:
             return self.DENY, f"Semantic violation: type into role '{role}'"
 
         for pat in self.high_risk_name_patterns:
             if pat.search(name):
                 _logger.warning(
                     "[PolicyEngine] REQUIRE_HUMAN_CONFIRMATION (AT-SPI): "
-                    "role=%r name=%r app=%r pattern=%r",
-                    role, name, app, pat.pattern,
+                    "role=%r name=%r app=%r", role, name, app,
                 )
-                return (
-                    self.REQUIRE_HUMAN_CONFIRMATION,
-                    f"High-risk label detected: {pat.pattern}",
+                return self.REQUIRE_HUMAN_CONFIRMATION, (
+                    f"High-risk label detected: {pat.pattern}"
                 )
 
         return self.ALLOW, None
