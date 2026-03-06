@@ -48,9 +48,13 @@ HEARTBEAT_INTERVAL = 0.25
 _RAW_TASK_SECONDS = int(
     os.environ.get("PROJECTZEO_MAX_TASK_SECONDS", str(90 * 60))
 )
-_MIN_EFFECTIVE_TASK_SECONDS = 86_400  # 24 hours
+# AUDIT-MED-1 FIX: Reduced _MIN_EFFECTIVE_TASK_SECONDS from 86400 (24 hours) to
+# 1800 (30 minutes) to prevent runaway tasks when env var is zero or negative.
+# Also cap at 8 hours maximum to bound worst-case runaway duration.
+_MIN_EFFECTIVE_TASK_SECONDS = 1_800   # 30 minutes (was: 86_400 = 24 hours)
+_MAX_EFFECTIVE_TASK_SECONDS = 28_800  # 8 hours hard cap
 MAX_TASK_SECONDS = (
-    _RAW_TASK_SECONDS
+    min(_RAW_TASK_SECONDS, _MAX_EFFECTIVE_TASK_SECONDS)
     if _RAW_TASK_SECONDS > 0
     else _MIN_EFFECTIVE_TASK_SECONDS
 )
