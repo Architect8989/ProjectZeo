@@ -1,12 +1,3 @@
-
-# RESTORATION SCOPE WARNING (added by audit patch):
-# The following are NOT captured in snapshots and will NOT be restored:
-#   - Browser tabs (URLs, scroll position, form state)
-#   - Clipboard contents
-#   - Unsaved document state
-#   - Terminal session history / current directory
-#   - Background processes started during the task
-# For tasks requiring precise restoration, use a VM snapshot instead.
 from __future__ import annotations
 
 import time
@@ -27,10 +18,7 @@ from core.mode_controller import ModeController, SystemMode
 
 
 
-# HIGH-3 FIX: Playwright browser session capture
-# Captures browser tab URLs, scroll positions, and active tab index before tasks.
-# Restores them after task completion to address the restoration gap identified
-# in Audit 1 HIGH-3 and Audit 2 EXEC-2.
+
 _PLAYWRIGHT_AVAILABLE: bool = False
 try:
     from playwright.sync_api import sync_playwright as _sync_playwright
@@ -78,10 +66,7 @@ class RestoreProvider:
         self._mode = mode_controller
         self._snapshot_provider = snapshot_provider
         self._lock = threading.Lock()
-        # HIGH-7 FIX: Store authority_state so _verify() can flag duplicate
-        # restore attempts via verification_warning. Previously __init__ never
-        # assigned self._authority_state so getattr() always returned None and
-        # the flag was never set — monitoring could not detect duplicate restores.
+        
         self._authority_state = authority_state
 
         # Ledger availability — disabled on read-only filesystems without raising
@@ -112,13 +97,7 @@ class RestoreProvider:
     # =========================================================================
 
     def _load_ledger(self) -> dict:
-        """
-        Load completed-snapshots ledger from disk.
-
-        SI-4 / H9 FIX: Returns {snapshot_id: timestamp}.
-        Backward-compatible: accepts the old JSON-list format (assigns
-        timestamp=0.0 so legacy entries are evicted first on trim).
-        """
+        
         if not os.path.exists(self._RESTORE_LEDGER_PATH):
             return {}
 
@@ -146,14 +125,7 @@ class RestoreProvider:
             raise RestorationError(f"Restore ledger load failed: {e}") from e
 
     def _persist_ledger(self) -> None:
-        """
-        Persist completed-snapshots ledger atomically.
-
-        SI-4 / H9 FIX: Trims by OLDEST timestamp (chronological eviction),
-        not by lexicographic SHA-256 hex ID sort.
-
-        Write is skipped when ledger directory is not writable (read-only FS).
-        """
+        
         if not self._ledger_available:
             return
 
@@ -189,31 +161,10 @@ class RestoreProvider:
                 file=sys.stderr,
             )
 
-    # =========================================================================
-    # PUBLIC ENTRY
-    # =========================================================================
-
-
-    # =========================================================================
-    # BROWSER SESSION CAPTURE AND RESTORE (HIGH-3 FIX)
-    # =========================================================================
+    
 
     def capture_browser_session(self) -> dict:
-        """
-        HIGH-3 FIX: Capture current browser session state using Playwright.
-
-        Returns a dict describing the current browser state:
-            {
-                "captured": bool,
-                "tabs": [{"url": str, "title": str}],
-                "active_tab_index": int,
-                "timestamp": float,
-            }
-
-        Called by SnapshotProvider.take_snapshot() and stored in snapshot metadata.
-        When Playwright is unavailable or no browser is running, returns
-        {"captured": False} so the fallback behaviour (cursor+window only) applies.
-        """
+        
         if not _PLAYWRIGHT_AVAILABLE:
             return {"captured": False, "reason": "playwright not installed"}
 
@@ -287,17 +238,7 @@ class RestoreProvider:
         return result
 
     def restore_browser_session(self, session_state: dict) -> bool:
-        """
-        HIGH-3 FIX: Restore browser session from previously captured state.
-
-        Attempts to:
-            1. Open tabs that were open at snapshot time
-            2. Navigate each tab to its original URL
-            3. Restore scroll position
-
-        Returns True if restoration was successful (or no browser to restore).
-        Always non-fatal: browser restoration failure never blocks workspace restore.
-        """
+        
         if not _PLAYWRIGHT_AVAILABLE:
             return False
 
@@ -377,11 +318,7 @@ class RestoreProvider:
             return False
 
     def restore_snapshot(self, snapshot_id: str) -> None:
-        """
-        Look up a snapshot by ID and restore it.  Delegates to restore().
-
-        Raises RestorationError if snapshot_id is invalid or not found.
-        """
+        
         if not isinstance(snapshot_id, str) or not snapshot_id.strip():
             raise RestorationError("Invalid snapshot_id: must be a non-empty string")
 
@@ -396,31 +333,7 @@ class RestoreProvider:
     # =========================================================================
 
     def restore(self, snapshot: RestorationSnapshot) -> None:
-        """
-        BUG-14 FIX: Restructured lock scope.
-
-        The lock now protects ONLY two things:
-          1. The idempotency check (is this snapshot_id already in the ledger?)
-          2. The ledger write after successful restoration.
-
-        The actual restoration work — stop_automated_input(), _restore_application(),
-        _restore_window(), _restore_cursor(), _verify() — runs OUTSIDE the lock.
-
-        Root cause of BUG-14:
-            The entire restore() body ran inside `with self._lock:`.  _verify()
-            calls self._os.get_cursor_position() → pyautogui.position() → X11 IPC.
-            X11 calls are blocking I/O.  Holding a threading.Lock during blocking
-            I/O is an antipattern: if another thread ever needs the lock while
-            restore() is sleeping inside _verify()'s retry loop (up to 5.0s total),
-            that thread blocks for the full verification window unnecessarily.
-            On non-CPython runtimes or under heavy load this can cascade into
-            apparent deadlocks.
-
-        Fix: narrow the lock to the two operations that actually need mutual
-        exclusion (idempotency check and ledger write).  Restoration is inherently
-        single-threaded in practice (only the main restoration thread calls
-        restore()), so dropping the lock during the work is safe.
-        """
+        
         if not isinstance(snapshot, RestorationSnapshot):
             raise RestorationError(
                 f"restore() requires RestorationSnapshot, got {type(snapshot).__name__}"
@@ -448,9 +361,7 @@ class RestoreProvider:
                         pass
                 return
 
-        # --- OUTSIDE LOCK: mode check, automation shutdown, restoration work ---
-        # These operations involve blocking I/O (X11, pyautogui, wmctrl) and must
-        # NOT hold self._lock during execution.
+        
 
         if self._mode.mode is not SystemMode.RESTORING:
             raise RestorationError(
@@ -492,22 +403,13 @@ class RestoreProvider:
 
         # --- LOCK: ledger write only ---
         with self._lock:
-            # Double-check idempotency in case another thread raced here
-            # (highly unlikely in production but correct under test parallelism).
+            
             if snapshot_id not in self._completed_snapshots:
-                # SI-4 / H9 FIX: timestamp (not just sentinel) enables oldest-first eviction
-                # HIGH-8 FIX: Use time.monotonic() instead of time.time() for
-                # ledger eviction ordering. NTP clock corrections can jump
-                # time.time() backwards, causing a "newer" snapshot to have a
-                # smaller timestamp than an "older" one and be evicted first.
-                # monotonic() is strictly non-decreasing within a process and
-                # immune to NTP adjustments.
+                
                 self._completed_snapshots[snapshot_id] = time.monotonic()
                 self._persist_ledger()
 
-    # =========================================================================
-    # RESTORE STEPS (best-effort; log and continue on OSError)
-    # =========================================================================
+    
 
     def _restore_application(self, snapshot: RestorationSnapshot) -> None:
         
@@ -555,20 +457,13 @@ class RestoreProvider:
         time.sleep(self.POST_ACTION_DELAY)
 
     def _restore_cursor(self, snapshot: RestorationSnapshot) -> None:
-        """
-        Reposition cursor to the coordinates captured in the snapshot.
-
-        This is a hard requirement: if cursor cannot be repositioned within
-        CURSOR_TOLERANCE_PX, _verify() will raise RestorationError.
-        """
+        
         self._os.set_cursor_position(
             {"x": snapshot.cursor.x, "y": snapshot.cursor.y}
         )
         time.sleep(self.POST_ACTION_DELAY)
 
-    # =========================================================================
-    # VERIFICATION (hard; raises RestorationError on failure)
-    # =========================================================================
+    
 
     def _verify(self, snapshot: RestorationSnapshot) -> None:
         
@@ -668,11 +563,7 @@ class RestoreProvider:
         if snapshot.focus.window_id == "__bare_desktop__":
             return True
 
-        # HIGH-3 FIX: Wayland fallback sentinel — when all Wayland backends
-        # (ydotool, AT-SPI2, wmctrl) are unavailable, SnapshotProvider stores
-        # "__wayland_unknown__  # Wayland: window title unavailable — cursor-only restore" as the window_id.  We cannot verify the window
-        # title in this case, so accept it rather than raising RestorationError
-        # on every Wayland session (Ubuntu 22.04+ default).
+        
         if snapshot.focus.window_id == "__wayland_unknown__  # Wayland: window title unavailable — cursor-only restore":
             return True
 
@@ -777,17 +668,7 @@ class RestoreProvider:
                 file=sys.stderr,
             )
 
-            # H-04 FIX: Terminate newly-spawned processes instead of only reporting.
-            # Tasks that spawn background processes (servers, downloaders, scheduled
-            # jobs) leave them running indefinitely after restoration unless explicitly
-            # terminated here.
-            #
-            # Termination policy:
-            #   - SIGTERM is sent first (graceful shutdown request).
-            #   - Processes in _TERMINATION_WHITELIST are skipped unconditionally.
-            #   - Termination errors are non-fatal — restoration continues regardless.
-            #   - Container/VM deployments should set PROJECTZEO_SKIP_PROCESS_TERM=1
-            #     and rely on the container runtime for process isolation instead.
+            
             _TERMINATION_WHITELIST: frozenset = frozenset({
                 # Core OS daemons that must never be killed
                 "systemd", "init", "kernel", "kthreadd", "dbus-daemon",
