@@ -1,38 +1,3 @@
-"""
-core/memory/episodic_synthesizer.py
-
-LLM-SYNTHESIZED EPISODIC MEMORY
-────────────────────────────────
-TRANSFORMATION STEP 4 & 5 (from GII Transformation Report):
-
-Replaces the regex-based fact extraction in GIIController._extract_semantic_facts_from_log()
-with genuine LLM-synthesized episodic memory.
-
-After every task completion, the full execution log is piped through the LLM to extract:
-  - Structured lessons learned (what worked, what failed, why)
-  - Application-specific quirks discovered during execution
-  - Error patterns and their resolutions
-  - Workflow sequences that proved effective
-
-These lessons are stored in SemanticMemory with higher confidence than regex-extracted facts
-and retrieved on subsequent tasks with the same goal type.
-
-Inspired by Cognee's knowledge graph approach: execution logs become structured knowledge
-that compounds with use. After 10 Blender renders, the system knows: the default scene has
-a cube, F12 starts a render, the render result window needs Image > Save As, and CUDA errors
-require switching to CPU rendering. This knowledge is available on the 11th render.
-
-Usage:
-    from core.memory.episodic_synthesizer import EpisodicSynthesizer
-
-    synthesizer = EpisodicSynthesizer(llm_callable=my_llm_fn)
-    synthesizer.synthesize_and_store(
-        execution_log=execution_log,
-        objective=terminal_prompt,
-        semantic_memory=semantic_memory,
-        focused_app=focused_app,
-    )
-"""
 from __future__ import annotations
 
 import json
@@ -83,12 +48,7 @@ Do not invent lessons. If the log shows nothing interesting, return an empty arr
 
 
 class EpisodicSynthesizer:
-    """
-    LLM-powered episodic memory synthesizer.
-
-    Analyzes execution logs after task completion and extracts structured,
-    reusable lessons that improve future performance on similar tasks.
-    """
+    
 
     # Maximum characters of execution log to send to LLM
     MAX_LOG_CHARS = 8000
@@ -119,17 +79,7 @@ class EpisodicSynthesizer:
         application_memory=None,
         block: bool = False,
     ) -> None:
-        """
-        Synthesize lessons from execution log and store in semantic memory.
-
-        Args:
-            execution_log: The task execution log dict.
-            objective: The task objective string.
-            semantic_memory: SemanticMemory instance to store lessons in.
-            focused_app: Primary application used during task (optional).
-            application_memory: ApplicationMemory instance for app-specific storage.
-            block: If True, wait for synthesis to complete. If False, run async.
-        """
+        
         if block:
             self._synthesize(execution_log, objective, semantic_memory, focused_app, application_memory)
         else:
