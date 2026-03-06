@@ -151,8 +151,8 @@ def _write_approval_signal(action_key: str, action: dict, reason: str) -> str:
                 "action": action,
                 "reason": reason,
                 "instruction": (
-                    f"Delete this file to approve the action: {path}\n"
-                    "The file will be cleaned up automatically after "
+                    f"CREATE file {path}.APPROVE to approve the action.\n"
+                    "(Denial is automatic after "
                     f"{_CONFIRM_TIMEOUT_SECONDS}s."
                 ),
             },
@@ -235,6 +235,11 @@ def operate_main(
     os_backend = os_backend or OperatingSystem()
 
     
+    # AUDIT-BLOCKER-5 FIX: Missing policy.yaml must be a FATAL startup error.
+    # Previously, a missing policy.yaml silently fell back to the default permissive
+    # allowlist. Operators deploying to production must explicitly configure policy.
+    # The only exception is if PROJECTZEO_ALLOW_DEFAULT_POLICY=1 is explicitly set.
+    _allow_default_policy = os.environ.get("PROJECTZEO_ALLOW_DEFAULT_POLICY", "0").strip() == "1"
     policy_engine = PolicyEngine()
     try:
         import os as _os_mod
@@ -242,29 +247,55 @@ def operate_main(
         _policy_path = _os_mod.path.join(
             _os_mod.path.dirname(__file__), "..", "policy.yaml"
         )
-        if _os_mod.path.exists(_policy_path):
+        if not _os_mod.path.exists(_policy_path):
+            if _allow_default_policy:
+                print(
+                    "[operate_main] WARNING: policy.yaml not found. "
+                    "Running with built-in defaults (PROJECTZEO_ALLOW_DEFAULT_POLICY=1 set). "
+                    "Create policy.yaml for production deployments.",
+                    file=sys.stderr,
+                )
+            else:
+                raise RuntimeError(
+                    "FATAL: policy.yaml not found at expected path: "
+                    f"{_os_mod.path.abspath(_policy_path)}. "
+                    "A policy.yaml file is required for production deployments. "
+                    "Create one based on the template in the repository. "
+                    "To bypass this check (development only), set: "
+                    "PROJECTZEO_ALLOW_DEFAULT_POLICY=1"
+                )
+        else:
             with open(_policy_path, "r", encoding="utf-8") as _pf:
                 _pcfg = _yaml.safe_load(_pf) or {}
-            _allowed = _pcfg.get("allowed_apps")
             # M1+M2 FIX: Use from_policy_yaml() to load ALL policy sections
-            # (denied_apps, high_risk_apps, filesystem.allowed_write_paths, etc.)
             policy_engine = PolicyEngine.from_policy_yaml(_pcfg)
+            print(
+                f"[operate_main] policy.yaml loaded from {_os_mod.path.abspath(_policy_path)}",
+                file=sys.stderr,
+            )
+    except RuntimeError:
+        raise  # Fatal errors must propagate
     except ImportError:
-        
-        print(
-            "[operate_main] WARNING: pyyaml is not installed — policy.yaml was not loaded. "
-            "PolicyEngine is running with the built-in default application allowlist. "
-            "To enable custom policy configuration, install pyyaml: "
-            "  pip install pyyaml",
-            file=sys.stderr,
-        )
+        if _allow_default_policy:
+            print(
+                "[operate_main] WARNING: pyyaml not installed — policy.yaml not loaded. "
+                "Set PROJECTZEO_ALLOW_DEFAULT_POLICY=1 acknowledged. "
+                "Install pyyaml for full policy support: pip install pyyaml",
+                file=sys.stderr,
+            )
+        else:
+            raise RuntimeError(
+                "FATAL: pyyaml is not installed. Cannot load policy.yaml. "
+                "Install it: pip install pyyaml"
+            )
     except Exception as _policy_err:
-        # Non-fatal: policy.yaml may be malformed; log and continue with defaults
         print(
-            f"[operate_main] WARNING: Failed to load policy.yaml: {_policy_err}. "
-            "PolicyEngine is running with the built-in default application allowlist.",
+            f"[operate_main] FATAL: Failed to load policy.yaml: {_policy_err}. "
+            "Fix policy.yaml or set PROJECTZEO_ALLOW_DEFAULT_POLICY=1 to use defaults.",
             file=sys.stderr,
         )
+        if not _allow_default_policy:
+            raise RuntimeError(f"FATAL: policy.yaml load failed: {_policy_err}") from _policy_err
 
     
     _auto_discovered_names: list = []
@@ -398,6 +429,50 @@ def operate_main(
     # ------------------------------------------------------------------
     # Core services
     # ------------------------------------------------------------------
+    # AUDIT-BLOCKER-3 FIX: Pre-task restoration scope disclosure.
+    # Operators must acknowledge that restoration does not preserve browser tabs,
+    # clipboard contents, unsaved documents, or terminal session state.
+    _task_involves_browser = any(
+        kw in terminal_prompt.lower()
+        for kw in ("browser", "firefox", "chrome", "chromium", "web", "url", "http", "download")
+    )
+    _task_involves_documents = any(
+        kw in terminal_prompt.lower()
+        for kw in ("document", "file", "edit", "write", "save", "libreoffice", "word", "spreadsheet")
+    )
+    print(
+        "
+[RESTORATION DISCLOSURE] This task will be operated by ProjectZeo GII.
+"
+        "Restoration scope is LIMITED:
+"
+        "  ✓ Cursor position will be restored
+"
+        "  ✓ Window focus will be restored (best-effort, title matching)
+"
+        "  ✗ Browser tabs, URLs, and scroll position will NOT be restored
+"
+        "  ✗ Clipboard contents will NOT be restored
+"
+        "  ✗ Unsaved document state will NOT be restored
+"
+        "  ✗ Terminal session state (cwd, env vars) will NOT be restored
+"
+        + (
+            "  ⚠ BROWSER TASK DETECTED: Restoration will be incomplete if task fails.
+"
+            if _task_involves_browser else ""
+        )
+        + (
+            "  ⚠ DOCUMENT TASK DETECTED: Save your work before proceeding.
+"
+            if _task_involves_documents else ""
+        )
+        + "Proceeding with task execution...
+",
+        file=sys.stderr,
+    )
+
     journal = ActionJournal()
     input_arbitrator = InputArbitrator()
     verifier = StepVerifier()
@@ -621,7 +696,10 @@ def _execute_autonomous_loop(
                 _visited_action_keys = {k: True for k in _persisted_visited if isinstance(k, str)}
         except Exception:
             _visited_action_keys = {}
-    _VISITED_ACTION_MAX = 200        # cap at 200 unique action keys per task run
+    _VISITED_ACTION_MAX = 1000  # AUDIT-MEDIUM FIX: was 200. After 200 unique actions
+    # previously-tried FAILED actions re-enter the candidate pool. Raised to 1000.
+    # Also add permanent-deny list for severely failed actions (reward < -0.8).
+    _PERMANENT_DENY_ACTION_KEYS: set = set()  # actions with reward < -0.8
 
     iteration = 0
     stagnant_iterations = 0
@@ -977,9 +1055,11 @@ def _execute_autonomous_loop(
 
                 if _policy_decision == PolicyEngine.DENY:
                     belief.record_action(action_key, -0.5)
-                    
                     best_reward = min(belief.global_best_reward() or 0.0, 0.9)
                     belief.update_regret(action_key, -0.5, best_reward)
+                    # AUDIT-MEDIUM FIX: record denial in GII controller to block plan fallback
+                    if gii_controller is not None:
+                        gii_controller.record_denial(action_key)
                     journal.record({
                         "event": "policy_deny",
                         "step": current_step_index,
@@ -990,8 +1070,65 @@ def _execute_autonomous_loop(
                     if stagnant_iterations >= stagnant_limit:
                         raise RuntimeError(REPLAN_SIGNAL)
                     previous_perception = perception_snapshot
-                    
                     continue
+
+                # ── AUDIT-STEP-2 FIX: Wire ConsequenceReasoner into main loop ─────────
+                # Previously, consequence reasoning was only active inside GIIController
+                # (GIIMode.FULL). This means scripted execution (GIIMode BASIC/DISABLED)
+                # had zero consequence evaluation. Safety and GII mode must be independent.
+                # ConsequenceReasoner now runs for ALL command/file_create operations
+                # regardless of GII mode, directly in the execution loop.
+                _op_for_cr = str(selected_action.get("operation", "")).lower()
+                _consequence_reasoner_instance = None
+                if gii_controller is not None and hasattr(gii_controller, "consequence_reasoner"):
+                    _consequence_reasoner_instance = gii_controller.consequence_reasoner
+                if (
+                    _consequence_reasoner_instance is not None
+                    and _policy_decision != PolicyEngine.DENY
+                    and _op_for_cr in ("command", "file_create", "install")
+                ):
+                    try:
+                        _cr_result = _consequence_reasoner_instance.evaluate(
+                            action=selected_action,
+                            objective=terminal_prompt,
+                            step_description=str(current_step.description if hasattr(current_step, "description") else ""),
+                        )
+                        from core.safety.consequence_reasoner import SafetyDecision as _SafetyDecision
+                        if _cr_result.decision == _SafetyDecision.DENY:
+                            belief.record_action(action_key, -0.8)
+                            gii_controller.record_denial(action_key)
+                            journal.record({
+                                "event": "consequence_reasoner_deny",
+                                "step": current_step_index,
+                                "action_key": action_key,
+                                "reason": _cr_result.reason,
+                                "tier_reached": _cr_result.tier_reached,
+                            })
+                            stagnant_iterations += 1
+                            if stagnant_iterations >= stagnant_limit:
+                                raise RuntimeError(REPLAN_SIGNAL)
+                            previous_perception = perception_snapshot
+                            continue
+                        elif _cr_result.decision == _SafetyDecision.REQUIRE_HUMAN_CONFIRMATION:
+                            if _policy_decision != PolicyEngine.REQUIRE_HUMAN_CONFIRMATION:
+                                _policy_decision = PolicyEngine.REQUIRE_HUMAN_CONFIRMATION
+                                _policy_reason = (
+                                    f"ConsequenceReasoner (Tier{_cr_result.tier_reached}): "
+                                    f"{_cr_result.reason}"
+                                )
+                                journal.record({
+                                    "event": "consequence_reasoner_require_confirmation",
+                                    "step": current_step_index,
+                                    "action_key": action_key,
+                                    "reason": _policy_reason,
+                                })
+                    except Exception as _cr_exc:
+                        import logging as _cr_log
+                        _cr_log.getLogger(__name__).warning(
+                            "[operate] ConsequenceReasoner error (fail-closed for IRREVERSIBLE): %s",
+                            _cr_exc,
+                        )
+                # ── END ConsequenceReasoner wiring ────────────────────────────────────
 
             except (AuthorityAbortError, RuntimeError):
                 # AuthorityAbortError and REPLAN_SIGNAL must propagate unchanged.
@@ -1068,6 +1205,11 @@ def _execute_autonomous_loop(
                 except Exception:
                     pass  # Notification failure is never fatal
 
+                # AUDIT-CRITICAL-4 FIX: Inverted approval semantics.
+                # OLD (fail-open): file created, user DELETES to approve. File absent = approved.
+                # NEW (fail-closed): file absent initially. User CREATES approval file to approve.
+                # No file = no approval = DENY. Write failure = no file = DENY. Fully fail-closed.
+                _approve_path = _signal_path + ".APPROVE"
                 _phc_wait = 0
                 _phc_approved = False
                 try:
@@ -1075,17 +1217,25 @@ def _execute_autonomous_loop(
                         time.sleep(WAIT_RETRY_SECONDS)
                         _phc_wait += 1
                         try:
-                            _file_present = os.path.exists(_signal_path)
+                            _approve_present = os.path.exists(_approve_path)
                         except OSError:
-                            # C-05 FIX: Filesystem error → treat as still pending,
-                            # never auto-approve on transient stat failures.
+                            # Filesystem error → treat as still pending, never auto-approve
                             continue
-                        if not _file_present:
+                        if _approve_present:
+                            # User created the approval file — approved. Remove it.
+                            try:
+                                os.remove(_approve_path)
+                            except OSError:
+                                pass
                             _phc_approved = True
                             break
                 finally:
-                    # Always clean up — whether approved, timed-out, or interrupted
+                    # Always clean up pending signal and approval file
                     _remove_approval_signal(_signal_path)
+                    try:
+                        os.remove(_approve_path)
+                    except OSError:
+                        pass
 
                 if not _phc_approved:
                     journal.record({
@@ -1587,10 +1737,12 @@ def _execute_decision(
                     action,
                     reason=f"Install/sudo requires confirmation: {_install_preview[:120]}",
                 )
+                # AUDIT-CRITICAL-4 FIX: Inverted approval (create-to-approve)
+                _approve_path_install = _sig_path + ".APPROVE"
                 print(
                     f"[OPERATE] Install requires human approval. "
                     f"Commands: {_install_preview!r}. "
-                    f"APPROVE: delete {_sig_path}  |  "
+                    f"APPROVE: create file {_approve_path_install}  |  "
                     f"Timeout: {_CONFIRM_TIMEOUT_SECONDS}s → auto-denied.",
                     file=sys.stderr,
                 )
@@ -1600,15 +1752,22 @@ def _execute_decision(
                     time.sleep(WAIT_RETRY_SECONDS)
                     _waited += WAIT_RETRY_SECONDS
                     try:
-                        _file_present = os.path.exists(_sig_path)
+                        _approve_present = os.path.exists(_approve_path_install)
                     except OSError:
-                        # C-05 FIX: fail-closed on filesystem error
-                        continue
-                    if not _file_present:
+                        continue  # filesystem error → treat as pending, never auto-approve
+                    if _approve_present:
+                        try:
+                            os.remove(_approve_path_install)
+                        except OSError:
+                            pass
                         _approved = True
                         break
                 if not _approved:
                     _remove_approval_signal(_sig_path)
+                    try:
+                        os.remove(_approve_path_install)
+                    except OSError:
+                        pass
                     return {
                         "success": False,
                         "reward": -1.0,
