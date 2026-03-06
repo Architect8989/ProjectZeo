@@ -50,45 +50,64 @@ def get_inference_lock() -> threading.Lock:
 
 
 # ---------------------------------------------------------------------------
-# M6 FIX: Injection marker detection for VL model output elements
+# AUDIT-HIGH FIX: Injection marker detection using FULL injection_markers.py frozenset
+# Previously used a local 8-item list; the full frozenset has 50+ markers with
+# Unicode normalization. This ensures VL model output elements are scanned with
+# the same comprehensive ruleset used for intent and plan validation.
 # ---------------------------------------------------------------------------
 _INJECTION_TYPE_RE = re.compile(
     r"injection[_\-]?attempt|prompt[_\-]?injection|ignore[_\-]?previous",
     re.IGNORECASE,
 )
 
-_INJECTION_TEXT_MARKERS: List[str] = [
-    "ignore previous instructions",
-    "ignore all previous",
-    "disregard instructions",
-    "new instruction",
-    "system prompt",
-    "you are now",
-    "act as",
-    "jailbreak",
-]
+# Load the full injection marker system — fallback to inline list if import fails
+try:
+    from core.security.injection_markers import contains_injection_marker as _contains_injection_marker
+    _FULL_INJECTION_CHECK_AVAILABLE = True
+except ImportError:
+    _FULL_INJECTION_CHECK_AVAILABLE = False
+    _INJECTION_TEXT_MARKERS: List[str] = [
+        "ignore previous instructions", "ignore all previous",
+        "disregard instructions", "new instruction",
+        "system prompt", "you are now", "act as", "jailbreak",
+    ]
 
 
 def _element_is_injection(element: Dict[str, Any]) -> bool:
-    
+    """
+    AUDIT-HIGH FIX: Uses full 50+ marker frozenset from injection_markers.py
+    with Unicode normalization instead of the original 8-item local list.
+    This catches Unicode fullwidth bypass attempts (e.g., ｒｍ　－ｒｆ　～).
+    """
     if not isinstance(element, dict):
         return False
 
-    # Check type field
+    # Check type field for injection type labels
     elem_type = str(element.get("type") or "")
     if _INJECTION_TYPE_RE.search(elem_type):
         return True
 
-    # Check text field
-    elem_text = str(element.get("text") or "").lower()
-    for marker in _INJECTION_TEXT_MARKERS:
-        if marker in elem_text:
-            return True
+    # Check text field using full marker system
+    elem_text = str(element.get("text") or "")
+    if elem_text:
+        if _FULL_INJECTION_CHECK_AVAILABLE:
+            if _contains_injection_marker(elem_text):
+                return True
+        else:
+            elem_lower = elem_text.lower()
+            for marker in _INJECTION_TEXT_MARKERS:
+                if marker in elem_lower:
+                    return True
 
-    # Check all string values for the word "injection"
-    for val in element.values():
-        if isinstance(val, str) and "injection" in val.lower():
-            return True
+    # Check all string values
+    for key, val in element.items():
+        if key == "text":
+            continue  # already checked above
+        if isinstance(val, str) and val:
+            if "injection" in val.lower():
+                return True
+            if _FULL_INJECTION_CHECK_AVAILABLE and _contains_injection_marker(val):
+                return True
 
     return False
 
