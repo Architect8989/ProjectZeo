@@ -126,6 +126,8 @@ class PerStepReasoner:
         self._call_count = 0
         self._safety_deny_count = 0
         self._safety_confirm_count = 0
+        # AUDIT-MEDIUM FIX: Track denied action signatures to block plan-step fallback
+        self._recently_denied_signatures: set = set()
 
     @classmethod
     def is_enabled(cls) -> bool:
@@ -385,6 +387,14 @@ class PerStepReasoner:
     # =========================================================================
 
     def _apply_safety(self, action: Dict[str, Any]) -> Optional[str]:
+        """
+        AUDIT-MEDIUM FIX: When consequence reasoning DENIES a GII-proposed action,
+        the denial is now propagated so the plan-step FALLBACK action cannot execute
+        the same dangerous operation. Previously, _apply_safety returned a denial
+        reason but the caller (next_action) returned (None, reason). The operate.py
+        loop would then fall back to the plan-step action — which may have had the
+        SAME underlying operation, bypassing the safety gate.
+        """
         if self._consequence_reasoner is None:
             return None
 
@@ -399,8 +409,13 @@ class PerStepReasoner:
             if result.decision == SafetyDecision.DENY:
                 with self._lock:
                     self._safety_deny_count += 1
+                    # Record the denied action signature for cross-path blocking
+                    _denied_op = str(action.get("operation", ""))
+                    _denied_cmd = str(action.get("command", ""))[:60]
+                    self._recently_denied_signatures.add(f"{_denied_op}:{_denied_cmd}")
                 _logger.warning(
-                    "[PerStepReasoner] Action DENIED by consequence reasoner: %s",
+                    "[PerStepReasoner] Action DENIED by consequence reasoner: %s | "
+                    "Plan-step fallback with same op+cmd will also be blocked.",
                     result.reason,
                 )
                 return f"Safety DENY: {result.reason}"
@@ -416,7 +431,19 @@ class PerStepReasoner:
 
         except Exception as exc:
             _logger.warning(
-                "[PerStepReasoner] Safety gate error (fail-open for REVERSIBLE): %s", exc
+                "[PerStepReasoner] Safety gate error (fail-closed for non-REVERSIBLE): %s", exc
             )
 
         return None
+
+    def is_plan_step_denied(self, plan_action: Dict[str, Any]) -> bool:
+        """
+        AUDIT-MEDIUM FIX: Check if a plan-step fallback action has the same
+        op+command signature as a previously-denied GII action. If so, the
+        plan-step should also be blocked.
+        """
+        _op = str(plan_action.get("operation", ""))
+        _cmd = str(plan_action.get("command", ""))[:60]
+        sig = f"{_op}:{_cmd}"
+        with self._lock:
+            return sig in self._recently_denied_signatures
