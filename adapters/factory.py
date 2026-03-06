@@ -1,30 +1,3 @@
-"""
-adapters/factory.py
-===================
-GII Transformation — Layer 0+1: Unified Adapter Factory
-
-New in this version:
-    • sglang/ prefix routes to SGLangAdapter for GPU inference
-      (Qwen3-32B fast, Qwen3-235B-Thinking deep, UI-TARS-2 vision, Qwen3-Coder)
-    • get_reasoning_client(tier) for consequence reasoner tier routing
-    • Graceful CPU fallback when PROJECTZEO_USE_SGLANG != "1"
-    • Health-check on SGLang startup to surface misconfiguration early
-
-Routing priority (build_llm):
-    1. "sglang/<tier>"  → SGLangAdapter for that tier (GPU path)
-    2. "anthropic:*"    → CloudAdapter (Anthropic API)
-    3. "openai:*"       → CloudAdapter (OpenAI API)
-    4. Known local name → Local Ollama adapter (qwen2.5-vl, llava, etc.)
-    5. Legacy cloud name → PureLLMWrapper (requires OLLAMA_ONLY=0)
-    6. Unknown          → ModelNotRecognizedException
-
-get_reasoning_client(tier) public function:
-    Returns the best available callable for the named tier.
-    Used by ConsequenceReasoner for automatic tier routing:
-        "fast" → Qwen3-32B (or Ollama fallback)
-        "deep" → Qwen3-235B-Thinking (or Ollama fallback)
-"""
-
 from __future__ import annotations
 
 import importlib
@@ -198,12 +171,7 @@ def _is_cloud_allowed() -> bool:
 
 
 def reconfigure_cloud_access(allow: bool) -> bool:
-    """
-    Reconfigure cloud access at runtime.
-
-    Raises RuntimeError if allow=True and OLLAMA_ONLY was set at startup.
-    Returns the previous value of _CLOUD_ACCESS_PERMITTED.
-    """
+    
     global _CLOUD_ACCESS_PERMITTED
 
     if allow and _OLLAMA_ONLY_FROZEN:
@@ -226,10 +194,7 @@ def reconfigure_cloud_access(allow: bool) -> bool:
 # ---------------------------------------------------------------------------
 
 def _build_sglang_adapter(tier: str) -> Any:
-    """
-    Build a SGLangAdapter for the named tier.
-    Performs a health check and warns (but does not fail) if unreachable.
-    """
+    
     try:
         from adapters.sglang_adapter import create_sglang_adapter_from_tier  # noqa: PLC0415
         adapter = create_sglang_adapter_from_tier(tier)
@@ -265,17 +230,7 @@ class AdapterFactory:
 
     @staticmethod
     def build_llm(model_name: str):
-        """
-        Build and return (or return cached) an LLM adapter for model_name.
-
-        Routing order:
-            1. "sglang/<tier>"  → SGLangAdapter (GPU)
-            2. "anthropic:*"    → CloudAdapter
-            3. "openai:*"       → CloudAdapter
-            4. Known local name → Local Ollama adapter
-            5. Legacy cloud     → PureLLMWrapper (requires OLLAMA_ONLY=0)
-            6. Unknown          → ModelNotRecognizedException
-        """
+        
         model_name = _validate_model_name(model_name)
         _ensure_patches()
 
@@ -385,22 +340,7 @@ class AdapterFactory:
 # ---------------------------------------------------------------------------
 
 def get_reasoning_client(tier: str = "fast") -> Any:
-    """
-    Return the best available LLM callable for the named reasoning tier.
-
-    Used by ConsequenceReasoner to route:
-        Tier 2 (REVERSIBLE checks)   → fast client (Qwen3-32B or Ollama)
-        Tier 3 (IRREVERSIBLE checks) → deep client (Qwen3-235B-Thinking or Ollama)
-
-    Falls back gracefully to the local Ollama adapter when SGLang is not
-    configured, so this is safe to call on CPU-only deployments.
-
-    Args:
-        tier: "fast" | "deep" | "vision" | "coder" | "local"
-
-    Returns:
-        An llm_callable-compatible object.
-    """
+    
     from config.model_config import is_gpu_mode  # noqa: PLC0415
 
     if is_gpu_mode():
@@ -445,10 +385,7 @@ class _CloudCallable:
 
 
 class _SGLangCallable:
-    """
-    Wrap a SGLangAdapter so it satisfies the llm_callable protocol.
-    Also exposes with_thinking() for tier-based thinking mode routing.
-    """
+    
 
     def __init__(self, adapter) -> None:
         self._adapter = adapter
