@@ -1,31 +1,3 @@
-"""
-core/gii/gii_loop.py
-
-GII GOAL-DIRECTED EXECUTION LOOP
-─────────────────────────────────
-TRANSFORMATION STEP 3 (from GII Transformation Report):
-
-Replaces _execute_autonomous_loop()'s current_step_index advancing through
-execution_plan.steps with a pure goal-directed reasoning loop.
-
-Architecture:
-  while not goal_complete and not timed_out:
-      world_state = world_graph.snapshot()
-      action, reason = gii_controller.decide_next_action(world_state)
-      if action is None:
-          action = reasoning_engine.propose_actions(...)
-      result = execute_decision(action, ...)
-      gii_controller.record_outcome(action, result)
-      if action.get("operation") == "done":
-          goal_complete = True
-
-The scaffold steps (from ExecutionPlanner) become a context HINT passed to
-the PerStepReasoner, NOT a control structure. No step index. No sequential
-plan iteration. The system acts until the goal is met.
-
-This module is designed to be called from operate.py when GII mode is active
-and the operator has opted into the full goal-directed architecture.
-"""
 from __future__ import annotations
 
 import logging
@@ -41,21 +13,7 @@ _DONE_OP = "done"
 
 
 class GIIGoalDirectedLoop:
-    """
-    Pure goal-directed execution engine. No step index. No pre-generated plan.
-
-    The execution loop observes the current world state, decides one action
-    at a time using PerStepReasoner, executes it through the OS backend,
-    records the outcome, and repeats until:
-      (a) PerStepReasoner emits {"operation": "done"}
-      (b) Wall-clock timeout is exceeded
-      (c) Stagnation limit is reached
-      (d) An irrecoverable error occurs
-
-    Scaffold steps (from ExecutionPlanner.create_milestone_scaffold()) are
-    injected into the PerStepReasoner context as guidance, not as sequential
-    steps to execute.
-    """
+    
 
     # Maximum iterations before forced termination (GII loop has no fixed plan length)
     MAX_ITERATIONS_DEFAULT = 500
@@ -105,15 +63,7 @@ class GIIGoalDirectedLoop:
     # =========================================================================
 
     def run(self, start_ts: Optional[float] = None) -> Dict[str, Any]:
-        """
-        Execute the goal-directed loop.
-
-        Returns a result dict with keys:
-          - success: bool
-          - reason: str
-          - iterations: int
-          - final_world_state: dict
-        """
+        
         start_ts = start_ts or time.time()
         goal_complete = False
         last_loop_ts = 0.0
