@@ -26,6 +26,18 @@ from restoration.snapshot_provider import SnapshotProvider
 from core.mode_controller import ModeController, SystemMode
 
 
+
+# HIGH-3 FIX: Playwright browser session capture
+# Captures browser tab URLs, scroll positions, and active tab index before tasks.
+# Restores them after task completion to address the restoration gap identified
+# in Audit 1 HIGH-3 and Audit 2 EXEC-2.
+_PLAYWRIGHT_AVAILABLE: bool = False
+try:
+    from playwright.sync_api import sync_playwright as _sync_playwright
+    _PLAYWRIGHT_AVAILABLE = True
+except ImportError:
+    _sync_playwright = None  # type: ignore[assignment]
+
 class RestorationError(RuntimeError):
     """Raised when restoration or post-restore verification fails."""
     pass
@@ -90,6 +102,10 @@ class RestoreProvider:
         self._completed_snapshots: dict = (
             self._load_ledger() if self._ledger_available else {}
         )
+
+        # HIGH-3 FIX: Browser session state (captured at snapshot time, restored on restore)
+        self._browser_session: dict = {}  # {url, scroll_x, scroll_y, tab_index, ...}
+        self._browser_capture_lock = threading.Lock()
 
     # =========================================================================
     # LEDGER
@@ -176,6 +192,189 @@ class RestoreProvider:
     # =========================================================================
     # PUBLIC ENTRY
     # =========================================================================
+
+
+    # =========================================================================
+    # BROWSER SESSION CAPTURE AND RESTORE (HIGH-3 FIX)
+    # =========================================================================
+
+    def capture_browser_session(self) -> dict:
+        """
+        HIGH-3 FIX: Capture current browser session state using Playwright.
+
+        Returns a dict describing the current browser state:
+            {
+                "captured": bool,
+                "tabs": [{"url": str, "title": str}],
+                "active_tab_index": int,
+                "timestamp": float,
+            }
+
+        Called by SnapshotProvider.take_snapshot() and stored in snapshot metadata.
+        When Playwright is unavailable or no browser is running, returns
+        {"captured": False} so the fallback behaviour (cursor+window only) applies.
+        """
+        if not _PLAYWRIGHT_AVAILABLE:
+            return {"captured": False, "reason": "playwright not installed"}
+
+        result = {
+            "captured": False,
+            "tabs": [],
+            "active_tab_index": 0,
+            "timestamp": time.time(),
+        }
+
+        try:
+            with _sync_playwright() as pw:
+                # Try to connect to an existing Chromium-based browser
+                # Requires browser to be launched with --remote-debugging-port=9222
+                _cdp_url = os.environ.get(
+                    "PROJECTZEO_CDP_URL", "http://localhost:9222"
+                ).strip()
+                try:
+                    browser = pw.chromium.connect_over_cdp(_cdp_url, timeout=3000)
+                    contexts = browser.contexts
+                    if not contexts:
+                        return result
+
+                    context = contexts[0]
+                    pages = context.pages
+                    if not pages:
+                        return result
+
+                    tabs = []
+                    for page in pages:
+                        try:
+                            url = page.url
+                            title = page.title()
+                            scroll_y = page.evaluate("window.scrollY") if url.startswith("http") else 0
+                            scroll_x = page.evaluate("window.scrollX") if url.startswith("http") else 0
+                            tabs.append({
+                                "url": url,
+                                "title": title,
+                                "scroll_x": scroll_x,
+                                "scroll_y": scroll_y,
+                            })
+                        except Exception:
+                            tabs.append({"url": "unknown", "title": "", "scroll_x": 0, "scroll_y": 0})
+
+                    result["tabs"] = tabs
+                    result["active_tab_index"] = 0  # first tab is active in CDP
+                    result["captured"] = True
+                    browser.close()
+
+                except Exception as cdp_exc:
+                    # CDP connection failed — browser may not be running with remote debugging
+                    print(
+                        f"[RestoreProvider] Browser session capture: CDP connect failed "
+                        f"({cdp_exc!s:.80}). "
+                        "To enable browser capture, launch browser with: "
+                        "--remote-debugging-port=9222",
+                        file=sys.stderr,
+                    )
+                    result["reason"] = f"CDP unavailable: {cdp_exc!s:.60}"
+
+        except Exception as exc:
+            result["reason"] = f"Playwright error: {exc!s:.80}"
+            print(
+                f"[RestoreProvider] Browser session capture failed: {exc!s:.80}",
+                file=sys.stderr,
+            )
+
+        with self._browser_capture_lock:
+            self._browser_session = dict(result)
+
+        return result
+
+    def restore_browser_session(self, session_state: dict) -> bool:
+        """
+        HIGH-3 FIX: Restore browser session from previously captured state.
+
+        Attempts to:
+            1. Open tabs that were open at snapshot time
+            2. Navigate each tab to its original URL
+            3. Restore scroll position
+
+        Returns True if restoration was successful (or no browser to restore).
+        Always non-fatal: browser restoration failure never blocks workspace restore.
+        """
+        if not _PLAYWRIGHT_AVAILABLE:
+            return False
+
+        if not session_state or not session_state.get("captured"):
+            return False
+
+        tabs = session_state.get("tabs", [])
+        if not tabs:
+            return True
+
+        try:
+            with _sync_playwright() as pw:
+                _cdp_url = os.environ.get(
+                    "PROJECTZEO_CDP_URL", "http://localhost:9222"
+                ).strip()
+                try:
+                    browser = pw.chromium.connect_over_cdp(_cdp_url, timeout=3000)
+                    contexts = browser.contexts
+                    if not contexts:
+                        return False
+
+                    context = contexts[0]
+
+                    # Close any tabs opened during the task
+                    current_pages = context.pages
+                    for page in current_pages[len(tabs):]:
+                        try:
+                            page.close()
+                        except Exception:
+                            pass
+
+                    # Navigate existing/new tabs to snapshot URLs
+                    for i, tab in enumerate(tabs):
+                        url = tab.get("url", "")
+                        if not url or url in ("about:blank", "about:newtab"):
+                            continue
+                        try:
+                            if i < len(current_pages):
+                                page = current_pages[i]
+                            else:
+                                page = context.new_page()
+
+                            if page.url != url:
+                                page.goto(url, timeout=10000, wait_until="domcontentloaded")
+
+                            # Restore scroll position
+                            sx = tab.get("scroll_x", 0)
+                            sy = tab.get("scroll_y", 0)
+                            if sx or sy:
+                                page.evaluate(f"window.scrollTo({sx}, {sy})")
+
+                        except Exception as page_exc:
+                            print(
+                                f"[RestoreProvider] Browser tab {i} restore failed: {page_exc!s:.80}",
+                                file=sys.stderr,
+                            )
+
+                    browser.close()
+                    print(
+                        f"[RestoreProvider] Browser session restored: {len(tabs)} tab(s).",
+                        file=sys.stderr,
+                    )
+                    return True
+
+                except Exception as cdp_exc:
+                    print(
+                        f"[RestoreProvider] Browser restore: CDP connect failed: {cdp_exc!s:.80}",
+                        file=sys.stderr,
+                    )
+                    return False
+
+        except Exception as exc:
+            print(
+                f"[RestoreProvider] Browser restore failed: {exc!s:.80}",
+                file=sys.stderr,
+            )
+            return False
 
     def restore_snapshot(self, snapshot_id: str) -> None:
         """
@@ -273,6 +472,18 @@ class RestoreProvider:
         self._restore_application(snapshot)
         self._restore_window(snapshot)
         self._restore_cursor(snapshot)
+
+        # HIGH-3 FIX: Restore browser session if captured at snapshot time
+        _browser_state = snapshot.metadata.get("browser_session")
+        if _browser_state and _browser_state.get("captured"):
+            try:
+                self.restore_browser_session(_browser_state)
+            except Exception as _br_err:
+                # Non-fatal: browser restore failure never blocks workspace restore
+                print(
+                    f"[RestoreProvider] Browser session restore failed (non-fatal): {_br_err}",
+                    file=sys.stderr,
+                )
 
         # Hard verification — raises RestorationError on failure
         self._verify(snapshot)
