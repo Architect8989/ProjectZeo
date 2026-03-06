@@ -1,41 +1,3 @@
-"""
-observer/observer_loop.py
-==========================
-GII Transformation — Layer 2 Vision: AT-SPI Event-Driven Perception
-
-CHANGE IN THIS VERSION (VIS-2 FIX):
-    ATSPIBridge is now wired as the PRIMARY perception trigger.
-    The 0.5s polling loop is retained only as FALLBACK for applications
-    that do not expose AT-SPI (Blender's OpenGL UI, games, Electron apps).
-
-Before (polling-only):
-    while True:
-        time.sleep(0.5)  ← 2 Hz, unconditional
-        frame = VisionRuntime.get_latest()
-        observer.tick()
-
-After (event-driven + polling fallback):
-    atspi_bridge.on_change_callback = lambda: trigger_vl_inference()
-    atspi_bridge.start()  ← primary trigger
-    while True:
-        if (time_since_last_inference > fallback_interval):
-            trigger_vl_inference()  ← fallback for non-accessible apps
-
-Benefits:
-    • 60–80% fewer LLM calls on accessible apps (Firefox, gedit, Nautilus)
-    • Immediate perception update on focus change (no 500ms lag)
-    • Preserves full-rate polling for OpenGL apps where AT-SPI is unavailable
-    • AT-SPI failure is non-fatal: falls back to polling silently
-
-AT-SPI events that trigger inference:
-    window:activate            Window brought to foreground
-    window:create              New window appeared
-    window:destroy             Window closed
-    object:state-changed:focused  Input focus changed
-    object:state-changed:showing  Element became visible/hidden
-    object:children-changed    UI tree structure changed
-"""
-
 from __future__ import annotations
 
 import logging
@@ -116,19 +78,7 @@ def _validate_perception_schema(perception: dict) -> "dict | None":
 
 
 class ObserverLoop:
-    """
-    Main perception loop that drives VLM inference on screen state changes.
-
-    PRIMARY path (when AT-SPI is available):
-        ATSPIBridge fires on_change_callback → _on_atspi_event() →
-        _ingest_frame() → observer.tick()
-
-    FALLBACK path (polling — for non-accessible apps):
-        Background thread at _fallback_interval Hz → _ingest_frame() → observer.tick()
-
-    Both paths converge on _ingest_frame() which validates, normalises,
-    and ingests the perception frame into ObserverCore and WorldGraph.
-    """
+    
 
     DEFAULT_TICK_INTERVAL: float = 0.20   # 5 Hz baseline for polling fallback
 
@@ -178,10 +128,7 @@ class ObserverLoop:
     # =========================================================================
 
     def _init_atspi(self) -> bool:
-        """
-        Attempt to initialise the AT-SPI bridge and register the callback.
-        Returns True if AT-SPI is available and the bridge was started.
-        """
+        
         try:
             from core.perception.atspi_bridge import ATSPIBridge, ATSPIUnavailableError  # noqa: PLC0415
 
@@ -210,13 +157,7 @@ class ObserverLoop:
         return False
 
     def _on_atspi_event(self) -> None:
-        """
-        Callback fired by ATSPIBridge when a relevant accessibility event occurs.
-
-        Runs in the AT-SPI event thread. Must be fast and non-blocking.
-        We acquire a lightweight lock to prevent concurrent inference on rapid events,
-        then fire VLM inference synchronously (VisionRuntime.get_latest() is non-blocking).
-        """
+        
         now = time.monotonic()
         with self._atspi_trigger_lock:
             # Enforce minimum interval between AT-SPI-triggered inferences
@@ -240,10 +181,7 @@ class ObserverLoop:
     # =========================================================================
 
     def _ingest_frame(self, raw_perception: Optional[Dict[str, Any]]) -> None:
-        """
-        Validate, normalise, and ingest a perception frame.
-        Updates ObserverCore and WorldGraph; calls observer.tick().
-        """
+        
         if (
             isinstance(raw_perception, dict)
             and raw_perception.get("available") is True
@@ -371,16 +309,7 @@ class ObserverLoop:
     # =========================================================================
 
     def _run(self) -> None:
-        """
-        Polling fallback loop.
-
-        When AT-SPI is active and triggering regularly, this loop sleeps for
-        _ATSPI_FALLBACK_INTERVAL seconds (default 0.5s) without invoking inference.
-        It only calls _ingest_frame() when:
-            (a) AT-SPI is unavailable (non-accessible app like Blender), OR
-            (b) No AT-SPI trigger has fired in the last fallback interval
-                (stale state guard: ensures a periodic refresh even in accessible apps)
-        """
+        
         _logger.info("[ObserverLoop] Polling loop started.")
         fallback_interval = _ATSPI_FALLBACK_INTERVAL if self._atspi_available else self._tick_interval
 
