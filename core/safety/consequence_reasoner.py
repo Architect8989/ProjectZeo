@@ -232,7 +232,7 @@ def check_goal_coherence(
     step_description: str,
     action: Dict[str, Any],
     llm_callable: Callable,
-    timeout_seconds: float = 8.0,
+    timeout_seconds: float = 150.0,  # AUDIT-CRITICAL-2 FIX: was 8s, CPU inference needs 150s
 ) -> CoherenceVerdict:
     
     action_summary = {k: v for k, v in action.items() if k not in ("_trusted_installer",)}
@@ -333,7 +333,7 @@ def simulate_consequences(
     action: Dict[str, Any],
     objective: str,
     llm_callable: Callable,
-    timeout_seconds: float = 10.0,
+    timeout_seconds: float = 180.0,  # AUDIT-CRITICAL-2 FIX: was 10s, CPU inference needs 180s
 ) -> ConsequenceVerdict:
     
     payload = json.dumps({
@@ -418,8 +418,8 @@ class ConsequenceReasoner:
         self,
         llm_callable: Optional[Callable] = None,
         *,
-        tier2_timeout: float = 8.0,
-        tier3_timeout: float = 10.0,
+        tier2_timeout: float = 150.0,  # AUDIT-CRITICAL-2 FIX: was 8s
+        tier3_timeout: float = 180.0,  # AUDIT-CRITICAL-2 FIX: was 10s
         enable_tier2: bool = True,
         enable_tier3: bool = True,
     ) -> None:
@@ -478,16 +478,25 @@ class ConsequenceReasoner:
         reversibility = classify_reversibility(action)
 
         if reversibility == Reversibility.REVERSIBLE:
-            # Fast path: no further tiers needed
-            return ConsequenceResult(
-                decision=SafetyDecision.ALLOW,
-                reversibility=reversibility,
-                coherence=CoherenceVerdict.SKIPPED,
-                consequence=ConsequenceVerdict.SKIPPED,
-                tier_reached=1,
-                reason="Reversible action — fast-path allowed",
-                latency_ms=(time.monotonic() - t0) * 1000,
-                action_snippet=snippet,
+            # AUDIT-HIGH FIX: REVERSIBLE fast-path now checks external content source.
+            # Click/scroll on browser/document content bypasses Tier 2 (injection check).
+            # If action target originates from external sources, always run Tier 2.
+            external_source = bool(action.get("_external_content_source"))
+            if not external_source or not self._enable_tier2:
+                return ConsequenceResult(
+                    decision=SafetyDecision.ALLOW,
+                    reversibility=reversibility,
+                    coherence=CoherenceVerdict.SKIPPED,
+                    consequence=ConsequenceVerdict.SKIPPED,
+                    tier_reached=1,
+                    reason="Reversible action — fast-path allowed",
+                    latency_ms=(time.monotonic() - t0) * 1000,
+                    action_snippet=snippet,
+                )
+            # External content source — run Tier 2 even for REVERSIBLE actions
+            _logger.info(
+                "[ConsequenceReasoner] External content source detected for REVERSIBLE action — "
+                "running Tier 2 goal coherence check to defend against prompt injection."
             )
 
         # ── TIER 2: Goal Coherence Check ──────────────────────────────────────
