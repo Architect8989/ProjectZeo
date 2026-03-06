@@ -1,23 +1,5 @@
 from __future__ import annotations
 
-# =============================================================================
-# ARCHITECTURE: GII REASONING LOOP
-# =============================================================================
-# AUDIT-CRIT-4 FIX: Replaced the scripted ExecutionPlan step-iteration model
-# with a pure goal-directed reasoning loop:
-#
-#   while not goal_complete:
-#       world  = observe()
-#       action = reason(world, goal)
-#       evaluate_safety(action)
-#       execute(action)
-#
-# The ExecutionPlan is now used ONLY as a scaffold (high-level phase guidance)
-# passed to PerStepReasoner.  It is NOT iterated.  There is NO current_step_index.
-# Goal completion is signalled by the reasoner emitting {"operation": "done"}.
-#
-# Files changed: operate/operate.py (this file), main.py, core/planner/execution_planner.py
-# =============================================================================
 
 import concurrent.futures
 import hashlib
@@ -71,7 +53,7 @@ WAIT_RETRY_SECONDS = 0.5
 
 
 def _resolve_confirm_timeout() -> int:
-    """Read PROJECTZEO_CONFIRM_TIMEOUT_SECONDS env var; default 60s."""
+    
     raw = os.environ.get("PROJECTZEO_CONFIRM_TIMEOUT_SECONDS", "")
     try:
         val = int(raw.strip())
@@ -101,8 +83,7 @@ _CRED_SCRUB_RE = _re_module.compile(
     _re_module.IGNORECASE,
 )
 
-# SEC-4 FIX: Regex to detect password-like values typed into fields.
-# Short alphanumeric strings with special chars are redacted from write/type journal entries.
+
 _TYPED_CREDENTIAL_RE = _re_module.compile(
     r"(?:password|passwd|secret|token|api.?key|bearer|private.?key"
     r"|aws.?secret|access.?key|auth.?token)\s*[:=]?\s*\S+",
@@ -121,12 +102,7 @@ def _scrub_credentials(text: str) -> str:
 
 
 def _scrub_write_type_content(action: dict) -> dict:
-    """
-    SEC-4 FIX: Scrub sensitive content from write/type action dicts before journaling.
-    The content field of write/type operations may contain typed passwords.
-    We redact credential patterns and also redact if the action has a password role.
-    Returns a copy with content scrubbed if necessary.
-    """
+    
     op = str(action.get("operation", "")).lower()
     if op not in ("write", "type"):
         return action
@@ -241,15 +217,7 @@ def operate_main(
     prior_execution_log: Optional[dict] = None,
     gii_controller=None,
 ) -> None:
-    """
-    Main entry point for autonomous task execution.
-
-    ARCHITECTURE NOTE (AUDIT-CRIT-4):
-        The prior_step_index parameter is DEPRECATED and IGNORED.
-        The execution loop no longer iterates ExecutionPlan.steps.
-        Instead it runs a pure `while not goal_complete` reasoning loop
-        where PerStepReasoner/GIIController decides each action from world state.
-    """
+    
     if not _CONFIRM_TIMEOUT_LOGGED[0]:
         _CONFIRM_TIMEOUT_LOGGED[0] = True
         print(
@@ -564,8 +532,7 @@ def operate_main(
         except Exception as _pb_save_err:
             print(f"[operate_main] WARNING: playbook save failed: {_pb_save_err}.", file=sys.stderr)
 
-        # MEMORY SYNTHESIS (MEM-2, MEM-5): Store task memories for cross-session recall.
-        # Runs in background thread — non-blocking.
+        
         try:
             from core.memory.mem0_store import Mem0Store as _Mem0StorePost  # noqa: PLC0415
             _mem0_post = _Mem0StorePost.get_instance()
@@ -604,14 +571,7 @@ def operate_main(
         _task_ui_executor.shutdown(wait=False)
 
 
-# =========================================================================
-# GII AUTONOMOUS EXECUTION LOOP
-# =========================================================================
-# AUDIT-CRIT-4 FIX: Replaced the scripted plan-step iteration model with a
-# pure goal-directed reasoning loop.  There is NO current_step_index.
-# The ExecutionPlan is used only as a scaffold (high-level phase descriptions)
-# passed to PerStepReasoner for guidance — it is NOT iterated.
-# =========================================================================
+
 
 def _execute_autonomous_loop(
     *,
@@ -860,12 +820,7 @@ def _execute_autonomous_loop(
 
                 previous_snapshot = world_snapshot
 
-                # ============================================================
-                # STEP 1b: MEMORY RETRIEVAL — Inject cross-session context
-                # MEM retrieval hook: retrieve relevant memories from Mem0
-                # before reasoning so the LLM has context from previous tasks.
-                # Non-blocking: memory retrieval failure never stalls execution.
-                # ============================================================
+                
                 _memory_context_for_reasoning: str = ""
                 if iteration == 1 or iteration % 10 == 0:  # refresh every 10 iters
                     try:
@@ -1039,11 +994,7 @@ def _execute_autonomous_loop(
                 if selected_action is None:
                     raise RuntimeError("TASK_FAILED:no_candidate_actions")
 
-                # HIGH-4 FIX: Check if this action was previously denied by
-                # ConsequenceReasoner inside PerStepReasoner and should be
-                # blocked at the fallback execution point.
-                # is_plan_step_denied() compares op+command signature against
-                # _recently_denied_signatures tracked in PerStepReasoner.
+                
                 if _per_step_reasoner is not None:
                     try:
                         if _per_step_reasoner.is_plan_step_denied(selected_action):
@@ -1131,11 +1082,7 @@ def _execute_autonomous_loop(
                     previous_perception = perception_snapshot
                     continue
 
-                # ============================================================
-                # STEP 4: SAFETY — ConsequenceReasoner for ALL executable ops
-                # AUDIT-HIGH-2 FIX: Runs for command/file_create/install
-                # regardless of GII mode. Safety and GII mode are independent.
-                # ============================================================
+                
                 _op_for_cr = str(selected_action.get("operation", "")).lower()
                 _consequence_reasoner_instance = None
                 if gii_controller is not None and hasattr(gii_controller, "consequence_reasoner"):
@@ -1209,13 +1156,7 @@ def _execute_autonomous_loop(
                 previous_perception = perception_snapshot
                 continue
 
-            # ================================================================
-            # STEP 4b: TIER 4 SAFETY — LlamaGuard3-8B content classifier
-            # SAFE-4 FIX: Runs after ConsequenceReasoner, before dispatch.
-            # Catches 14 hazard categories (violence, CBRN, cyberattack code, etc.)
-            # not covered by consequence reasoning (which focuses on goal coherence).
-            # Fail-open: LlamaGuard error never blocks execution — Tiers 1-3 cleared.
-            # ================================================================
+            
             if (
                 _policy_decision != PolicyEngine.DENY
                 and str(selected_action.get("operation", "")).lower()
@@ -1595,13 +1536,7 @@ def _execute_decision(
     focused_app: str = "",
     prefer_playwright: bool = True,
 ) -> dict:
-    """
-    Dispatch a single action to the appropriate OS backend.
-
-    AUDIT-CRIT-4: The 'current_step' parameter has been removed.
-    The dispatcher no longer needs step context — safety gates in the
-    reasoning loop have already validated the action before dispatch.
-    """
+    
     from core.safety.action_timeout import run_with_timeout, ActionTimeout
 
     op = (action.get("operation") or "").lower().strip()
@@ -1718,12 +1653,7 @@ def _execute_decision(
                 return {"success": False, "reward": -0.5, "reason": "click: no x/y or label"}
             return {"success": True, "reward": 0.8}
 
-        # ------------------------------------------------------------------
-        # WRITE / TYPE
-        # SEC-4 FIX: content is never stored in journal (action_key is a hash).
-        # _scrub_write_type_content() provides defence-in-depth for any path
-        # that would log the raw action dict.
-        # ------------------------------------------------------------------
+        
         elif op in ("write", "type"):
             content = str(action.get("content") or action.get("text") or "")
             if not content:
