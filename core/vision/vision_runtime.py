@@ -446,6 +446,20 @@ class VisionRuntime:
         if not isinstance(elements, list):
             elements = []
 
+        # CRIT-5 FIX: Detect browser-context frames and tag all DOM elements as
+        # _external_content_source=True.  Browser DOM content originates from
+        # untrusted external sources and must trigger Tier-2 safety evaluation
+        # unconditionally in the consequence reasoner.
+        _BROWSER_APPS: frozenset = frozenset({
+            "firefox", "chrome", "chromium", "brave", "edge", "safari",
+            "google-chrome", "microsoft-edge", "opera", "vivaldi",
+        })
+        focused_app_raw = str(parsed.get("focused_app") or "").lower().strip()
+        _is_browser_context = any(
+            focused_app_raw == b or focused_app_raw.startswith(b)
+            for b in _BROWSER_APPS
+        )
+
         # Validate and clamp each element
         clean_elements = []
         for el in elements[:MAX_ELEMENTS]:
@@ -460,6 +474,12 @@ class VisionRuntime:
                 "state": el.get("state"),
                 "confidence": max(0.0, min(1.0, float(el.get("confidence", 0.8)))),
             }
+            # CRIT-5 FIX: Propagate external content flag from element or from browser context.
+            # Once True it is never overridden to False.
+            clean_el["_external_content_source"] = (
+                _is_browser_context
+                or bool(el.get("_external_content_source", False))
+            )
             clean_elements.append(clean_el)
 
         dialogs = parsed.get("dialogs", [])
@@ -473,6 +493,8 @@ class VisionRuntime:
             "dialogs": dialogs,
             "frame_ts": time.time(),
             "available": True,
+            # CRIT-5 FIX: Propagate browser-context flag at the frame level too.
+            "_browser_context": _is_browser_context,
         }
 
     @staticmethod

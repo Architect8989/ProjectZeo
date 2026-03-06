@@ -49,6 +49,8 @@ class WorldGraph:
         self._focused_app: Optional[str] = None
         self._last_frame_ts: Optional[float] = None
         self._history = deque(maxlen=MAX_HISTORY)
+        # CRIT-5 FIX: Track whether current frame is from a browser context.
+        self._browser_context: bool = False
 
     # =================================================
     # RESET
@@ -101,6 +103,8 @@ class WorldGraph:
 
             focused = perception.get("focused_app")
             self._focused_app = focused if isinstance(focused, str) else None
+            # CRIT-5 FIX: Capture the browser-context flag from vision_runtime.py.
+            self._browser_context = bool(perception.get("_browser_context", False))
 
             # AUDIT-MEDIUM-1 FIX: Use extended stale window in lightweight mode
             # (observer running screenshot-only with no entity extraction).
@@ -147,6 +151,10 @@ class WorldGraph:
                     "first_seen": first_seen,
                     "last_seen": now,
                     "confidence": 1.0,
+                    # CRIT-5 FIX: Preserve _external_content_source flag from
+                    # vision_runtime.py.  Once True it is never overridden to False
+                    # so browser DOM entities remain flagged across world-state snapshots.
+                    "_external_content_source": bool(el.get("_external_content_source", False)),
                 }
 
             for eid, ent in self._entities.items():
@@ -179,6 +187,10 @@ class WorldGraph:
                 "focused_app": self._focused_app,
                 "entities": copy.deepcopy(list(self._entities.values())),
                 "entity_count": len(self._entities),
+                # CRIT-5 FIX: Propagate browser-context flag to consumers
+                # (operate.py, consequence_reasoner) so they know all entities
+                # may originate from untrusted external web content.
+                "_browser_context": self._browser_context,
             }
 
     # =================================================
