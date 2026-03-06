@@ -203,6 +203,46 @@ class ExecutionPlanner:
         # install with SUID/SGID/sticky bits set (install -m 4755, -m 6755, etc.):
         # sets executable files as SUID root — permanent privilege escalation
         r"\binstall\b.*-m\s*[0-7]*[4-7][0-7][0-7]",
+
+        # AUDIT-SAFETY FIX: Additional privilege escalation aliases not previously blocked
+        # sudo --non-interactive (full form of sudo -n)
+        r"\bsudo\b.*--non-interactive\b",
+        # pkexec: PolicyKit privilege escalation
+        r"\bpkexec\b",
+        # doas: OpenBSD sudo equivalent, used on some Linux distros
+        r"\bdoas\b",
+        # run0: systemd-run privilege escalation (newer systemd versions)
+        r"\brun0\b",
+        # systemd-run as privilege escalation vector
+        r"\bsystemd-run\b.*--uid=root\b",
+        r"\bsystemd-run\b.*--privileged\b",
+
+        # AUDIT-SAFETY FIX: Additional destruction paths not previously caught
+        # find piped to xargs rm (bypasses \bfind\b.*-exec\b.*\brm\b pattern)
+        r"\bfind\b.*\|\s*xargs\b.*\brm\b",
+        r"\bfind\b.*\|\s*xargs\b.*\btruncate\b",
+        # rsync --delete can destroy destination directory content
+        r"\brsync\b.*--delete\b",
+        # Python/shell one-liners that destroy via os.remove/shutil.rmtree
+        r"\bos\.remove\s*\(",
+        r"\bshutil\.rmtree\s*\(",
+        r"\bos\.unlink\s*\(",
+
+        # AUDIT-SAFETY FIX: User persistence paths (shell startup, autostart)
+        r">>?\s*~/?\.bashrc\b",
+        r">>?\s*~/?\.zshrc\b",
+        r">>?\s*~/?\.profile\b",
+        r">>?\s*~/?\.bash_profile\b",
+        r">>?\s*~/?\.bash_login\b",
+        r">>?\s*~/?\.config/autostart\b",
+        r">>?\s*~/?\.config/systemd/user\b",
+
+        # AUDIT-SAFETY FIX: Network exfiltration patterns
+        # curl/wget to arbitrary domains with file upload (not just known-bad domains)
+        r"\bcurl\b.*-[dF]\s+@",     # data from file upload
+        r"\bcurl\b.*--data.*@[~/]",  # file content exfiltration
+        r"\bwget\b.*--post-file\b",
+        r"\bbase64\b.*[~/]\.",      # base64-encode files for exfiltration
     ]
 
     def __init__(
