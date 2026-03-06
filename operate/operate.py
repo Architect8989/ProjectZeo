@@ -564,6 +564,31 @@ def operate_main(
         except Exception as _pb_save_err:
             print(f"[operate_main] WARNING: playbook save failed: {_pb_save_err}.", file=sys.stderr)
 
+        # MEMORY SYNTHESIS (MEM-2, MEM-5): Store task memories for cross-session recall.
+        # Runs in background thread — non-blocking.
+        try:
+            from core.memory.mem0_store import Mem0Store as _Mem0StorePost  # noqa: PLC0415
+            _mem0_post = _Mem0StorePost.get_instance()
+            _agent_id_post = _Mem0StorePost.make_agent_id(terminal_prompt)
+            # Build a compact conversation representing this task for memory extraction
+            _task_messages = [
+                {"role": "user", "content": f"Task: {terminal_prompt}"},
+                {"role": "assistant", "content": (
+                    f"Task {'completed successfully' if True else 'failed'}. "
+                    f"Execution log has {len(execution_plan.steps) if hasattr(execution_plan, 'steps') else 0} steps."
+                )},
+            ]
+            import threading as _mem_threading
+            def _store_memory():
+                try:
+                    _mem0_post.add_memory(_task_messages, _agent_id_post, metadata={"objective": terminal_prompt[:200]})
+                except Exception:
+                    pass
+            _mem_thread = _mem_threading.Thread(target=_store_memory, daemon=True)
+            _mem_thread.start()
+        except Exception as _mem_post_err:
+            pass  # Non-fatal
+
         try:
             from core.safety.checkpoint_store import clear_checkpoint as _clear_cp
             _clear_cp()
@@ -836,6 +861,40 @@ def _execute_autonomous_loop(
                 previous_snapshot = world_snapshot
 
                 # ============================================================
+                # STEP 1b: MEMORY RETRIEVAL — Inject cross-session context
+                # MEM retrieval hook: retrieve relevant memories from Mem0
+                # before reasoning so the LLM has context from previous tasks.
+                # Non-blocking: memory retrieval failure never stalls execution.
+                # ============================================================
+                _memory_context_for_reasoning: str = ""
+                if iteration == 1 or iteration % 10 == 0:  # refresh every 10 iters
+                    try:
+                        from core.memory.mem0_store import Mem0Store as _Mem0Store  # noqa: PLC0415
+                        _mem0 = _Mem0Store.get_instance()
+                        _agent_id = _Mem0Store.make_agent_id(terminal_prompt)
+                        _memories = _mem0.search(terminal_prompt, _agent_id, limit=5)
+                        if _memories:
+                            _memory_context_for_reasoning = _mem0.format_context(_memories)
+                    except Exception as _mem_err:
+                        log_warn(f"[MEMORY] Mem0 retrieval failed (non-fatal): {_mem_err}")
+
+                    try:
+                        from core.memory.cognee_store import CogneeStore as _CogneeStore  # noqa: PLC0415
+                        _cognee = _CogneeStore.get_instance()
+                        _cognee_facts = _cognee.query(terminal_prompt, max_results=5)
+                        if _cognee_facts:
+                            _cognee_ctx = "\n".join(f"• {f}" for f in _cognee_facts)
+                            _memory_context_for_reasoning = (
+                                _memory_context_for_reasoning + "\n" + _cognee_ctx
+                            ).strip()
+                    except Exception as _cog_err:
+                        pass  # Cognee is optional
+
+                    if _memory_context_for_reasoning and world_snapshot is not None:
+                        if isinstance(world_snapshot, dict):
+                            world_snapshot["_gii_memory_context"] = _memory_context_for_reasoning[:2000]
+
+                # ============================================================
                 # STEP 2: REASON — Get next action from GII reasoning chain
                 # ============================================================
                 selected_action: Optional[Dict[str, Any]] = None
@@ -980,6 +1039,38 @@ def _execute_autonomous_loop(
                 if selected_action is None:
                     raise RuntimeError("TASK_FAILED:no_candidate_actions")
 
+                # HIGH-4 FIX: Check if this action was previously denied by
+                # ConsequenceReasoner inside PerStepReasoner and should be
+                # blocked at the fallback execution point.
+                # is_plan_step_denied() compares op+command signature against
+                # _recently_denied_signatures tracked in PerStepReasoner.
+                if _per_step_reasoner is not None:
+                    try:
+                        if _per_step_reasoner.is_plan_step_denied(selected_action):
+                            _denied_op = selected_action.get("operation", "?")
+                            _denied_cmd = str(selected_action.get("command", ""))[:60]
+                            log_warn(
+                                f"[HIGH-4] Action BLOCKED by is_plan_step_denied(): "
+                                f"op={_denied_op!r} cmd={_denied_cmd!r}. "
+                                "This op+command was previously denied by ConsequenceReasoner. "
+                                "Skipping to avoid plan-step fallback bypass."
+                            )
+                            journal.record({
+                                "event": "plan_step_fallback_blocked",
+                                "iteration": iteration,
+                                "reason": "is_plan_step_denied",
+                                "operation": _denied_op,
+                            })
+                            stagnant_iterations += 1
+                            if stagnant_iterations >= stagnant_limit:
+                                raise RuntimeError(REPLAN_SIGNAL)
+                            previous_perception = perception_snapshot
+                            continue
+                    except (RuntimeError, SystemExit):
+                        raise
+                    except Exception as _psd_err:
+                        log_warn(f"[HIGH-4] is_plan_step_denied check failed: {_psd_err}")
+
                 action_key = action_ranker.action_key(selected_action)
 
                 # Record as visited (evict oldest when at cap)
@@ -1111,6 +1202,76 @@ def _execute_autonomous_loop(
                     "iteration": iteration,
                     "error_type": type(_iter_exc).__name__,
                     "error": str(_iter_exc),
+                })
+                stagnant_iterations += 1
+                if stagnant_iterations >= stagnant_limit:
+                    raise RuntimeError(REPLAN_SIGNAL)
+                previous_perception = perception_snapshot
+                continue
+
+            # ================================================================
+            # STEP 4b: TIER 4 SAFETY — LlamaGuard3-8B content classifier
+            # SAFE-4 FIX: Runs after ConsequenceReasoner, before dispatch.
+            # Catches 14 hazard categories (violence, CBRN, cyberattack code, etc.)
+            # not covered by consequence reasoning (which focuses on goal coherence).
+            # Fail-open: LlamaGuard error never blocks execution — Tiers 1-3 cleared.
+            # ================================================================
+            if (
+                _policy_decision != PolicyEngine.DENY
+                and str(selected_action.get("operation", "")).lower()
+                    in ("command", "file_create", "install", "write", "type")
+            ):
+                try:
+                    from core.safety.llamaguard_classifier import classify_with_llamaguard as _lgc  # noqa: PLC0415
+                    _lg_result = _lgc(selected_action)
+                    if _lg_result.is_blocked:
+                        belief.record_action(action_key, -1.0)
+                        if gii_controller is not None:
+                            gii_controller.record_denial(action_key)
+                        journal.record({
+                            "event": "llamaguard_tier4_block",
+                            "iteration": iteration,
+                            "action_key": action_key,
+                            "categories": _lg_result.categories,
+                            "reason": _lg_result.reason,
+                        })
+                        log_warn(
+                            f"[SAFE-4] LlamaGuard3 BLOCK: categories={_lg_result.categories} "
+                            f"reason={_lg_result.reason[:100]!r}"
+                        )
+                        _policy_decision = PolicyEngine.DENY
+                        _policy_reason = _lg_result.reason
+                    elif _lg_result.requires_confirmation:
+                        if _policy_decision != PolicyEngine.REQUIRE_HUMAN_CONFIRMATION:
+                            _policy_decision = PolicyEngine.REQUIRE_HUMAN_CONFIRMATION
+                            _policy_reason = _lg_result.reason
+                        journal.record({
+                            "event": "llamaguard_tier4_confirm_required",
+                            "iteration": iteration,
+                            "categories": _lg_result.categories,
+                        })
+                    elif _lg_result.action == "WARN":
+                        journal.record({
+                            "event": "llamaguard_tier4_warn",
+                            "iteration": iteration,
+                            "categories": _lg_result.categories,
+                        })
+                except ImportError:
+                    pass  # LlamaGuard not installed — skip Tier 4
+                except Exception as _lg_err:
+                    log_warn(f"[SAFE-4] LlamaGuard3 check error (fail-open): {_lg_err}")
+
+            if _policy_decision == PolicyEngine.DENY:
+                belief.record_action(action_key, -0.5)
+                best_reward = min(belief.global_best_reward() or 0.0, 0.9)
+                belief.update_regret(action_key, -0.5, best_reward)
+                if gii_controller is not None:
+                    gii_controller.record_denial(action_key)
+                journal.record({
+                    "event": "policy_deny_post_llamaguard",
+                    "iteration": iteration,
+                    "action_key": action_key,
+                    "reason": _policy_reason,
                 })
                 stagnant_iterations += 1
                 if stagnant_iterations >= stagnant_limit:
