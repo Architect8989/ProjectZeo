@@ -76,13 +76,31 @@ class ActionJournal:
         )
 
     def _scrub_payload(self, payload: dict) -> dict:
-        """Recursively scrub credential values from a journal entry dict."""
+        """Recursively scrub credential values from a journal entry dict.
+        
+        SEC-4 FIX: For write/type operation events, the 'content' and 'text' fields
+        are scrubbed unconditionally as they may contain typed passwords.  This is
+        defence-in-depth: operate.py already avoids logging raw write/type content,
+        but this ensures any future code path that does include it is safe.
+        """
         if not isinstance(payload, dict):
             return payload
+
+        # Detect write/type operation events to apply targeted scrubbing
+        _op = str(payload.get("operation") or "").lower()
+        _event = str(payload.get("event") or "").lower()
+        _is_write_type = _op in ("write", "type") or (
+            "write" in _event or "type" in _event
+        )
+
         out = {}
         for k, v in payload.items():
             if isinstance(v, str):
-                out[k] = self._scrub_text(v)
+                # SEC-4: Unconditionally redact content/text in write/type contexts
+                if _is_write_type and k in ("content", "text"):
+                    out[k] = "<REDACTED:write_type_content>"
+                else:
+                    out[k] = self._scrub_text(v)
             elif isinstance(v, dict):
                 out[k] = self._scrub_payload(v)
             elif isinstance(v, list):
