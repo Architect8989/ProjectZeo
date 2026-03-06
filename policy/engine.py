@@ -45,6 +45,7 @@ _SHELL_METACHAR_RE = re.compile(
 
 # Paths that are ALWAYS denied for file_create regardless of policy.yaml
 _HARDCODED_DENIED_PATHS: FrozenSet[str] = frozenset({
+    # System paths
     "/etc/cron.d", "/etc/cron.hourly", "/etc/cron.daily",
     "/etc/cron.weekly", "/etc/cron.monthly", "/etc/crontab",
     "/etc/passwd", "/etc/shadow", "/etc/sudoers", "/etc/sudoers.d",
@@ -55,6 +56,14 @@ _HARDCODED_DENIED_PATHS: FrozenSet[str] = frozenset({
     "/root", "/boot", "/proc", "/sys", "/dev",
     "/bin", "/sbin", "/usr/bin", "/usr/sbin",
     "/usr/lib", "/lib", "/lib64",
+    # AUDIT-SAFETY FIX: User persistence paths not previously blocked.
+    # These allow an agent to establish persistence across reboots via
+    # shell startup files, user systemd units, and autostart entries.
+    "~/.bashrc", "~/.zshrc", "~/.profile", "~/.bash_profile",
+    "~/.bash_login", "~/.zprofile", "~/.zshenv",
+    "~/.config/systemd/user",
+    "~/.config/autostart",
+    "~/.local/share/systemd/user",
 })
 
 # ---------------------------------------------------------------------------
@@ -334,16 +343,42 @@ class PolicyEngine:
         return self.ALLOW, None
 
     def _validate_file_content(self, content: str) -> Tuple[str, Optional[str]]:
+        """
+        AUDIT-LOW FIX: Apply FULL DANGEROUS_PATTERNS list to file content at dispatch time.
+        Previously only checked delete/remove/format/erase and shebangs. A two-step attack
+        (create a benign-looking script, then execute it) could evade this. Now the full
+        pattern list from ExecutionPlanner is applied to file content too.
+        """
         if not content:
             return self.ALLOW, None
+
+        # AUDIT-LOW: Apply full DANGEROUS_PATTERNS from ExecutionPlanner to file content
+        try:
+            from core.planner.execution_planner import ExecutionPlanner as _EP
+            _dp_compiled = [re.compile(p, re.IGNORECASE) for p in _EP.DANGEROUS_PATTERNS]
+            for _dp_pat in _dp_compiled:
+                # Apply to each line to handle multi-line script content
+                for line in content.splitlines():
+                    if _dp_pat.search(line):
+                        reason = (
+                            f"file_create content BLOCKED: dangerous command pattern "
+                            f"in file body: {_dp_pat.pattern[:80]!r}"
+                        )
+                        _logger.warning("[PolicyEngine] DISPATCH-CONTENT DENY: %s", reason)
+                        return self.DENY, reason
+        except Exception as _dp_err:
+            _logger.debug("[PolicyEngine] DANGEROUS_PATTERNS file content check failed: %s", _dp_err)
+
+        # Existing checks
         for pat in self.high_risk_name_patterns:
             if pat.search(content):
                 reason = (
-                    f"file_create content BLOCKED: dangerous pattern "
+                    f"file_create content requires confirmation: dangerous pattern "
                     f"{pat.pattern!r} detected."
                 )
-                _logger.warning("[PolicyEngine] M3 DENY: %s", reason)
+                _logger.warning("[PolicyEngine] M3 CONFIRM: %s", reason)
                 return self.REQUIRE_HUMAN_CONFIRMATION, reason
+
         if re.search(r"^#!\s*/", content, re.MULTILINE):
             reason = (
                 "file_create content requires confirmation: "
@@ -351,6 +386,7 @@ class PolicyEngine:
             )
             _logger.warning("[PolicyEngine] M3 CONFIRM: %s", reason)
             return self.REQUIRE_HUMAN_CONFIRMATION, reason
+
         return self.ALLOW, None
 
     # =========================================================================
@@ -491,12 +527,17 @@ class PolicyEngine:
         with self._apps_lock:
             app_allowed = app in self._allowed_apps
         if not app_allowed:
+            # AUDIT STRATEGY FIX: Unknown app → REQUIRE_HUMAN_CONFIRMATION, not hard DENY.
+            # Hard DENY prevents GII from operating on any unlisted application.
+            # Unknown apps trigger consequence evaluation + human approval instead.
             reason = (
-                f"Unauthorized application: {app!r}. "
-                "Add to allowed_apps or call allow_app() after installation."
+                f"Unknown application {app!r}. Consequence evaluation required. "
+                "Approve or add to allowed_apps in policy.yaml to avoid this prompt."
             )
-            _logger.warning("[PolicyEngine] DENY: op=%r app=%r — %s", op, app, reason)
-            return self.DENY, reason
+            _logger.warning(
+                "[PolicyEngine] REQUIRE_HUMAN_CONFIRMATION (unknown app): op=%r app=%r", op, app
+            )
+            return self.REQUIRE_HUMAN_CONFIRMATION, reason
 
         if app in self._high_risk_apps:
             reason = (
@@ -634,7 +675,15 @@ class PolicyEngine:
         with self._apps_lock:
             app_allowed = app in self._allowed_apps
         if not app_allowed:
-            return self.DENY, f"Unauthorized application: {app!r}."
+            # AUDIT STRATEGY FIX: Replace hard DENY with REQUIRE_HUMAN_CONFIRMATION
+            # for unknown apps. Hard DENY prevents GII from operating on any
+            # application not pre-approved — fundamentally contradicting GII goals.
+            # Instead, unknown apps trigger consequence evaluation + human confirmation.
+            # Over time the allowlist becomes a trust cache, not a hard gate.
+            return self.REQUIRE_HUMAN_CONFIRMATION, (
+                f"Unknown application {app!r}. Consequence evaluation required. "
+                "Approve or add to allowed_apps in policy.yaml."
+            )
 
         if app in self._high_risk_apps:
             return self.REQUIRE_HUMAN_CONFIRMATION, (
