@@ -78,6 +78,12 @@ def _element_is_injection(element: Dict[str, Any]) -> bool:
     AUDIT-HIGH FIX: Uses full 50+ marker frozenset from injection_markers.py
     with Unicode normalization instead of the original 8-item local list.
     This catches Unicode fullwidth bypass attempts (e.g., ｒｍ　－ｒｆ　～).
+
+    AUDIT-SAFETY FIX: Explicitly scans ``label``, ``aria-label``,
+    ``placeholder``, and ``tooltip`` fields in addition to ``text``.
+    Custom accessibility metadata injected via these fields was previously
+    only caught by the generic fallback scan, which missed the full marker
+    set when ``_FULL_INJECTION_CHECK_AVAILABLE`` is False.
     """
     if not isinstance(element, dict):
         return False
@@ -87,21 +93,32 @@ def _element_is_injection(element: Dict[str, Any]) -> bool:
     if _INJECTION_TYPE_RE.search(elem_type):
         return True
 
-    # Check text field using full marker system
-    elem_text = str(element.get("text") or "")
-    if elem_text:
+    def _check_string_value(val: str) -> bool:
+        """Return True if val contains an injection marker."""
+        if not val:
+            return False
         if _FULL_INJECTION_CHECK_AVAILABLE:
-            if _contains_injection_marker(elem_text):
+            return _contains_injection_marker(val)
+        # Fallback: check inline marker list (used when injection_markers import fails)
+        val_lower = val.lower()
+        for marker in _INJECTION_TEXT_MARKERS:
+            if marker in val_lower:
                 return True
-        else:
-            elem_lower = elem_text.lower()
-            for marker in _INJECTION_TEXT_MARKERS:
-                if marker in elem_lower:
-                    return True
+        return False
 
-    # Check all string values
+    # AUDIT-SAFETY FIX: Explicitly scan high-risk accessibility / UI metadata fields.
+    # These fields can carry injected instructions in web-rendered overlays and
+    # custom application UIs without appearing in visible text.
+    _HIGH_RISK_FIELDS = ("text", "label", "aria-label", "placeholder", "tooltip",
+                         "name", "description", "title", "value", "hint")
+    for field in _HIGH_RISK_FIELDS:
+        field_val = str(element.get(field) or "")
+        if field_val and _check_string_value(field_val):
+            return True
+
+    # Check remaining string values (catches any other model-specific fields)
     for key, val in element.items():
-        if key == "text":
+        if key in _HIGH_RISK_FIELDS:
             continue  # already checked above
         if isinstance(val, str) and val:
             if "injection" in val.lower():
