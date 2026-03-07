@@ -1,12 +1,3 @@
-"""
-consequence_reasoner.py — Three-tier safety evaluation with tiered model routing.
-
-AUDIT FIXES:
-  - Tier 2 (goal coherence): routes to FAST endpoint (Qwen3-32B, instruct mode)
-  - Tier 3 (consequence simulation): routes to DEEP endpoint (Qwen3-235B, thinking mode)
-  - Falls back gracefully to single llm_callable when tiered endpoints not configured
-  - Both tiers retain original generous timeouts (150s / 180s) for CPU fallback
-"""
 from __future__ import annotations
 
 import json
@@ -181,10 +172,7 @@ def classify_reversibility(action: Dict[str, Any]) -> Reversibility:
 # ---------------------------------------------------------------------------
 
 def _build_endpoint_callable(endpoint) -> Optional[Callable]:
-    """
-    Build an llm_callable from a ModelEndpoint (config/model_config.py).
-    Returns None if endpoint cannot be reached or SGLang is not configured.
-    """
+    
     if endpoint is None:
         return None
     try:
@@ -428,24 +416,7 @@ def simulate_consequences(
 # ---------------------------------------------------------------------------
 
 class ConsequenceReasoner:
-    """
-    Three-tier safety evaluator with tiered model routing.
-
-    AUDIT FIX: Tier 2 and Tier 3 now use separate model endpoints:
-      - Tier 2 (goal coherence): fast endpoint (Qwen3-32B, instruct mode, ~60s)
-      - Tier 3 (consequence simulation): deep endpoint (Qwen3-235B, thinking mode, ~300s)
-      - Both fall back gracefully to the shared `llm_callable` if endpoint callables
-        are not provided (e.g. CPU/Ollama deployments).
-
-    Constructor:
-        llm_callable  : default LLM callable (Ollama/CPU fallback, used when tiered
-                        callables are absent)
-        fast_callable : optional callable for Tier 2 (fast endpoint)
-        deep_callable : optional callable for Tier 3 (deep/thinking endpoint)
-
-    All callables must match the signature:
-        callable(messages, objective, session_id) → str | list
-    """
+    
 
     def __init__(
         self,
