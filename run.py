@@ -497,7 +497,15 @@ def _validate_runtime_dependencies(model_name: str) -> None:
                     "(first inference loads weights; may take 1-5 min on cold start)...",
                     file=sys.stderr,
                 )
-                _pw_client = _ollama_prewarm.Client()
+                # AUDIT LOW FIX: Add 120s timeout to pre-warm call.
+                # Previously no timeout was set — if Ollama hung, the process
+                # hung indefinitely at startup with no user feedback.
+                import httpx as _httpx_pw
+                _pw_client = _ollama_prewarm.Client(
+                    timeout=_httpx_pw.Timeout(
+                        connect=10.0, read=120.0, write=5.0, pool=2.0
+                    )
+                )
                 _pw_response = _pw_client.chat(
                     model=model_name,
                     messages=[{"role": "user", "content": "Hello. Reply with one word."}],
@@ -518,6 +526,35 @@ def _validate_runtime_dependencies(model_name: str) -> None:
                     "VisionRuntime warmup may take longer.",
                     file=sys.stderr,
                 )
+
+    # AUDIT LOW FIX: LlamaGuard Tier 4 status disclosure.
+    # Operators need to know whether Tier 4 content classification is active.
+    # Previously this was silently absent from the startup output — operators
+    # deploying without LlamaGuard could incorrectly assume Tier 4 was active.
+    _llamaguard_active = False
+    try:
+        from core.safety.llamaguard_classifier import classify_with_llamaguard as _lgc_check  # noqa
+        _llamaguard_active = True
+    except ImportError:
+        _llamaguard_active = False
+    except Exception:
+        _llamaguard_active = False
+
+    _require_llamaguard = os.environ.get("PROJECTZEO_REQUIRE_LLAMAGUARD", "0").strip() == "1"
+    _tier4_status = "ACTIVE" if _llamaguard_active else "INACTIVE"
+    _tier4_line = (
+        f"[SAFETY] LlamaGuard Tier 4 : {_tier4_status}"
+        + (" (REQUIRED — PROJECTZEO_REQUIRE_LLAMAGUARD=1)" if _require_llamaguard else "")
+        + ("" if _llamaguard_active else
+           " — install llama-guard for Tier 4 content classification")
+    )
+    print(_tier4_line, file=sys.stderr)
+
+    if _require_llamaguard and not _llamaguard_active:
+        errors.append(
+            "  [SAFETY] PROJECTZEO_REQUIRE_LLAMAGUARD=1 but LlamaGuard is not installed.\n"
+            "    Fix: pip install llama-guard  OR unset PROJECTZEO_REQUIRE_LLAMAGUARD"
+        )
 
     if warnings:
         print("\n[STARTUP] Dependency warnings (non-fatal):", file=sys.stderr)
