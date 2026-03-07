@@ -251,11 +251,19 @@ class ExecutionPlanner:
         llm_call,
         environment_fingerprint: Optional[Dict[str, Any]] = None,
         world_graph=None,
+        coder_llm_call=None,
     ):
         if not callable(llm_call):
             raise PlanningError("llm_call must be callable")
 
         self._llm_call = llm_call
+        # AUDIT FIX: Coder endpoint routing for command_execution / script generation
+        # When PROJECTZEO_USE_SGLANG=1 and a coder endpoint is available, shell and
+        # script generation steps are routed through Qwen3-Coder-480B instead of
+        # the default vision/reasoning model.
+        self._coder_llm_call = coder_llm_call if callable(coder_llm_call) else None
+        if self._coder_llm_call is None:
+            self._coder_llm_call = self._try_auto_wire_coder_callable()
         self._environment = environment_fingerprint or {}
         self._world_snapshot: Dict[str, Any] = {}
         self._executor = ThreadPoolExecutor(max_workers=1)
@@ -374,6 +382,49 @@ class ExecutionPlanner:
     def update_world_snapshot(self, snapshot: Dict[str, Any]):
         if isinstance(snapshot, dict):
             self._world_snapshot = snapshot
+
+    def _try_auto_wire_coder_callable(self):
+        """
+        AUDIT FIX: Auto-wire Qwen3-Coder-480B callable when SGLang GPU mode is active.
+        Returns None silently if SGLang is not configured or coder endpoint unreachable.
+        """
+        try:
+            from config.model_config import is_gpu_mode, get_coder_endpoint  # noqa
+            if not is_gpu_mode():
+                return None
+            ep = get_coder_endpoint()
+            from adapters.sglang_adapter import SGLangAdapter  # noqa
+            adapter = SGLangAdapter(
+                model_id=ep.model_id,
+                base_url=ep.base_url,
+                max_tokens=ep.max_tokens,
+                temperature=ep.temperature,
+                timeout_seconds=ep.timeout_seconds,
+                thinking_mode=ep.default_thinking,
+            )
+            if not adapter.health_check():
+                return None
+            def _coder_callable(messages, objective=None, session_id="planner_coder"):
+                return adapter(messages=messages, objective=objective, session_id=session_id)
+            _coder_callable.__name__ = "sglang_coder"
+            import logging as _lg
+            _lg.getLogger(__name__).info(
+                "[ExecutionPlanner] Auto-wired coder endpoint: %s @ %s",
+                ep.model_id, ep.base_url,
+            )
+            return _coder_callable
+        except Exception:
+            return None
+
+    def _is_code_heavy_goal(self, goal: str) -> bool:
+        """Heuristic: return True when a goal primarily involves shell/code generation."""
+        _CODE_KEYWORDS = {
+            "script", "command", "shell", "bash", "python", "code", "compile",
+            "build", "make", "cmake", "gcc", "clang", "cargo", "npm run",
+            "pip install", "apt install", "brew install", "docker", "kubectl",
+        }
+        goal_lower = goal.lower()
+        return any(kw in goal_lower for kw in _CODE_KEYWORDS)
 
     def get_llm_callable(self):
         return self._llm_call
@@ -791,7 +842,57 @@ class ExecutionPlanner:
                 )
                 raw_text = self._call_llm_text(prompt)
         else:
-            raw_text = self._call_llm_text(prompt)
+            # AUDIT FIX: Route code/script generation goals to Qwen3-Coder endpoint.
+            # For goals that are primarily shell commands or code generation, the
+            # Coder model produces significantly better plans than the vision model.
+            if (
+                self._coder_llm_call is not None
+                and self._is_code_heavy_goal(goal)
+            ):
+                try:
+                    coder_messages = [
+                        {
+                            "role": "system",
+                            "content": (
+                                "You are an expert execution planner specialising in "
+                                "shell commands, scripting, and code execution. "
+                                "Return ONLY valid JSON. No prose. No markdown fences."
+                            ),
+                        },
+                        {"role": "user", "content": prompt},
+                    ]
+                    import threading as _threading
+                    _coder_result = [None]
+                    def _coder_call():
+                        try:
+                            raw = self._coder_llm_call(
+                                coder_messages, None, "planner_coder"
+                            )
+                            if isinstance(raw, str):
+                                _coder_result[0] = raw
+                            elif isinstance(raw, list) and raw:
+                                item = raw[0]
+                                _coder_result[0] = (
+                                    item.get("content", "") if isinstance(item, dict)
+                                    else str(item)
+                                )
+                        except Exception as _ce:
+                            import logging as _lg
+                            _lg.getLogger(__name__).warning(
+                                "[ExecutionPlanner] Coder LLM call failed (%s) — "
+                                "falling back to default planner LLM.", _ce
+                            )
+                    _ct = _threading.Thread(target=_coder_call, daemon=True)
+                    _ct.start()
+                    _ct.join(timeout=120.0)
+                    if _coder_result[0]:
+                        raw_text = _coder_result[0]
+                    else:
+                        raw_text = self._call_llm_text(prompt)
+                except Exception:
+                    raw_text = self._call_llm_text(prompt)
+            else:
+                raw_text = self._call_llm_text(prompt)
 
         steps = self._parse_step_array(raw_text)
 
