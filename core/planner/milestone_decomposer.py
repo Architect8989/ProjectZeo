@@ -109,7 +109,13 @@ class Milestone:
 
 
 class MilestoneDecomposer:
-    
+    """
+    Decomposes an objective into a goal graph of milestone conditions.
+
+    This is the replacement for ExecutionPlanner.create_plan() sequential
+    step generation for GII execution.  The ExecutionPlanner is retained as
+    a scaffold generator (backward compatibility with PerStepReasoner).
+    """
 
     # Maximum number of milestones allowed (prevents runaway goal graphs)
     MAX_MILESTONES = 7
@@ -132,7 +138,15 @@ class MilestoneDecomposer:
         objective: str,
         environment: Optional[Dict[str, Any]] = None,
     ) -> List[Milestone]:
-        
+        """
+        Decompose objective into ordered milestone conditions.
+
+        Returns a list of Milestone objects ordered from first to last.
+        The last milestone's next_milestone is None (terminal state).
+
+        Raises MilestoneDecompositionError on LLM failure or parse error.
+        Falls back to a minimal 2-milestone plan on any error.
+        """
         if not isinstance(objective, str) or not objective.strip():
             raise MilestoneDecompositionError("Objective must be a non-empty string")
 
@@ -291,7 +305,14 @@ class MilestoneDecomposer:
 
     @staticmethod
     def milestones_to_scaffold_steps(milestones: List[Milestone]) -> List[Dict[str, Any]]:
-        
+        """
+        Convert milestones to scaffold step format for PerStepReasoner.
+
+        This bridges milestone-based GII planning with the existing
+        PerStepReasoner scaffold injection mechanism.
+        Each milestone becomes a scaffold phase: the reasoner knows the target
+        condition but is free to choose any action to achieve it.
+        """
         steps = []
         for ms in milestones:
             steps.append({
@@ -327,7 +348,26 @@ class MilestoneDecomposer:
         milestones: List[Milestone],
         current_idx: int,
     ) -> Tuple[int, Optional[Milestone]]:
-        
+        """
+        Mark the current milestone as achieved and return (next_idx, next_milestone).
+
+        Parameters
+        ----------
+        milestones      : Full milestone list (returned by decompose()).
+        current_idx     : Zero-based index of the milestone just completed.
+
+        Returns
+        -------
+        (next_idx, next_milestone)
+            next_idx is current_idx + 1.
+            next_milestone is None if all milestones are achieved.
+
+        Usage (GIIController):
+            idx, ms = MilestoneDecomposer.advance_milestone(self._milestones, self._current_milestone_idx)
+            self._current_milestone_idx = idx
+            if ms is not None:
+                self._inject_current_milestone()
+        """
         if milestones and 0 <= current_idx < len(milestones):
             milestones[current_idx].achieved = True
         next_idx = current_idx + 1
@@ -339,7 +379,27 @@ class MilestoneDecomposer:
         milestone: Milestone,
         world_state: Dict[str, Any],
     ) -> bool:
-        
+        """
+        Lightweight heuristic to detect milestone completion from world state.
+
+        Checks whether the milestone's completion_signal text appears in
+        the visible UI elements, focused application name, or last command output.
+
+        This is intentionally conservative: false negatives (missed completions)
+        cause the agent to do one extra unnecessary step. False positives
+        (premature advancement) cause the agent to skip work.
+
+        For production: replace with a VL-model semantic verification pass.
+
+        Parameters
+        ----------
+        milestone   : The Milestone to check.
+        world_state : The current world_snapshot dict from WorldGraph.snapshot().
+
+        Returns
+        -------
+        True if completion signal is detected, False otherwise.
+        """
         signal = milestone.completion_signal.lower().strip()
         if not signal:
             return False
