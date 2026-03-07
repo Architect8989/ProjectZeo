@@ -295,10 +295,15 @@ class PolicyEngine:
         if not path:
             return self.DENY, "file_create: empty path"
 
-        norm_path = os.path.normpath(os.path.expanduser(path))
+        # AUDIT HIGH FIX: Use os.path.realpath() before comparison to resolve
+        # symlinks and prevent symlink-based path escapes.
+        # Example attack: create symlink ~/allowed/evil -> /etc/sudoers.d/
+        # Without realpath(), the path check passes because ~/allowed/ is allowed.
+        # With realpath(), the resolved path starts with /etc/ and is denied.
+        norm_path = os.path.realpath(os.path.normpath(os.path.expanduser(path)))
 
         for denied in self._denied_write_paths:
-            denied_norm = os.path.normpath(denied)
+            denied_norm = os.path.realpath(os.path.normpath(os.path.expanduser(denied)))
             if norm_path == denied_norm or norm_path.startswith(denied_norm + os.sep):
                 reason = (
                     f"file_create DENIED: path {path!r} is in a protected "
