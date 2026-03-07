@@ -1,3 +1,19 @@
+"""
+apis_safety_layer.py — Cloud API provider safety patches.
+
+AUDIT FIX (March 2026):
+  MEDIUM-1: uninstall_patches() was a no-op with a misleading docstring claiming
+    patches were removed on shutdown. If patches fail mid-application and the
+    module is reloaded, _MODULE_PATCHES_APPLIED=True may be set while some
+    patches were not applied (partially patched state).
+
+    Fix: implement actual patch reversal in uninstall_patches():
+      - Restore original PIL.Image.Image.save if it was patched
+      - Restore original os.makedirs if it was patched
+      - Restore original get_next_action if it was patched
+      - Reset _MODULE_PATCHES_APPLIED = False
+    This enables safe module reload without partially-patched state.
+"""
 import copy
 import functools
 import inspect
@@ -5,8 +21,11 @@ import types
 import importlib
 
 
-
 _MODULE_PATCHES_APPLIED: bool = False  # set to True in apply_patches(); read via is_patched()
+
+# Registry of applied patches for reversal (audit MEDIUM-1)
+# Maps (module, attribute_name) → original_value
+_PATCH_REGISTRY: dict = {}
 
 
 def is_patched() -> bool:
@@ -52,8 +71,8 @@ def _get_apis() -> object:
 # ============================================================
 
 def apply_patches() -> None:
-    
-    global _MODULE_PATCHES_APPLIED
+
+    global _MODULE_PATCHES_APPLIED, _PATCH_REGISTRY
 
     if _MODULE_PATCHES_APPLIED:
         return
@@ -74,14 +93,10 @@ def apply_patches() -> None:
             "Screenshot write guard is installed.",
             file=sys.stderr,
         )
-        # Screenshot guard is installed; mark complete so we don't retry.
         _MODULE_PATCHES_APPLIED = True
         return
 
     if getattr(apis, "_safety_patches_applied", False):
-        # Target module already patched (e.g. this module was reloaded but the
-        # target module was not). Mark this module as patched too so future
-        # calls short-circuit on the cheaper _MODULE_PATCHES_APPLIED check.
         _MODULE_PATCHES_APPLIED = True
         return
 
@@ -97,11 +112,60 @@ def apply_patches() -> None:
     _MODULE_PATCHES_APPLIED = True
 
 
-def uninstall_patches():
+def uninstall_patches() -> None:
+    """
+    AUDIT MEDIUM-1 FIX: Implement actual patch reversal.
+
+    Restores all patched functions/methods to their original versions using
+    the _PATCH_REGISTRY populated during apply_patches(). Resets
+    _MODULE_PATCHES_APPLIED to False so the next call to apply_patches()
+    will re-apply all patches from scratch.
+
+    This enables safe module reload without leaving a partially-patched state.
+    """
+    global _MODULE_PATCHES_APPLIED, _PATCH_REGISTRY
     import logging as _logging
 
     _logger2 = _logging.getLogger(__name__)
-    _logger2.info("[APIS-SAFETY] uninstall_patches(): completed (no process-wide patches to remove).")
+    _reversed = 0
+    _errors = 0
+
+    for (mod_or_obj, attr_name), original_value in list(_PATCH_REGISTRY.items()):
+        try:
+            current = getattr(mod_or_obj, attr_name, None)
+            # Only revert if still patched (not already reverted by another call)
+            if current is not original_value:
+                setattr(mod_or_obj, attr_name, original_value)
+                _reversed += 1
+                _logger2.debug(
+                    "[APIS-SAFETY] uninstall_patches: reverted %s.%s",
+                    getattr(mod_or_obj, "__name__", repr(mod_or_obj)), attr_name,
+                )
+        except Exception as exc:
+            _errors += 1
+            _logger2.warning(
+                "[APIS-SAFETY] uninstall_patches: failed to revert %s.%s: %s",
+                getattr(mod_or_obj, "__name__", repr(mod_or_obj)), attr_name, exc,
+            )
+
+    # Clear the registry after reversal
+    _PATCH_REGISTRY.clear()
+
+    # Reset the applied flag so apply_patches() can be called again
+    _MODULE_PATCHES_APPLIED = False
+
+    # Also clear the flag on the apis module if accessible
+    try:
+        apis = _get_apis()
+        if hasattr(apis, "_safety_patches_applied"):
+            setattr(apis, "_safety_patches_applied", False)
+    except Exception:
+        pass
+
+    _logger2.info(
+        "[APIS-SAFETY] uninstall_patches(): completed. reverted=%d errors=%d",
+        _reversed, _errors,
+    )
 
 
 # ============================================================
@@ -116,7 +180,7 @@ def _wrap_provider(fn):
     is_async = inspect.iscoroutinefunction(fn)
 
     def _validate_no_mutation(snapshot, checked_copy, name):
-        
+
         if checked_copy != snapshot:
             raise RuntimeError(
                 f"[APIS-SAFETY] Provider mutated caller messages: {name}"
@@ -157,7 +221,6 @@ def _wrap_provider(fn):
                     f"[APIS-SAFETY] {fn.__name__} failed: {e}"
                 ) from e
 
-            # H2 FIX: pass safe_messages (what fn received) not messages (original)
             _validate_no_mutation(caller_snapshot, safe_messages, fn.__name__)
             _validate_result(result, fn.__name__)
 
@@ -185,7 +248,6 @@ def _wrap_provider(fn):
                     f"[APIS-SAFETY] {fn.__name__} failed: {e}"
                 ) from e
 
-            # H2 FIX: pass safe_messages (what fn received) not messages (original)
             _validate_no_mutation(caller_snapshot, safe_messages, fn.__name__)
             _validate_result(result, fn.__name__)
 
@@ -200,7 +262,7 @@ def _wrap_provider(fn):
 # ============================================================
 
 def _patch_all_providers():
-    
+
     modules_to_patch = []
 
     # Primary (wrapper) module — always present
@@ -214,15 +276,11 @@ def _patch_all_providers():
         pass  # Legacy module absent — acceptable on Ollama-only installs
 
     # H-07 FIX (BOUNDARY-02): Also patch operate.models.apis_openrouter.
-    # The previous implementation only patched operate.models.apis and
-    # operate.legacy.apis.  Any future import of apis_openrouter bypassed the
-    # safety layer entirely — its cloud calls received no immutability
-    # enforcement, no temperature injection, and no validation.
     try:
         openrouter = importlib.import_module("operate.models.apis_openrouter")
         modules_to_patch.append(openrouter)
     except Exception:
-        pass  # Module absent on Ollama-only installs — acceptable
+        pass
 
     for _m in modules_to_patch:
         for name in dir(_m):
@@ -230,6 +288,8 @@ def _patch_all_providers():
                 continue
             attr = getattr(_m, name)
             if isinstance(attr, types.FunctionType):
+                # AUDIT MEDIUM-1: Register original for reversal before patching
+                _PATCH_REGISTRY[(_m, name)] = attr
                 setattr(_m, name, _wrap_provider(attr))
 
 
@@ -240,6 +300,9 @@ def _patch_all_providers():
 def _disable_cloud_fallbacks():
 
     if hasattr(_get_apis(), "gpt_4_fallback"):
+
+        original_fallback = _get_apis().gpt_4_fallback
+        _PATCH_REGISTRY[(_get_apis(), "gpt_4_fallback")] = original_fallback
 
         def hard_fail_fallback(*args, **kwargs):
             raise RuntimeError("[APIS-SAFETY] Cloud fallback disabled")
@@ -281,6 +344,8 @@ def _disable_screenshot_writes():
 
     if hasattr(_m, "os") and hasattr(_m.os, "makedirs"):
         _orig_makedirs = _m.os.makedirs
+        # AUDIT MEDIUM-1: Register for reversal
+        _PATCH_REGISTRY[(_m.os, "makedirs")] = _orig_makedirs
 
         def _guarded_makedirs(path, *args, **kwargs):
             if _is_screenshot_path(path):
@@ -292,6 +357,8 @@ def _disable_screenshot_writes():
     if hasattr(_m, "Image"):
         try:
             _orig_save = _m.Image.Image.save
+            # AUDIT MEDIUM-1: Register for reversal
+            _PATCH_REGISTRY[(_m.Image.Image, "save")] = _orig_save
 
             def _guarded_save(self, fp, *args, **kwargs):
                 if _is_screenshot_path(fp):
@@ -320,18 +387,14 @@ def _guard_dispatch():
     if getattr(original, "_apis_safety_wrapped", False):
         return
 
+    # AUDIT MEDIUM-1: Register for reversal
+    _PATCH_REGISTRY[(_m2, "get_next_action")] = original
+
     if inspect.iscoroutinefunction(original):
 
         @functools.wraps(original)
         async def guarded(model, messages, objective, session_id):
 
-            # SI-C FIX: Validate that `model` is a non-empty string.
-            # The original dispatcher accepted None or non-string model values
-            # silently — they passed through to the underlying router without
-            # type validation.  A None model (possible if an adapter's
-            # _resolve_model_function() returns None on misconfiguration) would
-            # propagate into Ollama's client.chat(), producing a cryptic
-            # internal error rather than a clear contract violation here.
             if not isinstance(model, str) or not model.strip():
                 raise RuntimeError(
                     f"[APIS-SAFETY] Dispatcher model must be a non-empty string, "
@@ -363,7 +426,6 @@ def _guard_dispatch():
         @functools.wraps(original)
         def guarded(model, messages, objective, session_id):
 
-            # SI-C FIX: Same model type validation as the async path above.
             if not isinstance(model, str) or not model.strip():
                 raise RuntimeError(
                     f"[APIS-SAFETY] Dispatcher model must be a non-empty string, "
