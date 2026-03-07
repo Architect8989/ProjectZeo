@@ -1,3 +1,4 @@
+# Core
 ollama>=0.4.0
 annotated-types>=0.6.0
 anyio>=3.7.1
@@ -36,16 +37,44 @@ tqdm>=4.66.1
 typing_extensions>=4.8.0
 urllib3>=2.0.7
 pywin32>=306 ; sys_platform == "win32"
+
+# LLM providers
 anthropic>=0.40.0,<1.0.0
 google-genai>=1.0.0
 openai>=1.13.0
+
+# Async
 aiohttp>=3.9.1
+
+# Vision / OCR
 easyocr>=1.7.1
 pyyaml>=6.0
 playwright>=1.42.0
+
+# Agent framework
 langgraph>=0.1.0
 langchain-core>=0.1.0
+
+# Memory — Tier 1: Mem0 (lightweight, always-on fallback)
 mem0ai>=0.1.0
+
+# Memory — Tier 2: Qdrant vector database (used by both Cognee and standalone)
 qdrant-client>=1.7.0
+
+# Memory — Tier 3: Cognee (semantic graph memory, optional GPU acceleration)
+# Install: pip install cognee
+# cognee>=0.1.0
+
+# Memory — Tier 4: Letta (formerly MemGPT, persistent editing agent memory)
+# Install: pip install letta  (requires a running Letta server)
+# letta>=0.5.0
+
+# GPU inference — SGLang (primary, recommended for production)
 sglang[all]>=0.4.0
+
+# GPU inference — vLLM (alternative to SGLang, set PROJECTZEO_USE_VLLM=1)
+# Install: pip install vllm  (heavy dependency, CUDA required)
+# vllm>=0.4.0
+
+# Visualisation
 matplotlib>=3.8.1
