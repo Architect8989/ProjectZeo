@@ -368,17 +368,27 @@ class WorldGraph:
             }
         )
 
-    def proactive_cleanup(self) -> int:
+    def proactive_cleanup(self, *, lightweight_mode: bool = False) -> int:
         """
         AUDIT-MEDIUM-1: Force-evict entities that have exceeded the stale
         threshold based on wall-clock time.  Call periodically (e.g. every
         10s) when VL inference is running at reduced rate or after task
         completion to ensure no ghost entities survive into the next task.
 
+        AUDIT FIX: Accepts ``lightweight_mode`` parameter so callers in the
+        ObserverLoop can pass the current mode flag.  When ``lightweight_mode``
+        is True (1 Hz / inference-in-progress), the extended 120-second window
+        (``ENTITY_STALE_SECONDS_LIGHTWEIGHT``) is used to prevent mass-eviction
+        of legitimately present entities during long CPU inference cycles.
+
         Returns the number of entities evicted.
         """
         now = time.monotonic()
-        cutoff = now - ENTITY_STALE_SECONDS
+        stale_threshold = (
+            ENTITY_STALE_SECONDS_LIGHTWEIGHT if lightweight_mode
+            else ENTITY_STALE_SECONDS
+        )
+        cutoff = now - stale_threshold
 
         with self._lock:
             before = len(self._entities)
@@ -393,7 +403,8 @@ class WorldGraph:
             import logging as _log
             _log.getLogger(__name__).debug(
                 "[WorldGraph] proactive_cleanup: evicted %d stale entities "
-                "(threshold=%.1fs).", evicted, ENTITY_STALE_SECONDS,
+                "(threshold=%.1fs, lightweight=%s).",
+                evicted, stale_threshold, lightweight_mode,
             )
 
         return evicted
