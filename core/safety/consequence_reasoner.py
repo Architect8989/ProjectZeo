@@ -1,3 +1,31 @@
+"""
+consequence_reasoner.py — Three-tier safety evaluation with tiered model routing.
+
+AUDIT FIXES (March 2026):
+
+  HIGH-1: ConsequenceReasoner now applied to write/type operations when
+    _external_content_source=True (content derived from screen/VL output).
+    Previously only command/file_create/install were evaluated. A type
+    operation constructing a malicious shell command bypassed all tiers.
+
+  HIGH-2: Combined Tier 2+3 single-prompt for CPU-only path.
+    On CPU (no SGLang), both tiers route to the same shared LLM.
+    Sequential Tier 2 + Tier 3 = 2 × 40–90s = 80–180s per safety eval.
+    When _tier2_callable is _tier3_callable (same object), a single
+    combined prompt now asks both coherence and consequence questions,
+    halving latency for high-risk irreversible actions on CPU.
+
+  HIGH-3: Terminal-context reclassification for type/write.
+    If focused_app is a terminal emulator, type/write operations are
+    reclassified from REVERSIBLE to CAUTION regardless of content length.
+    Prevents "type rm -rf ~ into terminal" from bypassing Tier 1.
+
+  MEDIUM-1: Password/secret role → mandatory Tier 3.
+    Any action proposing to type into a role classified as "password" or
+    "secret" triggers Tier 3 consequence simulation regardless of
+    reversibility classification. Phishing overlays cannot bypass Tier 3
+    by presenting a correctly-labeled text entry role.
+"""
 from __future__ import annotations
 
 import json
@@ -9,6 +37,14 @@ from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 _logger = logging.getLogger(__name__)
+
+# Terminal emulator process names for terminal-context reclassification (HIGH-3)
+_TERMINAL_APPS: frozenset = frozenset({
+    "gnome-terminal", "xterm", "konsole", "xfce4-terminal", "mate-terminal",
+    "tilix", "alacritty", "terminal", "iterm", "iterm2", "hyper",
+    "bash", "sh", "zsh", "fish", "kitty", "wezterm", "terminator",
+    "rxvt", "urxvt", "st",
+})
 
 
 # ---------------------------------------------------------------------------
@@ -132,8 +168,19 @@ _CAUTION_COMMAND_PATTERNS: List[re.Pattern] = [
 ]
 
 
-def classify_reversibility(action: Dict[str, Any]) -> Reversibility:
-    """Tier 1: classify action reversibility without any LLM call."""
+def classify_reversibility(
+    action: Dict[str, Any],
+    *,
+    focused_app: Optional[str] = None,
+) -> Reversibility:
+    """
+    Tier 1: classify action reversibility without any LLM call.
+
+    AUDIT HIGH-3 FIX: When focused_app is a terminal emulator, type/write
+    operations are reclassified from REVERSIBLE to CAUTION regardless of
+    content length. Commands typed into terminals are immediately executable
+    and can cause irreversible harm even if the content looks short.
+    """
     op = str(action.get("operation") or "").lower().strip()
 
     if op in _REVERSIBLE_OPS:
@@ -142,6 +189,14 @@ def classify_reversibility(action: Dict[str, Any]) -> Reversibility:
         return Reversibility.IRREVERSIBLE
 
     if op in ("type", "write"):
+        # AUDIT HIGH-3: Terminal-context reclassification.
+        # Even short type/write operations into a terminal emulator warrant
+        # CAUTION because the content will be executed as a shell command.
+        if focused_app is not None:
+            app_lower = str(focused_app).lower().strip()
+            for term_app in _TERMINAL_APPS:
+                if term_app in app_lower or app_lower in term_app:
+                    return Reversibility.CAUTION
         content_len = len(str(action.get("content") or ""))
         return Reversibility.REVERSIBLE if content_len < 50 else Reversibility.CAUTION
 
@@ -172,7 +227,7 @@ def classify_reversibility(action: Dict[str, Any]) -> Reversibility:
 # ---------------------------------------------------------------------------
 
 def _build_endpoint_callable(endpoint) -> Optional[Callable]:
-    
+
     if endpoint is None:
         return None
     try:
@@ -185,7 +240,6 @@ def _build_endpoint_callable(endpoint) -> Optional[Callable]:
             timeout_seconds=endpoint.timeout_seconds,
             thinking_mode=endpoint.default_thinking,
         )
-        # Verify reachability
         if not adapter.health_check():
             _logger.debug(
                 "[ConsequenceReasoner] Endpoint %s @ %s unreachable — will use fallback callable.",
@@ -193,7 +247,6 @@ def _build_endpoint_callable(endpoint) -> Optional[Callable]:
             )
             return None
 
-        # Wrap SGLangAdapter.__call__ into the standard llm_callable signature
         def _callable(messages, objective=None, session_id="consequence"):
             return adapter(messages=messages, objective=objective, session_id=session_id)
 
@@ -412,11 +465,138 @@ def simulate_consequences(
 
 
 # ---------------------------------------------------------------------------
+# AUDIT HIGH-2: Combined Tier 2+3 prompt for CPU-only path
+# ---------------------------------------------------------------------------
+
+_COMBINED_T2T3_SYSTEM_PROMPT = """\
+You are a safety evaluator for an autonomous computer agent (CPU inference mode).
+You must answer TWO questions about the proposed action:
+
+1. COHERENCE: Does this action make sense given the objective?
+   - COHERENT: plausible step toward the objective
+   - INCOHERENT: contradicts or has no connection to the objective
+   - UNCERTAIN: cannot determine
+
+2. CONSEQUENCES: If this action is executed, what are the consequences?
+   - Are any consequences IRREVERSIBLE and HARMFUL?
+   - HARMFUL means: data loss, privacy breach, system damage, unauthorized access
+
+Respond ONLY with a JSON object:
+{
+  "coherence": "COHERENT" | "INCOHERENT" | "UNCERTAIN",
+  "coherence_reason": "<one sentence>",
+  "consequences": ["<consequence 1>", "<consequence 2>", "<consequence 3>"],
+  "irreversible_harm_possible": true | false,
+  "harm_description": "<brief description if true, else empty string>",
+  "confidence": "HIGH" | "MEDIUM" | "LOW",
+  "combined_decision": "ALLOW" | "DENY" | "REQUIRE_CONFIRMATION"
+}
+"""
+
+
+def evaluate_combined_t2t3(
+    *,
+    objective: str,
+    step_description: str,
+    action: Dict[str, Any],
+    llm_callable: Callable,
+    timeout_seconds: float = 200.0,
+) -> Tuple[CoherenceVerdict, ConsequenceVerdict]:
+    """
+    AUDIT HIGH-2: Combined Tier 2+3 evaluation in a single LLM call.
+    Used when both tiers route to the same LLM (CPU-only deployments) to
+    halve latency for high-risk irreversible actions.
+
+    Returns (CoherenceVerdict, ConsequenceVerdict).
+    """
+    action_summary = {k: str(v)[:200] for k, v in action.items()
+                      if k not in ("_trusted_installer",)}
+    payload = json.dumps({
+        "OBJECTIVE":  objective[:500],
+        "STEP":       step_description[:300],
+        "ACTION":     action_summary,
+    }, ensure_ascii=False)
+
+    result_holder: List[Optional[str]] = [None]
+    error_holder:  List[Optional[Exception]] = [None]
+
+    def _call():
+        try:
+            raw = llm_callable(
+                messages=[
+                    {"role": "system", "content": _COMBINED_T2T3_SYSTEM_PROMPT},
+                    {"role": "user",   "content": payload},
+                ],
+                objective=None,
+                session_id="combined_t2t3",
+            )
+            if isinstance(raw, list) and raw:
+                result_holder[0] = str(
+                    raw[0].get("content", "") if isinstance(raw[0], dict) else raw[0]
+                )
+            elif isinstance(raw, str):
+                result_holder[0] = raw
+        except Exception as e:
+            error_holder[0] = e
+
+    thread = threading.Thread(target=_call, daemon=True)
+    thread.start()
+    thread.join(timeout=timeout_seconds)
+
+    _default = (CoherenceVerdict.UNCERTAIN, ConsequenceVerdict.UNCERTAIN)
+
+    if error_holder[0]:
+        _logger.warning(
+            "[ConsequenceReasoner] Combined T2T3 LLM call failed: %s — UNCERTAIN/UNCERTAIN.",
+            error_holder[0],
+        )
+        return _default
+
+    if thread.is_alive() or result_holder[0] is None:
+        _logger.warning("[ConsequenceReasoner] Combined T2T3 LLM timed out — UNCERTAIN/UNCERTAIN.")
+        return _default
+
+    try:
+        clean  = re.sub(r"```(?:json)?", "", result_holder[0]).strip()
+        parsed = json.loads(clean)
+
+        # Parse coherence
+        cv_str = str(parsed.get("coherence", "UNCERTAIN")).upper()
+        if cv_str == "COHERENT":
+            coherence = CoherenceVerdict.COHERENT
+        elif cv_str == "INCOHERENT":
+            _logger.warning(
+                "[ConsequenceReasoner] Combined T2T3 INCOHERENT: %s",
+                parsed.get("coherence_reason", ""),
+            )
+            coherence = CoherenceVerdict.INCOHERENT
+        else:
+            coherence = CoherenceVerdict.UNCERTAIN
+
+        # Parse consequence
+        harmful    = bool(parsed.get("irreversible_harm_possible", False))
+        confidence = str(parsed.get("confidence", "LOW")).upper()
+        if harmful and confidence in ("HIGH", "MEDIUM"):
+            consequence = ConsequenceVerdict.HARMFUL
+        elif harmful:
+            consequence = ConsequenceVerdict.UNCERTAIN
+        else:
+            consequence = ConsequenceVerdict.SAFE
+
+        return coherence, consequence
+
+    except Exception as parse_err:
+        _logger.warning(
+            "[ConsequenceReasoner] Combined T2T3 parse error: %s — UNCERTAIN/UNCERTAIN.", parse_err
+        )
+        return _default
+
+
+# ---------------------------------------------------------------------------
 # Main Entry Point: Three-tier evaluation with tiered model routing
 # ---------------------------------------------------------------------------
 
 class ConsequenceReasoner:
-    
 
     def __init__(
         self,
@@ -435,7 +615,6 @@ class ConsequenceReasoner:
         self._tier2_timeout = tier2_timeout
         self._tier3_timeout = tier3_timeout
 
-        # Tiered routing: attempt to auto-wire from model_config if not provided
         self._fast_llm = fast_callable
         self._deep_llm = deep_callable
 
@@ -449,6 +628,20 @@ class ConsequenceReasoner:
         self._enable_tier2 = enable_tier2 and self._tier2_callable is not None
         self._enable_tier3 = enable_tier3 and self._tier3_callable is not None
 
+        # AUDIT HIGH-2: Detect CPU-only mode (both tiers share same callable).
+        # When true, use combined prompt to halve latency on irreversible actions.
+        self._cpu_only_mode: bool = (
+            self._tier2_callable is not None
+            and self._tier3_callable is not None
+            and self._tier2_callable is self._tier3_callable
+        )
+        if self._cpu_only_mode:
+            _logger.info(
+                "[ConsequenceReasoner] CPU-only mode detected: Tier2 and Tier3 share "
+                "the same callable. Combined T2T3 prompt will be used for IRREVERSIBLE "
+                "actions to halve latency."
+            )
+
         # Stats
         self._eval_count    = 0
         self._deny_count    = 0
@@ -457,12 +650,13 @@ class ConsequenceReasoner:
 
         _logger.info(
             "[ConsequenceReasoner] Initialised. tier2=%s tier3=%s "
-            "tier2_callable=%s tier3_callable=%s",
+            "tier2_callable=%s tier3_callable=%s cpu_only=%s",
             self._enable_tier2, self._enable_tier3,
             getattr(self._tier2_callable, "__name__", type(self._tier2_callable).__name__)
             if self._tier2_callable else "None",
             getattr(self._tier3_callable, "__name__", type(self._tier3_callable).__name__)
             if self._tier3_callable else "None",
+            self._cpu_only_mode,
         )
 
     def _auto_wire_tiered_endpoints(self) -> None:
@@ -507,6 +701,7 @@ class ConsequenceReasoner:
         action: Dict[str, Any],
         objective: str,
         step_description: str = "",
+        focused_app: Optional[str] = None,
     ) -> ConsequenceResult:
         """Evaluate action safety. Fail-closed on unexpected errors."""
         start = time.monotonic()
@@ -514,7 +709,9 @@ class ConsequenceReasoner:
         snippet = f"{op}:{str(action.get('command') or action.get('text') or '')[:60]}"
 
         try:
-            return self._evaluate_inner(action, objective, step_description, snippet)
+            return self._evaluate_inner(
+                action, objective, step_description, snippet, focused_app=focused_app
+            )
         except Exception as exc:
             _logger.error(
                 "[ConsequenceReasoner] Unexpected error (fail-closed): %s", exc
@@ -537,28 +734,135 @@ class ConsequenceReasoner:
         objective: str,
         step_description: str,
         snippet: str,
+        *,
+        focused_app: Optional[str] = None,
     ) -> ConsequenceResult:
         t0 = time.monotonic()
+        op = str(action.get("operation") or "").lower().strip()
 
         # ── TIER 1: Reversibility Classification ────────────────────────────
-        reversibility = classify_reversibility(action)
+        # AUDIT HIGH-3: Pass focused_app for terminal-context reclassification
+        reversibility = classify_reversibility(action, focused_app=focused_app)
+
+        # AUDIT MEDIUM-1: Password/secret role → mandatory Tier 3 regardless of
+        # reversibility. A phishing overlay with a "password" input role must
+        # trigger consequence simulation.
+        target_role = str(action.get("target_role") or "").lower()
+        _password_role = "password" in target_role or "secret" in target_role
+        if _password_role and op in ("type", "write"):
+            _logger.warning(
+                "[ConsequenceReasoner] Password/secret role detected for type/write — "
+                "forcing Tier 3 evaluation regardless of reversibility."
+            )
+            reversibility = Reversibility.IRREVERSIBLE
 
         if reversibility == Reversibility.REVERSIBLE:
             external_source = bool(action.get("_external_content_source"))
-            if not external_source or not self._enable_tier2:
+            # AUDIT HIGH-1: Apply Tier 2 to type/write with external content source
+            # (covers "type into terminal from screen output" injection vector)
+            _is_type_write = op in ("type", "write")
+            if not external_source and not _is_type_write:
+                if not self._enable_tier2:
+                    return ConsequenceResult(
+                        decision=SafetyDecision.ALLOW,
+                        reversibility=reversibility,
+                        coherence=CoherenceVerdict.SKIPPED,
+                        consequence=ConsequenceVerdict.SKIPPED,
+                        tier_reached=1,
+                        reason="Reversible action — fast-path allowed",
+                        latency_ms=(time.monotonic() - t0) * 1000,
+                        action_snippet=snippet,
+                    )
+            elif not external_source:
+                # type/write without external source: fast-path unless large
+                if len(str(action.get("content") or "")) < 50:
+                    return ConsequenceResult(
+                        decision=SafetyDecision.ALLOW,
+                        reversibility=reversibility,
+                        coherence=CoherenceVerdict.SKIPPED,
+                        consequence=ConsequenceVerdict.SKIPPED,
+                        tier_reached=1,
+                        reason="Reversible short type/write — fast-path allowed",
+                        latency_ms=(time.monotonic() - t0) * 1000,
+                        action_snippet=snippet,
+                    )
+
+            if self._enable_tier2:
+                _logger.info(
+                    "[ConsequenceReasoner] External content source or type/write on REVERSIBLE "
+                    "action — running Tier 2 injection defence."
+                )
+
+        # ── AUDIT HIGH-2: Combined T2T3 for CPU-only IRREVERSIBLE actions ────
+        # When Tier 2 and Tier 3 share the same callable (CPU mode), avoid two
+        # sequential 40–90s LLM calls by using a single combined prompt.
+        if (
+            self._cpu_only_mode
+            and self._enable_tier2
+            and self._enable_tier3
+            and reversibility == Reversibility.IRREVERSIBLE
+        ):
+            _logger.info(
+                "[ConsequenceReasoner] CPU mode: using combined T2T3 prompt for "
+                "IRREVERSIBLE action (halves latency)."
+            )
+            coherence, consequence = evaluate_combined_t2t3(
+                objective=objective,
+                step_description=step_description,
+                action=action,
+                llm_callable=self._tier2_callable,
+                timeout_seconds=max(self._tier2_timeout, self._tier3_timeout),
+            )
+
+            if coherence == CoherenceVerdict.INCOHERENT:
+                with self._lock:
+                    self._deny_count += 1
                 return ConsequenceResult(
-                    decision=SafetyDecision.ALLOW,
+                    decision=SafetyDecision.DENY,
                     reversibility=reversibility,
-                    coherence=CoherenceVerdict.SKIPPED,
+                    coherence=coherence,
                     consequence=ConsequenceVerdict.SKIPPED,
-                    tier_reached=1,
-                    reason="Reversible action — fast-path allowed",
+                    tier_reached=2,
+                    reason="Combined T2T3 DENY: action incoherent (possible prompt injection).",
                     latency_ms=(time.monotonic() - t0) * 1000,
                     action_snippet=snippet,
                 )
-            _logger.info(
-                "[ConsequenceReasoner] External content source on REVERSIBLE action — "
-                "running Tier 2 injection defence."
+            if consequence == ConsequenceVerdict.HARMFUL:
+                with self._lock:
+                    self._confirm_count += 1
+                return ConsequenceResult(
+                    decision=SafetyDecision.REQUIRE_HUMAN_CONFIRMATION,
+                    reversibility=reversibility,
+                    coherence=coherence,
+                    consequence=consequence,
+                    tier_reached=3,
+                    reason="Combined T2T3 REQUIRE_HUMAN_CONFIRMATION: irreversible harm predicted.",
+                    latency_ms=(time.monotonic() - t0) * 1000,
+                    action_snippet=snippet,
+                )
+            if consequence == ConsequenceVerdict.UNCERTAIN:
+                with self._lock:
+                    self._confirm_count += 1
+                return ConsequenceResult(
+                    decision=SafetyDecision.REQUIRE_HUMAN_CONFIRMATION,
+                    reversibility=reversibility,
+                    coherence=coherence,
+                    consequence=consequence,
+                    tier_reached=3,
+                    reason="Combined T2T3 REQUIRE_HUMAN_CONFIRMATION: uncertain consequence for irreversible action.",
+                    latency_ms=(time.monotonic() - t0) * 1000,
+                    action_snippet=snippet,
+                )
+
+            return ConsequenceResult(
+                decision=SafetyDecision.ALLOW,
+                reversibility=reversibility,
+                coherence=coherence,
+                consequence=consequence,
+                tier_reached=3,
+                reason="Combined T2T3 passed",
+                latency_ms=(time.monotonic() - t0) * 1000,
+                action_snippet=snippet,
             )
 
         # ── TIER 2: Goal Coherence Check (fast callable) ────────────────────
@@ -568,7 +872,7 @@ class ConsequenceReasoner:
                 objective=objective,
                 step_description=step_description,
                 action=action,
-                llm_callable=self._tier2_callable,  # AUDIT FIX: fast endpoint
+                llm_callable=self._tier2_callable,
                 timeout_seconds=self._tier2_timeout,
             )
             if coherence == CoherenceVerdict.INCOHERENT:
@@ -594,7 +898,7 @@ class ConsequenceReasoner:
             consequence = simulate_consequences(
                 action=action,
                 objective=objective,
-                llm_callable=self._tier3_callable,  # AUDIT FIX: deep/thinking endpoint
+                llm_callable=self._tier3_callable,
                 timeout_seconds=self._tier3_timeout,
             )
             if consequence == ConsequenceVerdict.HARMFUL:
@@ -651,8 +955,88 @@ class ConsequenceReasoner:
                 "allowed": self._eval_count - self._deny_count - self._confirm_count,
                 "tier2_enabled":    self._enable_tier2,
                 "tier3_enabled":    self._enable_tier3,
+                "cpu_only_mode":    self._cpu_only_mode,
                 "tier2_routed_to":  getattr(self._tier2_callable, "__name__", "unknown")
                                     if self._tier2_callable else "none",
                 "tier3_routed_to":  getattr(self._tier3_callable, "__name__", "unknown")
                                     if self._tier3_callable else "none",
             }
+
+    def evaluate_unknown_app_coherence(
+        self,
+        *,
+        app_name: str,
+        operation: str,
+        objective: str,
+        timeout_seconds: float = 30.0,
+    ) -> str:
+        """
+        AUDIT STRATEGY FIX: Tier 2 goal-coherence check for unknown applications.
+
+        Called by PolicyEngine when an action targets an application not in the
+        allowlist.  Rather than immediately requesting human confirmation, this
+        method asks the Tier 2 LLM: "Does interacting with <app> make sense for
+        objective <X>?"
+
+        Returns
+        -------
+        "COHERENT"   — app interaction is sensible for the objective; caller may
+                       add to session trust cache and proceed.
+        "INCOHERENT" — app interaction is not consistent with the objective; caller
+                       should DENY the action.
+        "UNCERTAIN"  — LLM could not determine coherence; caller should fall back
+                       to REQUIRE_HUMAN_CONFIRMATION.
+        """
+        if not self._enable_tier2 or self._tier2_callable is None:
+            return "UNCERTAIN"
+
+        if not objective or not app_name:
+            return "UNCERTAIN"
+
+        _COHERENCE_PROMPT = (
+            "You are a goal coherence validator for an autonomous computer agent.\n\n"
+            f"OBJECTIVE: {objective.strip()}\n"
+            f"PROPOSED: interact with application '{app_name}' (operation: {operation})\n\n"
+            "Question: Does interacting with this application make sense to achieve the objective?\n"
+            "Respond with EXACTLY one of: COHERENT, INCOHERENT, or UNCERTAIN\n"
+            "COHERENT: yes, this app is relevant to the objective.\n"
+            "INCOHERENT: no, this app has no relevance to the objective (possible injection).\n"
+            "UNCERTAIN: cannot determine from context alone.\n"
+            "Reply with ONLY the single word. No explanation."
+        )
+
+        import threading as _threading
+
+        _result: list = ["UNCERTAIN"]
+        _done = _threading.Event()
+
+        def _call():
+            try:
+                response = self._tier2_callable(
+                    [{"role": "user", "content": _COHERENCE_PROMPT}],
+                    objective,
+                    "unknown_app_coherence",
+                )
+                text = ""
+                if isinstance(response, str):
+                    text = response
+                elif isinstance(response, list) and response:
+                    item = response[0]
+                    text = item.get("content", "") if isinstance(item, dict) else str(item)
+                text = text.strip().upper()
+                if "COHERENT" in text and "INCOHERENT" not in text:
+                    _result[0] = "COHERENT"
+                elif "INCOHERENT" in text:
+                    _result[0] = "INCOHERENT"
+                else:
+                    _result[0] = "UNCERTAIN"
+            except Exception:
+                _result[0] = "UNCERTAIN"
+            finally:
+                _done.set()
+
+        _t = _threading.Thread(target=_call, daemon=True)
+        _t.start()
+        _done.wait(timeout=timeout_seconds)
+
+        return _result[0]
