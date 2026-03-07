@@ -4,7 +4,7 @@ import os
 import time
 import threading
 import json
-from typing import Dict, Any, Optional
+from typing import Callable, Dict, Any, Optional
 from collections import OrderedDict
 
 from restoration.snapshot_types import (
@@ -43,10 +43,14 @@ class SnapshotProvider:
         observer: Optional[ObserverCore],
         os_backend,
         mode_controller: ModeController,
+        browser_capture_fn: Optional[Callable[[], dict]] = None,
     ):
         self._observer = observer
         self._os = os_backend
         self._mode = mode_controller
+
+        
+        self._browser_capture_fn: Optional[Callable[[], dict]] = browser_capture_fn
 
         
         _env_val = os.environ.get("PROJECTZEO_ATOMIC_WINDOW_SECONDS")
@@ -78,6 +82,14 @@ class SnapshotProvider:
         # Reload surviving snapshots from disk (skip expired ones).
         if self._disk_persistence_available:
             self._reload_from_disk()
+
+    # =========================================================
+    # BROWSER CAPTURE WIRING
+    # =========================================================
+
+    def set_browser_capture_fn(self, fn: Optional[Callable[[], dict]]) -> None:
+        
+        self._browser_capture_fn = fn if callable(fn) else None
 
     # =========================================================
     # SNAPSHOT REGISTRY (LRU + TTL)
@@ -459,6 +471,19 @@ class SnapshotProvider:
         except Exception:
             pass  # process iteration failed — non-fatal
 
+        
+        _browser_session_state: dict = {}
+        if self._browser_capture_fn is not None:
+            try:
+                _browser_session_state = self._browser_capture_fn() or {}
+            except Exception as _bse:
+                import sys as _sys_bs
+                print(
+                    f"[SnapshotProvider] Browser session capture failed (non-fatal): "
+                    f"{_bse!s:.120}",
+                    file=_sys_bs.stderr,
+                )
+
         metadata = {
             "schema_version": self.SNAPSHOT_SCHEMA_VERSION,
             "captured_at_monotonic": float(t_end),
@@ -471,6 +496,10 @@ class SnapshotProvider:
             ),
             "extended": extended,
         }
+
+        
+        if _browser_session_state.get("captured"):
+            metadata["browser_session"] = _browser_session_state
 
         metadata = json.loads(
             json.dumps(
