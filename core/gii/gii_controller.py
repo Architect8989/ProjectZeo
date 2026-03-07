@@ -130,6 +130,8 @@ class GIIController:
 
         # AUDIT-CRITICAL-1 FIX: ConsequenceReasoner now active for BOTH BASIC and FULL.
         # Tier2 (goal coherence) always active. Tier3 only in FULL mode.
+        # AUDIT FIX: Pass auto_wire_endpoints=True so ConsequenceReasoner can route
+        # Tier 2 to the fast endpoint and Tier 3 to the deep/thinking endpoint.
         try:
             from core.safety.consequence_reasoner import ConsequenceReasoner
             enable_tier3 = self._gii_mode >= GIIMode.FULL
@@ -137,6 +139,7 @@ class GIIController:
                 llm_callable=self._llm,
                 enable_tier2=True,
                 enable_tier3=enable_tier3,
+                auto_wire_endpoints=True,   # AUDIT FIX: tiered model routing
             )
             _logger.info(
                 "[GIIController] ConsequenceReasoner active. tier2=True tier3=%s",
@@ -244,15 +247,40 @@ class GIIController:
             except Exception:
                 pass
         if self._semantic_memory and execution_log:
+            # AUDIT FIX: LLM synthesis is now PRIMARY. Regex extraction is the fallback.
+            # Previously, both ran unconditionally and errors were silently swallowed,
+            # meaning the regex path always dominated. Now:
+            #   1. Try LLM synthesis first (async thread, generous timeout).
+            #   2. If LLM synthesis stores ≥1 lesson, skip regex (LLM is better).
+            #   3. If LLM synthesis fails or stores 0 lessons, run regex as fallback.
+            llm_synthesis_succeeded = False
             try:
-                self._extract_semantic_facts_from_log(execution_log, focused_app)
-            except Exception as exc:
-                _logger.debug("[GIIController] Regex fact extraction error: %s", exc)
-            # TRANSFORMATION: LLM-synthesized episodic lessons
-            try:
+                lessons_before = (
+                    self._semantic_memory.stats().get("total_facts", 0)
+                    if hasattr(self._semantic_memory, "stats") else 0
+                )
                 self._synthesize_lessons_with_llm(execution_log, focused_app)
+                lessons_after = (
+                    self._semantic_memory.stats().get("total_facts", 0)
+                    if hasattr(self._semantic_memory, "stats") else 0
+                )
+                if lessons_after > lessons_before:
+                    llm_synthesis_succeeded = True
+                    _logger.info(
+                        "[GIIController] LLM lesson synthesis stored %d new facts — "
+                        "skipping regex fallback.",
+                        lessons_after - lessons_before,
+                    )
             except Exception as exc:
-                _logger.debug("[GIIController] LLM lesson synthesis error: %s", exc)
+                _logger.warning("[GIIController] LLM lesson synthesis error: %s", exc)
+
+            if not llm_synthesis_succeeded:
+                # Regex fallback only when LLM synthesis produced nothing
+                try:
+                    self._extract_semantic_facts_from_log(execution_log, focused_app)
+                    _logger.debug("[GIIController] Regex fact extraction used as LLM fallback.")
+                except Exception as exc:
+                    _logger.debug("[GIIController] Regex fact extraction error: %s", exc)
         if self._semantic_memory:
             try:
                 self._semantic_memory.save()
