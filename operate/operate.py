@@ -683,6 +683,29 @@ def _execute_autonomous_loop(
     _PERMANENT_DENY_ACTION_KEYS: set = set()
 
     # ------------------------------------------------------------------
+    # AUDIT FIX: Initialise MCP tool registry for this task session.
+    # MCPToolRegistry is a singleton — this call is idempotent.
+    # Tools are available to ExecutorAgent and the GII loop action dispatch.
+    # ------------------------------------------------------------------
+    _mcp_registry = None
+    try:
+        from core.tools.mcp_tools import get_registry as _get_mcp_registry  # noqa: PLC0415
+        _mcp_registry = _get_mcp_registry()
+        if _mcp_registry.is_enabled():
+            _mcp_registry.set_policy_engine(policy_engine)
+            journal.record({
+                "event": "mcp_registry_initialised",
+                "tools": _mcp_registry.list_tools(),
+                "servers": _mcp_registry.get_stats().get("connected_servers", []),
+            })
+            print(
+                f"[OPERATE] MCP tools available: {_mcp_registry.list_tools()}",
+                file=__import__('sys').stderr,
+            )
+    except Exception as _mcp_init_err:
+        log_warn(f"[MCP] Registry init failed (non-fatal): {_mcp_init_err}")
+
+    # ------------------------------------------------------------------
     # Initialize PerStepReasoner for the GII reasoning loop.
     # GIIController has its own internal PSR; fall back to standalone.
     # ------------------------------------------------------------------
@@ -1358,6 +1381,72 @@ def _execute_autonomous_loop(
 
             if authority == AuthorityDecision.ABORT:
                 raise AuthorityAbortError("Human authority abort — task terminated")
+
+            # ================================================================
+            # AUDIT FIX: MCP tool routing — intercept "mcp_tool" operation
+            # and delegate to MCPToolRegistry instead of os_backend dispatch.
+            # ================================================================
+            if (
+                _mcp_registry is not None
+                and _mcp_registry.is_enabled()
+                and str(selected_action.get("operation", "")).lower() == "mcp_tool"
+            ):
+                _mcp_tool_name = str(selected_action.get("tool_name", ""))
+                _mcp_args = {
+                    k: v for k, v in selected_action.items()
+                    if k not in ("operation", "tool_name", "thought", "_external_content_source",
+                                 "_trusted_installer")
+                }
+                _focused_app_for_mcp = (
+                    world_snapshot.get("focused_app", "__unknown_app__")
+                    if isinstance(world_snapshot, dict) else "__unknown_app__"
+                )
+                try:
+                    _mcp_result = _mcp_registry.call(
+                        _mcp_tool_name, _mcp_args, focused_app=_focused_app_for_mcp
+                    )
+                    action_success = _mcp_result.success
+                    _mcp_output = str(_mcp_result.output or _mcp_result.error or "")
+                    journal.record({
+                        "event": "mcp_tool_call",
+                        "iteration": iteration,
+                        "tool": _mcp_tool_name,
+                        "success": action_success,
+                        "latency_seconds": _mcp_result.latency_seconds,
+                        "output_snippet": _mcp_output[:200],
+                    })
+                    exec_result = {
+                        "success": action_success,
+                        "output": _mcp_output,
+                        "reward": 0.6 if action_success else -0.3,
+                    }
+                    # Record outcome and continue to next iteration
+                    if gii_controller is not None and gii_controller.enabled:
+                        try:
+                            gii_controller.record_outcome(
+                                selected_action, success=action_success, output=_mcp_output[:500]
+                            )
+                        except Exception:
+                            pass
+                    if _per_step_reasoner is not None:
+                        try:
+                            _per_step_reasoner.record_outcome(
+                                selected_action, success=action_success, output=_mcp_output[:300]
+                            )
+                        except Exception:
+                            pass
+                    previous_perception = perception_snapshot
+                    if not action_success:
+                        stagnant_iterations += 1
+                        if stagnant_iterations >= stagnant_limit:
+                            raise RuntimeError(REPLAN_SIGNAL)
+                    else:
+                        stagnant_iterations = 0
+                    continue  # MCP handled — skip normal dispatch
+                except RuntimeError:
+                    raise
+                except Exception as _mcp_exc:
+                    log_warn(f"[MCP] Tool call failed: {_mcp_exc} — falling through to normal dispatch")
 
             # ================================================================
             # STEP 5: EXECUTE — Dispatch action
