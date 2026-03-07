@@ -1213,10 +1213,43 @@ def _execute_autonomous_loop(
                 if gii_controller is not None and hasattr(gii_controller, "consequence_reasoner"):
                     _consequence_reasoner_instance = gii_controller.consequence_reasoner
 
+                # AUDIT HIGH FIX: Wire ConsequenceReasoner to write/type operations
+                # when _external_content_source=True (content from screen/VL/web).
+                # Previously write/type bypassed consequence evaluation entirely —
+                # a prompt injection via type("rm -rf ~" into terminal) was
+                # not evaluated. Now external-source write/type ops go through
+                # Tier 2 goal coherence check as an injection defence.
+                _cr_apply_external = (
+                    _op_for_cr in ("write", "type")
+                    and bool(selected_action.get("_external_content_source"))
+                )
+                # Also flag terminal-context write/type operations
+                _focused_app_for_cr = str(world_state.get("focused_app", "") or "").lower()
+                _terminal_names = frozenset({
+                    "gnome-terminal", "konsole", "xterm", "xfce4-terminal", "alacritty",
+                    "kitty", "tilix", "terminator", "bash", "zsh", "fish", "sh",
+                })
+                _cr_apply_terminal = (
+                    _op_for_cr in ("write", "type")
+                    and any(t in _focused_app_for_cr for t in _terminal_names)
+                )
+                if _cr_apply_external or _cr_apply_terminal:
+                    # Inject flags for ConsequenceReasoner Tier 1 classification
+                    if "_external_content_source" not in selected_action:
+                        selected_action = dict(selected_action)
+                        selected_action["_external_content_source"] = True
+                    if _cr_apply_terminal and "_terminal_context" not in selected_action:
+                        selected_action = dict(selected_action)
+                        selected_action["_terminal_context"] = True
+
                 if (
                     _consequence_reasoner_instance is not None
                     and _policy_decision != PolicyEngine.DENY
-                    and _op_for_cr in ("command", "file_create", "install")
+                    and (
+                        _op_for_cr in ("command", "file_create", "install")
+                        or _cr_apply_external
+                        or _cr_apply_terminal
+                    )
                 ):
                     try:
                         _cr_result = _consequence_reasoner_instance.evaluate(
@@ -1324,8 +1357,20 @@ def _execute_autonomous_loop(
                         })
                 except ImportError:
                     pass  # LlamaGuard not installed — skip Tier 4
+                    # AUDIT LOW FIX: Journal the skip and honor PROJECTZEO_REQUIRE_LLAMAGUARD
+                    import os as _os_lg
+                    if _os_lg.environ.get("PROJECTZEO_REQUIRE_LLAMAGUARD", "0").strip() == "1":
+                        raise RuntimeError(
+                            "PROJECTZEO_REQUIRE_LLAMAGUARD=1 but llama-guard is not installed. "
+                            "Fix: pip install llama-guard OR unset PROJECTZEO_REQUIRE_LLAMAGUARD"
+                        )
+                    journal.record({"event": "tier4_skipped", "reason": "ImportError: llama-guard not installed"})
                 except Exception as _lg_err:
                     log_warn(f"[SAFE-4] LlamaGuard3 check error (fail-open): {_lg_err}")
+                    import os as _os_lg2
+                    if _os_lg2.environ.get("PROJECTZEO_REQUIRE_LLAMAGUARD", "0").strip() == "1":
+                        raise RuntimeError(f"PROJECTZEO_REQUIRE_LLAMAGUARD=1 but LlamaGuard failed: {_lg_err}")
+                    journal.record({"event": "tier4_skipped", "reason": str(_lg_err)[:200]})
 
             if _policy_decision == PolicyEngine.DENY:
                 belief.record_action(action_key, -0.5)
