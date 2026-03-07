@@ -311,10 +311,66 @@ def main(llm_callable: Callable, model_name: str) -> None:
     vision_runtime = VisionRuntime(model_name=model_name)
     world_graph = WorldGraph()
 
+    # -------------------------------------------------------------------------
+    # VIS-1 FIX: UITARSRuntime as primary vision source when SGLang is active.
+    #
+    # Priority:
+    #   1. UITARSRuntime (UI-TARS-2 via SGLang) — when PROJECTZEO_USE_SGLANG=1
+    #      and the SGLang vision server is reachable.
+    #   2. VisionRuntime (Qwen2.5-VL via Ollama) — fallback, always available.
+    #
+    # VisionRuntime is NEVER removed; it is always passed to ObserverLoop as
+    # the fallback.  UITARSRuntime is layered on top.  If the SGLang server is
+    # unreachable at startup, the system falls back to VisionRuntime silently.
+    # -------------------------------------------------------------------------
+    _uitars_runtime = None
+    _use_sglang = os.environ.get("PROJECTZEO_USE_SGLANG", "0").strip() in ("1", "true", "yes")
+    if _use_sglang:
+        try:
+            from core.vision.uitars_runtime import UITARSRuntime as _UITARSRuntime
+            from config.model_config import get_vision_endpoint as _get_vision_ep
+            _vision_ep = _get_vision_ep()
+            _uitars_runtime = _UITARSRuntime(
+                endpoint_url=_vision_ep.base_url,
+                model_id=_vision_ep.model_id,
+                timeout_seconds=_vision_ep.timeout_seconds,
+            )
+            # Perform a lightweight health check before declaring UITARSRuntime active.
+            # If the SGLang server is not yet up, we log a warning and fall back.
+            if hasattr(_uitars_runtime, "is_healthy") and not _uitars_runtime.is_healthy():
+                print(
+                    "[MAIN] UITARSRuntime: SGLang vision server not reachable at "
+                    f"{_vision_ep.base_url}. Using VisionRuntime fallback. "
+                    "Start the SGLang server with: "
+                    f"python -m sglang.launch_server --model {_vision_ep.model_id} "
+                    f"--port {_vision_ep.base_url.split(':')[-1]}",
+                    file=sys.stderr,
+                )
+                _uitars_runtime = None
+            else:
+                print(
+                    f"[MAIN] UITARSRuntime active (UI-TARS-2 @ {_vision_ep.base_url}). "
+                    "VisionRuntime retained as fallback.",
+                    file=sys.stderr,
+                )
+        except ImportError as _uitars_import_err:
+            print(
+                f"[MAIN] UITARSRuntime import failed ({_uitars_import_err}). "
+                "Using VisionRuntime (Qwen2.5-VL) as sole vision source.",
+                file=sys.stderr,
+            )
+        except Exception as _uitars_err:
+            print(
+                f"[MAIN] UITARSRuntime init failed ({_uitars_err}). "
+                "Using VisionRuntime (Qwen2.5-VL) as sole vision source.",
+                file=sys.stderr,
+            )
+
     observer_loop = ObserverLoop(
         observer=observer,
         vision_runtime=vision_runtime,
         world_graph=world_graph,
+        uitars_runtime=_uitars_runtime,   # VIS-1 FIX: primary vision; None on CPU
     )
 
     mode = ModeController()
@@ -361,6 +417,18 @@ def main(llm_callable: Callable, model_name: str) -> None:
         mode.force_observer()
 
     vision_runtime.start()
+    # VIS-1 FIX: Start UITARSRuntime if registered (GPU path).
+    # VisionRuntime is always started first as the fallback is guaranteed.
+    if _uitars_runtime is not None and hasattr(_uitars_runtime, "start"):
+        try:
+            _uitars_runtime.start()
+            print("[MAIN] UITARSRuntime started.", file=sys.stderr)
+        except Exception as _uitars_start_err:
+            print(
+                f"[MAIN] UITARSRuntime start failed ({_uitars_start_err}). "
+                "VisionRuntime will be the sole vision source.",
+                file=sys.stderr,
+            )
     observer_loop.start()
 
     try:
@@ -471,8 +539,26 @@ def main(llm_callable: Callable, model_name: str) -> None:
                     try:
                         observer_loop.stop()
                         vision_runtime.stop()
+                        # VIS-1 FIX: also stop UITARSRuntime on restart if active
+                        if _uitars_runtime is not None and hasattr(_uitars_runtime, "stop"):
+                            try:
+                                _uitars_runtime.stop()
+                            except Exception:
+                                pass
                         time.sleep(2.0)
                         vision_runtime.start()
+                        if _uitars_runtime is not None and hasattr(_uitars_runtime, "start"):
+                            try:
+                                _uitars_runtime.start()
+                                # Re-enable UITARSRuntime in ObserverLoop after restart
+                                if hasattr(observer_loop, "reset_uitars"):
+                                    observer_loop.reset_uitars()
+                            except Exception as _u_restart_err:
+                                print(
+                                    f"[MAIN] UITARSRuntime restart failed ({_u_restart_err}); "
+                                    "VisionRuntime is sole vision source.",
+                                    file=sys.stderr,
+                                )
                         observer_loop.start()
                         time.sleep(VISION_RESTART_GRACE_SECONDS)
                         observer.reset_for_new_task()
@@ -1009,11 +1095,15 @@ def main(llm_callable: Callable, model_name: str) -> None:
             except Exception:
                 pass
 
-        for _cleanup_fn, _cleanup_name in [
+        # VIS-1 FIX: include UITARSRuntime in shutdown sequence when active.
+        _shutdown_targets = [
             (intent_listener.stop, "intent_listener"),
             (observer_loop.stop, "observer_loop"),
             (vision_runtime.stop, "vision_runtime"),
-        ]:
+        ]
+        if _uitars_runtime is not None and hasattr(_uitars_runtime, "stop"):
+            _shutdown_targets.append((_uitars_runtime.stop, "uitars_runtime"))
+        for _cleanup_fn, _cleanup_name in _shutdown_targets:
             try:
                 _cleanup_fn()
             except Exception as _e:
