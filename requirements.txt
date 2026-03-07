@@ -61,20 +61,30 @@ mem0ai>=0.1.0
 # Memory — Tier 2: Qdrant vector database (used by both Cognee and standalone)
 qdrant-client>=1.7.0
 
-# Memory — Tier 3: Cognee (semantic graph memory, optional GPU acceleration)
-# Install: pip install cognee
-# cognee>=0.1.0
+# Memory — Tier 3: Cognee (semantic graph memory, LLM-synthesized knowledge graph)
+# Replaces regex extraction in gii_controller._extract_semantic_facts_from_log().
+# Lightweight install — no CUDA required for CPU-based graph queries.
+cognee>=0.1.0
 
 # Memory — Tier 4: Letta (formerly MemGPT, persistent editing agent memory)
-# Install: pip install letta  (requires a running Letta server)
+# Requires a running Letta server: https://docs.letta.com/server
+# Install ONLY when a Letta server is available:
+#   pip install letta && letta server start
 # letta>=0.5.0
 
 # GPU inference — SGLang (primary, recommended for production)
 sglang[all]>=0.4.0
 
 # GPU inference — vLLM (alternative to SGLang, set PROJECTZEO_USE_VLLM=1)
-# Install: pip install vllm  (heavy dependency, CUDA required)
+# Requires CUDA. Install ONLY on GPU machines:
+#   pip install vllm
 # vllm>=0.4.0
+
+# OS control — Open Interpreter Computer API (unified mouse/keyboard/display layer)
+# Wraps computer.display.view(), computer.mouse.click(), computer.keyboard.type().
+# Enable at runtime: PROJECTZEO_USE_COMPUTER_API=1
+# See core/execution/computer_api.py for the integration wrapper.
+open-interpreter>=0.3.0
 
 # Visualisation
 matplotlib>=3.8.1
