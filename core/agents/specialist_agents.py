@@ -246,10 +246,13 @@ class ExecutorAgent(BaseAgent):
         *,
         os_backend,
         execute_decision_fn: Optional[Callable] = None,
+        execute_fn: Optional[Callable] = None,   # alias for execute_decision_fn
+        journal=None,
     ) -> None:
         super().__init__("ExecutorAgent")
         self._os = os_backend
-        self._execute_fn = execute_decision_fn
+        self._execute_fn = execute_decision_fn or execute_fn
+        self._journal = journal
 
     def run(self, state: WorldState) -> WorldState:
         if state.proposed_action is None or state.goal_complete:
@@ -336,13 +339,15 @@ class MemoryAgent(BaseAgent):
     def __init__(
         self,
         *,
-        gii_controller,
+        gii_controller=None,
         semantic_memory=None,
         application_memory=None,
         episodic_synthesizer=None,
+        objective: str = "",
     ) -> None:
         super().__init__("MemoryAgent")
         self._gii = gii_controller
+        self._objective = objective
         self._semantic = semantic_memory
         self._app_memory = application_memory
         self._synthesizer = episodic_synthesizer
@@ -374,15 +379,26 @@ class MemoryAgent(BaseAgent):
 # ---------------------------------------------------------------------------
 
 class AgentPipeline:
-    
 
     def __init__(
         self,
-        agents: List[BaseAgent],
+        agents: Optional[List[BaseAgent]] = None,
         *,
+        perceiver=None,
+        reasoner=None,
+        safety=None,
+        executor=None,
+        memory=None,
         max_consecutive_failures: int = 10,
     ) -> None:
-        self._agents = agents
+        # Accept either positional list or keyword agents
+        if agents is not None:
+            self._agents = list(agents)
+        else:
+            self._agents = [
+                a for a in [perceiver, reasoner, safety, executor, memory]
+                if a is not None
+            ]
         self._max_failures = max_consecutive_failures
 
     def step(self, state: WorldState) -> WorldState:
