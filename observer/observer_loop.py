@@ -10,6 +10,20 @@ from observer.observer_core import ObserverCore, ObserverBlindnessError
 from core.vision.vision_runtime import VisionRuntime
 from core.vision.world_graph import WorldGraph
 
+# UI-TARS-2 runtime — lazy import; available when SGLang is configured.
+# VisionRuntime (Qwen2.5-VL Ollama) is kept as the fallback.
+_UITARSRuntime = None
+def _get_uitars_runtime_cls():
+    global _UITARSRuntime
+    if _UITARSRuntime is not None:
+        return _UITARSRuntime
+    try:
+        from core.vision.uitars_runtime import UITARSRuntime as _U
+        _UITARSRuntime = _U
+        return _UITARSRuntime
+    except ImportError:
+        return None
+
 _logger = logging.getLogger(__name__)
 
 _REQUIRED_PERCEPTION_KEYS: frozenset = frozenset({"available"})
@@ -89,9 +103,25 @@ class ObserverLoop:
         vision_runtime: VisionRuntime,
         world_graph: Optional[WorldGraph] = None,
         tick_interval: float = DEFAULT_TICK_INTERVAL,
+        uitars_runtime=None,
     ) -> None:
         self._observer = observer
-        self._vision = vision_runtime
+        # VIS-1 FIX: UITARSRuntime is the primary vision source when SGLang is
+        # configured (PROJECTZEO_USE_SGLANG=1).  VisionRuntime (Qwen2.5-VL via
+        # Ollama) is kept as the fallback for CPU-only deployments or when
+        # UITARSRuntime is unavailable.  Never delete VisionRuntime — it is the
+        # production fallback that keeps the system operational on CPU hosts.
+        self._vision = vision_runtime            # fallback (always present)
+        self._uitars: Optional[Any] = uitars_runtime  # primary (GPU/SGLang)
+        self._using_uitars: bool = uitars_runtime is not None
+        self._uitars_failures: int = 0           # consecutive UITARSRuntime errors
+        _MAX_UITARS_FAILURES_BEFORE_FALLBACK = 3  # stored on self below
+        self._max_uitars_failures = _MAX_UITARS_FAILURES_BEFORE_FALLBACK
+        if self._using_uitars:
+            _logger.info(
+                "[ObserverLoop] UITARSRuntime registered as PRIMARY vision source. "
+                "VisionRuntime retained as fallback."
+            )
         self._world_graph = world_graph
 
         self._tick_interval: float = max(0.05, float(tick_interval))
@@ -171,10 +201,70 @@ class ObserverLoop:
 
         try:
             self._atspi_trigger_count += 1
-            raw_perception = self._vision.get_latest()
+            raw_perception = self._capture_frame()
             self._ingest_frame(raw_perception)
         except Exception as exc:
             _logger.debug("[ObserverLoop] AT-SPI triggered frame error: %s", exc)
+
+    # =========================================================================
+    # Frame capture — UITARSRuntime (primary) with VisionRuntime (fallback)
+    # =========================================================================
+
+    def _capture_frame(self) -> Optional[Dict[str, Any]]:
+        """
+        VIS-1 FIX: Capture a perception frame.
+
+        Priority:
+          1. UITARSRuntime (UI-TARS-2 via SGLang) — when registered and healthy.
+          2. VisionRuntime (Qwen2.5-VL via Ollama) — fallback, always available.
+
+        Automatic fallback: after _max_uitars_failures consecutive UITARSRuntime
+        errors, the loop demotes to VisionRuntime for the remainder of the session
+        and logs a WARNING so operators know to investigate the SGLang server.
+        Recovery: call reset_uitars() to re-enable UITARSRuntime.
+        """
+        if self._using_uitars and self._uitars is not None:
+            try:
+                result = self._uitars.get_latest()
+                # Successful UITARSRuntime call — reset failure counter.
+                self._uitars_failures = 0
+                return result
+            except Exception as exc:
+                self._uitars_failures += 1
+                _logger.warning(
+                    "[ObserverLoop] UITARSRuntime error #%d/%d: %s. "
+                    "%s",
+                    self._uitars_failures,
+                    self._max_uitars_failures,
+                    exc,
+                    "Falling back to VisionRuntime permanently this session."
+                    if self._uitars_failures >= self._max_uitars_failures
+                    else "Retrying next frame.",
+                )
+                if self._uitars_failures >= self._max_uitars_failures:
+                    self._using_uitars = False
+                    _logger.error(
+                        "[ObserverLoop] UITARSRuntime DEMOTED after %d consecutive "
+                        "failures. VisionRuntime (fallback) is now the active source. "
+                        "Call reset_uitars() to re-enable UITARSRuntime.",
+                        self._max_uitars_failures,
+                    )
+                # Fall through to VisionRuntime
+        # VisionRuntime fallback (always present)
+        return self._vision.get_latest()
+
+    def reset_uitars(self) -> None:
+        """Re-enable UITARSRuntime after it was demoted due to consecutive failures."""
+        if self._uitars is not None:
+            self._uitars_failures = 0
+            self._using_uitars = True
+            _logger.info("[ObserverLoop] UITARSRuntime re-enabled (manual reset).")
+
+    def get_active_vision_source(self) -> str:
+        """Return the name of the currently active vision source."""
+        if self._using_uitars and self._uitars is not None:
+            return "UITARSRuntime"
+        return "VisionRuntime"
 
     # =========================================================================
     # Frame ingestion (shared by AT-SPI callback and polling fallback)
@@ -358,7 +448,7 @@ class ObserverLoop:
                     )
 
                 try:
-                    raw_perception = self._vision.get_latest()
+                    raw_perception = self._capture_frame()
                     self._polling_trigger_count += 1
                     self._ingest_frame(raw_perception)
 
@@ -416,8 +506,8 @@ class ObserverLoop:
                 and self._thread.is_alive()
             )
 
-    def get_telemetry(self) -> Dict[str, int]:
-        """Return telemetry counters for monitoring and diagnostics."""
+    def get_telemetry(self) -> Dict[str, Any]:
+        """Return telemetry counters and health info for monitoring and diagnostics."""
         return {
             "total_valid_frames":       self._total_frames,
             "schema_rejection_count":   self._schema_rejection_count,
@@ -428,6 +518,11 @@ class ObserverLoop:
             "is_paused":                int(self._pause_event.is_set()),
             "is_lightweight_mode":      int(self._lightweight_mode_event.is_set()),
             "is_running":               int(self.is_running()),
+            # VIS-1: active vision source tracking
+            "active_vision_source":     self.get_active_vision_source(),
+            "uitars_registered":        int(self._uitars is not None),
+            "uitars_active":            int(self._using_uitars),
+            "uitars_consecutive_errors": self._uitars_failures,
         }
 
     def frame_age_seconds(self) -> Optional[float]:
