@@ -48,9 +48,7 @@ HEARTBEAT_INTERVAL = 0.25
 _RAW_TASK_SECONDS = int(
     os.environ.get("PROJECTZEO_MAX_TASK_SECONDS", str(90 * 60))
 )
-# AUDIT-MED-1 FIX: Reduced _MIN_EFFECTIVE_TASK_SECONDS from 86400 (24 hours) to
-# 1800 (30 minutes) to prevent runaway tasks when env var is zero or negative.
-# Also cap at 8 hours maximum to bound worst-case runaway duration.
+
 _MIN_EFFECTIVE_TASK_SECONDS = 1_800   # 30 minutes (was: 86_400 = 24 hours)
 _MAX_EFFECTIVE_TASK_SECONDS = 28_800  # 8 hours hard cap
 MAX_TASK_SECONDS = (
@@ -311,18 +309,7 @@ def main(llm_callable: Callable, model_name: str) -> None:
     vision_runtime = VisionRuntime(model_name=model_name)
     world_graph = WorldGraph()
 
-    # -------------------------------------------------------------------------
-    # VIS-1 FIX: UITARSRuntime as primary vision source when SGLang is active.
-    #
-    # Priority:
-    #   1. UITARSRuntime (UI-TARS-2 via SGLang) — when PROJECTZEO_USE_SGLANG=1
-    #      and the SGLang vision server is reachable.
-    #   2. VisionRuntime (Qwen2.5-VL via Ollama) — fallback, always available.
-    #
-    # VisionRuntime is NEVER removed; it is always passed to ObserverLoop as
-    # the fallback.  UITARSRuntime is layered on top.  If the SGLang server is
-    # unreachable at startup, the system falls back to VisionRuntime silently.
-    # -------------------------------------------------------------------------
+    
     _uitars_runtime = None
     _use_sglang = os.environ.get("PROJECTZEO_USE_SGLANG", "0").strip() in ("1", "true", "yes")
     if _use_sglang:
@@ -501,6 +488,9 @@ def main(llm_callable: Callable, model_name: str) -> None:
         snapshot_provider=snapshot_provider,
         authority_state=auth_state,
     )
+
+    
+    snapshot_provider.set_browser_capture_fn(restore_provider.capture_browser_session)
     restore_verifier = RestoreVerifier(
         os_backend=os_backend,
         mode_controller=mode,
