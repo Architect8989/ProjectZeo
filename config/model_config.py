@@ -177,6 +177,43 @@ def get_vision_endpoint() -> ModelEndpoint:
     )
 
 
+def get_vision_reasoning_endpoint() -> ModelEndpoint:
+    """
+    BRAIN-3: Qwen3-VL-235B — unified vision + reasoning model.
+
+    Purpose: consequence simulation that requires visual context (e.g. verifying
+    that a destructive action targets the correct file shown on screen).
+    Eliminates the round-trip between the perception layer and the reasoning layer
+    by sending the screenshot directly to a model that can reason over it.
+
+    GPU (SGLang port 30004): Qwen/Qwen3-VL-235B-Instruct
+    CPU fallback: standard vision endpoint (VisionRuntime / Qwen2.5-VL)
+
+    Activation:
+        PROJECTZEO_USE_SGLANG=1  (required)
+        PROJECTZEO_VISION_REASONING_MODEL  (optional override)
+        PROJECTZEO_VISION_REASONING_PORT   (optional, default 30004)
+    """
+    if _use_sglang():
+        return ModelEndpoint(
+            tier="vision_reasoning",
+            model_id=os.environ.get(
+                "PROJECTZEO_VISION_REASONING_MODEL",
+                "Qwen/Qwen3-VL-235B-Instruct",
+            ),
+            base_url=_build_sglang_url("PROJECTZEO_VISION_REASONING_PORT", 30004),
+            max_tokens=4096,
+            supports_thinking=True,
+            default_thinking=True,   # reasoning over visual context needs CoT
+            timeout_seconds=float(
+                os.environ.get("PROJECTZEO_VISION_REASONING_TIMEOUT", "120.0")
+            ),
+            temperature=0.0,
+        )
+    # CPU fallback: reuse the standard vision endpoint (no visual reasoning CoT)
+    return get_vision_endpoint()
+
+
 def get_coder_endpoint() -> ModelEndpoint:
     
     if _use_sglang():
@@ -219,13 +256,17 @@ def get_local_endpoint() -> ModelEndpoint:
 # ---------------------------------------------------------------------------
 
 def get_endpoint(tier: str) -> ModelEndpoint:
-    
+    """
+    Return the ModelEndpoint for the requested tier.
+    Valid tiers: fast | deep | vision | vision_reasoning | coder | local
+    """
     _MAP = {
-        "fast":   get_fast_endpoint,
-        "deep":   get_deep_endpoint,
-        "vision": get_vision_endpoint,
-        "coder":  get_coder_endpoint,
-        "local":  get_local_endpoint,
+        "fast":             get_fast_endpoint,
+        "deep":             get_deep_endpoint,
+        "vision":           get_vision_endpoint,
+        "vision_reasoning": get_vision_reasoning_endpoint,
+        "coder":            get_coder_endpoint,
+        "local":            get_local_endpoint,
     }
     builder = _MAP.get(tier)
     if builder is None:
@@ -233,6 +274,18 @@ def get_endpoint(tier: str) -> ModelEndpoint:
             f"Unknown tier {tier!r}. Valid tiers: {sorted(_MAP.keys())}"
         )
     return builder()
+
+
+def get_all_endpoints() -> dict:
+    """Return a dict of all tier endpoints for health-checks and startup banners."""
+    tiers = ["fast", "deep", "vision", "vision_reasoning", "coder", "local"]
+    result = {}
+    for t in tiers:
+        try:
+            result[t] = get_endpoint(t)
+        except Exception:
+            pass
+    return result
 
 
 def is_gpu_mode() -> bool:
