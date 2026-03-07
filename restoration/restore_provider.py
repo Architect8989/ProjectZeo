@@ -390,14 +390,19 @@ class RestoreProvider:
             try:
                 self.restore_browser_session(_browser_state)
             except Exception as _br_err:
-                # Non-fatal: browser restore failure never blocks workspace restore
                 print(
                     f"[RestoreProvider] Browser session restore failed (non-fatal): {_br_err}",
                     file=sys.stderr,
                 )
 
         # Hard verification — raises RestorationError on failure
-        self._verify(snapshot)
+        # AUDIT FIX: On failure, guarantee a last-resort cursor-only restore
+        # and set RESTORATION_INCOMPLETE flag before re-raising.
+        try:
+            self._verify(snapshot)
+        except RestorationError as _verify_err:
+            self._handle_restore_failure(snapshot, str(_verify_err))
+            raise
 
         self._report_unrestored_processes(snapshot)
 
@@ -410,6 +415,81 @@ class RestoreProvider:
                 self._persist_ledger()
 
     
+
+    def _handle_restore_failure(
+        self, snapshot: RestorationSnapshot, error_reason: str
+    ) -> None:
+        """
+        AUDIT MEDIUM FIX: Guaranteed last-resort actions on any restore failure.
+
+        On full restore failure or verification timeout:
+        1. Attempt cursor-only restoration unconditionally (cursor at safe position).
+        2. Write RESTORATION_INCOMPLETE flag to authority_state.
+        3. Log prominently so operator is aware before accepting next task.
+        """
+        # Step 1: Last-resort cursor-only restoration
+        try:
+            self._os.set_cursor_position({"x": snapshot.cursor.x, "y": snapshot.cursor.y})
+            print(
+                f"[RestoreProvider] LAST-RESORT: cursor restored to "
+                f"({snapshot.cursor.x}, {snapshot.cursor.y}) after full restore failure.",
+                file=sys.stderr,
+            )
+        except Exception as cursor_err:
+            # Absolute fallback: move cursor to screen center
+            try:
+                _w, _h = self._os.screen_size()
+                self._os.set_cursor_position({"x": _w // 2, "y": _h // 2})
+                print(
+                    f"[RestoreProvider] LAST-RESORT: cursor moved to screen center "
+                    f"({_w // 2}, {_h // 2}) — original position restore failed: {cursor_err}",
+                    file=sys.stderr,
+                )
+            except Exception as center_err:
+                print(
+                    f"[RestoreProvider] LAST-RESORT cursor restore completely failed: {center_err}",
+                    file=sys.stderr,
+                )
+
+        # Step 2: Set RESTORATION_INCOMPLETE flag on authority_state
+        try:
+            auth = getattr(self, "_authority_state", None)
+            if auth is not None:
+                if hasattr(auth, "restoration_incomplete"):
+                    auth.restoration_incomplete = True
+                elif hasattr(auth, "__dict__"):
+                    auth.__dict__["restoration_incomplete"] = True
+        except Exception:
+            pass
+
+        # Step 3: Write an incomplete-restoration marker to disk for operator
+        try:
+            import pathlib as _pl
+            _project_root = _pl.Path(__file__).resolve().parent.parent
+            _flag_path = _project_root / "temp" / "RESTORATION_INCOMPLETE"
+            _flag_path.parent.mkdir(parents=True, exist_ok=True)
+            _ts = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+            _snap_id = getattr(snapshot, 'snapshot_id', 'unknown')
+            _flag_text = (
+                "RESTORATION INCOMPLETE\n"
+                + f"Reason: {error_reason}\n"
+                + f"Snapshot: {_snap_id}\n"
+                + f"Time: {_ts}\n"
+                + "Operator must acknowledge this file before the next task runs.\n"
+            )
+            _flag_path.write_text(_flag_text,
+                encoding="utf-8",
+            )
+            print(
+                f"[RestoreProvider] RESTORATION_INCOMPLETE flag written to: {_flag_path}. "
+                "DELETE this file to acknowledge and allow the next task.",
+                file=sys.stderr,
+            )
+        except Exception as flag_err:
+            print(
+                f"[RestoreProvider] Could not write RESTORATION_INCOMPLETE flag: {flag_err}",
+                file=sys.stderr,
+            )
 
     def _restore_application(self, snapshot: RestorationSnapshot) -> None:
         
@@ -435,26 +515,61 @@ class RestoreProvider:
         time.sleep(self.POST_ACTION_DELAY)
 
     def _restore_window(self, snapshot: RestorationSnapshot) -> None:
-       
+        """
+        AUDIT MEDIUM FIX: Log every title mismatch to journal before continuing.
+        Previously, title mismatches were silently ignored — the system appeared
+        to succeed even when window focus was wrong.
+        """
         window_id = getattr(snapshot.focus, "window_id", None)
         if not isinstance(window_id, str) or not window_id.strip():
-            return  # No window to focus
+            return
 
         if window_id == "__bare_desktop__":
-            return  # Bare desktop sentinel — no window to focus
+            return
 
         try:
             self._os.focus_window({"title": window_id})
-        except OSError:
-            # Best-effort: window may have been closed during task execution
+        except OSError as _focus_err:
             print(
                 f"[RestoreProvider] WARNING: _restore_window() — "
-                f"focus_window({window_id!r}) raised OSError. "
+                f"focus_window({window_id!r}) raised OSError: {_focus_err}. "
                 "Window may have been closed during task execution. Continuing.",
                 file=sys.stderr,
             )
 
         time.sleep(self.POST_ACTION_DELAY)
+
+        # AUDIT FIX: Verify focus and log mismatch for operator awareness
+        try:
+            current_window = self._os.get_focused_window()
+            if isinstance(current_window, dict) and isinstance(current_window.get("title"), str):
+                expected_norm = " ".join(window_id.lower().strip().split())
+                actual_norm   = " ".join(current_window["title"].lower().strip().split())
+                _dist = levenshtein_distance(expected_norm, actual_norm)
+                if _dist > self.MAX_TITLE_DISTANCE:
+                    # AUDIT FIX: Log title mismatch prominently
+                    print(
+                        f"[RestoreProvider] TITLE MISMATCH after _restore_window: "
+                        f"expected={window_id!r} actual={current_window['title']!r} "
+                        f"levenshtein={_dist} (threshold={self.MAX_TITLE_DISTANCE}). "
+                        "Window focus may be incorrect. Operator should verify.",
+                        file=sys.stderr,
+                    )
+                    # For critical applications require exact match
+                    _CRITICAL_APP_PATTERNS = (
+                        "firefox", "chromium", "chrome", "code", "code-oss",
+                        "cursor", "vscode", "sublime", "atom",
+                    )
+                    expected_lower = window_id.lower()
+                    if any(p in expected_lower for p in _CRITICAL_APP_PATTERNS):
+                        print(
+                            f"[RestoreProvider] CRITICAL APP MISMATCH: {window_id!r} is a "
+                            "critical application. Exact title match required. "
+                            "Restoration may be incomplete.",
+                            file=sys.stderr,
+                        )
+        except Exception:
+            pass  # Title check is best-effort — never block restoration
 
     def _restore_cursor(self, snapshot: RestorationSnapshot) -> None:
         
