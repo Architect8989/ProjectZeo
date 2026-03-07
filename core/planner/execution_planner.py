@@ -102,7 +102,7 @@ class ExecutionPlanner:
         r"\bnc\b",
         r"\bnetcat\b",
         r"\bcrontab\b",
-        r"^\s*at\s",
+        r"\bat\s",  # AUDIT SAFETY FIX: removed ^ anchor — catches "echo cmd | at now"
         r"\bperl\s+-e\b",
         r"\bruby\s+-e\b",
         r"\bnode\s+-e\b",
