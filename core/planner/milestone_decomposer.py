@@ -1,34 +1,3 @@
-"""
-milestone_decomposer.py — GII Milestone Decomposition
-
-AUDIT ARCHITECTURAL FIX (March 2026):
-  Replaces the sequential JSON step array from ExecutionPlanner.create_plan()
-  as the primary planning artifact for GII execution.
-
-  In a true GII system, the planner should NOT generate a fixed sequence of
-  ordered actions before any action is taken. Instead, it should decompose the
-  objective into 3–7 milestone CONDITIONS — observable world states that
-  represent meaningful progress checkpoints.
-
-  Each milestone has:
-    - condition: what must be TRUE in the world state (observable fact)
-    - completion_signal: how to detect this condition from screen/VL output
-    - next_milestone: the name/id of the milestone to pursue next
-    - retry_allowed: whether the milestone can be retried if verification fails
-
-  The GII execution loop uses these milestones as a goal graph, not as a script.
-  Each step is decided from the current world state alone — the milestone tells
-  the reasoner WHAT state to achieve, not HOW to achieve it.
-
-  ExecutionPlanner.create_plan() is retained for backward compatibility
-  (scaffold generation for PerStepReasoner). MilestoneDecomposer provides the
-  goal-graph layer that replaces sequential plan bias.
-
-Usage:
-  decomposer = MilestoneDecomposer(llm_callable)
-  milestones = decomposer.decompose(objective, environment)
-  # Inject milestones into GIIController as the goal graph
-"""
 from __future__ import annotations
 
 import json
@@ -36,7 +5,7 @@ import logging
 import re
 import threading
 import time
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 _logger = logging.getLogger(__name__)
 
@@ -140,13 +109,7 @@ class Milestone:
 
 
 class MilestoneDecomposer:
-    """
-    Decomposes an objective into a goal graph of milestone conditions.
-
-    This is the replacement for ExecutionPlanner.create_plan() sequential
-    step generation for GII execution.  The ExecutionPlanner is retained as
-    a scaffold generator (backward compatibility with PerStepReasoner).
-    """
+    
 
     # Maximum number of milestones allowed (prevents runaway goal graphs)
     MAX_MILESTONES = 7
@@ -169,15 +132,7 @@ class MilestoneDecomposer:
         objective: str,
         environment: Optional[Dict[str, Any]] = None,
     ) -> List[Milestone]:
-        """
-        Decompose objective into ordered milestone conditions.
-
-        Returns a list of Milestone objects ordered from first to last.
-        The last milestone's next_milestone is None (terminal state).
-
-        Raises MilestoneDecompositionError on LLM failure or parse error.
-        Falls back to a minimal 2-milestone plan on any error.
-        """
+        
         if not isinstance(objective, str) or not objective.strip():
             raise MilestoneDecompositionError("Objective must be a non-empty string")
 
@@ -336,14 +291,7 @@ class MilestoneDecomposer:
 
     @staticmethod
     def milestones_to_scaffold_steps(milestones: List[Milestone]) -> List[Dict[str, Any]]:
-        """
-        Convert milestones to scaffold step format for PerStepReasoner.
-
-        This bridges milestone-based GII planning with the existing
-        PerStepReasoner scaffold injection mechanism.
-        Each milestone becomes a scaffold phase: the reasoner knows the target
-        condition but is free to choose any action to achieve it.
-        """
+        
         steps = []
         for ms in milestones:
             steps.append({
@@ -373,3 +321,49 @@ class MilestoneDecomposer:
                 f"       Verify by : {ms.completion_signal[:80]}"
             )
         return "\n".join(lines)
+
+    @staticmethod
+    def advance_milestone(
+        milestones: List[Milestone],
+        current_idx: int,
+    ) -> Tuple[int, Optional[Milestone]]:
+        
+        if milestones and 0 <= current_idx < len(milestones):
+            milestones[current_idx].achieved = True
+        next_idx = current_idx + 1
+        next_milestone = milestones[next_idx] if next_idx < len(milestones) else None
+        return next_idx, next_milestone
+
+    @staticmethod
+    def check_completion_signal(
+        milestone: Milestone,
+        world_state: Dict[str, Any],
+    ) -> bool:
+        
+        signal = milestone.completion_signal.lower().strip()
+        if not signal:
+            return False
+
+        # Split signal into meaningful words (>3 chars) to avoid stop-word noise
+        signal_words = [w for w in signal.split() if len(w) > 3]
+        if not signal_words:
+            return False
+
+        # Build a text corpus from the world state
+        entities = world_state.get("entities", [])
+        entity_text = " ".join(
+            str(e.get("text", "") or e.get("label", "")).lower()
+            for e in (entities if isinstance(entities, list) else [])[:50]
+            if isinstance(e, dict)
+        )
+        focused_app = str(world_state.get("focused_app", "")).lower()
+        last_output = str(world_state.get("_last_command_output", "")
+                          or world_state.get("_gii_last_output", "")).lower()
+        title = str(world_state.get("window_title", "")).lower()
+
+        corpus = f"{entity_text} {focused_app} {last_output} {title}"
+
+        # All key signal words must appear in corpus (AND logic, conservative)
+        n_matches = sum(1 for w in signal_words[:5] if w in corpus)
+        required = max(1, len(signal_words[:5]) // 2 + 1)  # majority
+        return n_matches >= required
