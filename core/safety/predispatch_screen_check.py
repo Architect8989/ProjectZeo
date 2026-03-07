@@ -1,60 +1,3 @@
-"""
-core/safety/predispatch_screen_check.py
-========================================
-Pre-dispatch screen diff module.
-
-AUDIT-HIGH FIX: Mandatory screen re-capture immediately before action dispatch.
-
-Problem
--------
-The VL inference cycle on CPU takes 40–90 seconds.  By the time ``PerStepReasoner``
-returns a proposed action, the screen may have changed (dialog appeared, window
-switched, download prompt opened, error overlay rendered).  Acting on a stale world
-model risks:
-  - Clicking an element that no longer exists
-  - Dismissing a safety dialog that appeared *after* the reasoning decision
-  - Executing a command while an adversarial overlay is covering the target UI
-
-Fix
----
-Before every action dispatch (post-reasoning, pre-execution), capture a new
-lightweight screenshot and compute a pixel-hash diff against the frame that was
-used during reasoning.  If the difference exceeds a configurable threshold
-(default: 5% of pixels changed), the proposed action is held and the reasoning
-loop re-runs from the new screen state.
-
-This module is intentionally standalone so it can be imported by operate.py
-without creating circular dependency chains.
-
-Configuration
--------------
-``PROJECTZEO_PREDISPATCH_CHANGE_THRESHOLD``
-    Float, 0.0–1.0.  Fraction of pixels that must change to trigger a re-reason.
-    Default: 0.05 (5%).
-
-``PROJECTZEO_PREDISPATCH_ENABLED``
-    Set to "0" to disable the check globally (development/testing only).
-
-Usage
------
-::
-
-    from core.safety.predispatch_screen_check import PreDispatchScreenChecker
-
-    checker = PreDispatchScreenChecker()
-    # At reasoning time:
-    checker.record_reasoning_frame()
-    # ... reasoning produces proposed_action ...
-    # Before dispatch:
-    changed, diff_ratio = checker.check_screen_changed()
-    if changed:
-        # Re-run reasoning with fresh world state
-        ...
-    else:
-        # Safe to dispatch
-        dispatch(proposed_action)
-"""
-
 from __future__ import annotations
 
 import hashlib
@@ -78,15 +21,7 @@ _SKIP_CHECK_OPS = frozenset({
 
 
 def _capture_frame() -> Optional[tuple]:
-    """
-    Capture a screenshot and return ``(sha256_hex, raw_rgb_bytes)`` or ``None``.
-
-    Uses ``mss`` (fast, no subprocess) for the capture if available, falling
-    back to ``pyautogui.screenshot()`` otherwise.
-
-    Returns None on any capture failure — callers treat None as "unchanged"
-    (fail-open, never block on capture failure).
-    """
+    
     try:
         import mss as _mss  # type: ignore[import]
         with _mss.mss() as sct:
@@ -113,18 +48,7 @@ def _capture_frame_hash() -> Optional[str]:
 
 
 def _pixel_diff_ratio(hash_a: str, hash_b: str, raw_a: Optional[bytes] = None, raw_b: Optional[bytes] = None) -> float:
-    """
-    Compute a pixel-level diff ratio between two screen captures.
-
-    Strategy (ordered by accuracy, falls back on failure):
-    1. If raw pixel bytes are available: true per-pixel difference as a fraction
-       of total pixels. O(N) but highly accurate. Catches subtle dialog overlays.
-    2. If only hashes are available: normalized Hamming distance on SHA-256 hex
-       digits. O(64), monotonic proxy. Used when raw bytes aren't passed.
-
-    Returns a float in [0.0, 1.0]. Values near 0 → virtually identical.
-    Values near 1 → completely different frames.
-    """
+    
     if not hash_a or not hash_b:
         return 0.0
     if hash_a == hash_b:
@@ -147,15 +71,7 @@ def _pixel_diff_ratio(hash_a: str, hash_b: str, raw_a: Optional[bytes] = None, r
 
 
 class PreDispatchScreenChecker:
-    """
-    Stateful helper for per-dispatch screen change detection.
-
-    One instance should be created per task execution and shared across all
-    iterations of the dispatch loop.
-
-    Thread-safety: the ``record_reasoning_frame`` and ``check_screen_changed``
-    methods are protected by an internal lock and safe to call from any thread.
-    """
+    
 
     def __init__(
         self,
@@ -175,13 +91,7 @@ class PreDispatchScreenChecker:
         self._changes_detected = 0
 
     def record_reasoning_frame(self) -> None:
-        """
-        Capture and record the screen state at the START of the reasoning cycle.
-
-        Call this immediately after the observer snapshot is taken and before
-        the LLM reasoning call.  The hash and raw bytes recorded here are
-        compared against the pre-dispatch snapshot in ``check_screen_changed()``.
-        """
+        
         if not self._enabled:
             return
 
@@ -200,24 +110,7 @@ class PreDispatchScreenChecker:
         *,
         proposed_operation: str = "",
     ) -> Tuple[bool, float]:
-        """
-        Capture a new screenshot and compare it with the reasoning-time frame.
-
-        Parameters
-        ----------
-        proposed_operation
-            The ``operation`` field of the proposed action.  Certain cheap ops
-            (scroll, hover, verify, done) skip the check automatically.
-
-        Returns
-        -------
-        (changed, diff_ratio)
-            ``changed`` is True if the screen has changed beyond the threshold.
-            ``diff_ratio`` is the raw diff ratio in [0.0, 1.0].
-
-        If the check is disabled, cannot capture, or has no baseline frame,
-        returns (False, 0.0) — never blocks on uncertainty.
-        """
+        
         if not self._enabled:
             return False, 0.0
 
