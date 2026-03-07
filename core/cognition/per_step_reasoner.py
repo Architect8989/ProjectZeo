@@ -1,11 +1,20 @@
 """
 per_step_reasoner.py — Dynamic per-step action selection with dual-mode reasoning.
 
-AUDIT FIXES:
-  - Dual-mode thinking selection: IRREVERSIBLE/complex decisions → thinking=True
-    (Qwen3 chain-of-thought); REVERSIBLE/fast decisions → thinking=False (instruct).
-  - Uses SGLangAdapter.with_thinking() when available; no-ops gracefully on CPU/Ollama.
-  - All prior fixes retained: denied-signature tracking, injection marker scan, etc.
+AUDIT FIXES (March 2026):
+  HIGH-1: History summarization when len(history) > 20.
+    Previously old entries were silently dropped at MAX_REASONING_HISTORY (30)
+    with no summarization. On tasks > 30 actions, the system lost memory of
+    earlier actions, causing loop recovery failures.
+    Fix: when len(_history) > 20, extract entries 0–10, send to LLM with a
+    "summarize these 10 actions in 3 sentences" prompt, and replace them with
+    a compressed summary entry. Cost: 1 additional LLM call per 20 actions.
+
+  Existing fixes retained:
+  - Dual-mode thinking selection (IRREVERSIBLE → thinking=True)
+  - Denied-signature tracking to block plan-step fallback
+  - Injection marker scan on thought field
+  - SGLangAdapter.with_thinking() support
 """
 from __future__ import annotations
 
@@ -23,6 +32,10 @@ _logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 MAX_REASONING_HISTORY   = 30
+# Summarization triggers when history length exceeds this value
+_SUMMARIZATION_TRIGGER  = 20
+# Entries to summarize in each compression call (first N entries)
+_ENTRIES_TO_SUMMARIZE   = 10
 MAX_HISTORY_TEXT_CHARS  = 300
 MAX_OBJECTIVE_CHARS     = 800
 MAX_ENTITY_COUNT        = 30
@@ -31,6 +44,10 @@ try:
     from config.timeouts import LLM_CALL_TIMEOUT_SECONDS as REASONING_TIMEOUT_SECONDS
 except ImportError:
     REASONING_TIMEOUT_SECONDS: float = 150.0
+
+# Summarization call timeout — shorter than full reasoning since it's a
+# compression task with well-defined structure
+_SUMMARIZATION_TIMEOUT = 60.0
 
 _USE_PER_STEP_ENV = "PROJECTZEO_USE_PER_STEP_REASONING"
 
@@ -104,6 +121,22 @@ HISTORY ({history_count} prior actions):
 What is the single best next action to make progress toward the objective?
 """
 
+# ---------------------------------------------------------------------------
+# History summarization prompt
+# ---------------------------------------------------------------------------
+
+_SUMMARIZE_SYSTEM_PROMPT = """\
+You are a concise execution log compressor.
+You will receive a list of agent actions and their outcomes.
+Summarize them in exactly 3 sentences, capturing:
+  1. What was accomplished (successes)
+  2. What failed and was tried
+  3. The current state after these actions
+
+Be factual. Keep important details (file names, commands, error messages).
+Return ONLY a plain-text summary — no JSON, no headers.
+"""
+
 
 # ---------------------------------------------------------------------------
 # PerStepReasoner
@@ -141,6 +174,7 @@ class PerStepReasoner:
         self._safety_confirm_count = 0
         self._thinking_calls  = 0
         self._instruct_calls  = 0
+        self._summarization_count = 0
         # Track denied action signatures to block plan-step fallback
         self._recently_denied_signatures: set = set()
 
@@ -167,6 +201,10 @@ class PerStepReasoner:
     ) -> Tuple[Optional[Dict[str, Any]], str]:
         with self._lock:
             self._call_count += 1
+
+        # AUDIT HIGH-1: Trigger summarization before building the user message
+        # so the compressed history is available for the current reasoning call.
+        self._maybe_summarize_history()
 
         user_msg = self._build_user_message(world_state, perception)
         action   = self._call_with_timeout(user_msg, world_state=world_state)
@@ -216,21 +254,143 @@ class PerStepReasoner:
         }
         with self._lock:
             self._history.append(entry)
+            # Hard cap: silently drop oldest entries beyond MAX_REASONING_HISTORY
+            # after summarization has already run. Summarization below reduces
+            # this to ~20 entries during normal operation.
             if len(self._history) > MAX_REASONING_HISTORY:
                 self._history = self._history[-MAX_REASONING_HISTORY:]
 
     def get_stats(self) -> dict:
         with self._lock:
             return {
-                "call_count":          self._call_count,
-                "history_entries":     len(self._history),
-                "safety_denials":      self._safety_deny_count,
-                "safety_confirmations": self._safety_confirm_count,
-                "timeout_seconds":     self._timeout,
-                "supports_thinking":   self._supports_thinking,
-                "thinking_calls":      self._thinking_calls,
-                "instruct_calls":      self._instruct_calls,
+                "call_count":             self._call_count,
+                "history_entries":        len(self._history),
+                "safety_denials":         self._safety_deny_count,
+                "safety_confirmations":   self._safety_confirm_count,
+                "timeout_seconds":        self._timeout,
+                "supports_thinking":      self._supports_thinking,
+                "thinking_calls":         self._thinking_calls,
+                "instruct_calls":         self._instruct_calls,
+                "summarization_count":    self._summarization_count,
             }
+
+    # =========================================================================
+    # AUDIT HIGH-1: History Summarization
+    # =========================================================================
+
+    def _maybe_summarize_history(self) -> None:
+        """
+        When history exceeds _SUMMARIZATION_TRIGGER entries, extract the
+        first _ENTRIES_TO_SUMMARIZE entries, send them to the LLM for
+        compression into a 3-sentence narrative, and replace them with
+        a single summary entry. This prevents silent truncation of early
+        action history on long tasks.
+
+        Thread-safe. Falls back silently if the LLM call fails.
+        """
+        with self._lock:
+            if len(self._history) <= _SUMMARIZATION_TRIGGER:
+                return
+            entries_to_compress = list(self._history[:_ENTRIES_TO_SUMMARIZE])
+            remaining = list(self._history[_ENTRIES_TO_SUMMARIZE:])
+
+        # Build a text representation of the entries to compress
+        lines = []
+        for i, h in enumerate(entries_to_compress, 1):
+            act    = h["action"]
+            op     = act.get("operation", "?")
+            detail = (
+                act.get("command") or act.get("content") or
+                act.get("text") or act.get("summary") or ""
+            )[:80]
+            outcome = h["outcome"]
+            output  = h.get("output_snippet", "")[:60]
+            lines.append(f"{i}. [{outcome.upper()}] {op}: {detail}")
+            if output:
+                lines.append(f"   Output: {output}")
+
+        log_text = "\n".join(lines)
+        prompt = (
+            f"Objective: {self._objective[:300]}\n\n"
+            f"Actions to summarize:\n{log_text}"
+        )
+
+        try:
+            summary_text = self._call_summarize(prompt)
+            if not summary_text or len(summary_text.strip()) < 10:
+                _logger.debug("[PerStepReasoner] Summarization returned empty text — skipping.")
+                return
+
+            summary_entry = {
+                "action": {
+                    "operation": "_summary",
+                    "content": summary_text.strip()[:600],
+                },
+                "outcome": "summary",
+                "output_snippet": f"[SUMMARIZED {len(entries_to_compress)} actions]",
+                "ts": time.time(),
+            }
+
+            with self._lock:
+                # Re-check in case another thread modified history
+                if len(self._history) > _SUMMARIZATION_TRIGGER:
+                    self._history = [summary_entry] + remaining
+                    self._summarization_count += 1
+                    _logger.info(
+                        "[PerStepReasoner] History summarized: compressed %d entries into 1 "
+                        "(total now=%d).",
+                        len(entries_to_compress), len(self._history),
+                    )
+
+        except Exception as exc:
+            _logger.warning(
+                "[PerStepReasoner] History summarization failed: %s — continuing without compression.",
+                exc,
+            )
+
+    def _call_summarize(self, prompt: str) -> Optional[str]:
+        """Call the LLM to compress action history. Returns plain-text summary or None."""
+        result_holder: List[Optional[str]] = [None]
+        error_holder:  List[Optional[Exception]] = [None]
+
+        def _call():
+            try:
+                messages = [
+                    {"role": "system", "content": _SUMMARIZE_SYSTEM_PROMPT},
+                    {"role": "user",   "content": prompt},
+                ]
+                # Use instruct mode (fast) for summarization — no need for thinking
+                llm = self._llm
+                if self._supports_thinking:
+                    try:
+                        llm = self._llm.with_thinking(False)
+                    except Exception:
+                        pass
+                raw = llm(
+                    messages=messages,
+                    objective=self._objective,
+                    session_id="history_summarization",
+                )
+                if isinstance(raw, str):
+                    result_holder[0] = raw
+                elif isinstance(raw, list) and raw:
+                    item = raw[0]
+                    result_holder[0] = (
+                        item.get("content", "") if isinstance(item, dict) else str(item)
+                    )
+            except Exception as e:
+                error_holder[0] = e
+
+        t = threading.Thread(target=_call, daemon=True)
+        t.start()
+        t.join(timeout=_SUMMARIZATION_TIMEOUT)
+
+        if error_holder[0]:
+            raise error_holder[0]
+        if t.is_alive():
+            raise TimeoutError(f"Summarization LLM call timed out after {_SUMMARIZATION_TIMEOUT}s")
+
+        return result_holder[0]
 
     # =========================================================================
     # Prompt construction
@@ -288,6 +448,10 @@ class PerStepReasoner:
         for h in history:
             act    = h["action"]
             op     = act.get("operation", "?")
+            # Special rendering for summary entries
+            if op == "_summary":
+                history_lines.append(f"  [SUMMARY] {act.get('content', '')[:200]}")
+                continue
             detail = (
                 act.get("command") or act.get("content") or
                 act.get("text") or act.get("summary") or ""
@@ -332,21 +496,17 @@ class PerStepReasoner:
         world_state: Optional[Dict[str, Any]],
     ) -> Callable:
         """
-        AUDIT FIX: Select LLM callable with appropriate thinking mode.
+        Select LLM callable with appropriate thinking mode.
 
         Heuristic for pre-selection (before we see the action):
           - If the last history entry suggests we're about to do something
             destructive (command, install), use thinking mode.
           - If world state has many complex entities, use thinking mode.
           - Otherwise use instruct mode (fast, lower latency).
-
-        After action is returned we could re-evaluate, but pre-selection
-        is sufficient for ~90% accuracy and avoids an extra LLM round-trip.
         """
         if not self._supports_thinking:
             return self._llm
 
-        # Check recent history for indicators of upcoming complex action
         with self._lock:
             recent = list(self._history[-3:])
 
