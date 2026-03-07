@@ -491,34 +491,136 @@ def operate_main(
         thread_name_prefix="ui_timeout_worker",
     )
 
+    # -------------------------------------------------------------------------
+    # AGENT-1 FIX: AgentOrchestrator integration.
+    #
+    # When PROJECTZEO_USE_AGENT_ORCHESTRATOR=1 (or PROJECTZEO_USE_LANGGRAPH=1),
+    # the task is executed via AgentOrchestrator which selects the best
+    # available backend:
+    #   1. LangGraph StateGraph  (PROJECTZEO_USE_LANGGRAPH=1)
+    #   2. AgentPipeline         (specialist-agent direct loop)
+    #   3. GIIGoalDirectedLoop   (always-available fallback)
+    #
+    # When PROJECTZEO_USE_AGENT_ORCHESTRATOR is not set (default), the
+    # original _execute_autonomous_loop is used.  This preserves 100% of
+    # existing behaviour for operators who have not opted in.
+    # -------------------------------------------------------------------------
+    _use_orchestrator = (
+        os.environ.get("PROJECTZEO_USE_AGENT_ORCHESTRATOR", "0").strip()
+        in ("1", "true", "yes")
+        or os.environ.get("PROJECTZEO_USE_LANGGRAPH", "0").strip()
+        in ("1", "true", "yes")
+    )
+
     try:
         _created_files_ledger: List[str] = []
 
-        _execute_autonomous_loop(
-            terminal_prompt=terminal_prompt,
-            execution_plan=execution_plan,
-            observer=observer,
-            world_graph=world_graph,
-            os_backend=os_backend,
-            accessibility_backend=accessibility_backend,
-            journal=journal,
-            input_arbitrator=input_arbitrator,
-            verifier=verifier,
-            progress=progress,
-            installer=installer,
-            reasoning_engine=reasoning_engine,
-            policy_engine=policy_engine,
-            max_wallclock_seconds=max_wallclock_seconds,
-            watchdog=watchdog,
-            prior_belief_state=prior_belief_state,
-            belief_state_out=belief_state_out,
-            task_ui_executor=_task_ui_executor,
-            prior_playbook_actions=_prior_playbook_actions,
-            prior_execution_log=prior_execution_log,
-            created_files_ledger=_created_files_ledger,
-            gii_controller=gii_controller,
-            likelihood_cfg=_likelihood_cfg,
-        )
+        if _use_orchestrator:
+            # -----------------------------------------------------------------
+            # Path A: AgentOrchestrator (LangGraph / AgentPipeline / GII loop)
+            # -----------------------------------------------------------------
+            try:
+                from agent_orchestrator import AgentOrchestrator as _AO  # noqa: PLC0415
+                _consequence_r = (
+                    gii_controller.consequence_reasoner
+                    if gii_controller and hasattr(gii_controller, "consequence_reasoner")
+                    else None
+                )
+                _sem_mem = (
+                    getattr(gii_controller, "_semantic_memory", None)
+                    if gii_controller else None
+                )
+                _app_mem = (
+                    getattr(gii_controller, "_application_memory", None)
+                    if gii_controller else None
+                )
+                _orchestrator = _AO.create(
+                    llm_callable=llm_callable,
+                    objective=terminal_prompt,
+                    os_backend=os_backend,
+                    world_graph=world_graph,
+                    policy_engine=policy_engine,
+                    journal=journal,
+                    gii_controller=gii_controller,
+                    consequence_reasoner=_consequence_r,
+                    semantic_memory=_sem_mem,
+                    application_memory=_app_mem,
+                    max_wallclock_seconds=max_wallclock_seconds,
+                    max_iterations=2000,
+                    watchdog=watchdog,
+                )
+                _orch_result = _orchestrator.run()
+                print(
+                    f"[operate_main] AgentOrchestrator completed. "
+                    f"backend={_orch_result.get('backend')} "
+                    f"success={_orch_result.get('success')} "
+                    f"elapsed={_orch_result.get('elapsed_seconds')}s",
+                    file=sys.stderr,
+                )
+                if not _orch_result.get("success"):
+                    reason = _orch_result.get("reason", "unknown")
+                    raise RuntimeError(f"TASK_FAILED:{reason}")
+            except ImportError as _ao_import_err:
+                # AgentOrchestrator not available — fall back gracefully
+                print(
+                    f"[operate_main] WARNING: AgentOrchestrator import failed "
+                    f"({_ao_import_err}). Falling back to _execute_autonomous_loop.",
+                    file=sys.stderr,
+                )
+                _execute_autonomous_loop(
+                    terminal_prompt=terminal_prompt,
+                    execution_plan=execution_plan,
+                    observer=observer,
+                    world_graph=world_graph,
+                    os_backend=os_backend,
+                    accessibility_backend=accessibility_backend,
+                    journal=journal,
+                    input_arbitrator=input_arbitrator,
+                    verifier=verifier,
+                    progress=progress,
+                    installer=installer,
+                    reasoning_engine=reasoning_engine,
+                    policy_engine=policy_engine,
+                    max_wallclock_seconds=max_wallclock_seconds,
+                    watchdog=watchdog,
+                    prior_belief_state=prior_belief_state,
+                    belief_state_out=belief_state_out,
+                    task_ui_executor=_task_ui_executor,
+                    prior_playbook_actions=_prior_playbook_actions,
+                    prior_execution_log=prior_execution_log,
+                    created_files_ledger=_created_files_ledger,
+                    gii_controller=gii_controller,
+                    likelihood_cfg=_likelihood_cfg,
+                )
+        else:
+            # -----------------------------------------------------------------
+            # Path B: Original _execute_autonomous_loop (default)
+            # -----------------------------------------------------------------
+            _execute_autonomous_loop(
+                terminal_prompt=terminal_prompt,
+                execution_plan=execution_plan,
+                observer=observer,
+                world_graph=world_graph,
+                os_backend=os_backend,
+                accessibility_backend=accessibility_backend,
+                journal=journal,
+                input_arbitrator=input_arbitrator,
+                verifier=verifier,
+                progress=progress,
+                installer=installer,
+                reasoning_engine=reasoning_engine,
+                policy_engine=policy_engine,
+                max_wallclock_seconds=max_wallclock_seconds,
+                watchdog=watchdog,
+                prior_belief_state=prior_belief_state,
+                belief_state_out=belief_state_out,
+                task_ui_executor=_task_ui_executor,
+                prior_playbook_actions=_prior_playbook_actions,
+                prior_execution_log=prior_execution_log,
+                created_files_ledger=_created_files_ledger,
+                gii_controller=gii_controller,
+                likelihood_cfg=_likelihood_cfg,
+            )
 
         try:
             _journal_actions = journal.get_all() if hasattr(journal, "get_all") else []
