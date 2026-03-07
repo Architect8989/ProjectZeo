@@ -1,29 +1,4 @@
-# ProjectZeo Policy Configuration Template
-# ==========================================
-# GAP-5 FIX: This file was completely absent from the repository.
-# PolicyEngine loads policy.yaml at task start. Without this file,
-# operators had no way to know:
-#   - The file exists and controls system behavior
-#   - What keys are supported
-#   - What the defaults are
-#   - How to customize the policy for their environment
-#
-# USAGE:
-#   1. Copy this file: cp policy.yaml.template policy.yaml
-#   2. Edit policy.yaml to match your environment
-#   3. Do NOT commit policy.yaml with real paths to git (add to .gitignore)
-#   4. ProjectZeo reads policy.yaml at each task start (hot-reload safe)
-#
-# All sections are optional — omit any section to use the built-in defaults.
-# ==========================================
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# ALLOWED APPLICATIONS
-# Which applications the agent is allowed to interact with.
-# Empty list = deny all UI interaction (dangerous — agent cannot do anything).
-# Omit this key = use built-in default allowlist (permissive for development).
-# ─────────────────────────────────────────────────────────────────────────────
 allowed_apps:
   # Common productivity tools — safe for most deployments
   - "Terminal"
@@ -66,16 +41,9 @@ allowed_apps:
   - "zoom"
   - "Zoom"
 
-# ─────────────────────────────────────────────────────────────────────────────
-# HIGH-RISK APPLICATIONS (require human confirmation before ANY action)
-# Agent must obtain explicit operator approval (delete signal file) before
-# acting in these applications.
-# ─────────────────────────────────────────────────────────────────────────────
+
 high_risk_apps:
-  # AUDIT FIX: "sudo" has been removed from high_risk_apps and placed in denied_apps below.
-  # Rationale: high_risk_apps only requires a one-click .APPROVE signal-file to bypass.
-  # Privilege escalation via sudo must require a deliberate, auditable change to this file,
-  # not a single-click operator action. Move sudo here only after a formal change-review.
+  
   - "root"
   - "gparted"
   - "synaptic"
@@ -91,27 +59,7 @@ high_risk_apps:
 # DENIED APPLICATIONS (agent is NEVER allowed to interact, hard block)
 # ─────────────────────────────────────────────────────────────────────────────
 denied_apps:
-  # ─── AUDIT FIX: sudo moved here from high_risk_apps (March 2026) ─────────
-  # HIGH-RISK is not strong enough for sudo. high_risk_apps generates a
-  # REQUIRE_HUMAN_CONFIRMATION gate that any operator can bypass by creating a
-  # single .signal.APPROVE file — even without understanding what the sudo
-  # command will do. A sudo exploit in an autonomous agent can:
-  #   • overwrite /etc/sudoers to establish permanent privilege escalation
-  #   • install kernel modules (rootkits)
-  #   • wipe all user data (sudo rm -rf /)
-  #
-  # denied_apps generates an unconditional DENY that cannot be bypassed at
-  # runtime. The ONLY way to permit sudo is to:
-  #   1. Edit THIS file (policy.yaml)
-  #   2. Move "sudo" back to high_risk_apps OR allowed_apps
-  #   3. Restart the agent
-  #
-  # This requires a deliberate, auditable human action — not a click.
-  #
-  # DEVELOPMENT OVERRIDE: If you need sudo during development, move it to
-  # high_risk_apps AND enable PROJECTZEO_CONFIRM_TIMEOUT_SECONDS=300 so
-  # operators have time to review.
-  # ─────────────────────────────────────────────────────────────────────────
+  
   - "sudo"    # AUDIT CRITICAL: Hard block. Edit policy.yaml to change this.
   - "su"      # Privilege escalation via user-switch — always denied
   - "ssh"
