@@ -1,58 +1,103 @@
-# config/timeouts.py
-"""
-Centralised timeout configuration for all LLM-related execution paths.
+from __future__ import annotations
 
-PATCHES APPLIED (Audit Fixes):
+import os as _os
 
-  ✅  §R4: LLM_CALL_TIMEOUT_SECONDS raised to 150s to accommodate CPU
-           inference on Qwen2.5-VL 7B (40–90s) plus network overhead.
-           The old 30s value caused the planner to abort mid-generation
-           on CPU-only machines.
 
-  ✅  §R4: LLM_THREAD_TIMEOUT_SECONDS raised proportionally to maintain
-           the required safety margin above LLM_CALL_TIMEOUT_SECONDS.
+# ---------------------------------------------------------------------------
+# Deployment mode detection
+# ---------------------------------------------------------------------------
 
-Design rules:
-  - Planner-level timeout must fire before thread-level timeout.
-  - Thread timeout must exceed planner timeout by a small safety margin.
-  - All LLM timeouts must be defined here to avoid drift.
-"""
+def _is_gpu_mode() -> bool:
+    """Return True when SGLang GPU inference is configured and enabled."""
+    return _os.environ.get("PROJECTZEO_USE_SGLANG", "0").strip() in ("1", "true", "yes")
 
-# Core LLM call timeout (used by ExecutionPlanner and AutonomousInstaller)
-# PATCH §R4: raised from 30s to 150s for CPU-inference compatibility.
-# CPU inference for Qwen2.5-VL 7B: 40–90s. 150s gives a comfortable margin.
-LLM_CALL_TIMEOUT_SECONDS: float = 150.0
 
-# Thread wrapper timeout (used in run.py)
-# Must be strictly greater than the WORST-CASE total time for a full planning
-# cycle including all internal retries.
-#
-# H1 FIX: The previous value was LLM_CALL_TIMEOUT_SECONDS + 15.0 = 165s.
-# This was insufficient for CPU-only deployments.
-#
-# Worst-case CPU planning budget:
-#   _PLAN_MAX_RETRIES = 3 (main.py)
-#   Per-call inference:       3 × 90s = 270s
-#   Exponential back-off:     2^1 + 2^2 = 6s
-#   LLM_CALL_TIMEOUT margin:  150s already baked into planner
-#   Safety headroom:          +150s
-#   Total ceiling:            ~600s
-#
-# On GPU (2–5s/call) this limit is never approached.  On CPU it gives the
-# planner its full 3-attempt budget before the thread is declared hung.
-LLM_THREAD_TIMEOUT_SECONDS: float = 600.0
 
-# Installation command timeout (used by AutonomousInstaller._try_terminal_install)
-# Large downloads (e.g. apt-get install build-essential) can take 5+ minutes.
+LLM_CALL_TIMEOUT_SECONDS_CPU: float = 150.0
+
+
+LLM_THREAD_TIMEOUT_SECONDS_CPU: float = 600.0
+
+
+
+LLM_CALL_TIMEOUT_SECONDS_GPU: float = float(
+    _os.environ.get("PROJECTZEO_GPU_CALL_TIMEOUT", "30.0")
+)
+
+# §GPU: Thread timeout — 3 retries x 30s = 90s worst-case + 30s safety margin.
+LLM_THREAD_TIMEOUT_SECONDS_GPU: float = float(
+    _os.environ.get("PROJECTZEO_GPU_THREAD_TIMEOUT", "120.0")
+)
+
+
+LLM_CONSEQUENCE_TIMEOUT_SECONDS_GPU: float = float(
+    _os.environ.get("PROJECTZEO_GPU_CONSEQUENCE_TIMEOUT", "90.0")
+)
+
+
+# ---------------------------------------------------------------------------
+# Effective (deployment-aware) accessors
+# ---------------------------------------------------------------------------
+
+def effective_llm_call_timeout() -> float:
+    """Return the correct LLM call timeout for the current deployment mode."""
+    return LLM_CALL_TIMEOUT_SECONDS_GPU if _is_gpu_mode() else LLM_CALL_TIMEOUT_SECONDS_CPU
+
+
+def effective_llm_thread_timeout() -> float:
+    """Return the correct thread-wrapper timeout for the current deployment mode."""
+    return LLM_THREAD_TIMEOUT_SECONDS_GPU if _is_gpu_mode() else LLM_THREAD_TIMEOUT_SECONDS_CPU
+
+
+def effective_consequence_timeout() -> float:
+    
+    return LLM_CONSEQUENCE_TIMEOUT_SECONDS_GPU if _is_gpu_mode() else 180.0
+
+
+
+LLM_CALL_TIMEOUT_SECONDS: float = effective_llm_call_timeout()
+LLM_THREAD_TIMEOUT_SECONDS: float = effective_llm_thread_timeout()
+
+
+
 INSTALL_COMMAND_TIMEOUT_SECONDS: float = 300.0
 
-# Step execution stagnation limits (used by operate.py)
-# Default for UI interaction steps — expect fast feedback
+
+
 MAX_STAGNANT_ITERS_UI: int = 12
 
 # For command_execution and tool_installation steps.
-# A slow download (e.g. nodejs via apt on a 10Mbps connection) can take 3+ minutes
-# with no progress event. 120 iterations × 0.25s heartbeat = 30s minimum.
-# Actual command blocking means real wall-clock time is the actual timeout
-# from the subprocess, so this guard is for the outer loop health check.
+# 120 iterations x 0.25s heartbeat = 30s minimum guard.
 MAX_STAGNANT_ITERS_COMMAND: int = 120
+
+
+# ---------------------------------------------------------------------------
+# Startup / warmup grace period
+# ---------------------------------------------------------------------------
+
+# GPU warmup is much faster than CPU — 60s vs 300s default.
+STARTUP_GRACE_SECONDS: float = float(
+    _os.environ.get(
+        "PROJECTZEO_STARTUP_GRACE_SECONDS",
+        "60.0" if _is_gpu_mode() else "300.0",
+    )
+)
+
+
+# ---------------------------------------------------------------------------
+# Introspection helper (used by startup banners)
+# ---------------------------------------------------------------------------
+
+def describe_timeout_mode() -> str:
+    """Return a one-line description of the active timeout regime."""
+    if _is_gpu_mode():
+        return (
+            f"GPU mode — call={LLM_CALL_TIMEOUT_SECONDS_GPU}s "
+            f"thread={LLM_THREAD_TIMEOUT_SECONDS_GPU}s "
+            f"consequence={LLM_CONSEQUENCE_TIMEOUT_SECONDS_GPU}s"
+        )
+    return (
+        f"CPU mode — call={LLM_CALL_TIMEOUT_SECONDS_CPU}s "
+        f"thread={LLM_THREAD_TIMEOUT_SECONDS_CPU}s "
+        f"consequence=180.0s"
+    )
