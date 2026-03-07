@@ -19,15 +19,17 @@ MAX_RUNTIME_SECONDS  = 3600         # 1 hour per task
 MAX_MEMORY_MB        = 4096         # 4 GB resident set
 MAX_CPU_PERCENT      = 90           # sustained CPU
 
-# M7 FIX: Minimum effective task timeout even in "unlimited" mode (24h)
-MIN_EFFECTIVE_TIMEOUT_SECONDS = 86_400  # 24 hours
+# AUDIT-FIX: Minimum effective task timeout (was incorrectly set to 86_400 = 24h).
+# main.py sets _MIN_EFFECTIVE_TASK_SECONDS = 1_800. Watchdog must be consistent.
+# 1_800 seconds = 30 minutes — minimum task budget even in "unlimited" mode.
+MIN_EFFECTIVE_TIMEOUT_SECONDS = 1_800  # 30 minutes (was 86_400 — DEFECT FIXED)
 
 # Sampling
 CPU_SAMPLE_INTERVAL  = 0.1          # seconds
 CPU_WINDOW_SECONDS   = 3.0          # sustained window
 CPU_MIN_SAMPLES      = int(CPU_WINDOW_SECONDS / CPU_SAMPLE_INTERVAL)
 
-# Background sampling thread interval (CRIT-NEW)
+# Background sampling thread interval
 BACKGROUND_SAMPLE_INTERVAL = 0.25   # seconds
 
 
@@ -37,9 +39,9 @@ class WatchdogViolation(RuntimeError):
 
 
 class RuntimeWatchdog:
-    
+
     def __init__(self):
-        # FIX RB-2 / SI-2: Dedicated lock for start_time
+        # Dedicated lock for start_time
         self._start_time_lock = threading.Lock()
         self._start_time: float = time.time()
 
@@ -52,11 +54,11 @@ class RuntimeWatchdog:
             except Exception:
                 self.process = None
 
-        # CPU sampling state (shared between main thread check() and bg thread)
+        # CPU sampling state
         self._cpu_samples: deque = deque(maxlen=CPU_MIN_SAMPLES)
         self._cpu_samples_lock = threading.Lock()
 
-        # CPU pause (FIX RB-4)
+        # CPU pause
         self._cpu_paused: bool = False
         self._cpu_pause_lock = threading.Lock()
 
@@ -64,7 +66,7 @@ class RuntimeWatchdog:
         self._pending_violation: Optional[str] = None
         self._violation_lock = threading.Lock()
 
-        # CRIT-NEW: Background sampling thread
+        # Background sampling thread
         self._bg_stop_event = threading.Event()
         self._bg_thread = threading.Thread(
             target=self._background_sample_loop,
@@ -73,11 +75,11 @@ class RuntimeWatchdog:
         )
         self._bg_thread.start()
 
-        # SEC-NEW: atexit forensic log
+        # atexit forensic log
         atexit.register(self._atexit_report)
 
     # =================================================
-    # START TIME PROPERTY (FIX SI-2 / RB-A2)
+    # START TIME PROPERTY
     # =================================================
 
     @property
@@ -90,16 +92,14 @@ class RuntimeWatchdog:
     def start_time(self, value: float) -> None:
         """Thread-safe write of the per-task start timestamp."""
         with self._start_time_lock:
-            # M7 FIX: Clear pending violation when task resets
             self._start_time = float(value)
         with self._violation_lock:
             self._pending_violation = None
-        # Clear CPU samples on new task start to avoid stale window
         with self._cpu_samples_lock:
             self._cpu_samples.clear()
 
     # =================================================
-    # CPU PAUSE / RESUME (FIX RB-4)
+    # CPU PAUSE / RESUME
     # =================================================
 
     def pause_cpu(self) -> None:
@@ -119,18 +119,15 @@ class RuntimeWatchdog:
             return self._cpu_paused
 
     # =================================================
-    # BACKGROUND SAMPLING THREAD (CRIT-NEW)
+    # BACKGROUND SAMPLING THREAD
     # =================================================
 
     def _background_sample_loop(self) -> None:
-        
         while not self._bg_stop_event.is_set():
             time.sleep(BACKGROUND_SAMPLE_INTERVAL)
-
             try:
                 self._bg_sample_once()
             except Exception as exc:
-                # Never crash the watchdog thread
                 print(
                     f"[WatchdogBGSampler] Unexpected error: {exc}",
                     file=sys.stderr,
@@ -141,7 +138,8 @@ class RuntimeWatchdog:
         now = time.time()
         elapsed = now - self.start_time
 
-        # M7 FIX: Enforce minimum effective timeout
+        # Enforce minimum effective timeout (consistent with main.py).
+        # AUDIT-FIX: MIN_EFFECTIVE_TIMEOUT_SECONDS is now 1_800, not 86_400.
         effective_timeout = max(MAX_RUNTIME_SECONDS, MIN_EFFECTIVE_TIMEOUT_SECONDS)
         _env_override = os.environ.get("PROJECTZEO_MAX_TASK_SECONDS", "")
         try:
@@ -149,7 +147,7 @@ class RuntimeWatchdog:
             if _env_val > 0:
                 effective_timeout = max(_env_val, MIN_EFFECTIVE_TIMEOUT_SECONDS)
             elif _env_val == 0:
-                # "unlimited" mode — still enforce 24h ceiling
+                # "unlimited" mode — still enforce 30-minute minimum
                 effective_timeout = MIN_EFFECTIVE_TIMEOUT_SECONDS
         except (ValueError, AttributeError):
             pass
@@ -200,7 +198,6 @@ class RuntimeWatchdog:
     # =================================================
 
     def check(self) -> None:
-        
         # Raise any violation detected by the background thread
         with self._violation_lock:
             pending = self._pending_violation
@@ -232,7 +229,7 @@ class RuntimeWatchdog:
             self._bg_thread.join(timeout=2.0)
 
     # =================================================
-    # ATEXIT FORENSICS (SEC-NEW)
+    # ATEXIT FORENSICS
     # =================================================
 
     def _atexit_report(self) -> None:
