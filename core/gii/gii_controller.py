@@ -69,6 +69,13 @@ class GIIController:
         self._consequence_reasoner = None
         self._semantic_memory = None
         self._application_memory = None
+        # MEM-2 FIX: Mem0Store as primary cross-session memory.
+        # BeliefState (in operate.py) is preserved as the per-task working memory.
+        # Mem0Store adds persistent memory that survives across task sessions.
+        self._mem0_store = None
+        # MEM-1 FIX: CogneeStore as primary knowledge-graph memory.
+        # SemanticMemory is preserved as the regex-extraction fallback.
+        self._cognee_store = None
         self._task_start: float = time.time()
         self._lock = threading.Lock()
         # AUDIT-MEDIUM FIX: Track denied action keys to block plan-fallback too
@@ -116,6 +123,10 @@ class GIIController:
         return self._consequence_reasoner
 
     def _initialise_components(self, memory_dir: Optional[str]) -> None:
+        # ----------------------------------------------------------------
+        # Layer 1: SemanticMemory — always initialised first as it is the
+        # universal fallback.  Cognee/Mem0 layer is layered on top.
+        # ----------------------------------------------------------------
         try:
             from core.memory.semantic_memory import SemanticMemory
             self._semantic_memory = SemanticMemory(memory_dir=memory_dir)
@@ -127,6 +138,44 @@ class GIIController:
             self._application_memory = ApplicationMemory(memory_dir=memory_dir)
         except Exception as exc:
             _logger.warning("[GIIController] ApplicationMemory init failed: %s", exc)
+
+        # ----------------------------------------------------------------
+        # Layer 2: Mem0Store — cross-session persistent working memory.
+        # Primary when mem0ai is installed; JSON-file fallback otherwise.
+        # BeliefState (per-task) is NOT replaced — it remains the in-session
+        # working memory.  Mem0 adds the cross-session layer on top.
+        # ----------------------------------------------------------------
+        try:
+            from core.memory.mem0_store import Mem0Store
+            self._mem0_store = Mem0Store.get_instance()
+            _logger.info(
+                "[GIIController] Mem0Store initialised. "
+                "available=%s cross-session memory active.",
+                self._mem0_store._available,
+            )
+        except Exception as exc:
+            _logger.warning(
+                "[GIIController] Mem0Store init failed (non-fatal): %s. "
+                "Cross-session memory will be unavailable this session.", exc
+            )
+
+        # ----------------------------------------------------------------
+        # Layer 3: CogneeStore — semantic knowledge graph from past tasks.
+        # Primary when cognee is installed; SemanticMemory is the fallback.
+        # ----------------------------------------------------------------
+        try:
+            from core.memory.cognee_store import CogneeStore
+            self._cognee_store = CogneeStore.get_instance()
+            _logger.info(
+                "[GIIController] CogneeStore initialised. "
+                "available=%s knowledge-graph memory active.",
+                self._cognee_store._available,
+            )
+        except Exception as exc:
+            _logger.warning(
+                "[GIIController] CogneeStore init failed (non-fatal): %s. "
+                "SemanticMemory will be used as knowledge-graph fallback.", exc
+            )
 
         # AUDIT-CRITICAL-1 FIX: ConsequenceReasoner now active for BOTH BASIC and FULL.
         # Tier2 (goal coherence) always active. Tier3 only in FULL mode.
@@ -212,17 +261,60 @@ class GIIController:
                 pass
 
     def get_planning_context(self, focused_app: Optional[str] = None) -> str:
+        """
+        Build the memory context injected into every per-step reasoning prompt.
+
+        Retrieval priority (highest to lowest):
+          1. Mem0Store — cross-session working memory (agent experiences)
+          2. CogneeStore — semantic knowledge graph (learned lessons)
+          3. SemanticMemory — regex-extracted facts (CPU fallback)
+          4. ApplicationMemory — per-app keyboard shortcuts / workflow patterns
+        """
         if not self._enabled:
             return ""
         parts = []
-        if self._application_memory and focused_app:
+
+        # --- Mem0: cross-session memory ---
+        if self._mem0_store is not None:
             try:
-                app_context = self._application_memory.format_profile_for_prompt(focused_app)
-                if app_context:
-                    parts.append(app_context)
-            except Exception:
-                pass
-        if self._semantic_memory:
+                agent_id = getattr(self._mem0_store, 'make_agent_id',
+                                   lambda x: x)(self._objective)
+                memories = self._mem0_store.search_memory(
+                    self._objective, agent_id, limit=6
+                )
+                if memories:
+                    lines = ["[Cross-session memories]"]
+                    for m in memories[:6]:
+                        text = m.get("memory") or m.get("text") or str(m)
+                        lines.append(f"  • {str(text)[:200]}")
+                    parts.append("\n".join(lines))
+                    _logger.debug(
+                        "[GIIController] Mem0 provided %d cross-session memories.",
+                        len(memories),
+                    )
+            except Exception as exc:
+                _logger.debug("[GIIController] Mem0 context retrieval error: %s", exc)
+
+        # --- CogneeStore: knowledge graph (primary) OR SemanticMemory (fallback) ---
+        _knowledge_sourced = False
+        if self._cognee_store is not None and self._cognee_store._available:
+            try:
+                cognee_results = self._cognee_store.search(self._objective, limit=8)
+                if cognee_results:
+                    lines = ["[Learned knowledge (Cognee)]"]
+                    for r in cognee_results[:8]:
+                        text = r.get("text") or r.get("object") or str(r)
+                        lines.append(f"  • {str(text)[:200]}")
+                    parts.append("\n".join(lines))
+                    _knowledge_sourced = True
+                    _logger.debug(
+                        "[GIIController] CogneeStore provided %d knowledge results.",
+                        len(cognee_results),
+                    )
+            except Exception as exc:
+                _logger.debug("[GIIController] CogneeStore context retrieval error: %s", exc)
+
+        if not _knowledge_sourced and self._semantic_memory:
             try:
                 facts = self._semantic_memory.query(self._objective, max_results=8)
                 sem_context = self._semantic_memory.format_for_prompt(facts)
@@ -230,6 +322,16 @@ class GIIController:
                     parts.append(sem_context)
             except Exception:
                 pass
+
+        # --- ApplicationMemory: per-app keyboard shortcuts and workflow patterns ---
+        if self._application_memory and focused_app:
+            try:
+                app_context = self._application_memory.format_profile_for_prompt(focused_app)
+                if app_context:
+                    parts.append(app_context)
+            except Exception:
+                pass
+
         return "\n\n".join(parts)
 
     def on_task_complete(
@@ -239,6 +341,16 @@ class GIIController:
         focused_app: Optional[str] = None,
         execution_log: Optional[Dict[str, Any]] = None,
     ) -> None:
+        """
+        Post-task memory synthesis.
+
+        Synthesis order (all run in background threads, non-blocking):
+          1. EpisodicSynthesizer (LLM) → SemanticMemory / CogneeStore
+          2. CogneeStore ingestion of execution log (knowledge graph)
+          3. Mem0Store memory extraction (cross-session working memory)
+          4. Regex fallback → SemanticMemory (if LLM synthesis produced nothing)
+          5. ApplicationMemory task count increment
+        """
         if not self._enabled:
             return
         if self._application_memory and focused_app:
@@ -246,6 +358,56 @@ class GIIController:
                 self._application_memory.increment_task_count(focused_app)
             except Exception:
                 pass
+
+        # --- Mem0: add task outcome to cross-session memory (background thread) ---
+        if self._mem0_store is not None and execution_log is not None:
+            def _store_mem0():
+                try:
+                    agent_id = getattr(self._mem0_store, 'make_agent_id',
+                                       lambda x: x)(self._objective)
+                    # Build a compact conversation for Mem0 extraction
+                    log_str = str(execution_log)[:3000]
+                    messages = [
+                        {"role": "user", "content": f"Task: {self._objective}"},
+                        {"role": "assistant", "content": (
+                            f"Task {'completed successfully' if success else 'failed'}. "
+                            f"Summary: {log_str}"
+                        )},
+                    ]
+                    self._mem0_store.add_memory(
+                        messages, agent_id,
+                        metadata={"objective": self._objective[:200], "success": success}
+                    )
+                    _logger.info(
+                        "[GIIController] Mem0 memory stored for agent_id=%s success=%s",
+                        agent_id, success,
+                    )
+                except Exception as exc:
+                    _logger.debug("[GIIController] Mem0 post-task storage error: %s", exc)
+            import threading as _t
+            _t.Thread(target=_store_mem0, daemon=True).start()
+
+        # --- CogneeStore: ingest execution log into knowledge graph (background) ---
+        if (self._cognee_store is not None
+                and self._cognee_store._available
+                and execution_log is not None):
+            def _store_cognee():
+                try:
+                    log_text = (
+                        f"Task: {self._objective}\n"
+                        f"Outcome: {'success' if success else 'failure'}\n"
+                        f"App: {focused_app or 'unknown'}\n"
+                        f"Log: {str(execution_log)[:4000]}"
+                    )
+                    self._cognee_store.add(log_text)
+                    _logger.info(
+                        "[GIIController] CogneeStore knowledge graph updated "
+                        "for task: %s", self._objective[:60],
+                    )
+                except Exception as exc:
+                    _logger.debug("[GIIController] CogneeStore post-task error: %s", exc)
+            import threading as _t2
+            _t2.Thread(target=_store_cognee, daemon=True).start()
         if self._semantic_memory and execution_log:
             # AUDIT FIX: LLM synthesis is now PRIMARY. Regex extraction is the fallback.
             # Previously, both ran unconditionally and errors were silently swallowed,
