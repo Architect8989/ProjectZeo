@@ -9,20 +9,13 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 _logger = logging.getLogger(__name__)
 
-# ─── AUDIT MEDIUM-1 FIX: Episodic checkpoint interval ────────────────────────
-# EpisodicSynthesizer.store_checkpoint() is called every N record_outcome()
-# calls to save partial lessons mid-task. Previously only called on task
-# completion — a crash at iteration 149/150 stored zero episodic knowledge.
-# Set via PROJECTZEO_EPISODIC_CHECKPOINT_INTERVAL (default 50).
+
 _EPISODIC_CHECKPOINT_INTERVAL: int = max(
     1,
     int(os.environ.get("PROJECTZEO_EPISODIC_CHECKPOINT_INTERVAL", "50") or "50"),
 )
 
-# ─── ARCH-1 FIX: MilestoneDecomposer opt-in ──────────────────────────────────
-# Set PROJECTZEO_USE_MILESTONES=1 to replace sequential scaffold steps with
-# observable milestone conditions as the primary planning artifact for GII.
-# Off by default to preserve existing behaviour.
+
 _USE_MILESTONES: bool = (
     os.environ.get("PROJECTZEO_USE_MILESTONES", "0").strip() == "1"
 )
@@ -171,12 +164,7 @@ class GIIController:
         except Exception as exc:
             _logger.warning("[GIIController] ApplicationMemory init failed: %s", exc)
 
-        # ----------------------------------------------------------------
-        # Layer 2: Mem0Store — cross-session persistent working memory.
-        # Primary when mem0ai is installed; JSON-file fallback otherwise.
-        # BeliefState (per-task) is NOT replaced — it remains the in-session
-        # working memory.  Mem0 adds the cross-session layer on top.
-        # ----------------------------------------------------------------
+        
         try:
             from core.memory.mem0_store import Mem0Store
             self._mem0_store = Mem0Store.get_instance()
@@ -191,10 +179,7 @@ class GIIController:
                 "Cross-session memory will be unavailable this session.", exc
             )
 
-        # ----------------------------------------------------------------
-        # Layer 3: CogneeStore — semantic knowledge graph from past tasks.
-        # Primary when cognee is installed; SemanticMemory is the fallback.
-        # ----------------------------------------------------------------
+        
         try:
             from core.memory.cognee_store import CogneeStore
             self._cognee_store = CogneeStore.get_instance()
@@ -209,10 +194,7 @@ class GIIController:
                 "SemanticMemory will be used as knowledge-graph fallback.", exc
             )
 
-        # AUDIT-CRITICAL-1 FIX: ConsequenceReasoner now active for BOTH BASIC and FULL.
-        # Tier2 (goal coherence) always active. Tier3 only in FULL mode.
-        # AUDIT FIX: Pass auto_wire_endpoints=True so ConsequenceReasoner can route
-        # Tier 2 to the fast endpoint and Tier 3 to the deep/thinking endpoint.
+        
         try:
             from core.safety.consequence_reasoner import ConsequenceReasoner
             enable_tier3 = self._gii_mode >= GIIMode.FULL
@@ -252,11 +234,7 @@ class GIIController:
             _logger.error("[GIIController] PerStepReasoner init failed: %s", exc)
             self._enabled = False
 
-        # ── AUDIT MEDIUM-1 FIX: EpisodicSynthesizer ───────────────────────────
-        # Wired here so store_checkpoint() can be called from record_outcome()
-        # every _EPISODIC_CHECKPOINT_INTERVAL iterations during task execution.
-        # Previously only synthesize_and_store() was called (post-task only);
-        # a crash at the last iteration stored zero learned lessons.
+        
         try:
             from core.memory.episodic_synthesizer import EpisodicSynthesizer
             self._episodic_synthesizer = EpisodicSynthesizer(
@@ -273,10 +251,7 @@ class GIIController:
                 "Post-task lesson synthesis will be unavailable.", exc,
             )
 
-        # ── ARCH-1 FIX: MilestoneDecomposer (opt-in PROJECTZEO_USE_MILESTONES=1) ─
-        # When active, PerStepReasoner's objective is replaced with the current
-        # milestone condition so the GII loop reasons toward observable checkpoints
-        # rather than a fixed ordered step sequence.
+        
         if _USE_MILESTONES:
             try:
                 from core.planner.milestone_decomposer import MilestoneDecomposer
@@ -521,16 +496,7 @@ class GIIController:
         focused_app: Optional[str] = None,
         execution_log: Optional[Dict[str, Any]] = None,
     ) -> None:
-        """
-        Post-task memory synthesis.
-
-        Synthesis order (all run in background threads, non-blocking):
-          1. EpisodicSynthesizer (LLM) → SemanticMemory / CogneeStore
-          2. CogneeStore ingestion of execution log (knowledge graph)
-          3. Mem0Store memory extraction (cross-session working memory)
-          4. Regex fallback → SemanticMemory (if LLM synthesis produced nothing)
-          5. ApplicationMemory task count increment
-        """
+        
         if not self._enabled:
             return
         if self._application_memory and focused_app:
@@ -589,12 +555,7 @@ class GIIController:
             import threading as _t2
             _t2.Thread(target=_store_cognee, daemon=True).start()
         if self._semantic_memory and execution_log:
-            # AUDIT FIX: LLM synthesis is now PRIMARY. Regex extraction is the fallback.
-            # Previously, both ran unconditionally and errors were silently swallowed,
-            # meaning the regex path always dominated. Now:
-            #   1. Try LLM synthesis first (async thread, generous timeout).
-            #   2. If LLM synthesis stores ≥1 lesson, skip regex (LLM is better).
-            #   3. If LLM synthesis fails or stores 0 lessons, run regex as fallback.
+            
             llm_synthesis_succeeded = False
             try:
                 lessons_before = (
