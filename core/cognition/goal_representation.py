@@ -1,38 +1,3 @@
-"""
-core/cognition/goal_representation.py
-======================================
-Structured, verifiable goal representation for ProjectZeo GII.
-
-Blueprint Reference: §3.3.2 Goal Representation (arXiv:2504.16563 GoalAct)
-
-Instead of a binary success/fail flag, every objective is decomposed into a
-set of verifiable sub-conditions (ObservableCondition). Each condition can be
-evaluated against the current screen state independently. Progress is a
-gradient 0.0–1.0, enabling operator selection to be guided by incremental
-advancement rather than blind execution.
-
-Design principles:
-  - LLM decomposes natural language → structured verifiable predicates
-  - Each condition has an evaluation method (LLM-based screen check)
-  - Confidence-weighted progress: uncertain conditions contribute less
-  - Thread-safe: can be evaluated from observer loop and GII loop concurrently
-  - Fallback: if LLM decomposition fails, single root condition is used
-  - Salience scoring: recently satisfied conditions boost memory storage
-  - Stall detection: if progress stagnates N evaluations, returns stall signal
-
-Interface expected by GlobalWorkspace.ReflectionModule:
-  .progress         → float 0.0-1.0
-  .is_complete      → bool
-  .progress_summary → str
-  .next_pending()   → Condition (with .description attr) | None
-  .evaluate_from_screen(obs: dict) → None  (updates internal state)
-
-Interface expected by GIIController:
-  ._conditions      → List[ObservableCondition]
-  .is_complete      → bool
-  .progress_summary → str
-  .evaluate_from_screen(world_state: dict) → None
-"""
 from __future__ import annotations
 
 import json
@@ -71,13 +36,7 @@ class ConditionStatus(str, Enum):
 
 @dataclass
 class ObservableCondition:
-    """
-    A single verifiable sub-condition of the overall goal.
-
-    Each condition is expressed as a predicate that can be evaluated against
-    a screen observation. Satisfaction is tracked with a confidence score to
-    handle ambiguous visual states.
-    """
+    
     condition_id:    str
     description:     str                     # Human-readable predicate
     screen_hint:     str                     # What to look for on screen
@@ -195,16 +154,7 @@ condition is not met.
 # ─────────────────────────────────────────────────────────────────────────────
 
 class GoalRepresentation:
-    """
-    Structured, gradient goal representation for a single task objective.
-
-    Lifecycle:
-      1. __init__: LLM decomposes objective → List[ObservableCondition]
-      2. evaluate_from_screen(): called per GII cycle with current obs
-      3. progress: 0.0→1.0 as conditions are satisfied
-      4. is_complete: True when progress >= _COMPLETE_THRESHOLD
-      5. next_pending(): returns highest-priority unsatisfied condition
-    """
+    
 
     def __init__(
         self,
@@ -341,17 +291,7 @@ class GoalRepresentation:
     # =========================================================================
 
     def evaluate_from_screen(self, observation: Dict[str, Any]) -> None:
-        """
-        Evaluate all pending conditions against the current screen observation.
-
-        observation: dict from VisionRuntime/WorldState with keys:
-          - entities: List[dict]     (UI elements)
-          - focused_app: str
-          - screen_description: str  (optional NL description)
-          - text_visible: str        (optional OCR dump)
-
-        Thread-safe. Non-blocking for individual condition evals (parallel).
-        """
+        
         with self._lock:
             self._eval_count += 1
             pending = [
@@ -427,15 +367,7 @@ class GoalRepresentation:
         conditions: List[ObservableCondition],
         observation: Dict[str, Any],
     ) -> None:
-        """
-        LLM-backed evaluation of multiple conditions in parallel threads.
-
-        DEFECT FIX: Previously the mark_failed + status reset was split across
-        two separate statements inside the lock, but the status reset was done
-        WITHOUT holding the lock — creating a race where another thread could
-        read a FAILED condition that was mid-reset to PENDING.
-        Now the entire mutation sequence is within a single lock acquisition.
-        """
+        
         import threading as _th
 
         screen_summary = self._build_screen_summary(observation)
@@ -554,10 +486,7 @@ class GoalRepresentation:
     # =========================================================================
 
     def _compute_progress(self) -> float:
-        """
-        Weighted progress score 0.0–1.0.
-        Uses effective weight (confidence-adjusted) for satisfied conditions.
-        """
+        
         if not self._conditions:
             return 0.0
         total_weight = sum(c.weight for c in self._conditions)
@@ -601,10 +530,7 @@ class GoalRepresentation:
             return "\n".join(parts)
 
     def next_pending(self) -> Optional[ObservableCondition]:
-        """
-        Return the highest-priority unsatisfied condition.
-        Priority: lowest order_index first among pending conditions.
-        """
+        
         with self._lock:
             pending = [c for c in self._conditions if not c.is_satisfied]
             if not pending:
@@ -657,10 +583,7 @@ class GoalRepresentation:
         screen_hint: str = "",
         weight: float = 1.0,
     ) -> ObservableCondition:
-        """
-        Dynamically inject an additional condition (e.g., from SOAR subgoal).
-        Thread-safe. Returns the new condition.
-        """
+        
         with self._lock:
             max_order = max((c.order_index for c in self._conditions), default=0)
             new_id = f"c_dyn_{len(self._conditions)+1}"
