@@ -1,43 +1,3 @@
-"""
-core/memory/openmemory_store.py
-================================
-OpenMemory 5-Sector Memory System for ProjectZeo GII.
-
-Blueprint Reference: §2.5.2 (github.com/CaviraOSS/OpenMemory)
-
-Implements a five-sector memory system modelled on cognitive science:
-
-  EPISODIC    — Events: what the agent did, when, and what happened
-  SEMANTIC    — Facts: application knowledge, UI patterns, user preferences
-  PROCEDURAL  — Skills: successful operator sequences (SOAR chunking target)
-  EMOTIONAL   — Preferences: user comfort/discomfort patterns, trust signals
-  REFLECTIVE  — Meta-insights: post-task lessons, failure patterns
-
-Each sector has:
-  - Independent salience/decay rate
-  - Sector-specific retrieval strategy
-  - valid_from/valid_to temporal indexing (point-in-time queries)
-  - Waypoint trace: which memory nodes were traversed during retrieval (auditability)
-
-Storage backends (tried in order):
-  1. Qdrant vector store (production, persistent)
-  2. Local SQLite + in-memory embeddings (fallback, no GPU)
-  3. Pure in-memory dict (last resort, session-only)
-
-Interface expected by GlobalWorkspace.MemoryModule:
-  .retrieve(query, top_k, sector?) → List[MemoryEntry]  (entries have .content attr)
-
-Interface expected by OperatorCycle:
-  .store_procedural(content, subject, importance) → None
-  .retrieve(query, top_k, sector="procedural") → List
-
-Interface expected by GIIController:
-  .store_episodic(...)
-  .store_semantic(...)
-  .store_reflective(...)
-  .store_emotional(...)
-  .query_at_time(sector, query, timestamp) → List   [temporal query]
-"""
 from __future__ import annotations
 
 import hashlib
@@ -112,12 +72,7 @@ class MemoryEntry:
     waypoint_trace: List[str] = field(default_factory=list)
 
     def effective_salience(self, query_ts: Optional[float] = None) -> float:
-        """
-        ACT-R-style activation:
-        S = base_level_learning * recency_boost * importance
-
-        base_level_learning decays with time since last access.
-        """
+        
         now = query_ts or time.time()
         sector_decay = _DECAY_RATES.get(self.sector, 0.02)
 
@@ -358,12 +313,7 @@ class _SQLiteBackend:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class OpenMemoryStore:
-    """
-    Five-sector temporal memory store for ProjectZeo GII.
-
-    Provides sector-aware storage and retrieval with temporal validity,
-    ACT-R-style salience decay, and waypoint tracing for auditability.
-    """
+   
 
     _instance: Optional["OpenMemoryStore"] = None
     _instance_lock = threading.Lock()
@@ -805,19 +755,7 @@ class OpenMemoryStore:
         return hashlib.sha256(raw.encode()).hexdigest()[:24]
 
     def get_stats(self) -> Dict[str, Any]:
-        """
-        Return counts per sector and overall statistics.
-
-        Returns a stable schema that includes:
-          - top-level ``{sector}_count`` keys (backward-compatible)
-          - ``sectors`` sub-dict with per-sector detail
-          - ``total`` aggregate count
-          - ``vacuum_needed`` flag when any sector is near capacity
-
-        DEFECT FIX: Previously missing ``sectors`` sub-dict which the docstring
-        promised and which any code expecting structured sector stats would fail
-        to find. Now both flat and structured formats are provided.
-        """
+        
         sector_counts: Dict[str, int] = {}
         for sector in MemorySector:
             sector_counts[sector.value] = self._sqlite.count_sector(sector.value)
