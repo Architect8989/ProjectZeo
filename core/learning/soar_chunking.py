@@ -1,36 +1,3 @@
-"""
-core/learning/soar_chunking.py
-================================
-SOAR Chunking — Procedural Memory from Successful Operator Sequences.
-
-Blueprint Reference: §3.5.2 (arXiv:2205.03854 SOAR Chunking)
-
-When a subgoal succeeds, SOAR compresses the reasoning trace that produced
-the success into a new production rule stored in procedural memory. On the
-next identical impasse, the stored rule fires immediately — no subgoal
-creation, no lookahead, no uncertainty.
-
-For ProjectZeo:
-  - "Successful operator sequence" = ordered list of action dicts that completed a task
-  - "Production rule" = (goal_pattern, app_context) → operator_sequence
-  - Storage: OpenMemoryStore procedural sector (persistent) + in-memory fast cache
-  - Retrieval: called by OperatorCycle before LLM proposal to check for matching chunk
-
-Chunking lifecycle:
-  1. GIIController calls on_operator_success() after task completion
-  2. SOARChunking.chunk() normalises the goal and compresses the operator sequence
-  3. LLM extracts a generalised condition-action rule from the sequence
-  4. Rule stored in OpenMemoryStore procedural sector with importance=0.85
-  5. On next task with similar goal/app: OperatorCycle retrieves and fires the rule
-  6. After N successful firings: rule is promoted (importance += 0.1)
-  7. After M failed firings: rule is demoted or deprecated
-
-Generalisation:
-  Raw sequences like "click Button_47 → type 'hello' → click Button_Submit" are
-  too specific to be reusable. The LLM generalises them to:
-  "click [form submit trigger] → type [content] → click [submit button]"
-  enabling cross-application transfer.
-"""
 from __future__ import annotations
 
 import hashlib
@@ -65,12 +32,7 @@ _CACHE_SIZE           = int(os.environ.get("PROJECTZEO_CHUNK_CACHE", "500"))
 
 @dataclass
 class ProductionRule:
-    """
-    A generalised SOAR production rule extracted from a successful operator sequence.
-
-    IF:   goal_pattern matches current goal AND app_context matches
-    THEN: execute operator_sequence (in order)
-    """
+    
     rule_id:          str
     goal_pattern:     str                     # Normalised/generalised goal description
     app_context:      str                     # Application (empty = cross-app)
@@ -156,10 +118,7 @@ OUTPUT FORMAT (JSON, no markdown):
 # ─────────────────────────────────────────────────────────────────────────────
 
 class SOARChunking:
-    """
-    SOAR Chunking: converts successful operator sequences into generalised
-    production rules stored in procedural memory.
-    """
+    
 
     def __init__(
         self,
@@ -194,18 +153,7 @@ class SOARChunking:
         *,
         success_reward:    float = 1.0,
     ) -> Optional[ProductionRule]:
-        """
-        Chunk a successful operator sequence into a production rule.
-
-        Args:
-            operator_sequence: List of action dicts (or Operator objects)
-            goal_description:  The natural language goal that was achieved
-            app_context:       Application context (empty = cross-app)
-            success_reward:    Reward signal from ARPO (0.0-1.0)
-
-        Returns:
-            The stored ProductionRule, or None if chunking was skipped.
-        """
+        
         if not _CHUNK_ENABLED:
             return None
 
@@ -303,17 +251,7 @@ class SOARChunking:
         app_context:      str = "",
         step_index:       int = 0,
     ) -> Optional[Dict[str, Any]]:
-        """
-        Recall a matching production rule's next action.
-
-        Args:
-            goal_description: Current active goal
-            app_context:      Current application
-            step_index:       Which step in the sequence to return
-
-        Returns:
-            Action dict for the next step, or None if no rule matches.
-        """
+        
         rule = self._find_matching_rule(goal_description, app_context)
         if rule is None:
             return None
