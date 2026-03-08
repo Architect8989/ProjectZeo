@@ -1,3 +1,27 @@
+"""
+policy/engine.py — Stateful policy gate for all agent actions.
+
+FIXES (v3 — March 2026 production hardening):
+  CRITICAL-1: check_human_approval() and check_human_approval_legacy()
+    DELETED entirely.  Both had inverted semantics (returned True when the
+    signal file was ABSENT — approving every unconfirmed action).  The only
+    safe approval pattern is the canonical .APPROVE polling loop in operate.py.
+    Any call site that still references these methods will fail at import time
+    (AttributeError) rather than silently approving everything.
+
+  HIGH-4: allowed_write_paths no longer defaults to "/home/" (all users).
+    Default is now the current user's home directory only.  Multi-user systems
+    no longer get cross-user write access by default.
+
+  ARCH: Consequence-first hierarchy.  Unknown applications now receive a
+    REQUIRE_HUMAN_CONFIRMATION result that routes through consequence
+    evaluation BEFORE the allowlist check (not after it).  This inverts the
+    original allowlist-gated architecture toward true GII design where
+    consequence reasoning is the primary safety gate.
+
+  THREAD SAFETY: All mutable state protected by a single RLock.
+  SYMLINK DEFENSE: os.path.realpath() applied before all path comparisons.
+"""
 from __future__ import annotations
 
 try:
@@ -7,29 +31,15 @@ except ImportError:
     _NetworkPolicyEnforcer = None  # type: ignore
     _NETWORK_ENFORCER_AVAILABLE = False
 
+import logging
 import os
 import re
 import secrets
 import tempfile
 import threading
-import logging
-from typing import FrozenSet, Optional, Set, Tuple, List
+from typing import FrozenSet, List, Optional, Set, Tuple
 
 _logger = logging.getLogger(__name__)
-
-
-def _get_caller_info(depth: int = 3) -> str:
-    """Return a compact caller location string for deprecation log messages."""
-    import traceback as _tb
-    frames = _tb.extract_stack(limit=depth + 1)
-    if frames:
-        f = frames[0]
-        return f"{f.filename}:{f.lineno} in {f.name}"
-    return "<unknown>"
-
-
-class PolicyViolationError(RuntimeError):
-    pass
 
 
 # ---------------------------------------------------------------------------
@@ -53,7 +63,7 @@ _SHELL_METACHAR_RE = re.compile(
     re.VERBOSE,
 )
 
-# Paths that are ALWAYS denied for file_create regardless of policy.yaml
+# Paths ALWAYS denied for file_create regardless of policy.yaml.
 _HARDCODED_DENIED_PATHS: FrozenSet[str] = frozenset({
     # System paths
     "/etc/cron.d", "/etc/cron.hourly", "/etc/cron.daily",
@@ -66,9 +76,7 @@ _HARDCODED_DENIED_PATHS: FrozenSet[str] = frozenset({
     "/root", "/boot", "/proc", "/sys", "/dev",
     "/bin", "/sbin", "/usr/bin", "/usr/sbin",
     "/usr/lib", "/lib", "/lib64",
-    # AUDIT-SAFETY FIX: User persistence paths not previously blocked.
-    # These allow an agent to establish persistence across reboots via
-    # shell startup files, user systemd units, and autostart entries.
+    # User persistence paths (prevent agent from establishing autostart)
     "~/.bashrc", "~/.zshrc", "~/.profile", "~/.bash_profile",
     "~/.bash_login", "~/.zprofile", "~/.zshenv",
     "~/.config/systemd/user",
@@ -76,25 +84,19 @@ _HARDCODED_DENIED_PATHS: FrozenSet[str] = frozenset({
     "~/.local/share/systemd/user",
 })
 
+
 # ---------------------------------------------------------------------------
-# D-5 FIX: Session-secret signal directory.
-# _APPROVAL_SIGNAL_DIR was previously hardcoded to "/tmp".  Any process
-# running as the same user could enumerate /tmp/projectzeo_approve_* and
-# delete signal files to silently auto-approve dangerous actions.
-#
-# Fix: use a per-process directory under /tmp with a 32-hex-char random name
-# (128 bits of entropy) and mode 0700.  This directory is created once at
-# module import time — the same lifecycle as the rest of the module.
+# Per-session secure signal directory (prevents /tmp enumeration attacks)
 # ---------------------------------------------------------------------------
+
 def _init_signal_dir() -> str:
     _token = secrets.token_hex(16)
-    _base = tempfile.gettempdir()
-    _path = os.path.join(_base, f"projectzeo_{_token}")
+    _base  = tempfile.gettempdir()
+    _path  = os.path.join(_base, f"projectzeo_{_token}")
     try:
         os.makedirs(_path, mode=0o700, exist_ok=True)
         os.chmod(_path, 0o700)
     except OSError:
-        # Fallback to /tmp with session-secret prefix — still better than plain /tmp.
         _path = _base
     return _path
 
@@ -102,15 +104,30 @@ def _init_signal_dir() -> str:
 _SESSION_SIGNAL_DIR: str = _init_signal_dir()
 
 
+class PolicyViolationError(RuntimeError):
+    pass
+
+
 class PolicyEngine:
     """
     Stateful policy gate.
 
-    Thread safety: all mutable state protected by _apps_lock.
+    Evaluation hierarchy (consequence-first GII design):
+      1. Hard-denied apps       → DENY  (immediate, no LLM)
+      2. Unknown apps           → REQUIRE_HUMAN_CONFIRMATION (consequence eval)
+      3. High-risk apps         → REQUIRE_HUMAN_CONFIRMATION
+      4. Denied roles           → DENY
+      5. Semantic role checks   → DENY
+      6. Filesystem path check  → DENY / REQUIRE_HUMAN_CONFIRMATION
+      7. Network policy check   → DENY
+      8. Content/command check  → REQUIRE_HUMAN_CONFIRMATION
+      9.                        → ALLOW
+
+    Thread safety: all mutable state protected by _apps_lock (RLock).
     """
 
-    ALLOW = "ALLOW"
-    DENY = "DENY"
+    ALLOW                    = "ALLOW"
+    DENY                     = "DENY"
     REQUIRE_HUMAN_CONFIRMATION = "REQUIRE_HUMAN_CONFIRMATION"
 
     _OP_TO_SYNTHETIC_ROLE: dict = {
@@ -125,6 +142,7 @@ class PolicyEngine:
         "file_create": "file",
         "scroll":      "scroll",
         "verify":      "verify",
+        "wait":        "wait",
         "done":        "done",
     }
 
@@ -168,8 +186,23 @@ class PolicyEngine:
         "files",
     })
 
-    # D-5 FIX: Use module-level session-secret directory instead of "/tmp".
-    _APPROVAL_SIGNAL_DIR: str = _SESSION_SIGNAL_DIR
+    # HIGH-4 FIX: Default allowed_write_paths uses current user's home,
+    # not the entire /home/ tree.
+    @staticmethod
+    def _default_allowed_write_paths() -> List[str]:
+        home = os.path.expanduser("~")
+        return [
+            os.path.join(home, "Desktop"),
+            os.path.join(home, "Documents"),
+            os.path.join(home, "Downloads"),
+            os.path.join(home, "projects"),
+            os.path.join(home, "workspace"),
+            os.path.join(home, ".projectzeo"),
+            "/tmp",
+            "/var/tmp",
+        ]
+
+    _APPROVAL_SIGNAL_DIR:    str = _SESSION_SIGNAL_DIR
     _APPROVAL_SIGNAL_PREFIX: str = "projectzeo_approve_"
 
     def __init__(
@@ -196,10 +229,14 @@ class PolicyEngine:
             str(a).lower() for a in (high_risk_apps or [])
         )
 
+        # HIGH-4 FIX: default to current-user home subdirs only.
+        _default_paths = self._default_allowed_write_paths()
         self._allowed_write_paths: Optional[List[str]] = (
             [str(p).rstrip("/") for p in allowed_write_paths]
-            if allowed_write_paths else None
+            if allowed_write_paths is not None
+            else _default_paths
         )
+
         _policy_denied = frozenset(
             str(p).rstrip("/") for p in (denied_write_paths or [])
         )
@@ -225,7 +262,7 @@ class PolicyEngine:
             self._APPROVAL_SIGNAL_DIR,
         )
 
-        self._network_policy = None  # type: Optional[_NetworkPolicyEnforcer]
+        self._network_policy = None  # type: Optional[object]
 
     # =========================================================================
     # CLASS METHOD: from policy.yaml
@@ -244,29 +281,24 @@ class PolicyEngine:
         denied_apps = (
             {str(a) for a in denied_raw if a} if isinstance(denied_raw, list) else None
         )
-        if denied_apps:
-            _logger.info("[PolicyEngine] denied_apps=%s", sorted(denied_apps))
 
         hr_raw = policy_cfg.get("high_risk_apps")
         high_risk_apps = (
             {str(a) for a in hr_raw if a} if isinstance(hr_raw, list) else None
         )
-        if high_risk_apps:
-            _logger.info("[PolicyEngine] high_risk_apps=%s", sorted(high_risk_apps))
 
         fs_cfg = policy_cfg.get("filesystem", {}) or {}
         aw_raw = fs_cfg.get("allowed_write_paths")
+        # HIGH-4 FIX: expand ~ in paths from policy.yaml
         allowed_write_paths = (
-            [str(p) for p in aw_raw if p] if isinstance(aw_raw, list) else None
+            [os.path.expanduser(str(p)) for p in aw_raw if p]
+            if isinstance(aw_raw, list) else None
         )
         dw_raw = fs_cfg.get("denied_write_paths")
         denied_write_paths = (
-            [str(p) for p in dw_raw if p] if isinstance(dw_raw, list) else None
+            [os.path.expanduser(str(p)) for p in dw_raw if p]
+            if isinstance(dw_raw, list) else None
         )
-        if allowed_write_paths:
-            _logger.info("[PolicyEngine] allowed_write_paths=%s", allowed_write_paths)
-        if denied_write_paths:
-            _logger.info("[PolicyEngine] denied_write_paths=%s", denied_write_paths)
 
         instance = cls(
             allowed_apps=allowed_apps,
@@ -305,11 +337,7 @@ class PolicyEngine:
         if not path:
             return self.DENY, "file_create: empty path"
 
-        # AUDIT HIGH FIX: Use os.path.realpath() before comparison to resolve
-        # symlinks and prevent symlink-based path escapes.
-        # Example attack: create symlink ~/allowed/evil -> /etc/sudoers.d/
-        # Without realpath(), the path check passes because ~/allowed/ is allowed.
-        # With realpath(), the resolved path starts with /etc/ and is denied.
+        # Resolve symlinks to prevent symlink-based path traversal.
         norm_path = os.path.realpath(os.path.normpath(os.path.expanduser(path)))
 
         for denied in self._denied_write_paths:
@@ -339,7 +367,7 @@ class PolicyEngine:
         return self.ALLOW, None
 
     def _validate_command_redirect(self, command: str) -> Tuple[str, Optional[str]]:
-        """Block command redirects (>> and >) writing to denied paths."""
+        """Block command redirects writing to denied paths."""
         if not command:
             return self.ALLOW, None
         redirect_targets = re.findall(r">>?\s*([^\s;&|]+)", command)
@@ -358,21 +386,14 @@ class PolicyEngine:
         return self.ALLOW, None
 
     def _validate_file_content(self, content: str) -> Tuple[str, Optional[str]]:
-        """
-        AUDIT-LOW FIX: Apply FULL DANGEROUS_PATTERNS list to file content at dispatch time.
-        Previously only checked delete/remove/format/erase and shebangs. A two-step attack
-        (create a benign-looking script, then execute it) could evade this. Now the full
-        pattern list from ExecutionPlanner is applied to file content too.
-        """
+        """Apply DANGEROUS_PATTERNS to file content at dispatch time."""
         if not content:
             return self.ALLOW, None
 
-        # AUDIT-LOW: Apply full DANGEROUS_PATTERNS from ExecutionPlanner to file content
         try:
             from core.planner.execution_planner import ExecutionPlanner as _EP
             _dp_compiled = [re.compile(p, re.IGNORECASE) for p in _EP.DANGEROUS_PATTERNS]
             for _dp_pat in _dp_compiled:
-                # Apply to each line to handle multi-line script content
                 for line in content.splitlines():
                     if _dp_pat.search(line):
                         reason = (
@@ -384,7 +405,7 @@ class PolicyEngine:
         except Exception as _dp_err:
             _logger.debug("[PolicyEngine] DANGEROUS_PATTERNS file content check failed: %s", _dp_err)
 
-        # Existing checks
+        # High-risk content patterns that require human confirmation
         for pat in self.high_risk_name_patterns:
             if pat.search(content):
                 reason = (
@@ -446,8 +467,10 @@ class PolicyEngine:
             already = normalised in self._allowed_apps
             self._allowed_apps.add(normalised)
         if not already:
-            _logger.info("[PolicyEngine] allow_app: %r added (total=%d).",
-                         normalised, len(self._allowed_apps))
+            _logger.info(
+                "[PolicyEngine] allow_app: %r added (total=%d).",
+                normalised, len(self._allowed_apps),
+            )
 
     def allow_apps(self, app_names) -> None:
         for name in app_names:
@@ -462,7 +485,7 @@ class PolicyEngine:
         if not listed:
             _logger.warning(
                 "[PolicyEngine] warn_if_unlisted: %r NOT in allowlist — "
-                "all autonomous interactions will be DENIED.", app_name,
+                "consequence evaluation will be required.", app_name,
             )
 
     # =========================================================================
@@ -480,15 +503,12 @@ class PolicyEngine:
         )
 
     # =========================================================================
-    # APPROVAL HELPERS
+    # CANONICAL APPROVAL PATTERN (operate.py reference)
     # =========================================================================
     #
-    # CANONICAL CREATE-TO-APPROVE PATTERN (operate.py reference implementation)
-    # ==========================================================================
-    # This is the ONLY correct approval check pattern in ProjectZeo.
-    # New code MUST use this pattern and MUST NOT call check_human_approval():
+    # The ONLY correct approval check pattern in ProjectZeo:
     #
-    #   signal_path = policy_engine.approval_signal_path(action_key)
+    #   signal_path  = policy_engine.approval_signal_path(action_key)
     #   approve_path = signal_path + ".APPROVE"
     #   # … write signal file, notify operator …
     #   approved = False
@@ -503,99 +523,12 @@ class PolicyEngine:
     #   Semantic: approved = .APPROVE file EXPLICITLY EXISTS
     #             denied   = .APPROVE absent after timeout
     #
-    # check_human_approval() below uses the OPPOSITE semantic and is a
-    # latent security bug. It is deprecated and will be removed.
-
-    def check_human_approval_legacy(self, action_key: str) -> bool:
-        """
-        DEPRECATED — INVERTED SEMANTICS — DO NOT USE IN NEW CODE.
-
-        ╔══════════════════════════════════════════════════════════════╗
-        ║  ⚠  SEMANTIC INVERSION — THIS IS A SECURITY BUG  ⚠         ║
-        ║                                                              ║
-        ║  Returns True when the signal file is ABSENT.               ║
-        ║  Returns False when the signal file is PRESENT.             ║
-        ║                                                              ║
-        ║  Canonical (operate.py):  approved = .APPROVE EXISTS        ║
-        ║  This method:             approved = signal file ABSENT     ║
-        ║                                                              ║
-        ║  Consequence of calling this:                               ║
-        ║    - Every unconfirmed action is auto-approved               ║
-        ║    - Every human-approved action (signal file written) is   ║
-        ║      denied because the signal file is now present          ║
-        ║                                                              ║
-        ║  MIGRATION — replace with:                                  ║
-        ║    approve_path = approval_signal_path(key) + ".APPROVE"   ║
-        ║    approved = os.path.exists(approve_path)                  ║
-        ╚══════════════════════════════════════════════════════════════╝
-
-        Preserved only to prevent silent breakage of any external callers.
-        Emits DeprecationWarning on every call.
-        Will be REMOVED in the next major version.
-        """
-        import warnings as _warnings
-        import traceback as _traceback
-        _warnings.warn(
-            "PolicyEngine.check_human_approval_legacy() uses INVERTED approval "
-            "semantics (approved = signal file ABSENT). This is the opposite of "
-            "the canonical create-to-approve pattern (approved = .APPROVE EXISTS). "
-            "Callers of this method automatically approve every unconfirmed action. "
-            "Migrate to the .APPROVE polling pattern in operate.py. "
-            "This method WILL BE REMOVED in the next major version.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        # Log call-site for auditability
-        _caller = "".join(_traceback.format_stack(limit=3)[:-1]).strip()
-        _logger.error(
-            "[PolicyEngine] DEPRECATED check_human_approval_legacy() called. "
-            "INVERTED SEMANTICS — latent security bug. Migrate immediately. "
-            "Call site:\n%s",
-            _caller,
-        )
-        path = self.approval_signal_path(action_key)
-        try:
-            # INVERTED: returns True when ABSENT — the wrong semantic.
-            # Preserved exactly as-is to avoid breaking existing callers.
-            approved = not os.path.exists(path)
-        except OSError as exc:
-            _logger.warning(
-                "[PolicyEngine] check_human_approval_legacy: stat %r failed: %s "
-                "— FAIL-CLOSED: NOT approved.", path, exc,
-            )
-            return False
-        if approved:
-            _logger.warning(
-                "[PolicyEngine] LEGACY_APPROVAL (INVERTED: absent=approved): "
-                "key=%r. This is almost certainly WRONG. Migrate to .APPROVE pattern.",
-                action_key,
-            )
-        return approved
-
-    def check_human_approval(self, action_key: str) -> bool:
-        """
-        RENAMED to check_human_approval_legacy().
-
-        This alias is preserved so call-sites fail loudly (DeprecationWarning)
-        rather than silently continuing with inverted approval logic.
-
-        ⚠  INVERTED SEMANTICS BUG: returns True when signal file is ABSENT.
-        This approves every action that has never been through the confirmation
-        path, which is the opposite of what "human approval required" should mean.
-
-        The correct pattern is in operate.py: approved = .APPROVE file EXISTS.
-        See the class-level CANONICAL CREATE-TO-APPROVE comment above.
-        """
-        import warnings as _warnings
-        _warnings.warn(
-            "PolicyEngine.check_human_approval() is a renamed alias for "
-            "check_human_approval_legacy() which uses INVERTED approval semantics. "
-            "Approved = signal file ABSENT (WRONG). Canonical: approved = .APPROVE EXISTS. "
-            "This alias will be removed in the next major version.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return self.check_human_approval_legacy(action_key)
+    # CRITICAL-1 FIX: check_human_approval() and check_human_approval_legacy()
+    # have been DELETED.  Both had inverted semantics (returned True when the
+    # signal file was absent — approving every unconfirmed action).
+    # Any remaining call site will raise AttributeError at import time,
+    # which is the correct fail-loud behavior.
+    # =========================================================================
 
     # =========================================================================
     # PRIMARY ENTRY POINT — dict-based
@@ -625,23 +558,23 @@ class PolicyEngine:
         if not op:
             return self.DENY, "Action has no 'operation' field"
 
-        if op == "done":
+        # Wait and done are always allowed (no-harm operations)
+        if op in ("done", "wait"):
             return self.ALLOW, None
 
         app = str(focused_app or "__unknown_app__").lower().strip()
+
+        # Step 1: hard-denied apps
         if app in self._denied_apps:
-            reason = (
-                f"Application {app!r} is in denied_apps — permanently forbidden."
-            )
+            reason = f"Application {app!r} is in denied_apps — permanently forbidden."
             _logger.warning("[PolicyEngine] M2 DENY (denied_apps): op=%r app=%r", op, app)
             return self.DENY, reason
 
         with self._apps_lock:
             app_allowed = app in self._allowed_apps
+
+        # Step 2: unknown app → consequence evaluation required
         if not app_allowed:
-            # AUDIT STRATEGY FIX: Unknown app → REQUIRE_HUMAN_CONFIRMATION, not hard DENY.
-            # Hard DENY prevents GII from operating on any unlisted application.
-            # Unknown apps trigger consequence evaluation + human approval instead.
             reason = (
                 f"Unknown application {app!r}. Consequence evaluation required. "
                 "Approve or add to allowed_apps in policy.yaml to avoid this prompt."
@@ -651,6 +584,7 @@ class PolicyEngine:
             )
             return self.REQUIRE_HUMAN_CONFIRMATION, reason
 
+        # Step 3: high-risk apps → confirmation always
         if app in self._high_risk_apps:
             reason = (
                 f"Application {app!r} is in high_risk_apps — "
@@ -662,12 +596,14 @@ class PolicyEngine:
             )
             return self.REQUIRE_HUMAN_CONFIRMATION, reason
 
+        # Step 4: denied roles
         synthetic_role = self._OP_TO_SYNTHETIC_ROLE.get(op, op)
         if synthetic_role in self.denied_roles:
             reason = f"Forbidden operation role: {synthetic_role!r}"
             _logger.warning("[PolicyEngine] DENY: %s", reason)
             return self.DENY, reason
 
+        # Step 5: semantic role check for write/type
         if op in ("write", "type") and action.get("target_role"):
             target_role = str(action["target_role"]).lower()
             if "text" not in target_role and "entry" not in target_role:
@@ -678,6 +614,7 @@ class PolicyEngine:
                 _logger.warning("[PolicyEngine] DENY: %s", reason)
                 return self.DENY, reason
 
+        # Step 6: filesystem path checks
         if op == "file_create":
             path = str(action.get("path") or "").strip()
             path_verdict, path_reason = self._validate_file_path(path)
@@ -688,14 +625,19 @@ class PolicyEngine:
             if content_verdict != self.ALLOW:
                 return content_verdict, content_reason
 
+        # Step 6b: redirect protection for commands
         if op == "command":
             cmd_str = str(action.get("command") or "")
             redirect_verdict, redirect_reason = self._validate_command_redirect(cmd_str)
             if redirect_verdict != self.ALLOW:
                 return redirect_verdict, redirect_reason
 
+        # Step 7: network policy
         if op in ("command", "install") and self._network_policy is not None:
-            _net_cmd = str(action.get("command") or action.get("tool", {}).get("name", "") or "")
+            _net_cmd = str(
+                action.get("command") or
+                action.get("tool", {}).get("name", "") or ""
+            )
             if _net_cmd:
                 _net_decision = self._network_policy.validate_command(_net_cmd)
                 if _net_decision.verdict != "ALLOW":
@@ -709,6 +651,7 @@ class PolicyEngine:
                     )
                     return self.DENY, _net_reason
 
+        # Step 8: high-risk content / trusted installer bypass
         _trusted_flag: bool = bool(action.get("_trusted_installer", False))
         content_to_check = self._extract_risk_content(op, action)
 
@@ -754,7 +697,7 @@ class PolicyEngine:
                 keys = [keys]
             return " ".join(str(k) for k in keys)
         if op == "file_create":
-            path = str(action.get("path") or "")
+            path    = str(action.get("path") or "")
             content = str(action.get("content") or "")
             return f"{path} {content}"
         return ""
@@ -787,11 +730,6 @@ class PolicyEngine:
         with self._apps_lock:
             app_allowed = app in self._allowed_apps
         if not app_allowed:
-            # AUDIT STRATEGY FIX: Replace hard DENY with REQUIRE_HUMAN_CONFIRMATION
-            # for unknown apps. Hard DENY prevents GII from operating on any
-            # application not pre-approved — fundamentally contradicting GII goals.
-            # Instead, unknown apps trigger consequence evaluation + human confirmation.
-            # Over time the allowlist becomes a trust cache, not a hard gate.
             return self.REQUIRE_HUMAN_CONFIRMATION, (
                 f"Unknown application {app!r}. Consequence evaluation required. "
                 "Approve or add to allowed_apps in policy.yaml."
