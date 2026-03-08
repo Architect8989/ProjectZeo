@@ -210,6 +210,10 @@ network:
   allow_outbound_http:  true
   allow_outbound_ssh:   false
 
+  # AUDIT FIX: Enable exfiltration guard for curl --data / wget --post-data
+  # This is a separate check from domain blocking — it detects data upload patterns
+  enable_exfiltration_guard: true
+
   # Denied domains — agent cannot resolve or connect to these
   denied_domains:
     - "ngrok.io"
@@ -219,6 +223,35 @@ network:
     - "requestbin.com"
     - "pipedream.net"
     - "localhost.run"
+    # Data exfiltration / reverse shell services
+    - "requestbin.net"
+    - "beeceptor.com"
+    - "hookbin.com"
+    - "0.tcp.ngrok.io"
+    - "burpcollaborator.net"
+    - "interactsh.com"
+    - "canarytokens.com"
+    - "oast.me"
+    - "oast.fun"
+    - "oast.live"
+    # DNS exfiltration services
+    - "dnsbin.zhack.ca"
+    - "dnsleak.com"
+    # Common exfil paste services
+    - "pastebin.com"
+    - "paste.ee"
+    - "pastecode.io"
+    - "hastebin.com"
+
+  # Commands that require human confirmation regardless of domain
+  require_confirmation_for_patterns:
+    - "--upload-file"
+    - "--data-binary"
+    - "--data-raw"
+    - "--post-data"
+    - "--post-file"
+    - "requests.post"
+    - "http.post"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -276,6 +309,49 @@ gii:
 
   # Human confirmation timeout in seconds
   confirm_timeout_seconds: 60
+
+  # ── Phase 1: SOAR Cognitive Loop (GII Blueprint §3.3) ──────────────────
+  # Enable SOAR operator-selection cycle (replaces scripted ExecutionPlanner)
+  use_operator_cycle: true
+
+  # Enable structured goal representation (GoalAct §2.4.1)
+  use_goal_representation: true
+
+  # Enable Global Workspace Theory broadcaster (§2.3.4)
+  use_global_workspace: true
+
+  # Enable HTN Planner for hierarchical task decomposition (§2.4.1)
+  use_htn_planner: true
+
+  # TSWM lookahead depth for pre-action prediction (3 = best quality/speed tradeoff)
+  tswm_lookahead_depth: 3
+
+  # GUI-Actor confidence threshold (below this: enter verification subgoal)
+  gui_actor_confidence_threshold: 0.70
+
+  # ── Phase 0: VLM Backbone (GII Blueprint §3.2) ─────────────────────────
+  # Prefer Qwen3-VL-8B when available (fallback: Qwen2.5-VL)
+  prefer_qwen3_vl: true
+
+  # ── Phase 0: Memory Upgrade (GII Blueprint §2.5) ───────────────────────
+  # Enable OpenMemory 5-sector store (Episodic/Semantic/Procedural/Emotional/Reflective)
+  use_openmemory: true
+
+  # ── Phase 3: Self-Improvement (GII Blueprint §3.1, §3.2) ───────────────
+  # Enable trajectory flywheel (GUI-Owl self-evolution)
+  use_trajectory_flywheel: true
+
+  # Enable Algorithm Distillation for in-context RL (Laskin 2023)
+  use_algorithm_distillation: true
+
+  # Enable SOAR chunking (procedural memory from success)
+  use_soar_chunking: true
+
+  # Enable V-JEPA 2 world model pretraining (requires GPU, set true to activate)
+  use_vjepa: false
+
+  # Flywheel background improvement interval in seconds (3600 = 1 hour)
+  flywheel_interval_seconds: 3600
 
 
 # ─────────────────────────────────────────────────────────────────────────────

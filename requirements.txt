@@ -88,3 +88,53 @@ open-interpreter>=0.3.0
 
 # Visualisation
 matplotlib>=3.8.1
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GII Blueprint — Phase 0, 1, 2, 3 Dependencies
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Phase 0.1: Qwen3-VL adapter (served via Ollama/vLLM — no pip package needed)
+# ollama pull qwen3-vl:8b  (or serve via vLLM)
+
+# Phase 0.2: GUI-Actor (served via vLLM — no pip package needed)
+# python -m vllm.entrypoints.openai.api_server --model microsoft/GUI-Actor-7B-Qwen2.5-VL --port 8080
+
+# Phase 0.3: Mem0 local stack
+mem0ai>=0.1.0
+
+# Phase 0.3: Qdrant vector store (local, for Mem0)
+qdrant-client>=1.7.0
+
+# Phase 1.1: SOAR operator cycle — no additional deps (pure Python)
+# Phase 1.2: GoalRepresentation — no additional deps (pure Python)
+# Phase 1.3: TSWM — uses Qwen3-VL (no additional deps)
+
+# Phase 1.4: Global Workspace Theory — no additional deps (pure Python)
+# Phase 2.4.1: HTN Planner — no additional deps (pure Python)
+
+# Phase 2: DreamerV3 world model (optional, GPU only)
+# pip install --find-links https://storage.googleapis.com/jax-releases/jax_cuda_releases.html \
+#   "jax[cuda]>=0.4.1" flax>=0.7.0 optax>=0.1.7
+
+# Phase 2: MCTS planning (MuZero-style)
+mctx>=0.0.5 ; python_version >= "3.9"
+
+# Phase 3: Algorithm Distillation — no additional deps (pure Python)
+# Phase 3: SOAR Chunking — no additional deps (pure Python)
+# Phase 3: Trajectory Flywheel — no additional deps (pure Python)
+
+# Phase 3: V-JEPA 2 (optional — requires GPU)
+# git clone https://github.com/facebookresearch/vjepa && pip install -e vjepa/
+
+# Agent S3 reference implementation (optional)
+# pip install gui-agents
+
+# Perceptual hashing (GAP-1 fix — already in use)
+imagehash>=4.3.1
+
+# Network / HTTP
+httpx>=0.25.2    # preferred HTTP client for adapter calls
+
+# Safety
+# LlamaGuard (Tier 4 safety) — served via Ollama:
+# ollama pull llama-guard3:8b
