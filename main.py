@@ -575,7 +575,26 @@ def main(llm_callable: Callable, model_name: str) -> None:
 
                 snapshot_id = mode.consume_snapshot()
                 if not snapshot_id:
-                    raise RuntimeError("Missing snapshot")
+                    # AUDIT FIX: If no snapshot exists at arm time, there is NO recovery
+                    # baseline. Warn loudly — restoration will be best-effort only.
+                    print(
+                        "\n[MAIN] ⚠  WARNING: No snapshot available at task start.\n"
+                        "  Restoration after failure will be best-effort (cursor + window focus only).\n"
+                        "  The system has NO known-good state to restore to.\n"
+                        "  This is risky for tasks with irreversible side-effects.\n",
+                        file=sys.stderr,
+                    )
+                    # Attempt an emergency snapshot before proceeding
+                    try:
+                        _emergency_snap = snapshot_provider.take_snapshot()
+                        if _emergency_snap:
+                            snapshot_id = _emergency_snap
+                            print(f"[MAIN] Emergency snapshot taken: {snapshot_id}", file=sys.stderr)
+                        else:
+                            raise RuntimeError("Emergency snapshot also failed")
+                    except Exception as _snap_emergency_err:
+                        _logger.warning("[MAIN] Emergency snapshot failed: %s", _snap_emergency_err)
+                        raise RuntimeError(f"Missing snapshot and emergency snapshot failed: {_snap_emergency_err}")
 
                 _ingest_latest_perception(observer, world_graph)
 
@@ -679,11 +698,75 @@ def main(llm_callable: Callable, model_name: str) -> None:
                         file=sys.stderr,
                     )
                 except Exception as _gii_err:
-                    print(
-                        f"[MAIN] GIIController init failed: {_gii_err}. "
-                        "Falling back to scripted execution.",
-                        file=sys.stderr,
+                    # AUDIT FIX: Silent capability downgrade → loud degraded-mode warning.
+                    # The original message was logged to stderr and buried; make it
+                    # impossible to miss. Operating in scripted mode means all GII
+                    # capabilities (milestones, consequence reasoning, world model,
+                    # per-step adaptation) are absent.
+                    _gii_degraded_msg = (
+                        f"\n[MAIN] ⚠  CAPABILITY DEGRADED — GIIController FAILED TO INIT\n"
+                        f"  Error: {_gii_err}\n"
+                        f"  Impact: Falling back to scripted step execution.\n"
+                        f"          Consequence reasoning, milestone decomposition,\n"
+                        f"          world model, and per-step GII adaptation are INACTIVE.\n"
+                        f"  This is NOT safe for production unsupervised use.\n"
+                        f"  Resolve the error above and restart.\n"
                     )
+                    print(_gii_degraded_msg, file=sys.stderr)
+
+                # LAYER-2: Wire VeriSafe Agent
+                _vsa = None
+                try:
+                    from core.safety.verisafe_agent import VeriSafeAgent
+                    _vsa = VeriSafeAgent()
+                    _vsa.start_task(intent, mode.get_llm_callable(), timeout_seconds=45.0)
+                    print("[MAIN] VeriSafe Agent active.", file=sys.stderr)
+                except Exception as _vsa_err:
+                    _logger.warning("[MAIN] VSA init failed (non-fatal): %s", _vsa_err)
+
+                # LAYER-5: Wire PIGuard
+                _piguard = None
+                try:
+                    from core.safety.piguard import create_piguard
+                    _piguard = create_piguard(use_neural=False)
+                    print("[MAIN] PIGuard heuristic filter active.", file=sys.stderr)
+                except Exception as _pig_err:
+                    _logger.warning("[MAIN] PIGuard init failed (non-fatal): %s", _pig_err)
+
+                # LAYER-4: Wire Graphiti store
+                _graphiti = None
+                try:
+                    from core.memory.graphiti_store import GraphitiStore
+                    _graphiti = GraphitiStore(memory_dir=_auth_dir)
+                    print(f"[MAIN] GraphitiStore active (backend={_graphiti._backend}).", file=sys.stderr)
+                except Exception as _gs_err:
+                    _logger.warning("[MAIN] GraphitiStore init failed (non-fatal): %s", _gs_err)
+
+                # LAYER-6: Wire ARPO trainer
+                _arpo = None
+                try:
+                    from core.learning.arpo_trainer import ARPOTrainer
+                    _arpo = ARPOTrainer(memory_dir=_auth_dir)
+                    _arpo.start_trajectory(intent, app_name="", temperature=0.7)
+                except Exception as _ar_err:
+                    _logger.debug("[MAIN] ARPO init: %s", _ar_err)
+
+                # LAYER-6: Wire UI-Evol
+                _ui_evol = None
+                try:
+                    from core.learning.arpo_trainer import UIEvol
+                    _ui_evol = UIEvol(graphiti_store=_graphiti, llm_callable=mode.get_llm_callable())
+                except Exception as _ue_err:
+                    _logger.debug("[MAIN] UIEvol init: %s", _ue_err)
+
+                # LAYER-7: Wire MCP Tool Router
+                _mcp_router = None
+                try:
+                    from core.tools.mcp_tool_router import MCPToolRouter
+                    _mcp_router = MCPToolRouter()
+                    print("[MAIN] MCP Tool Router active.", file=sys.stderr)
+                except Exception as _mcp_err:
+                    _logger.debug("[MAIN] MCPToolRouter init: %s", _mcp_err)
 
                 try:
                     observer_loop.resume()
@@ -756,6 +839,60 @@ def main(llm_callable: Callable, model_name: str) -> None:
                                         execution_log=_belief_state_out[0].get(
                                             "_execution_log", {}
                                         ) if _belief_state_out else {},
+                                    )
+                                except Exception:
+                                    pass
+
+                            # AUDIT FIX: Belief state persistence — guard against
+                            # lost episodic data if persist() raises.
+                            _belief_for_persist = _safe_belief_snapshot(_belief_state_out)
+                            if _belief_for_persist:
+                                try:
+                                    auth_state.persist(
+                                        belief_state_full=_belief_for_persist,
+                                        dirty=False,
+                                    )
+                                except Exception as _bs_persist_err:
+                                    _logger.warning(
+                                        "[MAIN] Belief state persist failed (episodic data lost): %s",
+                                        _bs_persist_err,
+                                    )
+
+                            # LAYER-6: ARPO finalization
+                            if _arpo is not None:
+                                try:
+                                    _arpo.finalize_trajectory(success=True, reason="task_complete")
+                                except Exception:
+                                    pass
+
+                            # LAYER-6: UI-Evol post-task knowledge refinement
+                            if _ui_evol is not None:
+                                try:
+                                    _focused_app = (
+                                        world_graph.snapshot().get("focused_app", "")
+                                        if world_graph else ""
+                                    )
+                                    _ui_evol.run_post_task(
+                                        objective=intent,
+                                        app_name=_focused_app,
+                                        planned_actions=list(execution_plan.steps) if hasattr(execution_plan, "steps") else [],
+                                        actual_actions=_belief_for_persist.get("action_history", []) if _belief_for_persist else [],
+                                        success=True,
+                                    )
+                                except Exception:
+                                    pass
+
+                            # LAYER-4: Graphiti outcome storage for compound learning
+                            if _graphiti is not None:
+                                try:
+                                    _graphiti.store_task_outcome(
+                                        app_name=(world_graph.snapshot().get("focused_app", "") if world_graph else ""),
+                                        objective=intent,
+                                        milestone_sequence=[],
+                                        stagnation_events=[],
+                                        vsa_violations=[],
+                                        success=True,
+                                        duration_sec=time.time() - _task_now,
                                     )
                                 except Exception:
                                     pass
