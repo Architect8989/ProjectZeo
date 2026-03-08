@@ -27,7 +27,8 @@ STEP SCHEMA (return exactly this structure for every element):
 {
   "type": <string, one of: "ui_interaction" | "command_execution" | "file_creation" | "verification" | "tool_installation">,
   "description": <string, plain English description of what this step does>,
-  "estimated_duration": <float, seconds this step is expected to take, 0.0–600.0>,
+  "estimated_duration": <float, seconds this step is expected to take, 0.0-86400.0. Use realistic values: 5-60 for UI ops, 60-600 for installs, 600-14400 for renders/compiles, 86400 for ML training>,
+  "stagnant_limit_override": <integer or null. Set for long ops: installs=2400, downloads=4800, renders=14400, ML=28800. null for normal steps>,
   "retryable": <boolean, true if the step is safe to retry on failure>,
   "verification": {
     "expected_state": <string, what the screen/system should look like after success>,
@@ -74,10 +75,100 @@ RULES:
 """
 
 
+def _infer_stagnant_override(
+    step_type: str,
+    estimated_duration: float,
+    action: dict,
+    explicit_override: object = None,
+) -> object:
+    """
+    CRITICAL-2 FIX: Infer the appropriate stagnant_limit_override for a step.
+
+    The stagnation counter increments every 0.25s. At the default limit of 480
+    (120 seconds), any step that runs for more than 2 minutes will trigger REPLAN.
+    This is catastrophic for: apt installs, npm install, git clone, renders,
+    ML training, file downloads, and test suites.
+
+    Priority:
+      1. Explicit LLM-provided override (validated integer 1-288000)
+      2. Duration-derived heuristic (estimated_duration / 0.25s per tick)
+      3. Step-type heuristic for known long-running types
+      4. None (use global default MAX_STAGNANT_ITERS_COMMAND)
+    """
+    # 1. Use explicit override if valid
+    if explicit_override is not None:
+        try:
+            val = int(explicit_override)
+            if 1 <= val <= 288000:
+                return val
+        except (TypeError, ValueError):
+            pass
+
+    # 2. Duration-derived: estimated_duration / 0.25s per tick, with 2x safety margin
+    _TICK_SECONDS = 0.25
+    if estimated_duration and estimated_duration > 30.0:
+        derived = int((estimated_duration / _TICK_SECONDS) * 2.0)
+        derived = min(max(derived, 480), 288000)
+        return derived
+
+    # 3. Step-type heuristics for known long-running operations
+    cmd = str(action.get("command", "")).lower()
+    desc = str(action.get("description", "")).lower()
+    text = cmd + " " + desc
+
+    # Package installation (apt, pip, npm, cargo, etc.)
+    _INSTALL_KEYWORDS = (
+        "apt-get install", "apt install", "pip install", "pip3 install",
+        "npm install", "yarn install", "yarn add", "cargo install",
+        "brew install", "pacman -S", "yum install", "dnf install",
+        "gem install", "go get", "go install",
+    )
+    if any(kw in text for kw in _INSTALL_KEYWORDS):
+        try:
+            from config.timeouts import STAGNANT_OVERRIDE_INSTALL
+            return STAGNANT_OVERRIDE_INSTALL
+        except ImportError:
+            return 2400  # 600s
+
+    # Download operations
+    _DOWNLOAD_KEYWORDS = ("wget ", "curl -O", "curl --output", "git clone", "download")
+    if any(kw in text for kw in _DOWNLOAD_KEYWORDS):
+        try:
+            from config.timeouts import STAGNANT_OVERRIDE_DOWNLOAD
+            return STAGNANT_OVERRIDE_DOWNLOAD
+        except ImportError:
+            return 4800  # 1200s
+
+    # Render / compile / build
+    _RENDER_KEYWORDS = (
+        "blender", "ffmpeg", "render", "compile", "make", "cmake",
+        "gradle", "mvn ", "tsc ", "webpack", "vite build", "cargo build",
+    )
+    if any(kw in text for kw in _RENDER_KEYWORDS):
+        try:
+            from config.timeouts import STAGNANT_OVERRIDE_RENDER
+            return STAGNANT_OVERRIDE_RENDER
+        except ImportError:
+            return 14400  # 3600s
+
+    # Test suites
+    _TEST_KEYWORDS = ("pytest", "jest", "mocha", "cargo test", "go test", "mvn test")
+    if any(kw in text for kw in _TEST_KEYWORDS):
+        try:
+            from config.timeouts import STAGNANT_OVERRIDE_TEST
+            return STAGNANT_OVERRIDE_TEST
+        except ImportError:
+            return 4800  # 1200s
+
+    # 4. No override needed — use global default
+    return None
+
+
+
 class ExecutionPlanner:
 
     MAX_SCREEN_CHARS = 2000
-    MAX_ESTIMATED_DURATION = 600.0
+    MAX_ESTIMATED_DURATION = 86400.0  # 24 hours for renders/ML training
     MAX_STEPS_PER_GOAL = 25
     MAX_COMMAND_LENGTH = 2048
     DECOMPOSE_THRESHOLD_CHARS = 60
@@ -485,6 +576,15 @@ class ExecutionPlanner:
             for spec in expanded:
                 deps = [last_step_id] if last_step_id else []
 
+                # CRITICAL-2 FIX: Populate stagnant_limit_override for long-running steps.
+                # This prevents REPLAN being triggered during downloads, installs, renders, etc.
+                # Priority order: (1) LLM-provided override, (2) duration-derived heuristic
+                _llm_override = spec.get("stagnant_limit_override")
+                _stagnant_override = _infer_stagnant_override(
+                    spec["type"], spec["estimated_duration"], spec["action"],
+                    explicit_override=_llm_override,
+                )
+
                 step = ExecutionStep(
                     id=step_id,
                     type=spec["type"],
@@ -494,6 +594,7 @@ class ExecutionPlanner:
                     dependencies=deps,
                     estimated_duration=spec["estimated_duration"],
                     retryable=spec["retryable"],
+                    stagnant_limit_override=_stagnant_override,
                 )
 
                 execution_steps.append(step)
@@ -1061,6 +1162,17 @@ class ExecutionPlanner:
             if len(action["command"]) > self.MAX_COMMAND_LENGTH:
                 action["command"] = action["command"][: self.MAX_COMMAND_LENGTH]
 
+        # Parse LLM-provided stagnant_limit_override
+        _raw_slo = raw.get("stagnant_limit_override")
+        _stagnant_limit_override = None
+        if _raw_slo is not None:
+            try:
+                _slo_val = int(_raw_slo)
+                if 1 <= _slo_val <= 288000:
+                    _stagnant_limit_override = _slo_val
+            except (TypeError, ValueError):
+                pass
+
         return {
             "type": raw_type,
             "description": description.strip(),
@@ -1068,6 +1180,7 @@ class ExecutionPlanner:
             "retryable": retryable,
             "verification": verification,
             "action": action,
+            "stagnant_limit_override": _stagnant_limit_override,
         }
 
     def _extract_required_tools(self, requirements: Dict[str, Any]) -> List[str]:
