@@ -149,7 +149,12 @@ OUTPUT FORMAT (JSON array, no markdown):
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TrajectoryFlywheel:
+    """
+    Background self-improvement loop for ProjectZeo GII.
 
+    Submit trajectories via submit(). The flywheel processes them
+    asynchronously in a daemon thread, updating memory and learning systems.
+    """
 
     def __init__(
         self,
@@ -201,7 +206,10 @@ class TrajectoryFlywheel:
     # =========================================================================
 
     def submit(self, event: TrajectoryEvent) -> bool:
-        
+        """
+        Submit a completed trajectory for asynchronous processing.
+        Non-blocking: returns False if queue is full.
+        """
         if not _FLYWHEEL_ENABLED:
             return False
         try:
