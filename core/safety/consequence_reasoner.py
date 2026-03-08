@@ -1,31 +1,3 @@
-"""
-consequence_reasoner.py — Three-tier safety evaluation with tiered model routing.
-
-AUDIT FIXES (March 2026):
-
-  HIGH-1: ConsequenceReasoner now applied to write/type operations when
-    _external_content_source=True (content derived from screen/VL output).
-    Previously only command/file_create/install were evaluated. A type
-    operation constructing a malicious shell command bypassed all tiers.
-
-  HIGH-2: Combined Tier 2+3 single-prompt for CPU-only path.
-    On CPU (no SGLang), both tiers route to the same shared LLM.
-    Sequential Tier 2 + Tier 3 = 2 × 40–90s = 80–180s per safety eval.
-    When _tier2_callable is _tier3_callable (same object), a single
-    combined prompt now asks both coherence and consequence questions,
-    halving latency for high-risk irreversible actions on CPU.
-
-  HIGH-3: Terminal-context reclassification for type/write.
-    If focused_app is a terminal emulator, type/write operations are
-    reclassified from REVERSIBLE to CAUTION regardless of content length.
-    Prevents "type rm -rf ~ into terminal" from bypassing Tier 1.
-
-  MEDIUM-1: Password/secret role → mandatory Tier 3.
-    Any action proposing to type into a role classified as "password" or
-    "secret" triggers Tier 3 consequence simulation regardless of
-    reversibility classification. Phishing overlays cannot bypass Tier 3
-    by presenting a correctly-labeled text entry role.
-"""
 from __future__ import annotations
 
 import json
@@ -131,18 +103,12 @@ class ConsequenceResult:
 # ---------------------------------------------------------------------------
 
 _REVERSIBLE_OPS: frozenset = frozenset({
-    # NOTE: "click" is intentionally NOT in this set because GAP-4 (Tier 1.5)
-    # requires high-risk click label inspection before granting fast-path.
-    # "click" is handled separately in classify_reversibility() below.
+    
     "scroll", "move", "hover", "focus", "screenshot",
     "verify", "done", "press",
 })
 
-# GAP-4 FIX: Tier 1.5 — high-risk UI label fragments for click operations.
-# Research §3.2: VSA solves the "click Delete Account" problem that bypassed
-# consequence reasoning because 'click' was classified as REVERSIBLE.
-# This label set catches the most common high-risk labels at Tier 1 cost (no LLM).
-# The check runs ONLY for click operations with a populated label/target_label field.
+
 _HIGH_RISK_CLICK_LABEL_PATTERNS: List[re.Pattern] = [
     re.compile(r"\bdelete\b", re.IGNORECASE),
     re.compile(r"\bremove\b", re.IGNORECASE),
@@ -207,21 +173,10 @@ def classify_reversibility(
     *,
     focused_app: Optional[str] = None,
 ) -> Reversibility:
-    """
-    Tier 1: classify action reversibility without any LLM call.
-
-    AUDIT HIGH-3 FIX: When focused_app is a terminal emulator, type/write
-    operations are reclassified from REVERSIBLE to CAUTION regardless of
-    content length. Commands typed into terminals are immediately executable
-    and can cause irreversible harm even if the content looks short.
-    """
+    
     op = str(action.get("operation") or "").lower().strip()
 
-    # GAP-4 FIX: Tier 1.5 — click operations must inspect target label.
-    # Previously 'click' was unconditionally REVERSIBLE, allowing "Delete Account"
-    # button clicks to bypass all consequence reasoning (Tiers 2+3).
-    # Fix: if the target label matches a high-risk pattern, reclassify as CAUTION
-    # so Tier 2 goal coherence runs. This adds ~0ms (pure regex, no LLM).
+    
     if op == "click":
         target_label = str(
             action.get("target_label")
@@ -705,10 +660,7 @@ class ConsequenceReasoner:
         self._confirm_count = 0
         self._lock          = threading.Lock()
 
-        # HIGH-3 FIX: Stagnation grace flag.
-        # When True, operate.py suspends the stagnation counter so that
-        # consequence evaluation latency (40-180s on CPU) does not fire a REPLAN
-        # that bypasses the safety gate.
+        
         self._is_evaluating: threading.Event = threading.Event()
 
         _logger.info(
@@ -723,11 +675,7 @@ class ConsequenceReasoner:
         )
 
     def _auto_wire_tiered_endpoints(self) -> None:
-        """
-        Attempt to build tiered callables from model_config.py endpoints.
-        Only runs when PROJECTZEO_USE_SGLANG=1.
-        Silently skips if SGLang is not configured or endpoints are unreachable.
-        """
+        
         try:
             from config.model_config import is_gpu_mode, get_fast_endpoint, get_deep_endpoint  # noqa
             if not is_gpu_mode():
@@ -760,12 +708,7 @@ class ConsequenceReasoner:
 
     @property
     def is_evaluating(self) -> bool:
-        """
-        HIGH-3 FIX: True while a Tier 2/3 LLM evaluation is in progress.
-        operate.py checks this to suspend the stagnation counter during
-        consequence evaluation, preventing the safety gate from being
-        bypassed by its own latency.
-        """
+        
         return self._is_evaluating.is_set()
 
     def evaluate(
@@ -819,9 +762,7 @@ class ConsequenceReasoner:
         # AUDIT HIGH-3: Pass focused_app for terminal-context reclassification
         reversibility = classify_reversibility(action, focused_app=focused_app)
 
-        # AUDIT MEDIUM-1: Password/secret role → mandatory Tier 3 regardless of
-        # reversibility. A phishing overlay with a "password" input role must
-        # trigger consequence simulation.
+        
         target_role = str(action.get("target_role") or "").lower()
         _password_role = "password" in target_role or "secret" in target_role
         if _password_role and op in ("type", "write"):
@@ -868,9 +809,7 @@ class ConsequenceReasoner:
                     "action — running Tier 2 injection defence."
                 )
 
-        # ── AUDIT HIGH-2: Combined T2T3 for CPU-only IRREVERSIBLE actions ────
-        # When Tier 2 and Tier 3 share the same callable (CPU mode), avoid two
-        # sequential 40–90s LLM calls by using a single combined prompt.
+        
         if (
             self._cpu_only_mode
             and self._enable_tier2
@@ -1045,23 +984,7 @@ class ConsequenceReasoner:
         objective: str,
         timeout_seconds: float = 30.0,
     ) -> str:
-        """
-        AUDIT STRATEGY FIX: Tier 2 goal-coherence check for unknown applications.
-
-        Called by PolicyEngine when an action targets an application not in the
-        allowlist.  Rather than immediately requesting human confirmation, this
-        method asks the Tier 2 LLM: "Does interacting with <app> make sense for
-        objective <X>?"
-
-        Returns
-        -------
-        "COHERENT"   — app interaction is sensible for the objective; caller may
-                       add to session trust cache and proceed.
-        "INCOHERENT" — app interaction is not consistent with the objective; caller
-                       should DENY the action.
-        "UNCERTAIN"  — LLM could not determine coherence; caller should fall back
-                       to REQUIRE_HUMAN_CONFIRMATION.
-        """
+        
         if not self._enable_tier2 or self._tier2_callable is None:
             return "UNCERTAIN"
 
