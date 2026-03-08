@@ -648,6 +648,12 @@ class ConsequenceReasoner:
         self._confirm_count = 0
         self._lock          = threading.Lock()
 
+        # HIGH-3 FIX: Stagnation grace flag.
+        # When True, operate.py suspends the stagnation counter so that
+        # consequence evaluation latency (40-180s on CPU) does not fire a REPLAN
+        # that bypasses the safety gate.
+        self._is_evaluating: threading.Event = threading.Event()
+
         _logger.info(
             "[ConsequenceReasoner] Initialised. tier2=%s tier3=%s "
             "tier2_callable=%s tier3_callable=%s cpu_only=%s",
@@ -695,6 +701,16 @@ class ConsequenceReasoner:
                 "[ConsequenceReasoner] Auto-wire tiered endpoints skipped: %s", exc
             )
 
+    @property
+    def is_evaluating(self) -> bool:
+        """
+        HIGH-3 FIX: True while a Tier 2/3 LLM evaluation is in progress.
+        operate.py checks this to suspend the stagnation counter during
+        consequence evaluation, preventing the safety gate from being
+        bypassed by its own latency.
+        """
+        return self._is_evaluating.is_set()
+
     def evaluate(
         self,
         *,
@@ -708,6 +724,7 @@ class ConsequenceReasoner:
         op      = str(action.get("operation") or "").lower()
         snippet = f"{op}:{str(action.get('command') or action.get('text') or '')[:60]}"
 
+        self._is_evaluating.set()
         try:
             return self._evaluate_inner(
                 action, objective, step_description, snippet, focused_app=focused_app
@@ -725,6 +742,7 @@ class ConsequenceReasoner:
                 action_snippet=snippet,
             )
         finally:
+            self._is_evaluating.clear()
             with self._lock:
                 self._eval_count += 1
 
