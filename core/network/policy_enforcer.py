@@ -7,6 +7,13 @@ import socket
 import time
 import threading
 from dataclasses import dataclass, field
+
+# ExfiltrationGuard integration — audit fix for curl --data / wget --post-data
+try:
+    from core.network.exfiltration_guard import check_command as _exfil_check
+    _EXFIL_GUARD_AVAILABLE = True
+except ImportError:
+    _EXFIL_GUARD_AVAILABLE = False
 from typing import FrozenSet, List, Optional, Set, Tuple
 
 _logger = logging.getLogger(__name__)
@@ -252,6 +259,41 @@ class NetworkPolicyEnforcer:
             return NetworkDecision(verdict=ALLOW, reason="Empty command", host="", port=None)
 
         snippet = command_snippet_for_log or command[:80]
+
+        # ── Exfiltration guard (audit fix: curl --data, wget --post-data, etc.) ──
+        if _EXFIL_GUARD_AVAILABLE:
+            try:
+                exfil_result = _exfil_check(command)
+                if exfil_result.decision == "DENY":
+                    deny_dec = NetworkDecision(
+                        verdict=DENY,
+                        reason=f"ExfiltrationGuard DENY: {exfil_result.reason}",
+                        host="",
+                        port=None,
+                        matched_rule="exfiltration-guard",
+                    )
+                    self._audit(deny_dec, command_snippet=snippet)
+                    _logger.warning(
+                        "[NetworkPolicyEnforcer] ExfilGuard DENY: pattern=%r | cmd=%r",
+                        exfil_result.pattern, snippet,
+                    )
+                    return deny_dec
+                elif exfil_result.decision == "REQUIRE_HUMAN_CONFIRMATION":
+                    confirm_dec = NetworkDecision(
+                        verdict="REQUIRE_HUMAN_CONFIRMATION",
+                        reason=f"ExfiltrationGuard: {exfil_result.reason}",
+                        host="",
+                        port=None,
+                        matched_rule="exfiltration-guard-confirm",
+                    )
+                    _logger.info(
+                        "[NetworkPolicyEnforcer] ExfilGuard REQUIRE_HUMAN: pattern=%r | cmd=%r",
+                        exfil_result.pattern, snippet,
+                    )
+                    return confirm_dec
+            except Exception as _eg_exc:
+                _logger.debug("[NetworkPolicyEnforcer] ExfilGuard error (fail-open): %s", _eg_exc)
+        # ── end exfiltration guard ──
 
         # Extract all hostnames/IPs from command
         hosts_found: List[Tuple[str, Optional[int]]] = []
