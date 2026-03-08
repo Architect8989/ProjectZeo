@@ -22,10 +22,20 @@ _LOCAL_REGISTRY: Dict[str, str] = {
     "llava":         "adapters.llava_ollama_adapter.LLaVAOllamaAdapter",
     "llava-llama3":  "adapters.llava_ollama_adapter.LLaVAOllamaAdapter",
     "llava-phi3":    "adapters.llava_ollama_adapter.LLaVAOllamaAdapter",
-    # Qwen3 variants registered for future Ollama support
-    # (when Ollama ships Qwen3, these become local-only entries)
+    # Qwen3-VL (GII Blueprint Phase 0.1 — arXiv:2505.09388)
+    # 256K context, built-in GUI agent training, thinking mode
+    "qwen3-vl":      "adapters.qwen3_vl_adapter.Qwen3VLAdapter",
+    "qwen3-vl:8b":   "adapters.qwen3_vl_adapter.Qwen3VLAdapter",
+    "qwen3-vl:32b":  "adapters.qwen3_vl_adapter.Qwen3VLAdapter",
+    "qwen3-vl:2b":   "adapters.qwen3_vl_adapter.Qwen3VLAdapter",
+    "qwen3-vl:30b":  "adapters.qwen3_vl_adapter.Qwen3VLAdapter",
+    # Qwen3 text-only variants
     "qwen3-32b":     "adapters.qwen_ollama_adapter.QwenOllamaAdapter",
     "qwen3-235b":    "adapters.qwen_ollama_adapter.QwenOllamaAdapter",
+    # GUI-Actor (GII Blueprint Phase 0.2 — arXiv:2506.03143)
+    # Coordinate-free grounding via attention peaks
+    "gui-actor":     "adapters.gui_actor_adapter.GUIActorAdapter",
+    "gui-actor-7b":  "adapters.gui_actor_adapter.GUIActorAdapter",
 }
 
 # SGLang tier aliases: "sglang/<tier>" maps to a tier name
@@ -276,6 +286,35 @@ class AdapterFactory:
             base_model = _resolve_base_model(model_name)
 
             # -------------------------------------------------------------------
+            # Route C1: Qwen3-VL — special constructor (no model_name arg)
+            # -------------------------------------------------------------------
+            if base_model in ("qwen3-vl", "qwen3-vl:8b", "qwen3-vl:32b",
+                              "qwen3-vl:2b", "qwen3-vl:30b"):
+                try:
+                    from adapters.qwen3_vl_adapter import get_qwen3_vl  # noqa: PLC0415
+                    vl_instance = get_qwen3_vl()
+                    vl_callable = _Qwen3VLCallable(vl_instance)
+                    with _ADAPTER_CACHE_LOCK:
+                        _cache_put(model_name, vl_callable)
+                    return vl_callable
+                except ImportError as exc:
+                    _logger.warning("[AdapterFactory] Qwen3VL import failed: %s", exc)
+
+            # -------------------------------------------------------------------
+            # Route C2: GUI-Actor — special constructor (no model_name arg)
+            # -------------------------------------------------------------------
+            if base_model in ("gui-actor", "gui-actor-7b"):
+                try:
+                    from adapters.gui_actor_adapter import get_gui_actor  # noqa: PLC0415
+                    actor_instance = get_gui_actor()
+                    actor_callable = _GUIActorCallable(actor_instance)
+                    with _ADAPTER_CACHE_LOCK:
+                        _cache_put(model_name, actor_callable)
+                    return actor_callable
+                except ImportError as exc:
+                    _logger.warning("[AdapterFactory] GUIActor import failed: %s", exc)
+
+            # -------------------------------------------------------------------
             # Route C: Local adapter (Ollama)
             # -------------------------------------------------------------------
             local_path = _LOCAL_REGISTRY.get(base_model)
@@ -413,4 +452,62 @@ class _SGLangCallable:
 
 # Module-level aliases for backward compatibility
 build_llm = AdapterFactory.build_llm
+
+
+class _Qwen3VLCallable:
+    """Wrap Qwen3VLAdapter so it satisfies the llm_callable protocol."""
+
+    def __init__(self, adapter) -> None:
+        self._adapter = adapter
+        self.model_name: str = getattr(adapter, "_model", "qwen3-vl")
+
+    def __call__(self, messages, objective=None, session_id=None):
+        return self._adapter.llm_call(
+            messages, objective=objective or "", session_id=session_id or ""
+        )
+
+    def get_llm_callable(self):
+        return self
+
+    def with_thinking(self, enabled: bool) -> "_Qwen3VLCallable":
+        """Toggle thinking mode on the underlying adapter."""
+        try:
+            self._adapter._thinking = enabled
+        except Exception:
+            pass
+        return self
+
+    def health_check(self) -> bool:
+        return self._adapter.is_available()
+
+    def get_stats(self) -> Dict[str, Any]:
+        return self._adapter.health_check()
+
+    def __getattr__(self, name: str):
+        return getattr(self._adapter, name)
+
+
+class _GUIActorCallable:
+    """Wrap GUIActorAdapter so it satisfies the llm_callable protocol."""
+
+    def __init__(self, adapter) -> None:
+        self._adapter = adapter
+        self.model_name: str = getattr(adapter, "_model", "gui-actor-7b")
+
+    def __call__(self, messages, objective=None, session_id=None):
+        # GUI-Actor is a grounding tool, not an LLM — return empty for text calls
+        _logger.debug("[GUIActorCallable] text-only call — GUI-Actor is a grounding tool")
+        return ""
+
+    def get_llm_callable(self):
+        return self
+
+    def ground(self, screenshot, description: str):
+        return self._adapter.ground(screenshot, description)
+
+    def health_check(self) -> bool:
+        return self._adapter.is_available()
+
+    def __getattr__(self, name: str):
+        return getattr(self._adapter, name)
 get_action = AdapterFactory.get_action
