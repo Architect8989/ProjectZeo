@@ -1,42 +1,3 @@
-"""
-core/learning/trajectory_flywheel.py
-======================================
-Self-Evolving Trajectory Flywheel for ProjectZeo GII.
-
-Blueprint Reference: §3.5.1 (GUI-Owl arXiv:2508.15144), §3.1
-
-Implements the background self-improvement loop that makes ProjectZeo
-continuously better without human intervention:
-
-  ┌─────────────────────────────────────────────────────────────┐
-  │                   TRAJECTORY FLYWHEEL                        │
-  │                                                              │
-  │  GII runs task → ARPO records trajectory                     │
-  │       ↓                                                      │
-  │  UIEvol analyses failures → generates retry strategies       │
-  │       ↓                                                      │
-  │  Success → SOAR chunking (procedural memory)                 │
-  │  Failure → Higher bBoN N retry → record outcome              │
-  │       ↓                                                      │
-  │  OpenMemory update: new outcomes, UI patterns, lessons       │
-  │       ↓                                                      │
-  │  Periodic RSSM/GRPO batch (Phase 2, future)                  │
-  │       ↓                                                      │
-  │  Agent improves for next identical/similar task              │
-  └─────────────────────────────────────────────────────────────┘
-
-The flywheel runs in a background thread and processes completed
-trajectories asynchronously, never blocking the main GII loop.
-
-Key behaviours:
-  - Analyses every completed trajectory (success AND failure)
-  - For failures: generates alternative action strategies, attempts them
-  - For successes: extracts operator sequences for SOAR chunking
-  - Continuously updates OpenMemory with new outcomes and patterns
-  - Detects systemic failure patterns (same task repeatedly failing)
-  - Implements "curriculum" scheduling: harder tasks attempted after easier ones
-  - Rate-limited to not overload the LLM (configurable min interval)
-"""
 from __future__ import annotations
 
 import json
@@ -188,12 +149,7 @@ OUTPUT FORMAT (JSON array, no markdown):
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TrajectoryFlywheel:
-    """
-    Background self-improvement loop for ProjectZeo GII.
 
-    Submit trajectories via submit(). The flywheel processes them
-    asynchronously in a daemon thread, updating memory and learning systems.
-    """
 
     def __init__(
         self,
@@ -245,10 +201,7 @@ class TrajectoryFlywheel:
     # =========================================================================
 
     def submit(self, event: TrajectoryEvent) -> bool:
-        """
-        Submit a completed trajectory for asynchronous processing.
-        Non-blocking: returns False if queue is full.
-        """
+        
         if not _FLYWHEEL_ENABLED:
             return False
         try:
