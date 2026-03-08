@@ -1,29 +1,3 @@
-"""
-core/cognition/operator_cycle.py
-==================================
-SOAR-Inspired Operator-Selection Cycle for ProjectZeo GII.
-
-Blueprint Reference: §3.3.1 (arXiv:2205.03854 SOAR), §3.3.3 TSWM, §3.2.2 GUI-Actor
-
-Replaces the static ExecutionPlanner JSON step-array with a continuous, world-
-state-driven decision loop. At each cycle:
-
-  1. PERCEIVE   — build WorkingMemory from current screen entities + goal
-  2. PROPOSE    — LLM generates N candidate operators from WM + active goal
-  3. EVALUATE   — TSWM scores each operator's predicted outcome against goal
-  4. SELECT     — highest-preference operator chosen (ActionRanker UCB/softmax)
-  5. IMPASSE?   — if no operator has adequate preference → impasse resolution
-  6. EXECUTE    — caller executes the selected operator
-  7. OBSERVE    — update WM with action outcome
-  8. CHUNK      — on success, store operator sequence as procedural memory
-
-Key properties:
-  - No fixed plan: every action is selected fresh from current world state
-  - Graceful degradation: falls back to LLM-only scoring if TSWM unavailable
-  - Impasse-driven subgoaling: automatically creates subgoals for stuck states
-  - GUI-Actor confidence gating: low-confidence grounds trigger verification
-  - Thread-safe: can be called from GII loop and observer loop concurrently
-"""
 from __future__ import annotations
 
 import json
@@ -94,10 +68,7 @@ class Impasse:
 
 @dataclass
 class WorkingMemory:
-    """
-    Short-term context buffer — the 'scratchpad' for current-cycle reasoning.
-    Passed between GIIController and OperatorCycle each step.
-    """
+    
     entities:         List[Dict[str, Any]]
     focused_app:      str
     screen_desc:      str
@@ -245,23 +216,7 @@ OUTPUT FORMAT (JSON, no markdown):
 # ─────────────────────────────────────────────────────────────────────────────
 
 class OperatorCycle:
-    """
-    SOAR-inspired operator-selection cycle.
-
-    Lifecycle:
-      cycle = OperatorCycle(llm_call=..., tswm=..., gui_actor=...)
-
-      # Per-step call from GIIController:
-      operator, impasse = cycle.step(working_memory, goal_repr, screenshot=img)
-      if impasse:
-          resolution = cycle.resolve_impasse(impasse, working_memory)
-      else:
-          # Execute operator.action
-          cycle.record_outcome(operator, success=True, outcome_text="...")
-
-      # Post-task on success:
-      cycle.on_success(executed_operators, goal_description, app_context)
-    """
+    
 
     def __init__(
         self,
@@ -307,12 +262,7 @@ class OperatorCycle:
         *,
         screenshot: Optional[Any] = None,
     ) -> Tuple[Optional[Operator], Optional[Impasse]]:
-        """
-        Execute one SOAR decision cycle.
-
-        Returns (operator, None) if a good operator was selected.
-        Returns (None, impasse) if no operator could be selected.
-        """
+        
         with self._lock:
             self._cycle_count += 1
             wm.iteration = self._cycle_count
@@ -496,10 +446,7 @@ class OperatorCycle:
             if not isinstance(action, dict):
                 action = {}
 
-            # DEFECT FIX: Skip operators without a valid operation key.
-            # Previously, malformed LLM responses (e.g. condition dicts misidentified
-            # as operators) produced Operator(action={}) which is falsy — causing
-            # decide_next_action_operator_cycle to silently return None.
+            
             operation = action.get("operation", "").strip()
             if not operation:
                 _logger.debug(
@@ -532,14 +479,7 @@ class OperatorCycle:
         return operators
 
     def _parse_operators(self, raw: str) -> List[Dict[str, Any]]:
-        """
-        Parse LLM JSON array output into operator dicts.
-
-        Only items with a valid `action.operation` field are accepted.
-        This prevents condition/fact dicts (which lack an 'action' key) from
-        being silently accepted as operators — a common failure mode when the
-        LLM returns goal-decomposition JSON instead of operator JSON.
-        """
+        
         if not raw:
             return []
         cleaned = re.sub(r"```(?:json)?", "", raw).strip()
@@ -575,12 +515,7 @@ class OperatorCycle:
         if not isinstance(data, list):
             return []
 
-        # DEFECT FIX: Filter out non-operator items (e.g. condition/fact dicts).
-        # A valid operator dict MUST have an `action` key with a non-empty
-        # `operation` field. Without this filter, goal-decomposition responses
-        # (which have `description` but no `action`) were previously accepted as
-        # operators, producing Operator(action={}) which is falsy — causing the
-        # GII loop to silently return no action every cycle.
+        
         validated: List[Dict[str, Any]] = []
         for item in data:
             if not isinstance(item, dict):
@@ -610,10 +545,7 @@ class OperatorCycle:
         operators: List[Operator],
         screenshot: Any,
     ) -> List[Operator]:
-        """
-        Use GUI-Actor to ground operator targets to pixel coordinates.
-        Updates operator.confidence and operator.action['x'/'y'].
-        """
+        
         def _ground_one(op: Operator) -> None:
             if op.action.get("operation") not in ("click", "double_click", "right_click"):
                 op.confidence = 1.0
@@ -660,13 +592,7 @@ class OperatorCycle:
         wm: WorkingMemory,
         goal_repr: Any,
     ) -> List[Operator]:
-        """
-        Use Textual Sketch World Model to score each operator's predicted outcome.
-        Implements MobileDreamer-style lookahead (arXiv:2601.04035).
-
-        For each operator: predict what the screen will look like after execution,
-        then score how well that predicted state matches the active goal condition.
-        """
+        
         goal_next = getattr(goal_repr, "next_pending", lambda: None)()
         goal_cond = goal_next.description if goal_next else str(
             getattr(goal_repr, "_objective", "")[:200]
@@ -698,10 +624,7 @@ class OperatorCycle:
         wm: WorkingMemory,
         goal_condition: str,
     ) -> Tuple[float, str]:
-        """
-        Single TSWM prediction: (goal_alignment, predicted_state_text).
-        Uses Qwen3-VL or the LLM fallback for text-based prediction.
-        """
+        
         action_str = (
             f"{op.action.get('operation', '?')} "
             f"on '{op.action.get('target', '') or op.action.get('text', '')}'"
@@ -775,12 +698,7 @@ class OperatorCycle:
         impasse: Impasse,
         wm: WorkingMemory,
     ) -> Optional[Dict[str, Any]]:
-        """
-        Resolve a SOAR impasse using the LLM.
-
-        Returns an action dict to execute as impasse resolution,
-        or None if the impasse cannot be resolved.
-        """
+        
         if impasse.depth >= _MAX_SUBGOAL_DEPTH:
             _logger.warning(
                 "[OperatorCycle] Max subgoal depth %d reached — escalating to REQUIRE_HUMAN",
@@ -892,10 +810,7 @@ class OperatorCycle:
         with self._lock:
             if success:
                 self._executed.append(operator)
-                # Pop subgoal stack if we were in a subgoal
-                # (simple heuristic: success clears one subgoal level)
-                # Actual subgoal stack is managed in WorkingMemory by caller
-            # Update consecutive failure tracking handled by GII loop
+                
 
         _logger.debug(
             "[OperatorCycle] Outcome recorded: op=%s success=%s",
@@ -908,10 +823,7 @@ class OperatorCycle:
         goal_description: str,
         app_context: str = "",
     ) -> None:
-        """
-        SOAR Chunking: called after task completion.
-        Stores the successful operator sequence as procedural memory.
-        """
+        
         if not _PROCEDURAL_CHUNK_ENABLED:
             return
         if not successful_operators:
@@ -972,10 +884,7 @@ class OperatorCycle:
         wm: WorkingMemory,
         goal_repr: Any,
     ) -> Optional[Dict[str, Any]]:
-        """
-        Check if any stored procedural chunk matches the current context.
-        Returns the next action from the matching chunk sequence, or None.
-        """
+        
         if not self._procedural_cache:
             return None
 
@@ -1008,14 +917,7 @@ class OperatorCycle:
         return None
 
     def _load_procedural_cache(self) -> None:
-        """
-        Load procedural memories from OpenMemory at init.
-
-        DEFECT FIX: Previously contained a dead `pass` stub — stored procedural
-        memories were retrieved but never parsed, so every session started with
-        an empty ProceduralChunk cache regardless of prior task history.
-        Now fully parses stored operator sequences into ProceduralChunk objects.
-        """
+        
         if self._openmemory is None:
             return
         try:
