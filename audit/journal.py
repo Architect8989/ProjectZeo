@@ -1,92 +1,123 @@
+"""
+audit/journal.py — Tamper-evident action journal with credential scrubbing.
+
+HIGH-2 FIX (March 2026):
+  _scrub_payload() previously only scrubbed key=value patterns from strings.
+  Shell CLI args like `curl -u admin:pass` or `--token SECRET` were stored
+  plaintext in the journal.
+
+  Fix 1: Extended _CREDENTIAL_RE to catch CLI flag patterns:
+    --password <value>, -p <value>, -u user:pass, --token <value>,
+    Authorization: Bearer <token>, https://user:pass@host URLs.
+
+  Fix 2: Added _scrub_command_string() for shell command fields.
+    Applied in _scrub_payload() for all keys in _COMMAND_FIELD_NAMES:
+    'command', 'cmd', 'args', 'action_command', 'install_command', etc.
+
+  Fix 3: List items in command-like fields are individually scrubbed
+    (e.g. install_commands: ["pip install x --index-url https://user:pass@..."])
+"""
 import json
 import time
 import hashlib
 import os
+import re
 import pathlib
 from typing import Any
 
 _PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _DEFAULT_JOURNAL_PATH = str(_PROJECT_ROOT / "logs" / "action_audit.jsonl")
 
+# ---------------------------------------------------------------------------
+# Credential scrubbing regexes
+# ---------------------------------------------------------------------------
+
+# Pattern 1: key=value and key:value forms
+_KV_CRED_RE = re.compile(
+    r"(?:password|passwd|secret|token|api.?key|auth.?token"
+    r"|bearer|private.?key|aws.?secret|access.?key"
+    r"|database.?url|db.?password|connection.?string"
+    r"|encryption.?key|signing.?key|client.?secret"
+    r"|x.?api.?key|authorization|api_token"
+    r")\s*[:=]\s*\S+",
+    re.IGNORECASE,
+)
+
+# Pattern 2: CLI flag patterns (HIGH-2 FIX)
+_CLI_CRED_RE = re.compile(
+    r"(?:"
+    r"--(?:password|passwd|secret|token|api-?key|auth-?token|bearer"
+    r"|private-?key|aws-?secret|access-?key|client-?secret"
+    r"|api-?token|auth|credential|credentials)\s+\S+"
+    r"|(?<!\w)-(?:p|P|w|W|k)\s+\S+"
+    r"|(?:https?://)[^@\s]+:[^@\s]+@\S+"
+    r"|Authorization:\s*(?:Bearer|Basic|Token)\s+\S+"
+    r"|(?<!\w)-u\s+[^:\s]+:[^\s]+"
+    r")",
+    re.IGNORECASE,
+)
+
+# Pattern 3: AWS access key IDs
+_AWS_KEY_RE = re.compile(r"\b(AKIA[A-Z0-9]{16})\b")
+
+# Fields that are shell command strings — apply CLI scrubber too
+_COMMAND_FIELD_NAMES: frozenset = frozenset({
+    "command", "cmd", "args", "action_command", "install_command",
+    "shell_command", "exec_command", "run_command", "command_string",
+    "full_cmd", "last_command",
+})
+
 
 class ActionJournal:
-    
+    """Tamper-evident, credential-scrubbed, append-only action journal."""
 
     def __init__(self, path: str = _DEFAULT_JOURNAL_PATH):
         self.path = path
         self.last_hash = "0" * 64
         self.last_intent_hash = None
-
-        # Ensure the log directory exists before _initialize_session() writes.
         try:
             os.makedirs(os.path.dirname(self.path), exist_ok=True)
         except (PermissionError, OSError):
-            pass  # Read-only filesystem: write will fail gracefully in record().
-
+            pass
         try:
             self._initialize_session()
         except Exception as e:
-            raise RuntimeError(
-                f"JOURNAL_INITIALIZATION_FAILURE: {e}"
-            ) from e
+            raise RuntimeError(f"JOURNAL_INITIALIZATION_FAILURE: {e}") from e
 
-    # -------------------------------------------------
-    # INTERNALS
-    # -------------------------------------------------
-
-    def _canonicalize(self, payload: dict) -> str:
-        """
-        Deterministic JSON serialization.
-        Degrades safely on exotic types.
-        """
-        try:
-            return json.dumps(
-                payload,
-                sort_keys=True,
-                separators=(",", ":"),
-                default=str,  # <- critical fix
-            )
-        except Exception as e:
-            raise RuntimeError(
-                f"AUDIT_INTEGRITY_FAILURE: canonicalization failed: {e}"
-            ) from e
-
-    def _hash(self, payload: dict) -> str:
-        serialized = self._canonicalize(payload)
-        return hashlib.sha256(
-            serialized.encode("utf-8")
-        ).hexdigest()
-
-
-    import re as _re_cred_journal
-    _CREDENTIAL_RE = _re_cred_journal.compile(
-        r"(?:password|passwd|secret|token|api.?key|auth.?token"
-        r"|bearer|private.?key|aws.?secret|access.?key)"
-        r"\s*[:=]\s*\S+",
-        _re_cred_journal.IGNORECASE,
-    )
+    # =========================================================================
+    # Credential scrubbing
+    # =========================================================================
 
     def _scrub_text(self, text: str) -> str:
-        """CRIT-NEW: Redact credentials from command output before journal write."""
+        """Scrub key=value and key:value credential patterns."""
         if not isinstance(text, str):
             return text
-        return self._CREDENTIAL_RE.sub(
+        text = _KV_CRED_RE.sub(
             lambda m: m.group(0).split(":")[0].split("=")[0] + "=<REDACTED>",
             text,
         )
+        text = _AWS_KEY_RE.sub("<REDACTED:AWS_KEY>", text)
+        return text
+
+    def _scrub_command_string(self, cmd: str) -> str:
+        """HIGH-2 FIX: Scrub CLI credential patterns from shell command strings."""
+        if not isinstance(cmd, str):
+            return cmd
+        cmd = self._scrub_text(cmd)
+        cmd = _CLI_CRED_RE.sub("<REDACTED:CLI_CREDENTIAL>", cmd)
+        return cmd
 
     def _scrub_payload(self, payload: dict) -> dict:
-        """Recursively scrub credential values from a journal entry dict.
-        
-        SEC-4 FIX: For write/type operation events, the 'content' and 'text' fields
-        are scrubbed unconditionally as they may contain typed passwords.  This is
-        defence-in-depth: operate.py already avoids logging raw write/type content,
-        but this ensures any future code path that does include it is safe.
+        """
+        Recursively scrub credentials from a journal entry dict.
+
+        HIGH-2 FIX: Command-string fields in _COMMAND_FIELD_NAMES now have
+        the CLI credential scrubber applied. Previously only KV patterns
+        were caught; CLI args like `curl -u user:pass` were stored plaintext.
         """
         if not isinstance(payload, dict):
             return payload
 
-        # Detect write/type operation events to apply targeted scrubbing
         _op = str(payload.get("operation") or "").lower()
         _event = str(payload.get("event") or "").lower()
         _is_write_type = _op in ("write", "type") or (
@@ -96,151 +127,112 @@ class ActionJournal:
         out = {}
         for k, v in payload.items():
             if isinstance(v, str):
-                # SEC-4: Unconditionally redact content/text in write/type contexts
                 if _is_write_type and k in ("content", "text"):
                     out[k] = "<REDACTED:write_type_content>"
+                elif k in _COMMAND_FIELD_NAMES:
+                    out[k] = self._scrub_command_string(v)
                 else:
                     out[k] = self._scrub_text(v)
             elif isinstance(v, dict):
                 out[k] = self._scrub_payload(v)
             elif isinstance(v, list):
-                out[k] = [
-                    self._scrub_text(i) if isinstance(i, str)
-                    else self._scrub_payload(i) if isinstance(i, dict)
-                    else i
-                    for i in v
-                ]
+                scrubbed = []
+                for item in v:
+                    if isinstance(item, str):
+                        scrubbed.append(self._scrub_command_string(item))
+                    elif isinstance(item, dict):
+                        scrubbed.append(self._scrub_payload(item))
+                    else:
+                        scrubbed.append(item)
+                out[k] = scrubbed
             else:
                 out[k] = v
         return out
 
+    # =========================================================================
+    # Internal helpers
+    # =========================================================================
+
+    def _canonicalize(self, payload: dict) -> str:
+        try:
+            return json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+        except Exception as e:
+            raise RuntimeError(f"AUDIT_INTEGRITY_FAILURE: canonicalization failed: {e}") from e
+
+    def _hash(self, payload: dict) -> str:
+        return hashlib.sha256(self._canonicalize(payload).encode("utf-8")).hexdigest()
+
     def _persist(self, payload: dict) -> None:
-        """
-        Best-effort durability.
-        Journal failure does NOT kill the process.
-        """
-        # CRIT-NEW: Scrub credentials before persisting to plaintext audit log
         payload = self._scrub_payload(payload)
         try:
             with open(self.path, "a", encoding="utf-8") as f:
-                f.write(
-                    json.dumps(payload, sort_keys=True) + "\n"
-                )
+                f.write(json.dumps(payload, sort_keys=True) + "\n")
                 f.flush()
                 try:
                     os.fsync(f.fileno())
                 except Exception:
-                    # fsync failure logged implicitly by missing durability
                     pass
         except Exception as e:
-            raise RuntimeError(
-                f"AUDIT_PERSISTENCE_FAILURE: {e}"
-            ) from e
+            raise RuntimeError(f"AUDIT_PERSISTENCE_FAILURE: {e}") from e
 
     def _now(self) -> dict:
-        return {
-            "timestamp_wall": time.time(),
-            "timestamp_mono": time.monotonic(),
-        }
+        return {"timestamp_wall": time.time(), "timestamp_mono": time.monotonic()}
 
-    # -------------------------------------------------
-    # SESSION
-    # -------------------------------------------------
+    # =========================================================================
+    # Session management
+    # =========================================================================
 
     def _initialize_session(self) -> None:
-        entry = {
-            "type": "SESSION_START",
-            **self._now(),
-        }
-        self._record_internal(entry)
+        self._record_internal({"type": "SESSION_START", **self._now()})
 
-    # -------------------------------------------------
-    # PUBLIC API
-    # -------------------------------------------------
+    # =========================================================================
+    # Public API
+    # =========================================================================
 
     def record(self, entry: dict) -> None:
-        """
-        Public record API.
-
-        Enforces:
-        - Intent → Effect pairing
-        - No silent corruption
-        """
-
-        phase = entry.get("phase")
+        phase      = entry.get("phase")
         entry_type = entry.get("type")
 
-        # --- dangling intent guard ---
-        if (
-            entry_type == "SESSION_SEAL"
-            and self.last_intent_hash is not None
-        ):
-            # Auto-seal dangling intent instead of bricking journal
+        if entry_type == "SESSION_SEAL" and self.last_intent_hash is not None:
             self._force_seal_intent("implicit recovery")
 
         if phase == "INTENT":
             if self.last_intent_hash is not None:
-                raise RuntimeError(
-                    "AUDIT_INTEGRITY_FAILURE: INTENT already active"
-                )
+                raise RuntimeError("AUDIT_INTEGRITY_FAILURE: INTENT already active")
 
         if phase == "EFFECT":
             if self.last_intent_hash is None:
-                raise RuntimeError(
-                    "AUDIT_INTEGRITY_FAILURE: EFFECT without INTENT"
-                )
-            entry["intent_ref"] = self.last_intent_hash
+                raise RuntimeError("AUDIT_INTEGRITY_FAILURE: EFFECT without INTENT")
+            entry["intent_ref"]   = self.last_intent_hash
             self.last_intent_hash = None
 
         self._record_internal(entry)
 
-    def seal(self, reason="NORMAL") -> None:
-        entry = {
-            "type": "SESSION_SEAL",
-            "reason": reason,
-            **self._now(),
-        }
-        self.record(entry)
+    def seal(self, reason: str = "NORMAL") -> None:
+        self.record({"type": "SESSION_SEAL", "reason": reason, **self._now()})
 
-    # -------------------------------------------------
-    # INTERNAL RECORD
-    # -------------------------------------------------
+    # =========================================================================
+    # Internal record + recovery
+    # =========================================================================
 
     def _record_internal(self, entry: dict) -> None:
         entry["prev_hash"] = self.last_hash
-
-        current_hash = self._hash(entry)
-        entry["hash"] = current_hash
-
+        current_hash       = self._hash(entry)
+        entry["hash"]      = current_hash
         if entry.get("phase") == "INTENT":
             self.last_intent_hash = current_hash
-
         self.last_hash = current_hash
         self._persist(entry)
 
-    # -------------------------------------------------
-    # RECOVERY
-    # -------------------------------------------------
-
     def _force_seal_intent(self, reason: str) -> None:
-        """
-        Crash recovery hook.
-        Explicitly seals dangling intent.
-        """
-        entry = {
-            "type": "INTENT_ABORT",
-            "reason": reason,
-            **self._now(),
-        }
         self.last_intent_hash = None
-        self._record_internal(entry)
+        self._record_internal({"type": "INTENT_ABORT", "reason": reason, **self._now()})
 
-    # -------------------------------------------------
-    # QUERY
-    # -------------------------------------------------
+    # =========================================================================
+    # Query
+    # =========================================================================
 
     def get_all(self) -> list:
-        
         entries = []
         try:
             if not os.path.exists(self.path):
