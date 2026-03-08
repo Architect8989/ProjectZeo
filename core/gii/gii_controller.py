@@ -140,6 +140,22 @@ class GIIController:
         self._world_model        = None   # Persistent world model
         self._self_model         = None   # Agent self-model
 
+        # Phase 1: SOAR Cognitive Loop (blueprint §3.3)
+        self._operator_cycle     = None   # SOAR operator-selection cycle
+        self._goal_repr          = None   # Structured goal representation
+        self._global_workspace   = None   # GWT broadcaster (§2.3.4)
+
+        # Phase 1: HTN Planning (blueprint §2.4.1)
+        self._htn_planner        = None
+
+        # Phase 3: Self-improving (blueprint §3.1, §3.2)
+        self._trajectory_flywheel = None  # GUI-Owl self-evolution
+        self._algorithm_distiller = None  # Algorithm Distillation (Laskin 2023)
+        self._soar_chunker        = None  # SOAR chunking
+
+        # Phase 0: OpenMemory 5-sector store (blueprint §2.5.2)
+        self._openmemory_store   = None
+
         # Planning
         self._milestone_decomposer  = None
         self._milestones: list       = []
@@ -163,6 +179,10 @@ class GIIController:
             world_model_active=self._world_model is not None,
             self_model_active=self._self_model is not None,
         )
+        # Phase 1 and Phase 3 components (non-blocking: failures are warnings)
+        if self._enabled:
+            self._initialise_phase1_components()
+            self._initialise_phase3_components()
         _logger.info(
             "[GIIController] Initialised. mode=%d enabled=%s consequence=%s "
             "milestones=%s world_model=%s self_model=%s checkpoint_interval=%d",
@@ -425,6 +445,263 @@ class GIIController:
             self._current_milestone_idx + 1, len(self._milestones),
         )
         return True
+
+    # =========================================================================
+    # Phase 1: SOAR Cognitive Loop + GoalAct + GlobalWorkspace
+    # =========================================================================
+
+    def _initialise_phase1_components(self) -> None:
+        """
+        Initialise Phase 1 GII components:
+          - GoalRepresentation (GoalAct structured goals)
+          - OperatorCycle (SOAR operator selection)
+          - GlobalWorkspace (GWT broadcaster)
+          - HTNPlanner (hierarchical task network)
+          - OpenMemoryStore (5-sector memory)
+        """
+        # OpenMemory 5-sector store (Phase 0.3)
+        try:
+            from core.memory.openmemory_store import OpenMemoryStore
+            self._openmemory_store = OpenMemoryStore()
+            _logger.info("[GIIController] OpenMemoryStore (5-sector) active.")
+        except Exception as exc:
+            _logger.warning("[GIIController] OpenMemoryStore init failed: %s", exc)
+
+        # GoalRepresentation — structured, verifiable goal decomposition
+        try:
+            from core.cognition.goal_representation import GoalRepresentation
+            self._goal_repr = GoalRepresentation(
+                objective=self._objective,
+                llm_call=self._llm,
+            )
+            _logger.info("[GIIController] GoalRepresentation active: %d sub-conditions.",
+                         len(self._goal_repr._conditions))
+        except Exception as exc:
+            _logger.warning("[GIIController] GoalRepresentation init failed: %s", exc)
+
+        # SOAR OperatorCycle — replaces scripted plan with per-step reasoning
+        try:
+            from core.cognition.operator_cycle import OperatorCycle
+            # Try Qwen3-VL as TSWM if available
+            tswm = None
+            try:
+                from adapters.qwen3_vl_adapter import get_qwen3_vl, is_qwen3_vl_preferred
+                if is_qwen3_vl_preferred():
+                    tswm = get_qwen3_vl()
+                    _logger.info("[GIIController] OperatorCycle: Qwen3-VL as TSWM.")
+            except Exception:
+                pass
+
+            # Try GUI-Actor for grounding
+            gui_actor = None
+            try:
+                from adapters.gui_actor_adapter import get_gui_actor
+                gui_actor = get_gui_actor()
+                _logger.info("[GIIController] OperatorCycle: GUI-Actor grounding active.")
+            except Exception:
+                pass
+
+            self._operator_cycle = OperatorCycle(
+                llm_call=self._llm,
+                tswm=tswm,
+                gui_actor=gui_actor,
+                openmemory=self._openmemory_store,
+            )
+            _logger.info("[GIIController] OperatorCycle (SOAR) active.")
+        except Exception as exc:
+            _logger.warning("[GIIController] OperatorCycle init failed: %s", exc)
+
+        # HTN Planner
+        try:
+            from core.planner.htn_planner import HTNPlanner
+            self._htn_planner = HTNPlanner(
+                llm_call=self._llm,
+                objective=self._objective,
+            )
+            _logger.info("[GIIController] HTNPlanner active.")
+        except Exception as exc:
+            _logger.warning("[GIIController] HTNPlanner init failed: %s", exc)
+
+        # Global Workspace Theory broadcaster
+        try:
+            from core.cognition.global_workspace import (
+                GlobalWorkspace, PerceptionModule, MemoryModule, ReflectionModule
+            )
+            self._global_workspace = GlobalWorkspace(objective=self._objective)
+            self._global_workspace.register(MemoryModule(self._openmemory_store))
+            self._global_workspace.register(ReflectionModule(self._goal_repr))
+            _logger.info("[GIIController] GlobalWorkspace (GWT) active.")
+        except Exception as exc:
+            _logger.warning("[GIIController] GlobalWorkspace init failed: %s", exc)
+
+    # =========================================================================
+    # Phase 3: Self-improving Flywheel + Algorithm Distillation + SOAR Chunking
+    # =========================================================================
+
+    def _initialise_phase3_components(self) -> None:
+        """
+        Initialise Phase 3 self-improvement components:
+          - TrajectoryFlywheel (GUI-Owl self-evolution)
+          - AlgorithmDistiller (Laskin 2023 in-context RL)
+          - SOARChunking (procedural memory from success)
+        """
+        # TrajectoryFlywheel
+        try:
+            from core.learning.trajectory_flywheel import TrajectoryFlywheel
+            self._trajectory_flywheel = TrajectoryFlywheel(
+                self._llm,
+                openmemory=self._openmemory_store,
+            )
+            _logger.info("[GIIController] TrajectoryFlywheel active.")
+        except Exception as exc:
+            _logger.warning("[GIIController] TrajectoryFlywheel init failed: %s", exc)
+
+        # Algorithm Distillation
+        try:
+            from core.learning.algorithm_distillation import AlgorithmDistiller
+            self._algorithm_distiller = AlgorithmDistiller(llm_call=self._llm)
+            _logger.info("[GIIController] AlgorithmDistiller (in-context RL) active.")
+        except Exception as exc:
+            _logger.warning("[GIIController] AlgorithmDistiller init failed: %s", exc)
+
+        # SOAR Chunking
+        try:
+            from core.learning.soar_chunking import SOARChunking as SOARChunker
+            self._soar_chunker = SOARChunker(
+                self._llm,
+                self._openmemory_store,
+            )
+            _logger.info("[GIIController] SOARChunker active.")
+        except Exception as exc:
+            _logger.warning("[GIIController] SOARChunker init failed: %s", exc)
+
+    # =========================================================================
+    # Phase 1: Operator-based action decision
+    # =========================================================================
+
+    def decide_next_action_operator_cycle(
+        self,
+        world_state: Dict[str, Any],
+        *,
+        screenshot=None,
+    ) -> Tuple[Optional[Dict[str, Any]], str]:
+        """
+        SOAR operator-selection cycle action decision.
+        Used when OperatorCycle is active (Phase 1+).
+
+        Returns the selected operator's action dict.
+        """
+        if self._operator_cycle is None or self._goal_repr is None:
+            return None, "OperatorCycle not initialised"
+
+        from core.cognition.operator_cycle import WorkingMemory
+
+        # Build WorkingMemory from world_state
+        wm = WorkingMemory(
+            entities=world_state.get("entities", []),
+            focused_app=world_state.get("focused_app", "unknown"),
+            screen_desc=world_state.get("screen_description", ""),
+            goal=self._goal_repr,
+            active_milestones=(
+                [getattr(m, "name", str(m)) for m in self._milestones[:3]]
+                if self._milestones else []
+            ),
+        )
+
+        # Update GlobalWorkspace with current observation
+        if self._global_workspace is not None:
+            try:
+                gws_broadcast = self._global_workspace.run_cycle(
+                    external_state={"entity_count": len(wm.entities),
+                                    "focused_app": wm.focused_app,
+                                    "objective": self._objective}
+                )
+                # Inject GWT reflection insights into world_state
+                if gws_broadcast and gws_broadcast.winner:
+                    from core.cognition.global_workspace import ModuleType
+                    if gws_broadcast.winner.module_type == ModuleType.REFLECTION:
+                        prog = gws_broadcast.winner.content.get("goal_progress", 0.0)
+                        if gws_broadcast.winner.content.get("is_complete", False):
+                            return (
+                                {"operation": "done",
+                                 "summary": f"Goal complete ({prog:.0%})"},
+                                "GWT reflection: goal complete"
+                            )
+            except Exception as gws_exc:
+                _logger.debug("[GIIController] GWT cycle error: %s", gws_exc)
+
+        # Run SOAR operator cycle
+        operator, impasse = self._operator_cycle.step(
+            wm, self._goal_repr, screenshot=screenshot
+        )
+
+        if impasse is not None:
+            # Resolve impasse — may create subgoal or require human confirmation
+            resolution = self._operator_cycle.resolve_impasse(impasse, wm)
+            if resolution:
+                if resolution.get("operation") == "require_human_confirmation":
+                    return None, f"Impasse REQUIRE_HUMAN: {impasse.description}"
+                return resolution, f"Impasse resolved: {impasse.impasse_type}"
+            return None, f"Impasse unresolved: {impasse.description}"
+
+        if operator is None:
+            return None, "OperatorCycle returned no operator"
+
+        # GoalAct check: update goal progress
+        if self._goal_repr is not None:
+            try:
+                self._goal_repr.evaluate_from_screen(world_state)
+                if self._goal_repr.is_complete:
+                    return (
+                        {"operation": "done",
+                         "summary": f"Goal complete: {self._goal_repr.progress_summary}"},
+                        "GoalAct: all conditions satisfied"
+                    )
+            except Exception:
+                pass
+
+        # HTN GoalAct anti-stall check
+        if self._htn_planner is not None:
+            try:
+                goalact = self._htn_planner.goalact_check(world_state)
+                if goalact.get("stall_detected") and goalact.get("recommendation") == "replan":
+                    _logger.info("[GIIController] GoalAct stall detected — triggering replan.")
+                    world_state["_gii_loop_note"] = (
+                        f"GoalAct: stall detected — {goalact.get('reason', '')}"
+                    )
+            except Exception:
+                pass
+
+        return operator.action, f"OperatorCycle: {operator.description[:100]}"
+
+    def on_operator_success(
+        self,
+        executed_operators: list,
+        focused_app: str = "",
+    ) -> None:
+        """
+        Called after successful task completion to trigger SOAR chunking
+        and Algorithm Distillation episode recording.
+        """
+        # SOAR chunking — store operator sequence as procedural memory
+        if self._operator_cycle and executed_operators:
+            try:
+                self._operator_cycle.on_success(
+                    successful_operators=executed_operators,
+                    goal_description=self._objective,
+                    app_context=focused_app,
+                )
+                _logger.info("[GIIController] SOAR chunk stored: %d operators.",
+                             len(executed_operators))
+            except Exception as exc:
+                _logger.debug("[GIIController] SOAR chunking error: %s", exc)
+
+        # Force goal complete
+        if self._goal_repr is not None:
+            try:
+                self._goal_repr.force_complete()
+            except Exception:
+                pass
 
     # =========================================================================
     # Primary action decision
@@ -861,4 +1138,17 @@ class GIIController:
             stats["world_model"] = self._world_model.stats()
         if self._self_model and hasattr(self._self_model, "get_stats"):
             stats["self_model"] = self._self_model.get_stats()
+        if self._operator_cycle is not None:
+            stats["operator_cycle_active"] = True
+        if self._goal_repr is not None:
+            stats["goal_progress"] = self._goal_repr.progress
+            stats["goal_complete"] = self._goal_repr.is_complete
+        if self._global_workspace is not None:
+            stats["global_workspace"] = self._global_workspace.get_stats()
+        if self._htn_planner is not None:
+            stats["htn_active"] = True
+        if self._algorithm_distiller is not None:
+            stats["algorithm_distillation_active"] = True
+        if self._openmemory_store is not None:
+            stats["openmemory_active"] = True
         return stats

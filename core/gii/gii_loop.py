@@ -128,6 +128,13 @@ class GIIGoalDirectedLoop:
         # GAP-1: perceptual hash at reasoning time
         self._last_reasoning_phash: Optional[int] = None
 
+        # Blueprint Phase 1: GoalRepresentation integration
+        # Pulled from GIIController if available
+        self._goal_repr = getattr(gii_controller, "_goal_repr", None)
+        self._operator_cycle = getattr(gii_controller, "_operator_cycle", None)
+        self._algorithm_distiller = getattr(gii_controller, "_algorithm_distiller", None)
+        self._executed_operators: list = []   # Track for SOAR chunking
+
     # =========================================================================
     # Main entry point
     # =========================================================================
@@ -342,6 +349,49 @@ class GIIGoalDirectedLoop:
             except Exception:
                 pass
 
+            # Blueprint §2.6.2: Algorithm Distillation — record trajectory step
+            if self._algorithm_distiller is not None:
+                try:
+                    focused_app = world_state.get("focused_app", "unknown")
+                    obs_summary = (
+                        f"App: {focused_app} | "
+                        f"Entities: {len(world_state.get('entities', []))}"
+                    )
+                    ad_episode = getattr(self, "_ad_current_episode", None)
+                    if ad_episode is None:
+                        ad_episode = self._algorithm_distiller.create_episode(
+                            task_type=self._objective[:80],
+                            app_context=focused_app,
+                        )
+                        self._ad_current_episode = ad_episode
+                    ad_episode.add_step(
+                        observation=obs_summary,
+                        action=action,
+                        reward=1.0 if exec_success else 0.0,
+                        outcome="success" if exec_success else "failure",
+                    )
+                except Exception:
+                    pass
+
+            # GoalRepresentation: evaluate progress after each action
+            if self._goal_repr is not None:
+                try:
+                    self._goal_repr.evaluate_from_screen(world_state)
+                    if self._goal_repr.is_complete:
+                        _logger.info("[GIILoop] GoalRepresentation: all conditions satisfied.")
+                        self._journal.record({
+                            "event": "gii_loop_goal_complete_via_goal_repr",
+                            "iteration": self._iteration,
+                            "progress": self._goal_repr.progress,
+                        })
+                        # Finalise AD episode on success
+                        ad_ep = getattr(self, "_ad_current_episode", None)
+                        if ad_ep and self._algorithm_distiller:
+                            self._algorithm_distiller.finalize_episode(ad_ep, success=True)
+                        return self._result(True, "All goal sub-conditions satisfied")
+                except Exception:
+                    pass
+
             if self._on_action_executed is not None:
                 try:
                     self._on_action_executed(action, exec_success, exec_output, self._iteration)
@@ -474,4 +524,30 @@ class GIIGoalDirectedLoop:
             return False
 
     def _result(self, success: bool, reason: str) -> Dict[str, Any]:
-        return {"success": success, "reason": reason, "iterations": self._iteration, "stagnant_count": self._stagnant_count, "final_world_state": self._get_world_state()}
+        # Finalise Algorithm Distillation episode
+        ad_ep = getattr(self, "_ad_current_episode", None)
+        if ad_ep is not None and self._algorithm_distiller is not None:
+            try:
+                self._algorithm_distiller.finalize_episode(ad_ep, success=success)
+            except Exception:
+                pass
+
+        # SOAR on_success callback
+        if success and hasattr(self._gii, "on_operator_success"):
+            try:
+                focused_app = self._get_world_state().get("focused_app", "")
+                self._gii.on_operator_success(
+                    executed_operators=self._executed_operators,
+                    focused_app=focused_app,
+                )
+            except Exception:
+                pass
+
+        return {
+            "success": success,
+            "reason": reason,
+            "iterations": self._iteration,
+            "stagnant_count": self._stagnant_count,
+            "final_world_state": self._get_world_state(),
+            "goal_progress": getattr(self._goal_repr, "progress", None),
+        }
