@@ -1,6 +1,31 @@
+# policy.yaml — ProjectZeo GII Security Policy
+#
+# HIGH-4 FIX (March 2026):
+#   allowed_write_paths previously contained "/home/" which grants write
+#   access to ALL users' home directories, not just the current user.
+#   This is a path traversal risk: any step that resolves to /home/otheruser/
+#   would be permitted.
+#
+#   Fix: replaced "/home/" with user-specific home subdirectories.
+#   The policy engine expands "~/" to the current user's home at runtime.
+#
+#   Additional denied_write_paths added:
+#   - Shell dotfiles (bashrc, zshrc, profile) — persistence via shell injection
+#   - systemd user units — persistence via service autostart
+#   - autostart directory — GUI autostart persistence
+#   - cron directories — scheduled task persistence
+#   - sudoers.d — privilege escalation persistence
+#
+# OPERATOR NOTE: Review allowed_write_paths before deploying.
+# The defaults are conservative. Expand for your specific workspace.
 
+# ─────────────────────────────────────────────────────────────────────────────
+# ALLOWED APPLICATIONS
+# Agent may interact with these application windows.
+# Unknown apps are routed through consequence reasoning before being allowed.
+# ─────────────────────────────────────────────────────────────────────────────
 allowed_apps:
-  # Common productivity tools — safe for most deployments
+  # Terminals
   - "Terminal"
   - "gnome-terminal"
   - "konsole"
@@ -10,40 +35,61 @@ allowed_apps:
   - "iTerm2"
   - "bash"
   - "zsh"
-  - "Code"                  # VS Code
-  - "cursor"                # Cursor IDE
-  - "codium"                # VSCodium
+  - "fish"
+
+  # Code editors / IDEs
+  - "Code"           # VS Code
+  - "cursor"         # Cursor IDE
+  - "codium"         # VSCodium
   - "gedit"
   - "kate"
   - "vim"
   - "neovim"
   - "nano"
-  - "Files"                 # GNOME Files
+  - "sublime_text"
+
+  # File managers
+  - "Files"          # GNOME Files / Nautilus
   - "Nautilus"
-  - "Finder"                # macOS
+  - "Finder"         # macOS
+  - "thunar"
+  - "dolphin"
+
+  # Browsers
   - "Firefox"
+  - "firefox"
   - "chromium"
   - "Chromium"
   - "Google Chrome"
   - "google-chrome"
   - "Brave Browser"
   - "brave-browser"
+
+  # Document apps
   - "Thunderbird"
-  - "Evince"                # PDF viewer
+  - "Evince"
   - "okular"
   - "libreoffice"
   - "LibreOffice"
   - "calc"
   - "writer"
   - "impress"
+  - "soffice"
+
+  # Communication
   - "Slack"
   - "Discord"
   - "zoom"
   - "Zoom"
+  - "Teams"
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# HIGH-RISK APPLICATIONS
+# Agent may interact but must route through consequence reasoning first.
+# Any action targeting these requires Tier 3 safety evaluation.
+# ─────────────────────────────────────────────────────────────────────────────
 high_risk_apps:
-  
   - "root"
   - "gparted"
   - "synaptic"
@@ -52,37 +98,52 @@ high_risk_apps:
   - "pacman"
   - "yum"
   - "dnf"
-  - "Disk Utility"          # macOS
-  - "Registry Editor"       # Windows
+  - "Disk Utility"       # macOS
+  - "Registry Editor"    # Windows
+  - "htop"
+  - "top"
+  - "systemctl"
+
 
 # ─────────────────────────────────────────────────────────────────────────────
-# DENIED APPLICATIONS (agent is NEVER allowed to interact, hard block)
+# DENIED APPLICATIONS
+# Agent is NEVER allowed to interact with these. Hard block regardless of
+# consequence reasoning outcome. Override only in system prompt.
 # ─────────────────────────────────────────────────────────────────────────────
 denied_apps:
-  
-  - "sudo"    # AUDIT CRITICAL: Hard block. Edit policy.yaml to change this.
-  - "su"      # Privilege escalation via user-switch — always denied
-  - "ssh"
-  - "scp"
-  - "sftp"
+  - "sudo"    # Privilege escalation — always denied at app level
+  - "su"      # User-switch privilege escalation
+  - "ssh"     # Remote shell access
+  - "scp"     # Remote file copy
+  - "sftp"    # Remote file transfer
+  - "pkexec"  # PolicyKit privilege escalation
+  - "doas"    # Alternative sudo
+  - "run0"    # systemd privilege escalation
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # FILESYSTEM POLICY
-# Controls where the agent is allowed to create/modify files.
+# HIGH-4 FIX: allowed_write_paths changed from "/home/" (ALL users)
+# to current-user home subdirectories only (expanded at runtime by engine).
 # ─────────────────────────────────────────────────────────────────────────────
 filesystem:
-  # Directories the agent MAY write to (prefix match)
+  # Directories the agent MAY write to.
+  # "~/" is expanded to the current user's home directory at runtime.
+  # OPERATOR: Add your specific workspace paths here.
   allowed_write_paths:
     - "/tmp/"
-    - "/home/"
+    - "/var/tmp/"
     - "~/Desktop/"
     - "~/Documents/"
     - "~/Downloads/"
     - "~/projects/"
-    - "/var/tmp/"
+    - "~/workspace/"
+    - "~/.projectzeo/"
 
-  # Directories the agent is NEVER allowed to write to (hard deny, prefix match)
+  # Directories NEVER allowed (hard deny, checked BEFORE allowed_write_paths).
+  # HIGH-4 FIX: Added shell dotfiles, systemd, autostart, cron, sudoers.
   denied_write_paths:
+    # System directories
     - "/etc/"
     - "/sys/"
     - "/proc/"
@@ -93,76 +154,134 @@ filesystem:
     - "/usr/sbin/"
     - "/bin/"
     - "/sbin/"
+    - "/lib/"
+    - "/lib64/"
+    - "/snap/"
+
+    # Persistence vectors (HIGH-4 FIX)
+    # Shell startup files
+    - "~/.bashrc"
+    - "~/.zshrc"
+    - "~/.profile"
+    - "~/.bash_profile"
+    - "~/.bash_login"
+    - "~/.bash_logout"
+    - "~/.zprofile"
+    - "~/.zshenv"
+    - "~/.zlogin"
+
+    # Desktop/GUI autostart
+    - "~/.config/autostart/"
+    - "~/.kde/Autostart/"
+    - "~/.kde4/Autostart/"
+
+    # systemd user units (service persistence)
+    - "~/.config/systemd/user/"
+    - "/etc/systemd/system/"
+    - "/etc/systemd/user/"
+
+    # Cron (scheduled task persistence)
+    - "/etc/cron.d/"
+    - "/etc/cron.daily/"
+    - "/etc/cron.weekly/"
+    - "/etc/cron.monthly/"
+    - "/var/spool/cron/"
+
+    # Privilege escalation persistence
+    - "/etc/sudoers"
+    - "/etc/sudoers.d/"
+
+    # SSH (unauthorized access vector)
+    - "~/.ssh/"
+
+    # Package manager hooks
+    - "/etc/apt/sources.list.d/"
+    - "/etc/yum.repos.d/"
+
+    # Bash history (evidence tampering)
+    - "~/.bash_history"
+    - "~/.zsh_history"
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # NETWORK POLICY
-# Controls what network operations the agent may perform.
 # ─────────────────────────────────────────────────────────────────────────────
 network:
-  # Allow outbound HTTP/HTTPS (required for install, research, web tasks)
-  allow_outbound_http: true
+  allow_outbound_http:  true
+  allow_outbound_ssh:   false
 
-  # Allow outbound SSH (set false unless the agent explicitly needs remote access)
-  allow_outbound_ssh: false
-
-  # Denied domains — agent cannot resolve or connect to these via browser/curl
+  # Denied domains — agent cannot resolve or connect to these
   denied_domains:
     - "ngrok.io"
+    - "ngrok.com"
     - "pagekite.net"
+    - "webhook.site"
+    - "requestbin.com"
+    - "pipedream.net"
+    - "localhost.run"
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # COMMAND EXECUTION POLICY
 # ─────────────────────────────────────────────────────────────────────────────
 commands:
-  # Require human confirmation for any command that uses sudo
+  # Require human confirmation for any command using sudo
   require_confirmation_for_sudo: true
 
   # Maximum time in seconds for a single shell command (0 = use system default)
   max_command_timeout_seconds: 300
 
-  # Shell to use for command execution (leave empty for system default)
+  # Shell for command execution
   shell: ""
 
+
 # ─────────────────────────────────────────────────────────────────────────────
-# BROWSER AUTOMATION POLICY (requires playwright — GAP-1 fix)
+# BROWSER AUTOMATION POLICY
 # ─────────────────────────────────────────────────────────────────────────────
 browser:
-  # Use Playwright DOM automation for browser-targeted actions when available.
-  # Falls back to pyautogui coordinate clicks if playwright is not installed.
-  prefer_playwright: true
+  prefer_playwright:      true
+  playwright_browser:     "chromium"
+  headless:               false
+  navigation_timeout_ms:  30000
 
-  # Browser to launch for Playwright sessions
-  # Options: "chromium", "firefox", "webkit"
-  playwright_browser: "chromium"
-
-  # Launch browser in headless mode (false = visible browser window)
-  headless: false
-
-  # Wait for network idle before considering a navigation complete (ms)
-  navigation_timeout_ms: 30000
 
 # ─────────────────────────────────────────────────────────────────────────────
 # RESTORATION POLICY
 # ─────────────────────────────────────────────────────────────────────────────
 restoration:
-  # Whether to attempt snapshot/restore after each task
-  enabled: true
+  enabled:              true
+  cursor_tolerance_px:  5
+  timeout_seconds:      60
 
-  # Restoration verification tolerance for cursor position (pixels)
-  cursor_tolerance_px: 5
 
-  # Timeout for the restoration phase (seconds)
-  timeout_seconds: 60
+# ─────────────────────────────────────────────────────────────────────────────
+# GII POLICY
+# Enable/disable GII capabilities at the policy level.
+# ─────────────────────────────────────────────────────────────────────────────
+gii:
+  # Enable milestone decomposition (default: on)
+  use_milestones: true
+
+  # Enable world model persistence (default: on)
+  use_world_model: true
+
+  # Enable agent self-model (default: on)
+  use_self_model: true
+
+  # Consequence reasoning mode: 0=disabled, 1=basic, 2=full
+  consequence_reasoning_mode: 2
+
+  # Require LlamaGuard Tier 4 (set true to make it non-optional)
+  require_llamaguard: false
+
+  # Human confirmation timeout in seconds
+  confirm_timeout_seconds: 60
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # LOGGING AND AUDIT
 # ─────────────────────────────────────────────────────────────────────────────
 logging:
-  # Journal log level: DEBUG | INFO | WARNING | ERROR
-  level: "INFO"
-
-  # Maximum journal log file size in MB before rotation
-  max_size_mb: 50
-
-  # Keep last N journal files
-  keep_files: 5
+  level:        "INFO"
+  max_size_mb:  50
+  keep_files:   5
