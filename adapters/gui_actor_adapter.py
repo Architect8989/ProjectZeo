@@ -1,37 +1,3 @@
-"""
-adapters/gui_actor_adapter.py
-==============================
-Microsoft GUI-Actor-7B Grounding Adapter for ProjectZeo GII.
-
-Blueprint Reference: §2.1.4 (arXiv:2506.03143), §3.2.2
-
-GUI-Actor replaces coordinate-based grounding with attention-based action heads.
-Instead of predicting (x, y) pixel coordinates directly, it identifies the
-semantically correct UI element through cross-attention between the instruction
-and the screenshot, then maps attention peaks to screen positions.
-
-Advantages over OmniParser coordinate grounding:
-  - Resolution-agnostic: handles DPI scaling, windowed/full-screen, multi-monitor
-  - Native confidence scores from attention peaks
-  - Uncertainty quantification: low-confidence peaks trigger verification subgoal
-  - SOTA on ScreenSpot-Pro benchmark with Qwen2.5-VL backbone
-
-Serving options (tried in order):
-  1. Remote vLLM server (PROJECTZEO_GUI_ACTOR_URL) — production
-  2. HuggingFace Transformers (local GPU, microsoft/GUI-Actor-7B-Qwen2.5-VL)
-  3. Coordinate-extraction fallback (OmniParser / AT-SPI bounding boxes)
-
-Key interface:
-  adapter.ground(screenshot, instruction) → {"x": int, "y": int, "confidence": float, ...}
-
-Environment variables:
-    PROJECTZEO_GUI_ACTOR_URL    — vLLM/SGLang endpoint, e.g. http://localhost:8080
-    PROJECTZEO_GUI_ACTOR_MODEL  — model ID (default: microsoft/GUI-Actor-7B-Qwen2.5-VL)
-    PROJECTZEO_GUI_ACTOR_PORT   — port for local vLLM server (default: 8080)
-    PROJECTZEO_GUI_ACTOR_CONF   — minimum confidence threshold (default: 0.70)
-    PROJECTZEO_GUI_ACTOR_LOCAL  — "1" to force local HF loading
-    PROJECTZEO_GUI_ACTOR_TIMEOUT — request timeout in seconds (default: 30)
-"""
 from __future__ import annotations
 
 import base64
@@ -318,11 +284,7 @@ class _LocalHFBackend:
 
 
 class _FallbackBackend:
-    """
-    Coordinate-extraction fallback using entity list from VisionRuntime.
-    Used when neither remote nor local GUI-Actor is available.
-    Provides best-effort grounding with lower accuracy and no attention confidence.
-    """
+    
 
     def is_available(self) -> bool:
         return True  # Always available as last resort
@@ -484,17 +446,7 @@ def _parse_grounding_response(
 # ─────────────────────────────────────────────────────────────────────────────
 
 class GUIActorAdapter:
-    """
-    GUI-Actor-7B grounding adapter.
-
-    Usage:
-        adapter = GUIActorAdapter()
-        result = adapter.ground(screenshot_pil, "click the Save button")
-        if result.is_confident:
-            pyautogui.click(result.x, result.y)
-        else:
-            # Trigger verification subgoal
-    """
+    
 
     def __init__(
         self,
@@ -538,24 +490,7 @@ class GUIActorAdapter:
         *,
         entities: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
-        """
-        Ground a natural language instruction to screen coordinates.
-
-        Args:
-            screenshot: PIL.Image, numpy array, base64 string, or None
-            instruction: Natural language description of target element
-            entities: Optional entity list from VisionRuntime (for fallback)
-
-        Returns:
-            dict with keys: x, y, confidence, element_type, element_label, bbox, backend
-
-        Notes:
-            DEFECT FIX: Previously crashed with ``ValueError: Unsupported screenshot
-            type: <class 'NoneType'>`` when screenshot=None (e.g. when OperatorCycle
-            calls ground() before a screenshot is available). Now returns a low-
-            confidence centred fallback result instead of raising, matching the
-            graceful-degradation contract expected by OperatorCycle.
-        """
+        
         t0 = time.perf_counter()
 
         # DEFECT FIX: guard None/invalid before _prepare_image raises.
@@ -699,10 +634,7 @@ class GUIActorAdapter:
     # =========================================================================
 
     def _prepare_image(self, screenshot: Any) -> Tuple[str, Tuple[int, int]]:
-        """
-        Convert any screenshot format to (base64_png_string, (width, height)).
-        Handles: PIL.Image, numpy array, bytes, base64 string, file path.
-        """
+        
         try:
             from PIL import Image
         except ImportError:
