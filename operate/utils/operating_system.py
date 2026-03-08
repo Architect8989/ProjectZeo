@@ -361,14 +361,31 @@ class OperatingSystem:
         w, h = pya.size()
         return int(w), int(h)
 
-    def exec(self, cmd: str, *, sudo: bool = False, timeout: Optional[int] = None) -> subprocess.CompletedProcess:
+    def exec(self, cmd: str, *, timeout: Optional[int] = None) -> subprocess.CompletedProcess:
+        """
+        Execute a shell command safely.
+
+        HIGH-1 FIX (March 2026): The `sudo: bool` parameter has been REMOVED.
+        Previously, exec() accepted sudo=True which prepended "sudo" to the
+        command BEFORE the dangerous-pattern filter ran. This allowed callers
+        to bypass the filter: exec("bash -i", sudo=True) → checked as
+        "sudo bash -i" which does NOT match the "bash -i" pattern.
+
+        Callers that previously passed sudo=True must be updated to either:
+          a) Use explicit sudo in the command string (which WILL be filtered)
+          b) Route through the human-confirmation gate before calling exec()
+
+        The dangerous-pattern filter now runs on the ORIGINAL command string
+        before any modification, ensuring patterns like "bash -i" are caught
+        regardless of any prefix.
+        """
         if not isinstance(cmd, str) or not cmd.strip():
             raise RuntimeError("exec(): invalid command")
 
         full_cmd = cmd.strip()
-        if sudo and hasattr(os, "geteuid") and os.geteuid() != 0:
-            full_cmd = f"sudo {full_cmd}"
 
+        # HIGH-1 FIX: Apply dangerous-pattern filter to ORIGINAL cmd,
+        # before any prefix is added. This is the only safe ordering.
         try:
             from core.planner.execution_planner import ExecutionPlanner as _EP  # noqa: PLC0415
             from core.security.injection_markers import normalize_for_injection_check as _norm  # noqa: PLC0415
