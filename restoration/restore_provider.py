@@ -1,12 +1,26 @@
+"""
+restoration/restore_provider.py  (patched — March 2026)
+
+Orchestrates all restoration tiers differentially:
+  Tier 0: Cursor + active application (always)
+  Tier 1: Window layout via wmctrl/xdotool (always)
+  Tier 2: Browser tabs via Playwright CDP (only if browser was open pre-task)
+  Tier 3: Filesystem via BTRFS/rsync (only if task wrote files)
+  Tier 4: Process checkpoint via CRIU (only for interrupted long-running procs)
+
+Every tier is conditional. The provider asks "did the user have this before
+the task?" and only restores what existed, cleaning up what the agent added.
+"""
 from __future__ import annotations
 
-import time
-import threading
 import json
+import logging
 import os
 import subprocess
 import sys
-from typing import Optional
+import threading
+import time
+from typing import Any, Dict, List, Optional
 
 from restoration.snapshot_types import (
     RestorationSnapshot,
@@ -16,43 +30,70 @@ from restoration.snapshot_types import (
 from restoration.snapshot_provider import SnapshotProvider
 from core.mode_controller import ModeController, SystemMode
 
-
-
-
-_PLAYWRIGHT_AVAILABLE: bool = False
 try:
-    from playwright.sync_api import sync_playwright as _sync_playwright
-    _PLAYWRIGHT_AVAILABLE = True
+    from restoration.window_state_provider import (
+        capture as _win_capture,
+        restore as _win_restore,
+        close_agent_windows as _win_close_new,
+        verify as _win_verify,
+        WindowStateSnapshot,
+    )
+    _WIN_AVAILABLE = True
 except ImportError:
-    _sync_playwright = None  # type: ignore[assignment]
+    _WIN_AVAILABLE = False
+
+try:
+    from restoration.browser_snapshot_provider import (
+        capture as _browser_capture,
+        restore as _browser_restore,
+        BrowserSnapshot,
+    )
+    _BROWSER_AVAILABLE = True
+except ImportError:
+    _BROWSER_AVAILABLE = False
+
+try:
+    from restoration.fs_snapshot_provider import (
+        capture as _fs_capture,
+        restore as _fs_restore,
+        cleanup as _fs_cleanup,
+        verify as _fs_verify,
+        FsSnapshot,
+    )
+    _FS_AVAILABLE = True
+except ImportError:
+    _FS_AVAILABLE = False
+
+try:
+    from restoration.criu_provider import (
+        capture as _criu_capture,
+        restore as _criu_restore,
+        cleanup as _criu_cleanup,
+        CriuSnapshot,
+    )
+    _CRIU_AVAILABLE = True
+except ImportError:
+    _CRIU_AVAILABLE = False
+
+_logger = logging.getLogger(__name__)
+
 
 class RestorationError(RuntimeError):
-    """Raised when restoration or post-restore verification fails."""
     pass
 
 
 class RestoreProvider:
-   
 
-    CURSOR_TOLERANCE_PX = 5
-
-    
-    POST_ACTION_DELAY: float = 0.50     # was 0.25s
-    MAX_VERIFY_ATTEMPTS: int = 10       # was 5 → total window: 10 × 0.50 = 5.0s
-
-    MAX_LEDGER_ENTRIES = 10_000
-    
-    MAX_TITLE_DISTANCE = 5
+    CURSOR_TOLERANCE_PX  = 5
+    POST_ACTION_DELAY    = 0.50
+    MAX_VERIFY_ATTEMPTS  = 10
+    MAX_LEDGER_ENTRIES   = 10_000
+    MAX_TITLE_DISTANCE   = 5
 
     _RESTORE_LEDGER_PATH: str = os.path.join(
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-        "memory",
-        "restore_ledger.json",
+        "memory", "restore_ledger.json",
     )
-
-    # ------------------------------------------------------------------
-    # INIT
-    # ------------------------------------------------------------------
 
     def __init__(
         self,
@@ -60,856 +101,425 @@ class RestoreProvider:
         os_backend,
         mode_controller: ModeController,
         snapshot_provider: SnapshotProvider,
-        authority_state=None,  # HIGH-7 FIX: wired from main.py so duplicate-restore warning flag is set
+        authority_state=None,
     ) -> None:
-        self._os = os_backend
-        self._mode = mode_controller
+        self._os               = os_backend
+        self._mode             = mode_controller
         self._snapshot_provider = snapshot_provider
-        self._lock = threading.Lock()
-        
-        self._authority_state = authority_state
+        self._authority_state  = authority_state
+        self._lock             = threading.Lock()
 
-        # Ledger availability — disabled on read-only filesystems without raising
-        self._ledger_available: bool = True
+        self._ledger_available = True
         try:
             os.makedirs(os.path.dirname(self._RESTORE_LEDGER_PATH), exist_ok=True)
-        except (PermissionError, OSError) as _ledger_dir_err:
+        except (PermissionError, OSError) as e:
             self._ledger_available = False
-            print(
-                f"[RestoreProvider] WARNING: Cannot create ledger directory "
-                f"({os.path.dirname(self._RESTORE_LEDGER_PATH)!r}): "
-                f"{_ledger_dir_err}. "
-                "Duplicate-restore protection is DISABLED for this session. "
-                "This is expected on read-only filesystems (containers, NFS, CI).",
-                file=sys.stderr,
-            )
+            _logger.warning("[RestoreProvider] Ledger dir unavailable: %s", e)
 
         self._completed_snapshots: dict = (
             self._load_ledger() if self._ledger_available else {}
         )
 
-        # HIGH-3 FIX: Browser session state (captured at snapshot time, restored on restore)
-        self._browser_session: dict = {}  # {url, scroll_x, scroll_y, tab_index, ...}
-        self._browser_capture_lock = threading.Lock()
+        # Extended tier snapshots — keyed by base snapshot_id
+        self._win_snaps:  Dict[str, Any] = {}
+        self._brow_snaps: Dict[str, Any] = {}
+        self._fs_snaps:   Dict[str, Any] = {}
+        self._criu_snaps: Dict[str, Any] = {}
+
+        # Track per-task metadata: did agent open a browser? did it write files?
+        self._task_opened_browser: Dict[str, bool] = {}
+        self._task_wrote_files:    Dict[str, bool] = {}
 
     # =========================================================================
     # LEDGER
     # =========================================================================
 
     def _load_ledger(self) -> dict:
-        
         if not os.path.exists(self._RESTORE_LEDGER_PATH):
             return {}
-
         try:
             with open(self._RESTORE_LEDGER_PATH, "r", encoding="utf-8") as f:
                 data = json.load(f)
-
             if isinstance(data, dict):
-                # New format: {snapshot_id: float_timestamp}
-                return {
-                    str(k): float(v)
-                    for k, v in list(data.items())[: self.MAX_LEDGER_ENTRIES]
-                    if isinstance(v, (int, float))
-                }
-
+                return {str(k): float(v) for k, v in list(data.items())[:self.MAX_LEDGER_ENTRIES] if isinstance(v, (int, float))}
             if isinstance(data, list):
-                # Old format: ["snapshot_id", ...] — upgrade in memory
-                return {str(x): 0.0 for x in data[: self.MAX_LEDGER_ENTRIES]}
-
-            raise RestorationError("Restore ledger corrupted: unexpected format")
-
+                return {str(x): 0.0 for x in data[:self.MAX_LEDGER_ENTRIES]}
+            raise RestorationError("Restore ledger corrupted")
         except RestorationError:
             raise
         except Exception as e:
-            raise RestorationError(f"Restore ledger load failed: {e}") from e
+            raise RestorationError(f"Ledger load failed: {e}") from e
 
     def _persist_ledger(self) -> None:
-        
         if not self._ledger_available:
             return
-
-        tmp_path = self._RESTORE_LEDGER_PATH + ".tmp"
-
+        tmp = self._RESTORE_LEDGER_PATH + ".tmp"
         try:
-            # SI-4 / H9: Evict oldest entries (lowest timestamps) to stay under cap
             if len(self._completed_snapshots) > self.MAX_LEDGER_ENTRIES:
-                sorted_by_ts = sorted(
-                    self._completed_snapshots.items(),
-                    key=lambda kv: kv[1],           # sort ascending by timestamp
-                )
-                self._completed_snapshots = dict(
-                    sorted_by_ts[-self.MAX_LEDGER_ENTRIES:]  # keep newest
-                )
-
-            with open(tmp_path, "w", encoding="utf-8") as f:
-                json.dump(
-                    self._completed_snapshots,
-                    f,
-                    separators=(",", ":"),
-                )
+                sorted_entries = sorted(self._completed_snapshots.items(), key=lambda kv: kv[1])
+                self._completed_snapshots = dict(sorted_entries[-self.MAX_LEDGER_ENTRIES:])
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self._completed_snapshots, f, separators=(",", ":"))
                 f.flush()
                 os.fsync(f.fileno())
-
-            os.replace(tmp_path, self._RESTORE_LEDGER_PATH)
-
+            os.replace(tmp, self._RESTORE_LEDGER_PATH)
         except Exception as e:
-            # Non-fatal: ledger persistence failure logs but does not abort restoration
-            print(
-                f"[RestoreProvider] WARNING: Ledger persist failed: {e}. "
-                "Duplicate-restore protection may be incomplete for this session.",
-                file=sys.stderr,
-            )
+            _logger.warning("[RestoreProvider] Ledger persist failed: %s", e)
 
-    
+    # =========================================================================
+    # PRE-TASK CAPTURE (all tiers)
+    # =========================================================================
 
-    def capture_browser_session(self) -> dict:
-        
-        if not _PLAYWRIGHT_AVAILABLE:
-            return {"captured": False, "reason": "playwright not installed"}
+    def capture_extended_state(
+        self,
+        snapshot_id: str,
+        task_writes_files: bool = False,
+        target_pids: Optional[List[int]] = None,
+    ) -> None:
+        """
+        Capture all extended-tier state before a task starts.
+        Call this immediately after the base RestorationSnapshot is taken.
+        """
+        # Tier 1: Window layout
+        if _WIN_AVAILABLE:
+            try:
+                win_snap = _win_capture()
+                if win_snap:
+                    self._win_snaps[snapshot_id] = win_snap
+            except Exception as e:
+                _logger.debug("[RestoreProvider] Window capture error: %s", e)
 
-        result = {
-            "captured": False,
-            "tabs": [],
-            "active_tab_index": 0,
-            "timestamp": time.time(),
-        }
+        # Tier 2: Browser — record whether browser was running pre-task
+        if _BROWSER_AVAILABLE:
+            try:
+                brow_snap = _browser_capture()
+                self._brow_snaps[snapshot_id] = brow_snap
+            except Exception as e:
+                _logger.debug("[RestoreProvider] Browser capture error: %s", e)
 
-        try:
-            with _sync_playwright() as pw:
-                # Try to connect to an existing Chromium-based browser
-                # Requires browser to be launched with --remote-debugging-port=9222
-                _cdp_url = os.environ.get(
-                    "PROJECTZEO_CDP_URL", "http://localhost:9222"
-                ).strip()
-                try:
-                    browser = pw.chromium.connect_over_cdp(_cdp_url, timeout=3000)
-                    contexts = browser.contexts
-                    if not contexts:
-                        return result
+        # Tier 3: Filesystem — only if task will write files
+        if _FS_AVAILABLE and task_writes_files:
+            try:
+                fs_snap = _fs_capture(task_writes_files=True)
+                if fs_snap:
+                    self._fs_snaps[snapshot_id] = fs_snap
+            except Exception as e:
+                _logger.debug("[RestoreProvider] FS capture error: %s", e)
 
-                    context = contexts[0]
-                    pages = context.pages
-                    if not pages:
-                        return result
+        # Tier 4: CRIU — only for explicit long-running process protection
+        if _CRIU_AVAILABLE and target_pids:
+            try:
+                criu_snap = _criu_capture(target_pids=target_pids)
+                self._criu_snaps[snapshot_id] = criu_snap
+            except Exception as e:
+                _logger.debug("[RestoreProvider] CRIU capture error: %s", e)
 
-                    tabs = []
-                    for page in pages:
-                        try:
-                            url = page.url
-                            title = page.title()
-                            scroll_y = page.evaluate("window.scrollY") if url.startswith("http") else 0
-                            scroll_x = page.evaluate("window.scrollX") if url.startswith("http") else 0
-                            tabs.append({
-                                "url": url,
-                                "title": title,
-                                "scroll_x": scroll_x,
-                                "scroll_y": scroll_y,
-                            })
-                        except Exception:
-                            tabs.append({"url": "unknown", "title": "", "scroll_x": 0, "scroll_y": 0})
+        self._task_wrote_files[snapshot_id]    = task_writes_files
+        self._task_opened_browser[snapshot_id] = False  # updated during task
 
-                    result["tabs"] = tabs
-                    result["active_tab_index"] = 0  # first tab is active in CDP
-                    result["captured"] = True
-                    browser.close()
-
-                except Exception as cdp_exc:
-                    # CDP connection failed — browser may not be running with remote debugging
-                    print(
-                        f"[RestoreProvider] Browser session capture: CDP connect failed "
-                        f"({cdp_exc!s:.80}). "
-                        "To enable browser capture, launch browser with: "
-                        "--remote-debugging-port=9222",
-                        file=sys.stderr,
-                    )
-                    result["reason"] = f"CDP unavailable: {cdp_exc!s:.60}"
-
-        except Exception as exc:
-            result["reason"] = f"Playwright error: {exc!s:.80}"
-            print(
-                f"[RestoreProvider] Browser session capture failed: {exc!s:.80}",
-                file=sys.stderr,
-            )
-
-        with self._browser_capture_lock:
-            self._browser_session = dict(result)
-
-        return result
-
-    def restore_browser_session(self, session_state: dict) -> bool:
-        
-        if not _PLAYWRIGHT_AVAILABLE:
-            return False
-
-        if not session_state or not session_state.get("captured"):
-            return False
-
-        tabs = session_state.get("tabs", [])
-        if not tabs:
-            return True
-
-        try:
-            with _sync_playwright() as pw:
-                _cdp_url = os.environ.get(
-                    "PROJECTZEO_CDP_URL", "http://localhost:9222"
-                ).strip()
-                try:
-                    browser = pw.chromium.connect_over_cdp(_cdp_url, timeout=3000)
-                    contexts = browser.contexts
-                    if not contexts:
-                        return False
-
-                    context = contexts[0]
-
-                    # Close any tabs opened during the task
-                    current_pages = context.pages
-                    for page in current_pages[len(tabs):]:
-                        try:
-                            page.close()
-                        except Exception:
-                            pass
-
-                    # Navigate existing/new tabs to snapshot URLs
-                    for i, tab in enumerate(tabs):
-                        url = tab.get("url", "")
-                        if not url or url in ("about:blank", "about:newtab"):
-                            continue
-                        try:
-                            if i < len(current_pages):
-                                page = current_pages[i]
-                            else:
-                                page = context.new_page()
-
-                            if page.url != url:
-                                page.goto(url, timeout=10000, wait_until="domcontentloaded")
-
-                            # Restore scroll position
-                            sx = tab.get("scroll_x", 0)
-                            sy = tab.get("scroll_y", 0)
-                            if sx or sy:
-                                page.evaluate(f"window.scrollTo({sx}, {sy})")
-
-                        except Exception as page_exc:
-                            print(
-                                f"[RestoreProvider] Browser tab {i} restore failed: {page_exc!s:.80}",
-                                file=sys.stderr,
-                            )
-
-                    browser.close()
-                    print(
-                        f"[RestoreProvider] Browser session restored: {len(tabs)} tab(s).",
-                        file=sys.stderr,
-                    )
-                    return True
-
-                except Exception as cdp_exc:
-                    print(
-                        f"[RestoreProvider] Browser restore: CDP connect failed: {cdp_exc!s:.80}",
-                        file=sys.stderr,
-                    )
-                    return False
-
-        except Exception as exc:
-            print(
-                f"[RestoreProvider] Browser restore failed: {exc!s:.80}",
-                file=sys.stderr,
-            )
-            return False
-
-    def restore_snapshot(self, snapshot_id: str) -> None:
-        
-        if not isinstance(snapshot_id, str) or not snapshot_id.strip():
-            raise RestorationError("Invalid snapshot_id: must be a non-empty string")
-
-        snapshot = self._snapshot_provider.get_snapshot(snapshot_id)
-        if snapshot is None:
-            raise RestorationError(f"Snapshot not found in provider: {snapshot_id!r}")
-
-        self.restore(snapshot)
+    def mark_agent_opened_browser(self, snapshot_id: str) -> None:
+        self._task_opened_browser[snapshot_id] = True
 
     # =========================================================================
     # CORE RESTORE
     # =========================================================================
 
+    def restore_snapshot(self, snapshot_id: str) -> None:
+        snapshot = self._snapshot_provider.get_snapshot(snapshot_id)
+        if snapshot is None:
+            raise RestorationError(f"Snapshot not found: {snapshot_id!r}")
+        self.restore(snapshot)
+
     def restore(self, snapshot: RestorationSnapshot) -> None:
-        
         if not isinstance(snapshot, RestorationSnapshot):
-            raise RestorationError(
-                f"restore() requires RestorationSnapshot, got {type(snapshot).__name__}"
-            )
+            raise RestorationError(f"restore() requires RestorationSnapshot, got {type(snapshot).__name__}")
 
-        snapshot_id = snapshot.snapshot_id
+        sid = snapshot.snapshot_id
 
-        # --- LOCK: idempotency check only ---
         with self._lock:
-            if snapshot_id in self._completed_snapshots:
-                import sys as _sys
-                print(
-                    f"[RestoreProvider] WARNING BUG-06: Idempotency guard fired "
-                    f"for snapshot_id={snapshot_id!r} — this snapshot was already "
-                    "marked completed.  If this is a replan fallback, the workspace "
-                    "may NOT have been restored to the pre-task state.  "
-                    "Inspect the authority log and verify workspace manually.",
-                    file=_sys.stderr,
-                )
-                _auth = getattr(self, "_authority_state", None)
-                if _auth is not None and hasattr(_auth, "verification_warning"):
+            if sid in self._completed_snapshots:
+                _logger.warning("[RestoreProvider] Idempotency guard: snapshot %s already completed.", sid)
+                auth = getattr(self, "_authority_state", None)
+                if auth is not None and hasattr(auth, "verification_warning"):
                     try:
-                        _auth.verification_warning = True
+                        auth.verification_warning = True
                     except Exception:
                         pass
                 return
 
-        
-
         if self._mode.mode is not SystemMode.RESTORING:
             raise RestorationError(
-                f"restore() attempted in mode {self._mode.mode!r}; "
-                "only RESTORING mode is permitted (fail-closed)."
+                f"restore() in mode {self._mode.mode!r}; only RESTORING mode permitted."
             )
 
-        # Stop all automated input before manipulating the workspace
         try:
             self._os.stop_automated_input()
             self._os.force_release_all(reason="restoration")
             self._os.mark_automation_inactive()
         except Exception as e:
-            raise RestorationError(
-                f"Automation shutdown failed before restore: {e}"
-            ) from e
+            raise RestorationError(f"Automation shutdown failed: {e}") from e
 
-        # Best-effort workspace restoration
+        # --- Tier 4: CRIU (restore long-running processes first) ---
+        criu_snap = self._criu_snaps.get(sid)
+        if criu_snap is not None and _CRIU_AVAILABLE:
+            try:
+                _criu_restore(criu_snap)
+            except Exception as e:
+                _logger.warning("[RestoreProvider] CRIU restore error (non-fatal): %s", e)
+
+        # --- Tier 3: Filesystem ---
+        fs_snap = self._fs_snaps.get(sid)
+        if fs_snap is not None and _FS_AVAILABLE and self._task_wrote_files.get(sid, False):
+            try:
+                _fs_restore(fs_snap)
+            except Exception as e:
+                _logger.warning("[RestoreProvider] FS restore error (non-fatal): %s", e)
+
+        # --- Tier 2: Browser (differential) ---
+        brow_snap = self._brow_snaps.get(sid)
+        if brow_snap is not None and _BROWSER_AVAILABLE:
+            try:
+                agent_opened = self._task_opened_browser.get(sid, False)
+                _browser_restore(brow_snap, agent_opened_browser=agent_opened)
+            except Exception as e:
+                _logger.warning("[RestoreProvider] Browser restore error (non-fatal): %s", e)
+
+        # --- Tier 1: Window layout ---
+        win_snap = self._win_snaps.get(sid)
+        if win_snap is not None and _WIN_AVAILABLE:
+            try:
+                post_win = _win_capture()
+                _win_close_new(win_snap, post_win)
+                _win_restore(win_snap)
+            except Exception as e:
+                _logger.warning("[RestoreProvider] Window restore error (non-fatal): %s", e)
+
+        # --- Tier 0: Application + window focus + cursor (always) ---
         self._restore_application(snapshot)
         self._restore_window(snapshot)
         self._restore_cursor(snapshot)
 
-        # HIGH-3 FIX: Restore browser session if captured at snapshot time
-        _browser_state = snapshot.metadata.get("browser_session")
-        if _browser_state and _browser_state.get("captured"):
-            try:
-                self.restore_browser_session(_browser_state)
-            except Exception as _br_err:
-                print(
-                    f"[RestoreProvider] Browser session restore failed (non-fatal): {_br_err}",
-                    file=sys.stderr,
-                )
-
-        # Hard verification — raises RestorationError on failure
-        # AUDIT FIX: On failure, guarantee a last-resort cursor-only restore
-        # and set RESTORATION_INCOMPLETE flag before re-raising.
         try:
             self._verify(snapshot)
-        except RestorationError as _verify_err:
-            self._handle_restore_failure(snapshot, str(_verify_err))
+        except RestorationError as err:
+            self._handle_restore_failure(snapshot, str(err))
             raise
 
         self._report_unrestored_processes(snapshot)
 
-        # --- LOCK: ledger write only ---
+        # Cleanup extended snapshots
+        self._cleanup_extended(sid)
+
         with self._lock:
-            
-            if snapshot_id not in self._completed_snapshots:
-                
-                self._completed_snapshots[snapshot_id] = time.monotonic()
+            if sid not in self._completed_snapshots:
+                self._completed_snapshots[sid] = time.monotonic()
                 self._persist_ledger()
 
-    
+    def _cleanup_extended(self, snapshot_id: str) -> None:
+        if _FS_AVAILABLE:
+            fs_snap = self._fs_snaps.pop(snapshot_id, None)
+            if fs_snap:
+                try:
+                    _fs_cleanup(fs_snap)
+                except Exception:
+                    pass
+        if _CRIU_AVAILABLE:
+            criu_snap = self._criu_snaps.pop(snapshot_id, None)
+            if criu_snap:
+                try:
+                    _criu_cleanup(criu_snap)
+                except Exception:
+                    pass
+        self._win_snaps.pop(snapshot_id, None)
+        self._brow_snaps.pop(snapshot_id, None)
+        self._task_wrote_files.pop(snapshot_id, None)
+        self._task_opened_browser.pop(snapshot_id, None)
 
-    def _handle_restore_failure(
-        self, snapshot: RestorationSnapshot, error_reason: str
-    ) -> None:
-        """
-        AUDIT MEDIUM FIX: Guaranteed last-resort actions on any restore failure.
+    # =========================================================================
+    # TIER 0 RESTORE HELPERS
+    # =========================================================================
 
-        On full restore failure or verification timeout:
-        1. Attempt cursor-only restoration unconditionally (cursor at safe position).
-        2. Write RESTORATION_INCOMPLETE flag to authority_state.
-        3. Log prominently so operator is aware before accepting next task.
-        """
-        # Step 1: Last-resort cursor-only restoration
+    def _restore_application(self, snapshot: RestorationSnapshot) -> None:
+        if snapshot.application.process_name == "__bare_desktop__":
+            return
+        try:
+            self._os.activate_application({"title": snapshot.application.process_name})
+        except OSError as e:
+            _logger.warning("[RestoreProvider] activate_application failed: %s", e)
+        time.sleep(self.POST_ACTION_DELAY)
+
+    def _restore_window(self, snapshot: RestorationSnapshot) -> None:
+        wid = getattr(snapshot.focus, "window_id", None)
+        if not isinstance(wid, str) or not wid.strip() or wid == "__bare_desktop__":
+            return
+        try:
+            self._os.focus_window({"title": wid})
+        except OSError as e:
+            _logger.warning("[RestoreProvider] focus_window failed: %s", e)
+        time.sleep(self.POST_ACTION_DELAY)
+
+        try:
+            cw = self._os.get_focused_window()
+            if isinstance(cw, dict) and isinstance(cw.get("title"), str):
+                dist = levenshtein_distance(
+                    " ".join(wid.lower().split()),
+                    " ".join(cw["title"].lower().split()),
+                )
+                if dist > self.MAX_TITLE_DISTANCE:
+                    _logger.warning(
+                        "[RestoreProvider] Window title mismatch: expected=%r actual=%r dist=%d",
+                        wid, cw["title"], dist,
+                    )
+        except Exception:
+            pass
+
+    def _restore_cursor(self, snapshot: RestorationSnapshot) -> None:
+        self._os.set_cursor_position({"x": snapshot.cursor.x, "y": snapshot.cursor.y})
+        time.sleep(self.POST_ACTION_DELAY)
+
+    # =========================================================================
+    # VERIFICATION
+    # =========================================================================
+
+    def _verify(self, snapshot: RestorationSnapshot) -> None:
+        if self._mode.mode is not SystemMode.RESTORING:
+            raise RestorationError("Verification attempted outside RESTORING mode.")
+
+        cursor_fail = window_fail = app_fail = 0
+        for attempt in range(1, self.MAX_VERIFY_ATTEMPTS + 1):
+            cursor      = self._os.get_cursor_position()
+            cur_window  = self._os.get_focused_window()
+            cur_app     = self._os.get_active_application()
+
+            c_ok = self._validate_cursor(cursor, snapshot)
+            w_ok = self._validate_window(cur_window, snapshot)
+            a_ok = self._validate_application(cur_app, snapshot)
+
+            if c_ok and w_ok and a_ok:
+                return
+
+            if not c_ok: cursor_fail += 1
+            if not w_ok: window_fail += 1
+            if not a_ok: app_fail    += 1
+
+            if attempt < self.MAX_VERIFY_ATTEMPTS:
+                time.sleep(self.POST_ACTION_DELAY)
+
+        raise RestorationError(
+            f"Verification failed after {self.MAX_VERIFY_ATTEMPTS} attempts. "
+            f"cursor_fails={cursor_fail} window_fails={window_fail} app_fails={app_fail}."
+        )
+
+    def _validate_cursor(self, cursor, snapshot: RestorationSnapshot) -> bool:
+        if not isinstance(cursor, dict):
+            return False
+        try:
+            return (
+                abs(int(cursor["x"]) - snapshot.cursor.x) <= self.CURSOR_TOLERANCE_PX
+                and abs(int(cursor["y"]) - snapshot.cursor.y) <= self.CURSOR_TOLERANCE_PX
+            )
+        except (KeyError, TypeError, ValueError):
+            return False
+
+    def _normalize(self, text: str) -> str:
+        return " ".join(text.lower().strip().split())
+
+    def _strict_match(self, expected: str, actual: str) -> bool:
+        if not expected or not actual:
+            return False
+        return _title_match_shared(expected, actual, max_distance=self.MAX_TITLE_DISTANCE)
+
+    def _validate_window(self, current_window, snapshot: RestorationSnapshot) -> bool:
+        if snapshot.focus.window_id in ("__bare_desktop__", "__wayland_unknown__"):
+            return True
+        if not isinstance(current_window, dict) or not isinstance(current_window.get("title"), str):
+            return False
+        return self._strict_match(
+            self._normalize(snapshot.focus.window_id),
+            self._normalize(current_window["title"]),
+        )
+
+    def _validate_application(self, current_app, snapshot: RestorationSnapshot) -> bool:
+        if snapshot.application.process_name == "__bare_desktop__":
+            return True
+        if not isinstance(current_app, dict) or not isinstance(current_app.get("title"), str):
+            return False
+        return self._strict_match(
+            self._normalize(snapshot.application.process_name),
+            self._normalize(current_app["title"]),
+        )
+
+    # =========================================================================
+    # FAILURE HANDLER
+    # =========================================================================
+
+    def _handle_restore_failure(self, snapshot: RestorationSnapshot, reason: str) -> None:
         try:
             self._os.set_cursor_position({"x": snapshot.cursor.x, "y": snapshot.cursor.y})
-            print(
-                f"[RestoreProvider] LAST-RESORT: cursor restored to "
-                f"({snapshot.cursor.x}, {snapshot.cursor.y}) after full restore failure.",
-                file=sys.stderr,
-            )
-        except Exception as cursor_err:
-            # Absolute fallback: move cursor to screen center
+        except Exception:
             try:
-                _w, _h = self._os.screen_size()
-                self._os.set_cursor_position({"x": _w // 2, "y": _h // 2})
-                print(
-                    f"[RestoreProvider] LAST-RESORT: cursor moved to screen center "
-                    f"({_w // 2}, {_h // 2}) — original position restore failed: {cursor_err}",
-                    file=sys.stderr,
-                )
-            except Exception as center_err:
-                print(
-                    f"[RestoreProvider] LAST-RESORT cursor restore completely failed: {center_err}",
-                    file=sys.stderr,
-                )
+                w, h = self._os.screen_size()
+                self._os.set_cursor_position({"x": w // 2, "y": h // 2})
+            except Exception:
+                pass
 
-        # Step 2: Set RESTORATION_INCOMPLETE flag on authority_state
-        try:
-            auth = getattr(self, "_authority_state", None)
-            if auth is not None:
+        auth = getattr(self, "_authority_state", None)
+        if auth is not None:
+            try:
                 if hasattr(auth, "restoration_incomplete"):
                     auth.restoration_incomplete = True
                 elif hasattr(auth, "__dict__"):
                     auth.__dict__["restoration_incomplete"] = True
+            except Exception:
+                pass
+
+        try:
+            import pathlib
+            flag = pathlib.Path(__file__).resolve().parent.parent / "temp" / "RESTORATION_INCOMPLETE"
+            flag.parent.mkdir(parents=True, exist_ok=True)
+            flag.write_text(
+                f"RESTORATION INCOMPLETE\nReason: {reason}\n"
+                f"Snapshot: {snapshot.snapshot_id}\n"
+                f"Time: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n",
+                encoding="utf-8",
+            )
         except Exception:
             pass
 
-        # Step 3: Write an incomplete-restoration marker to disk for operator
-        try:
-            import pathlib as _pl
-            _project_root = _pl.Path(__file__).resolve().parent.parent
-            _flag_path = _project_root / "temp" / "RESTORATION_INCOMPLETE"
-            _flag_path.parent.mkdir(parents=True, exist_ok=True)
-            _ts = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
-            _snap_id = getattr(snapshot, 'snapshot_id', 'unknown')
-            _flag_text = (
-                "RESTORATION INCOMPLETE\n"
-                + f"Reason: {error_reason}\n"
-                + f"Snapshot: {_snap_id}\n"
-                + f"Time: {_ts}\n"
-                + "Operator must acknowledge this file before the next task runs.\n"
-            )
-            _flag_path.write_text(_flag_text,
-                encoding="utf-8",
-            )
-            print(
-                f"[RestoreProvider] RESTORATION_INCOMPLETE flag written to: {_flag_path}. "
-                "DELETE this file to acknowledge and allow the next task.",
-                file=sys.stderr,
-            )
-        except Exception as flag_err:
-            print(
-                f"[RestoreProvider] Could not write RESTORATION_INCOMPLETE flag: {flag_err}",
-                file=sys.stderr,
-            )
-
-    def _restore_application(self, snapshot: RestorationSnapshot) -> None:
-        
-        if snapshot.application.process_name == "__bare_desktop__":
-            return  # Bare desktop: no application to activate
-
-        try:
-            self._os.activate_application(
-                {"title": snapshot.application.process_name}
-            )
-        except OSError as _app_err:
-            # GAP-02: Log the specific failure reason before continuing
-            print(
-                f"[RestoreProvider] WARNING: _restore_application() — "
-                f"activate_application({snapshot.application.process_name!r}) "
-                f"raised OSError: {_app_err}. "
-                "Target application may have been closed during task execution. "
-                "Continuing with best-effort restoration (cursor will still be restored).",
-                file=sys.stderr,
-            )
-            # Best-effort: continue; _verify() will detect and report the mismatch
-
-        time.sleep(self.POST_ACTION_DELAY)
-
-    def _restore_window(self, snapshot: RestorationSnapshot) -> None:
-        """
-        AUDIT MEDIUM FIX: Log every title mismatch to journal before continuing.
-        Previously, title mismatches were silently ignored — the system appeared
-        to succeed even when window focus was wrong.
-        """
-        window_id = getattr(snapshot.focus, "window_id", None)
-        if not isinstance(window_id, str) or not window_id.strip():
-            return
-
-        if window_id == "__bare_desktop__":
-            return
-
-        try:
-            self._os.focus_window({"title": window_id})
-        except OSError as _focus_err:
-            print(
-                f"[RestoreProvider] WARNING: _restore_window() — "
-                f"focus_window({window_id!r}) raised OSError: {_focus_err}. "
-                "Window may have been closed during task execution. Continuing.",
-                file=sys.stderr,
-            )
-
-        time.sleep(self.POST_ACTION_DELAY)
-
-        # AUDIT FIX: Verify focus and log mismatch for operator awareness
-        try:
-            current_window = self._os.get_focused_window()
-            if isinstance(current_window, dict) and isinstance(current_window.get("title"), str):
-                expected_norm = " ".join(window_id.lower().strip().split())
-                actual_norm   = " ".join(current_window["title"].lower().strip().split())
-                _dist = levenshtein_distance(expected_norm, actual_norm)
-                if _dist > self.MAX_TITLE_DISTANCE:
-                    # AUDIT FIX: Log title mismatch prominently
-                    print(
-                        f"[RestoreProvider] TITLE MISMATCH after _restore_window: "
-                        f"expected={window_id!r} actual={current_window['title']!r} "
-                        f"levenshtein={_dist} (threshold={self.MAX_TITLE_DISTANCE}). "
-                        "Window focus may be incorrect. Operator should verify.",
-                        file=sys.stderr,
-                    )
-                    # For critical applications require exact match
-                    _CRITICAL_APP_PATTERNS = (
-                        "firefox", "chromium", "chrome", "code", "code-oss",
-                        "cursor", "vscode", "sublime", "atom",
-                    )
-                    expected_lower = window_id.lower()
-                    if any(p in expected_lower for p in _CRITICAL_APP_PATTERNS):
-                        print(
-                            f"[RestoreProvider] CRITICAL APP MISMATCH: {window_id!r} is a "
-                            "critical application. Exact title match required. "
-                            "Restoration may be incomplete.",
-                            file=sys.stderr,
-                        )
-        except Exception:
-            pass  # Title check is best-effort — never block restoration
-
-    def _restore_cursor(self, snapshot: RestorationSnapshot) -> None:
-        
-        self._os.set_cursor_position(
-            {"x": snapshot.cursor.x, "y": snapshot.cursor.y}
-        )
-        time.sleep(self.POST_ACTION_DELAY)
-
-    
-
-    def _verify(self, snapshot: RestorationSnapshot) -> None:
-        
-        if self._mode.mode is not SystemMode.RESTORING:
-            raise RestorationError(
-                "Verification attempted outside RESTORING mode — "
-                "this indicates a mode-controller bug or external mode mutation."
-            )
-
-        _verify_cursor_failures = 0
-        _verify_window_failures = 0
-        _verify_app_failures = 0
-
-        for attempt in range(1, self.MAX_VERIFY_ATTEMPTS + 1):
-
-            cursor = self._os.get_cursor_position()
-            current_window = self._os.get_focused_window()
-            current_app = self._os.get_active_application()
-
-            _cursor_ok = self._validate_cursor(cursor, snapshot)
-            _window_ok = self._validate_window(current_window, snapshot)
-            _app_ok = self._validate_application(current_app, snapshot)
-
-            if _cursor_ok and _window_ok and _app_ok:
-                return  # All checks passed — restoration verified
-
-            # Increment per-dimension failure counters for diagnostics
-            if not _cursor_ok:
-                _verify_cursor_failures += 1
-            if not _window_ok:
-                _verify_window_failures += 1
-            if not _app_ok:
-                _verify_app_failures += 1
-
-            # Wait before retrying — gives WM time to propagate focus events
-            if attempt < self.MAX_VERIFY_ATTEMPTS:
-                time.sleep(self.POST_ACTION_DELAY)
-
-        # All attempts exhausted — raise with full diagnostic context
-        raise RestorationError(
-            f"Post-restore verification failed after {self.MAX_VERIFY_ATTEMPTS} attempts "
-            f"(window={self.MAX_VERIFY_ATTEMPTS * self.POST_ACTION_DELAY:.1f}s total). "
-            f"Failures: cursor={_verify_cursor_failures}, "
-            f"window={_verify_window_failures}, "
-            f"app={_verify_app_failures}. "
-            f"Expected: cursor=({snapshot.cursor.x},{snapshot.cursor.y}) "
-            f"±{self.CURSOR_TOLERANCE_PX}px, "
-            f"window={snapshot.focus.window_id!r}, "
-            f"app={snapshot.application.process_name!r}. "
-            "Possible causes: "
-            "(1) Window manager did not propagate focus within the verification window — "
-            f"increase POST_ACTION_DELAY (currently {self.POST_ACTION_DELAY}s) or "
-            f"MAX_VERIFY_ATTEMPTS (currently {self.MAX_VERIFY_ATTEMPTS}). "
-            "(2) Target application was closed during task execution (check window failures). "
-            "(3) Display server is unresponsive (check cursor failures)."
-        )
-
     # =========================================================================
-    # VALIDATION HELPERS
+    # PROCESS CENSUS
     # =========================================================================
-
-    def _validate_cursor(self, cursor, snapshot: RestorationSnapshot) -> bool:
-        """True iff cursor is within CURSOR_TOLERANCE_PX of the expected position."""
-        if not isinstance(cursor, dict):
-            return False
-
-        try:
-            cx = int(cursor["x"])
-            cy = int(cursor["y"])
-        except (KeyError, TypeError, ValueError):
-            return False
-
-        return (
-            abs(cx - snapshot.cursor.x) <= self.CURSOR_TOLERANCE_PX
-            and abs(cy - snapshot.cursor.y) <= self.CURSOR_TOLERANCE_PX
-        )
-
-    def _normalize(self, text: str) -> str:
-        """Normalise a window/app title for fuzzy comparison."""
-        return " ".join(text.lower().strip().split())
-
-    def _levenshtein(self, a: str, b: str) -> int:
-        
-        return levenshtein_distance(a, b)
-
-    def _strict_match(self, expected: str, actual: str) -> bool:
-        
-        if not expected or not actual:
-            return False
-        return _title_match_shared(expected, actual, max_distance=self.MAX_TITLE_DISTANCE)
-        # RTB-02 FIX: removed dead code `shared = expected_tokens & actual_tokens`
-        # (undefined names; unreachable after the return above)
-
-    def _validate_window(self, current_window, snapshot: RestorationSnapshot) -> bool:
-        """True iff the currently focused window matches the snapshot's window title."""
-        # Bare desktop: no window expected — always passes
-        if snapshot.focus.window_id == "__bare_desktop__":
-            return True
-
-        
-        if snapshot.focus.window_id == "__wayland_unknown__  # Wayland: window title unavailable — cursor-only restore":
-            return True
-
-        if (
-            not isinstance(current_window, dict)
-            or not isinstance(current_window.get("title"), str)
-        ):
-            return False
-
-        expected = self._normalize(snapshot.focus.window_id)
-        actual = self._normalize(current_window["title"])
-        return self._strict_match(expected, actual)
 
     def _report_unrestored_processes(self, snapshot: RestorationSnapshot) -> None:
-        
-        baseline_names = snapshot.metadata.get("extended", {}).get("processes")
-        if not baseline_names:
-            # Census was not captured at snapshot time (psutil unavailable,
-            # degraded mode, or legacy snapshot).  Cannot compute diff.
-            print(
-                "[RestoreProvider] DEBUG IH-6: No process census in snapshot "
-                "metadata['extended']['processes'] — unrestored-process diff "
-                "skipped. Ensure psutil is installed for census capture.",
-                file=sys.stderr,
-            )
+        baseline = snapshot.metadata.get("extended", {}).get("processes")
+        if not baseline:
+            return
+        try:
+            import psutil
+            current = {p.name() for p in psutil.process_iter(["name"]) if p.name()}
+        except ImportError:
+            return
+        except Exception:
             return
 
-        try:
-            # Collect current process NAMES using the same strategy as snapshot
-            # creation (psutil first, /proc fallback for Linux).
-            current_names: list = []
+        new_procs = sorted(current - set(baseline))
+        if not new_procs:
+            return
+
+        _WHITELIST = frozenset({
+            "systemd", "init", "dbus-daemon", "NetworkManager",
+            "pulseaudio", "pipewire", "gnome-shell", "xorg", "ollama", "ydotoold",
+        })
+        import signal as _signal
+        for name in new_procs:
+            if name in _WHITELIST:
+                continue
             try:
-                import psutil as _psutil
-                current_names = sorted(
-                    {p.name() for p in _psutil.process_iter(["name"]) if p.name()}
-                )
-            except ImportError:
-                # psutil not installed — try /proc on Linux
-                try:
-                    import os as _os2
-                    _names = set()
-                    for _pid_str in _os2.listdir("/proc"):
-                        if _pid_str.isdigit():
-                            _comm = f"/proc/{_pid_str}/comm"
-                            try:
-                                with open(_comm, "r") as _f:
-                                    _names.add(_f.read().strip())
-                            except OSError:
-                                pass
-                    current_names = sorted(_names)
-                except Exception:
-                    print(
-                        "[RestoreProvider] DEBUG IH-6: Cannot enumerate current "
-                        "process names — unrestored-process diff skipped.",
-                        file=sys.stderr,
-                    )
-                    return
-            except Exception:
-                print(
-                    "[RestoreProvider] DEBUG IH-6: psutil.process_iter() failed "
-                    "— unrestored-process diff skipped.",
-                    file=sys.stderr,
-                )
-                return
-
-            baseline_set = set(baseline_names)
-            current_set = set(current_names)
-            new_names = sorted(current_set - baseline_set)
-
-            if not new_names:
-                print(
-                    f"[RestoreProvider] IH-6: Process census diff: 0 new process "
-                    f"names since snapshot {snapshot.snapshot_id!r}. "
-                    "No unrestored processes detected.",
-                    file=sys.stderr,
-                )
-                return
-
-            # Resolve new names to PIDs for actionable reporting.
-            name_pids: dict = {}
-            try:
-                import psutil as _psutil2
-                for _proc in _psutil2.process_iter(["pid", "name"]):
-                    try:
-                        _n = _proc.name()
-                        if _n in new_names:
-                            name_pids.setdefault(_n, []).append(_proc.pid)
-                    except Exception:
-                        pass
+                import psutil
+                for proc in psutil.process_iter(["pid", "name"]):
+                    if proc.name() == name:
+                        os.kill(proc.pid, _signal.SIGTERM)
             except Exception:
                 pass
 
-            name_summary = ", ".join(
-                f"{name}(pids={name_pids.get(name, ['?'])})" for name in new_names
-            )
-
-            print(
-                f"[RestoreProvider] WARNING IH-6: {len(new_names)} process name(s) "
-                f"present after restoration that were NOT present at snapshot time: "
-                f"{name_summary}. "
-                "Attempting SIGTERM on detected processes.",
-                file=sys.stderr,
-            )
-
-            
-            _TERMINATION_WHITELIST: frozenset = frozenset({
-                # Core OS daemons that must never be killed
-                "systemd", "init", "kernel", "kthreadd", "dbus-daemon",
-                "NetworkManager", "pulseaudio", "pipewire",
-                # Session components the desktop depends on
-                "gnome-shell", "xorg", "x11", "wayland", "weston",
-                # The agent's own supporting processes
-                "ollama", "ydotoold",
-            })
-
-            _skip_term = (
-                os.environ.get("PROJECTZEO_SKIP_PROCESS_TERM", "").strip().lower()
-                in ("1", "true", "yes")
-            )
-
-            if not _skip_term:
-                import signal as _signal
-                import subprocess as _subprocess
-                import shutil as _shutil
-                _sigterm_pids: dict = {}
-                for _name in new_names:
-                    if _name in _TERMINATION_WHITELIST:
-                        print(
-                            f"[RestoreProvider] IH-6: Skipping SIGTERM for "
-                            f"{_name!r} (in termination whitelist).",
-                            file=sys.stderr,
-                        )
-                        continue
-                    _pids = name_pids.get(_name, [])
-                    for _pid in _pids:
-                        try:
-                            os.kill(_pid, _signal.SIGTERM)
-                            _sigterm_pids.setdefault(_name, []).append(_pid)
-                            print(
-                                f"[RestoreProvider] IH-6: SIGTERM sent to "
-                                f"{_name!r} (pid={_pid}).",
-                                file=sys.stderr,
-                            )
-                        except ProcessLookupError:
-                            pass
-                        except PermissionError:
-                            print(
-                                f"[RestoreProvider] IH-6: SIGTERM denied for "
-                                f"{_name!r} (pid={_pid}) — insufficient permission. "
-                                "Process persists.",
-                                file=sys.stderr,
-                            )
-                        except Exception as _sig_err:
-                            print(
-                                f"[RestoreProvider] IH-6: SIGTERM failed for "
-                                f"{_name!r} (pid={_pid}): {_sig_err}.",
-                                file=sys.stderr,
-                            )
-
-                if _sigterm_pids:
-                    time.sleep(5.0)
-                    for _name, _pids in _sigterm_pids.items():
-                        for _pid in _pids:
-                            try:
-                                os.kill(_pid, 0)
-                                os.kill(_pid, _signal.SIGKILL)
-                                print(
-                                    f"[RestoreProvider] IH-6: SIGKILL sent to "
-                                    f"{_name!r} (pid={_pid}) — still alive after SIGTERM.",
-                                    file=sys.stderr,
-                                )
-                            except (ProcessLookupError, PermissionError):
-                                pass
-                            except Exception as _kill_err:
-                                print(
-                                    f"[RestoreProvider] IH-6: SIGKILL failed for "
-                                    f"{_name!r} (pid={_pid}): {_kill_err}.",
-                                    file=sys.stderr,
-                                )
-
-                if _shutil.which("xclip"):
-                    try:
-                        _subprocess.run(
-                            ["xclip", "-i", "/dev/null", "-selection", "clipboard"],
-                            shell=False, capture_output=True, timeout=3,
-                        )
-                    except Exception:
-                        pass
-                elif _shutil.which("xsel"):
-                    try:
-                        _subprocess.run(
-                            ["xsel", "--clear", "--clipboard"],
-                            shell=False, capture_output=True, timeout=3,
-                        )
-                    except Exception:
-                        pass
-            else:
-                print(
-                    "[RestoreProvider] IH-6: PROJECTZEO_SKIP_PROCESS_TERM=1 — "
-                    "process termination skipped. "
-                    f"Unrestored processes: {name_summary}",
-                    file=sys.stderr,
-                )
-
-            try:
-                snapshot.metadata["unrestored_process_names"] = new_names
-                snapshot.metadata["unrestored_process_name_pids"] = name_pids
-            except Exception:
-                pass
-
-        except Exception as _diff_err:
-            print(
-                f"[RestoreProvider] DEBUG IH-6: Process census diff failed "
-                f"unexpectedly: {_diff_err}. Restoration is still complete.",
-                file=sys.stderr,
-            )
-
-    def _validate_application(
-        self, current_app, snapshot: RestorationSnapshot
-    ) -> bool:
-        """True iff the currently active application matches the snapshot's app name."""
-        # Bare desktop: no application expected — always passes
-        if snapshot.application.process_name == "__bare_desktop__":
-            return True
-
-        if (
-            not isinstance(current_app, dict)
-            or not isinstance(current_app.get("title"), str)
-        ):
-            return False
-
-        expected = self._normalize(snapshot.application.process_name)
-        actual = self._normalize(current_app["title"])
-        return self._strict_match(expected, actual)
+        _logger.info("[RestoreProvider] Cleaned up %d new process(es): %s", len(new_procs), new_procs)
