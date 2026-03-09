@@ -713,6 +713,12 @@ def main(llm_callable: Callable, model_name: str) -> None:
                         f"  Resolve the error above and restart.\n"
                     )
                     print(_gii_degraded_msg, file=sys.stderr)
+                    # Hard guard: if PROJECTZEO_REQUIRE_GII=1, refuse to run without GII
+                    if os.environ.get("PROJECTZEO_REQUIRE_GII", "0").strip() == "1":
+                        raise RuntimeError(
+                            "PROJECTZEO_REQUIRE_GII=1 — refusing to run in scripted fallback mode. "
+                            f"GIIController init error: {_gii_err}"
+                        )
 
                 # LAYER-2: Wire VeriSafe Agent
                 _vsa = None
@@ -758,6 +764,50 @@ def main(llm_callable: Callable, model_name: str) -> None:
                     _ui_evol = UIEvol(graphiti_store=_graphiti, llm_callable=mode.get_llm_callable())
                 except Exception as _ue_err:
                     _logger.debug("[MAIN] UIEvol init: %s", _ue_err)
+
+                # LAYER-6b: Wire AgentQ for DPO pair collection
+                _agent_q = None
+                try:
+                    from core.learning.agent_q import get_agent_q
+                    _agent_q = get_agent_q()
+                    print("[MAIN] AgentQ active.", file=sys.stderr)
+                except Exception as _aq_err:
+                    _logger.debug("[MAIN] AgentQ init: %s", _aq_err)
+
+                # LAYER-6c: Wire nightly consolidation (starts daemon thread)
+                try:
+                    from core.learning.nightly_consolidation import get_consolidator
+                    _consolidator = get_consolidator()
+                    _consolidator.start()
+                    print("[MAIN] Nightly consolidation scheduler started.", file=sys.stderr)
+                except Exception as _nc_err:
+                    _logger.debug("[MAIN] Consolidation init: %s", _nc_err)
+
+                # LAYER-6d: Wire HippoRAG
+                try:
+                    from core.memory.hippo_rag import get_hippo_rag
+                    _hippo = get_hippo_rag()
+                    if _graphiti:
+                        _hippo.ingest_from_graphiti(_graphiti)
+                    print(f"[MAIN] HippoRAG active ({_hippo.get_stats()['nodes']} nodes).", file=sys.stderr)
+                except Exception as _hr_err:
+                    _logger.debug("[MAIN] HippoRAG init: %s", _hr_err)
+
+                # LAYER-6e: Wire UserModel
+                try:
+                    from core.cognition.user_model import get_user_model
+                    _user_model = get_user_model()
+                    print("[MAIN] UserModel active.", file=sys.stderr)
+                except Exception as _um_err:
+                    _logger.debug("[MAIN] UserModel init: %s", _um_err)
+
+                # LAYER-6f: Wire SNN event processor
+                try:
+                    from core.perception.snn_event_processor import get_snn_processor
+                    _snn = get_snn_processor()
+                    print("[MAIN] SNN event processor active.", file=sys.stderr)
+                except Exception as _snn_err:
+                    _logger.debug("[MAIN] SNN init: %s", _snn_err)
 
                 # LAYER-7: Wire MCP Tool Router
                 _mcp_router = None
@@ -864,6 +914,18 @@ def main(llm_callable: Callable, model_name: str) -> None:
                                     _arpo.finalize_trajectory(success=True, reason="task_complete")
                                 except Exception:
                                     pass
+
+                            # LAYER-6b: AgentQ — ingest LATS DPO pairs on task complete
+                            if _agent_q is not None and gii_controller is not None:
+                                try:
+                                    _lats = getattr(getattr(gii_controller, "_loop", None), "_lats", None)
+                                    if _lats and hasattr(_lats, "get_dpo_pairs"):
+                                        pairs = _lats.get_dpo_pairs()
+                                        if pairs:
+                                            stored = _agent_q.ingest_lats_pairs(pairs)
+                                            _logger.info("[MAIN] AgentQ stored %d DPO pairs.", stored)
+                                except Exception as _aq_ingest_err:
+                                    _logger.debug("[MAIN] AgentQ ingest error: %s", _aq_ingest_err)
 
                             # LAYER-6: UI-Evol post-task knowledge refinement
                             if _ui_evol is not None:
