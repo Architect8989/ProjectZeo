@@ -198,6 +198,10 @@ class PerStepReasoner:
         self._screenshot_buffer: List[str] = []  # base64 encoded
         self._screenshot_lock = threading.Lock()
 
+        # ── ReAct / Reflexion / KnowledgeVault injection (Blueprint §7.2, §8.1, §10.4)
+        self._reflexion_context: str = ""
+        self._vault_context: str = ""
+
         # Track consecutive failures for adaptive thresholds
         self._consecutive_failures: int = 0
 
@@ -346,6 +350,53 @@ class PerStepReasoner:
                 "instruct_calls":       self._instruct_calls,
                 "summarization_count":  self._summarization_count,
             }
+
+    # =========================================================================
+    # ReAct Context Injection (Blueprint §7.2)
+    # =========================================================================
+
+    def _build_react_context(self, recent_history: List[Dict[str, Any]]) -> str:
+        """
+        Build ReAct (Thought, Action, Observation) triples from recent history.
+
+        Blueprint §7.2: PSR generates reasoning but does NOT inject the
+        reasoning back as context for the next step's reasoning.
+        Fix: inject last 3 (Thought, Action, Observation) triples.
+        """
+        if not recent_history:
+            return ""
+        triples = []
+        for i, entry in enumerate(recent_history, 1):
+            thought  = entry.get("thought") or entry.get("description") or ""
+            action   = entry.get("action") or {}
+            outcome  = entry.get("outcome") or "unknown"
+            op       = action.get("operation", "?") if isinstance(action, dict) else str(action)
+            obs      = entry.get("output") or entry.get("observation") or outcome
+            triples.append(
+                f"  T{i}: {thought[:100]}\n"
+                f"  A{i}: {op} → {obs[:100]}\n"
+                f"  O{i}: {('SUCCESS' if outcome == 'success' else 'FAILED' if outcome == 'failure' else outcome).upper()}"
+            )
+        return "\n".join(triples)
+
+    def set_reflexion_context(self, context: str) -> None:
+        """
+        Set Reflexion context to inject in next reasoning call (Blueprint §8.1).
+        Called by gii_loop.py before each step after a milestone failure.
+        """
+        self._reflexion_context = context or ""
+
+    def set_vault_context(self, context: str) -> None:
+        """
+        Set Knowledge Vault context to inject in next reasoning call (Blueprint §10.4).
+        Called by gii_loop.py with relevant lessons for current milestone.
+        """
+        self._vault_context = context or ""
+
+    def clear_injected_contexts(self) -> None:
+        """Clear all injected contexts after a step completes."""
+        self._reflexion_context = ""
+        self._vault_context = ""
 
     # =========================================================================
     # World-state enrichment (GII continuous grounding)
@@ -612,6 +663,22 @@ class PerStepReasoner:
 
         if mem_parts:
             msg += "\n\nMEMORY CONTEXT:\n" + "\n\n".join(mem_parts)
+
+        # ── ReAct: inject last 3 (Thought, Action, Observation) triples (Blueprint §7.2)
+        # Critical missing piece: PSR generates reasoning but does NOT inject
+        # the reasoning back as context for the next step's reasoning.
+        # Fix: inject last 3 ReAct triples as context into each new reasoning call.
+        react_triples = self._build_react_context(history[-3:] if history else [])
+        if react_triples:
+            msg += "\n\nReAct CONTEXT (last 3 thought-action-observation triples):\n" + react_triples
+
+        # ── Reflexion: inject failure reflections for current milestone (Blueprint §8.1)
+        if hasattr(self, "_reflexion_context") and self._reflexion_context:
+            msg += "\n\n" + self._reflexion_context
+
+        # ── Knowledge Vault: inject relevant lessons (Blueprint §10.4)
+        if hasattr(self, "_vault_context") and self._vault_context:
+            msg += "\n\n" + self._vault_context
 
         return msg
 
