@@ -11,10 +11,13 @@ import numpy as np
 
 _logger = logging.getLogger(__name__)
 
-_VJEPA_ENABLED     = os.environ.get("PROJECTZEO_VJEPA_ENABLED", "0") == "1"
+_VJEPA_ENABLED     = os.environ.get("PROJECTZEO_VJEPA_ENABLED", "1") != "0"
 _VJEPA_CHECKPOINT  = os.path.expanduser(
     os.environ.get("PROJECTZEO_VJEPA_CHECKPOINT", "~/.projectzeo/vjepa/checkpoint.npz")
 )
+# Checkpoint acquisition: download via
+# python -c "from huggingface_hub import snapshot_download; snapshot_download("facebook/vjepa2-vitl-fpc64-256", local_dir="~/.projectzeo/vjepa")"
+# Set PROJECTZEO_VJEPA_CHECKPOINT to the downloaded path.
 _VJEPA_EMBED_DIM   = int(os.environ.get("PROJECTZEO_VJEPA_EMBED_DIM", "768"))
 _VJEPA_PATCH_SIZE  = int(os.environ.get("PROJECTZEO_VJEPA_PATCH_SIZE", "16"))
 _SCREEN_H          = int(os.environ.get("PROJECTZEO_SCREEN_H", "224"))
