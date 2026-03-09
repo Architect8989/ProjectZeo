@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import tempfile
@@ -21,9 +22,61 @@ _DEFAULT_MEMORY_DIR = os.path.join(
 )
 _MEMORY_FILE = "semantic_facts.json"
 _MAX_FACTS = 10_000
-_CONFIDENCE_DECAY_PER_DAY = 0.02   # 2% per day
 _MIN_CONFIDENCE = 0.05              # facts below this are pruned
-_RETRIEVAL_THRESHOLD = 0.20         # minimum confidence to return in query
+_RETRIEVAL_THRESHOLD = 0.20         # minimum activation to return in query
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ACT-R Base-Level Activation (Blueprint §3.2)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# B_i = ln(SUM_{j=1}^{n} t_j^{-d})
+#
+# Where:
+#   B_i = activation of memory chunk i
+#   t_j = time (seconds) since j-th access to chunk i
+#   d   = decay rate (≈0.5 for human memory — Newell & Anderson 1972)
+#   n   = total number of accesses
+#
+# Spreading Activation (§3.2 extension):
+#   goal_context_boost is added to facts semantically related to current goal.
+#   Activation = B_i + spreading_activation(goal_context, fact)
+#
+# Replaces the old flat 2%/day decay which is mathematically inferior.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_ACTR_DECAY_RATE = float(os.environ.get("PROJECTZEO_ACTR_DECAY", "0.5"))
+_ACTR_MIN_ACTIVATION = -5.0          # ln floor; maps to exp(-5) ≈ 0.007
+_SPREADING_ACTIVATION_WEIGHT = float(
+    os.environ.get("PROJECTZEO_SPREADING_WEIGHT", "0.3")
+)
+
+
+def _actr_base_activation(access_times: List[float], now: float, d: float = _ACTR_DECAY_RATE) -> float:
+    """
+    Compute ACT-R base-level activation from a list of access timestamps.
+    B_i = ln(SUM_{j} t_j^{-d}) where t_j = seconds since j-th access.
+    Returns value in [_ACTR_MIN_ACTIVATION, 0.0] approximately.
+    """
+    if not access_times:
+        return _ACTR_MIN_ACTIVATION
+    acc = 0.0
+    for ts in access_times:
+        delta = max(0.001, now - ts)  # seconds since access
+        acc += delta ** (-d)
+    if acc <= 0:
+        return _ACTR_MIN_ACTIVATION
+    raw = math.log(acc)
+    return max(_ACTR_MIN_ACTIVATION, min(0.0, raw))
+
+
+def _activation_to_confidence(activation: float) -> float:
+    """Map ACT-R activation [-5, 0] to confidence [0.05, 1.0]."""
+    # Sigmoid: conf = 1 / (1 + exp(-k*(activation - midpoint)))
+    # Tuned: activation=-2 → conf≈0.5; activation=0 → conf≈0.88
+    k = 1.8
+    mid = -2.0
+    sig = 1.0 / (1.0 + math.exp(-k * (activation - mid)))
+    return max(_MIN_CONFIDENCE, min(1.0, sig))
 
 
 # ---------------------------------------------------------------------------
@@ -32,26 +85,77 @@ _RETRIEVAL_THRESHOLD = 0.20         # minimum confidence to return in query
 
 @dataclass
 class SemanticFact:
-    
+    """
+    A semantic memory chunk with ACT-R base-level activation.
+
+    ACT-R replaces old flat 2%/day decay (Blueprint §3.2):
+    - access_history: timestamps of every retrieval
+    - Each confirmation adds a new timestamp → reinforces activation
+    - Rarely-used facts decay exponentially; frequently-used facts stay active
+    - activation = ln(SUM_{j} t_j^{-0.5}) per Anderson (1983)
+    """
     fact_id: str
     subject: str          # Application name, error code, tool name, etc.
     predicate: str        # Relationship type
     object: str           # The fact value
     category: str         # One of: application_facts, ui_patterns, error_solutions,
                           #         install_outcomes, shortcut_map, general
-    confidence: float     # 0.0–1.0
+    confidence: float     # Base confidence at store time (0.0–1.0)
     source: str           # "observed" | "llm_extracted" | "operator_provided"
     created_at: float     # Unix timestamp
     last_confirmed_at: float
     confirmation_count: int = 0
     refutation_count: int = 0
     metadata: Dict[str, Any] = field(default_factory=dict)
+    # ACT-R: access history — list of Unix timestamps when this fact was retrieved
+    access_history: List[float] = field(default_factory=list)
+
+    def _actr_activation(self) -> float:
+        """Compute ACT-R base-level activation from access history."""
+        now = time.time()
+        # Include creation and confirmations in access history
+        all_accesses = list(self.access_history) + [self.last_confirmed_at]
+        return _actr_base_activation(all_accesses, now, d=_ACTR_DECAY_RATE)
 
     def current_confidence(self) -> float:
-        """Return confidence adjusted for age-based decay."""
-        days_since_confirmed = (time.time() - self.last_confirmed_at) / 86400.0
-        decayed = self.confidence - (days_since_confirmed * _CONFIDENCE_DECAY_PER_DAY)
-        return max(_MIN_CONFIDENCE, min(1.0, decayed))
+        """
+        Return confidence using ACT-R activation formula.
+        Replaces flat 2%/day decay (Blueprint §3.2).
+        Frequently-used facts stay accessible; rarely-used facts fade.
+        """
+        activation = self._actr_activation()
+        # Combine initial confidence with ACT-R activation
+        actr_conf = _activation_to_confidence(activation)
+        # Weighted average: initial confidence decays toward ACT-R value
+        # High confirmation_count → trust ACT-R more
+        actr_weight = min(0.9, 0.3 + self.confirmation_count * 0.05)
+        combined = (1.0 - actr_weight) * self.confidence + actr_weight * actr_conf
+        # Penalty for high refutation count
+        if self.refutation_count > 0:
+            combined *= max(0.2, 1.0 - self.refutation_count * 0.3)
+        return max(_MIN_CONFIDENCE, min(1.0, combined))
+
+    def record_access(self) -> None:
+        """Record a retrieval access — reinforces ACT-R activation."""
+        self.access_history.append(time.time())
+        # Keep bounded to last 50 accesses (sufficient for activation computation)
+        if len(self.access_history) > 50:
+            self.access_history = self.access_history[-50:]
+
+    def spreading_activation(self, goal_context: str) -> float:
+        """
+        Compute spreading activation from goal_context to this fact.
+        Blueprint §3.2: activation propagates from current goal to associated chunks.
+        Returns bonus in [0.0, SPREADING_ACTIVATION_WEIGHT].
+        """
+        if not goal_context:
+            return 0.0
+        ctx_tokens = set(re.sub(r"[^\w]", " ", goal_context.lower()).split())
+        fact_tokens = set(re.sub(r"[^\w]", " ", f"{self.subject} {self.predicate} {self.object}").split())
+        if not ctx_tokens or not fact_tokens:
+            return 0.0
+        overlap = len(ctx_tokens & fact_tokens) / max(len(ctx_tokens | fact_tokens), 1)
+        return overlap * _SPREADING_ACTIVATION_WEIGHT
 
     def is_usable(self) -> bool:
         return self.current_confidence() >= _RETRIEVAL_THRESHOLD
@@ -133,8 +237,11 @@ class SemanticMemory:
             existing = self._facts.get(fid)
 
             if existing:
-                # Confirmation: boost confidence
+                # Confirmation: boost confidence + record access for ACT-R
                 new_confidence = min(1.0, existing.confidence + 0.05)
+                new_history = list(existing.access_history) + [now]
+                if len(new_history) > 50:
+                    new_history = new_history[-50:]
                 updated = SemanticFact(
                     fact_id=fid,
                     subject=existing.subject,
@@ -148,6 +255,7 @@ class SemanticMemory:
                     confirmation_count=existing.confirmation_count + 1,
                     refutation_count=existing.refutation_count,
                     metadata={**existing.metadata, **(metadata or {})},
+                    access_history=new_history,
                 )
                 self._facts[fid] = updated
                 self._dirty = True
@@ -190,8 +298,15 @@ class SemanticMemory:
         max_results: int = 10,
         min_confidence: float = _RETRIEVAL_THRESHOLD,
         category: Optional[str] = None,
+        goal_context: str = "",   # ACT-R spreading activation context
     ) -> List[SemanticFact]:
-        
+        """
+        Query semantic memory using ACT-R activation + spreading activation.
+
+        ACT-R Spreading Activation (Blueprint §3.2):
+            If current goal is "save file in Blender", Blender-related memories
+            get an activation bonus, increasing retrieval probability.
+        """
         query_tokens = set(re.sub(r"[^\w\s]", "", query_text.lower()).split())
         if not query_tokens:
             return []
@@ -214,12 +329,24 @@ class SemanticMemory:
                 if overlap == 0:
                     continue
 
-                # Relevance = token overlap fraction × confidence
+                # Relevance = token overlap × ACT-R confidence
                 relevance = (overlap / max(len(query_tokens), 1)) * conf
+
+                # ACT-R Spreading Activation bonus
+                if goal_context:
+                    relevance += fact.spreading_activation(goal_context)
+
                 candidates.append((relevance, fact))
 
             candidates.sort(key=lambda x: x[0], reverse=True)
-            return [fact for _, fact in candidates[:max_results]]
+            top_facts = [fact for _, fact in candidates[:max_results]]
+
+            # Record access for ACT-R activation update
+            for fact in top_facts:
+                fact.record_access()
+                self._dirty = True
+
+            return top_facts
 
     def query_by_subject(
         self,
