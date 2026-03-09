@@ -135,6 +135,81 @@ class GIIGoalDirectedLoop:
         self._algorithm_distiller = getattr(gii_controller, "_algorithm_distiller", None)
         self._executed_operators: list = []   # Track for SOAR chunking
 
+        # ─────────────────────────────────────────────────────────────────────
+        # Blueprint §7.2 / §8.1 / §3.3 / §7.4 / §15.4 — Wire all components
+        # ─────────────────────────────────────────────────────────────────────
+
+        # STACK 2: Reflexion Engine (Blueprint §8.1)
+        try:
+            from core.learning.reflexion_engine import get_global_reflexion_engine
+            _llm_for_reflexion = getattr(gii_controller, "_llm_callable", None)
+            self._reflexion = get_global_reflexion_engine(llm_caller=_llm_for_reflexion)
+        except Exception:
+            self._reflexion = None
+
+        # STACK 3: BDI Gate (Blueprint §3.3)
+        try:
+            from core.cognition.bdi_gate import BDIGate
+            self._bdi_gate = BDIGate()
+        except Exception:
+            self._bdi_gate = None
+
+        # STACK 4: LATS Planner (Blueprint §7.4)
+        try:
+            from core.planner.lats_planner import LATSPlanner
+            _cr = getattr(gii_controller, "consequence_reasoner", None)
+            _llm_lats = getattr(gii_controller, "_llm_callable", None)
+            self._lats = LATSPlanner(llm_caller=_llm_lats, consequence_reasoner=_cr)
+        except Exception:
+            self._lats = None
+
+        # STACK 7: Knowledge Vault (Blueprint §10.4)
+        try:
+            from core.memory.knowledge_vault import get_global_knowledge_vault
+            self._vault = get_global_knowledge_vault()
+        except Exception:
+            self._vault = None
+
+        # STACK 9a: Monitor Agent (Blueprint §15.4)
+        try:
+            from core.agents.monitor_agent import MonitorAgent
+            _atspi = getattr(gii_controller, "_atspi_bridge", None)
+            self._monitor = MonitorAgent(atspi_bridge=_atspi)
+            self._monitor.start()
+        except Exception:
+            self._monitor = None
+
+        # STACK 9b: Safety Agent (Blueprint §15.4)
+        try:
+            from core.agents.safety_agent import get_global_safety_agent
+            _llm_safety = getattr(gii_controller, "_llm_callable", None)
+            self._safety_agent = get_global_safety_agent(llm_caller=_llm_safety)
+        except Exception:
+            self._safety_agent = None
+
+        # STACK 9c: Validator Agent (Blueprint §15.4)
+        try:
+            from core.agents.validator_agent import ValidatorAgent
+            _llm_validator = getattr(gii_controller, "_llm_callable", None)
+            self._validator = ValidatorAgent(llm_caller=_llm_validator, os_backend=os_backend)
+        except Exception:
+            self._validator = None
+
+        # Track current milestone for per-milestone Reflexion/BDI context
+        self._current_milestone: Optional[str] = None
+        self._milestone_trajectory: List[Dict[str, Any]] = []
+        self._milestone_start_world: Optional[Dict[str, Any]] = None
+        self._current_app: str = ""
+
+        _logger.info(
+            "[GIILoop] Components wired: reflexion=%s bdi=%s lats=%s vault=%s "
+            "monitor=%s safety=%s validator=%s",
+            self._reflexion is not None, self._bdi_gate is not None,
+            self._lats is not None, self._vault is not None,
+            self._monitor is not None, self._safety_agent is not None,
+            self._validator is not None,
+        )
+
     # =========================================================================
     # Main entry point
     # =========================================================================
@@ -159,6 +234,11 @@ class GIIGoalDirectedLoop:
             self._objective[:80], self._max_iterations,
             self._vsa is not None, self._piguard is not None, self._use_process_fence,
         )
+
+        # ── Blueprint §3.3: Set initial BDI plan context from first world observation
+        # (will be populated after first world state fetch below)
+        self._current_milestone = self._objective  # Default until HTN sets milestones
+        self._milestone_trajectory = []
 
         while self._iteration < self._max_iterations:
 
@@ -209,6 +289,12 @@ class GIIGoalDirectedLoop:
                 summary = action.get("summary", "Task complete")
                 self._journal.record({"event": "gii_goal_complete", "iteration": self._iteration, "summary": summary})
                 _logger.info("[GIILoop] Goal complete: %s (iter=%d)", summary, self._iteration)
+                # Stop Monitor Agent on completion
+                if self._monitor is not None:
+                    try:
+                        self._monitor.stop()
+                    except Exception:
+                        pass
                 return self._result(True, summary)
 
             # LAYER-5: PIGuard on external content
@@ -256,6 +342,69 @@ class GIIGoalDirectedLoop:
                 continue
 
             focused_app = world_state.get("focused_app", "__unknown_app__")
+            self._current_app = focused_app
+
+            # ── Monitor Agent: update world context + check for interrupts (Blueprint §15.4)
+            if self._monitor is not None:
+                try:
+                    self._monitor.update_world_context(world_state)
+                    monitor_alerts = self._monitor.summarize_for_primary_agent()
+                    if monitor_alerts:
+                        world_state["_monitor_alerts"] = monitor_alerts
+                        _logger.info("[GIILoop] Monitor alerts injected at iter=%d", self._iteration)
+                except Exception as mon_exc:
+                    _logger.debug("[GIILoop] Monitor update error: %s", mon_exc)
+
+            # ── BDI Gate: check if belief state has diverged enough to replan (Blueprint §3.3)
+            if self._bdi_gate is not None and self._milestone_start_world is not None:
+                try:
+                    bdi_result = self._bdi_gate.should_reconsider(
+                        world_state, active_goal=self._current_milestone or self._objective
+                    )
+                    if bdi_result.should_reconsider:
+                        _logger.info(
+                            "[GIILoop] BDI reconsideration: %s (iter=%d)",
+                            bdi_result.reason[:80], self._iteration,
+                        )
+                        self._journal.record({
+                            "event": "bdi_reconsider",
+                            "iteration": self._iteration,
+                            "reason": bdi_result.reason,
+                            "jaccard": bdi_result.jaccard_similarity,
+                            "divergence_type": bdi_result.divergence_type,
+                        })
+                        # Reset milestone context and trigger re-planning
+                        self._milestone_start_world = world_state
+                        if self._bdi_gate is not None:
+                            self._bdi_gate.reset_commitment()
+                        world_state["_bdi_replan_signal"] = bdi_result.reason
+                    else:
+                        self._bdi_gate.update_actual_state(world_state)
+                except Exception as bdi_exc:
+                    _logger.debug("[GIILoop] BDI gate error: %s", bdi_exc)
+
+            # ── Inject Reflexion context + Knowledge Vault into PerStepReasoner (Blueprint §8.1, §10.4)
+            psr = getattr(self._gii, "_per_step_reasoner", None)
+            if psr is not None:
+                try:
+                    # Reflexion context for current milestone
+                    if self._reflexion is not None and self._current_milestone:
+                        reflex_ctx = self._reflexion.inject_context(self._current_milestone)
+                        psr.set_reflexion_context(reflex_ctx)
+
+                    # Knowledge Vault: query relevant lessons
+                    if self._vault is not None:
+                        vault_entries = self._vault.query_relevant(
+                            f"{self._current_milestone or self._objective} {focused_app}",
+                            max_results=3,
+                            subject_filter=focused_app.lower() if focused_app else None,
+                        )
+                        if vault_entries:
+                            vault_ctx = self._vault.format_for_prompt(vault_entries)
+                            psr.set_vault_context(vault_ctx)
+                except Exception as psr_exc:
+                    _logger.debug("[GIILoop] PSR context injection error: %s", psr_exc)
+
             policy_decision, policy_reason = self._policy.validate_action_dict(action, focused_app=focused_app)
 
             if policy_decision == "DENY":
@@ -336,10 +485,85 @@ class GIIGoalDirectedLoop:
                     "success": exec_success,
                     "output_snippet": exec_output[:200],
                 })
+
+                # Track milestone trajectory for Reflexion
+                if self._current_milestone:
+                    self._milestone_trajectory.append({
+                        "operation": action.get("operation"),
+                        "thought": action.get("thought", ""),
+                        "outcome": "success" if exec_success else "failure",
+                        "output": exec_output[:100],
+                    })
+
             except Exception as exec_exc:
                 exec_success = False
                 exec_output = str(exec_exc)
                 _logger.warning("[GIILoop] Action execution failed: %s | %s", action_key, exec_exc)
+
+                # ── Reflexion on failure (Blueprint §8.1)
+                if (
+                    self._reflexion is not None
+                    and self._current_milestone
+                    and self._stagnant_count >= 2
+                ):
+                    try:
+                        traj_summary = "; ".join(
+                            f"{s.get('operation','?')}: {s.get('thought','')[:60]}"
+                            for s in self._milestone_trajectory[-5:]
+                        )
+                        self._reflexion.reflect_on_failure(
+                            milestone_desc=self._current_milestone,
+                            trajectory_summary=traj_summary or "No trajectory recorded",
+                            failure_reason=exec_output[:200],
+                            belief_state_summary=str(world_state.get("focused_app","")) + " - " + str(self._iteration),
+                            app_name=self._current_app or None,
+                        )
+                        # Store lesson in Knowledge Vault
+                        if self._vault is not None:
+                            self._vault.store_failure_pattern(
+                                f"In {self._current_app}: '{self._current_milestone[:100]}' failed — {exec_output[:150]}",
+                                subject=self._current_app.lower() if self._current_app else "general",
+                                importance=0.7,
+                            )
+                    except Exception as rfx_exc:
+                        _logger.debug("[GIILoop] Reflexion store failed: %s", rfx_exc)
+
+                # ── LATS recovery on repeated stagnation (Blueprint §7.4)
+                if (
+                    self._lats is not None
+                    and self._stagnant_count >= 3
+                    and self._current_milestone
+                ):
+                    try:
+                        reflex_ctx = ""
+                        if self._reflexion and self._current_milestone:
+                            reflex_ctx = self._reflexion.inject_context(self._current_milestone)
+
+                        lats_result = self._lats.recover(
+                            milestone_desc=self._current_milestone,
+                            world_snapshot=world_state,
+                            objective=self._objective,
+                            reflection_context=reflex_ctx,
+                            previous_trajectory=self._milestone_trajectory[-5:],
+                        )
+                        if lats_result.success and lats_result.best_action:
+                            _logger.info(
+                                "[GIILoop] LATS recovery found action (score=%.2f) at iter=%d",
+                                lats_result.best_prm_score, self._iteration,
+                            )
+                            self._journal.record({
+                                "event": "lats_recovery_activated",
+                                "iteration": self._iteration,
+                                "milestone": self._current_milestone[:80],
+                                "prm_score": lats_result.best_prm_score,
+                                "elapsed_ms": lats_result.elapsed_ms,
+                            })
+                            # Inject LATS action as override hint
+                            world_state["_lats_recovery_action"] = lats_result.best_action
+                            world_state["_lats_recovery_thought"] = lats_result.best_thought
+                    except Exception as lats_exc:
+                        _logger.debug("[GIILoop] LATS recovery failed: %s", lats_exc)
+
                 self._stagnant_count += 1
                 if self._stagnant_count >= self._max_stagnant:
                     return self._result(False, f"Stagnation: repeated execution failures. Last: {exec_exc}")
