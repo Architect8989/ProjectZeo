@@ -1306,15 +1306,37 @@ def _execute_autonomous_loop(
                         selected_action = dict(selected_action)
                         selected_action["_terminal_context"] = True
 
-                if (
+                # ─────────────────────────────────────────────────────────
+                # UNIVERSAL CONSEQUENCE GATE (Blueprint §13 / Sin #2 Fix)
+                # ─────────────────────────────────────────────────────────
+                # OLD (BROKEN): type-gated — only command/file_create/install
+                #   reach ConsequenceReasoner. All click operations bypass it.
+                #   A click on "Wipe All Data" was as unguarded as "OK".
+                #
+                # NEW (FIXED): consequence-gated for ALL operation types.
+                #   Fast-path: if PolicyEngine returns ALLOW and the op is
+                #   statically REVERSIBLE (scroll, move, focus), skip the
+                #   expensive LLM CR call. Every other operation — including
+                #   ALL clicks — goes through ConsequenceReasoner.
+                #
+                # 21 high-risk click patterns (from consequence_reasoner.py:911)
+                # are now evaluated because clicks reach this block.
+                # ─────────────────────────────────────────────────────────
+                _REVERSIBLE_FAST_PATH_OPS: frozenset = frozenset({
+                    "scroll", "move_mouse", "focus", "screenshot",
+                    "observe", "wait", "done",
+                })
+                _cr_policy_fast_path = (
+                    _policy_decision == PolicyEngine.ALLOW
+                    and _op_for_cr in _REVERSIBLE_FAST_PATH_OPS
+                )
+                _cr_should_evaluate = (
                     _consequence_reasoner_instance is not None
                     and _policy_decision != PolicyEngine.DENY
-                    and (
-                        _op_for_cr in ("command", "file_create", "install")
-                        or _cr_apply_external
-                        or _cr_apply_terminal
-                    )
-                ):
+                    and not _cr_policy_fast_path
+                )
+
+                if _cr_should_evaluate:
                     try:
                         _cr_result = _consequence_reasoner_instance.evaluate(
                             action=selected_action,
