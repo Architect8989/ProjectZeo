@@ -58,10 +58,16 @@ class SafetyDecision(str, Enum):
 # ---------------------------------------------------------------------------
 
 class ConsequenceResult:
-    """Complete result of a three-tier safety evaluation."""
+    """Complete result of a three-tier safety evaluation.
+
+    numeric_score (Blueprint §13 PRM migration):
+        0.0 = certain DENY | 0.5 = REQUIRE_HUMAN_CONFIRMATION | 1.0 = certain ALLOW
+        Used by LATS value function and GRPO reward signal.
+    """
     __slots__ = (
         "decision", "reversibility", "coherence", "consequence",
         "tier_reached", "reason", "latency_ms", "action_snippet",
+        "numeric_score",
     )
 
     def __init__(
@@ -75,6 +81,7 @@ class ConsequenceResult:
         reason: str = "",
         latency_ms: float = 0.0,
         action_snippet: str = "",
+        numeric_score: Optional[float] = None,
     ) -> None:
         self.decision       = decision
         self.reversibility  = reversibility
@@ -84,6 +91,15 @@ class ConsequenceResult:
         self.reason         = reason
         self.latency_ms     = latency_ms
         self.action_snippet = action_snippet
+        # Derive numeric_score from decision if not explicitly set
+        if numeric_score is not None:
+            self.numeric_score = float(numeric_score)
+        elif decision == SafetyDecision.ALLOW:
+            self.numeric_score = 0.95 if reversibility == Reversibility.REVERSIBLE else 0.75
+        elif decision == SafetyDecision.REQUIRE_HUMAN_CONFIRMATION:
+            self.numeric_score = 0.40
+        else:  # DENY
+            self.numeric_score = 0.05
 
     def to_dict(self) -> dict:
         return {
@@ -95,6 +111,7 @@ class ConsequenceResult:
             "reason":         self.reason,
             "latency_ms":     round(self.latency_ms, 2),
             "action_snippet": self.action_snippet,
+            "numeric_score":  round(self.numeric_score, 4),
         }
 
 
