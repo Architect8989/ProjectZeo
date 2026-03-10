@@ -1212,9 +1212,22 @@ def _execute_autonomous_loop(
                         _sa_log.getLogger(__name__).debug(
                             "[operate] ScaffoldAudit check error (non-fatal): %s", _sa_exc
                         )
+                # ── SIN-2 FINAL FIX: Universal pre-dispatch snapshot ───────────────
+                # Blueprint §2 Sin 2 residue: click/hotkey/press/fill were excluded.
+                # A click on "Wipe All Data" got no rollback point.
+                # Fixed: expand IRREVERSIBLE_OPS to ALL ops that mutate state,
+                # including click/hotkey/press/fill. Only truly observational ops
+                # (scroll, move_mouse, screenshot, observe, wait, done) are exempt.
+                # ─────────────────────────────────────────────────────────────────
                 _IRREVERSIBLE_OPS = frozenset({
                     "command", "file_create", "file_delete", "install",
                     "file_move", "file_write", "navigate", "file_modify",
+                    # NEWLY ADDED — these can trigger irreversible UI changes:
+                    "click",    # clicking "Delete", "Confirm", UAC prompts
+                    "hotkey",   # Ctrl+S, Ctrl+W, Alt+F4 etc.
+                    "press",    # Enter on a confirmation dialog
+                    "fill",     # Form submission pre-fill
+                    "key",      # keyboard shortcut dispatch
                 })
                 if _op_for_cr in _IRREVERSIBLE_OPS:
                     # GII-FIX: Use restore_provider passed from main.py.
