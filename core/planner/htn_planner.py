@@ -141,6 +141,7 @@ class HTNPlanner:
         objective: str,
         goalact_check_interval: int = 10,
         consequence_reasoner: Any = None,  # optional CR for PRM scoring
+        semantic_memory: Any = None,       # GII-WIRE: ACT-R spreading activation
     ) -> None:
         self._llm = llm_call
         self._objective = objective
@@ -156,6 +157,22 @@ class HTNPlanner:
         # ToT milestone stagnation tracking
         self._milestone_fail_counts: Dict[str, int] = {}   # task_id → fail count
         self._consequence_reasoner = consequence_reasoner  # for PRM scoring
+
+        # GII-WIRE: ACT-R Spreading Activation (Blueprint §3.2)
+        # SemanticMemory.set_active_goal() registers the current task objective
+        # so query() automatically boosts memories related to the current goal
+        # context — callers don't need to pass goal_context= explicitly.
+        # Called here (init) and in decompose() for each sub-task.
+        self._semantic_memory = semantic_memory
+        if self._semantic_memory is not None:
+            try:
+                self._semantic_memory.set_active_goal(objective)
+                _logger.debug(
+                    "[HTN] ACT-R spreading activation seeded with objective: %r",
+                    objective[:60],
+                )
+            except Exception as _exc:
+                _logger.debug("[HTN] SemanticMemory.set_active_goal failed: %s", _exc)
 
         self._build_root(objective)
 
@@ -187,6 +204,21 @@ class HTNPlanner:
 
         if parent.task_type == TaskType.PRIMITIVE:
             return []
+
+        # GII-WIRE: ACT-R Spreading Activation (Blueprint §3.2)
+        # Update SemanticMemory's active goal to the PARENT task description
+        # so that memory queries during this decomposition get the correct
+        # spreading activation boost.  This is the missing link that was
+        # causing ACT-R to always spread from the root objective rather than
+        # the current sub-task context.
+        if self._semantic_memory is not None:
+            try:
+                self._semantic_memory.set_active_goal(parent.description)
+                _logger.debug(
+                    "[HTN] ACT-R goal context → sub-task: %r", parent.description[:60]
+                )
+            except Exception as _exc:
+                _logger.debug("[HTN] set_active_goal in decompose failed: %s", _exc)
 
         world_summary = ""
         if world_state:
