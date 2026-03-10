@@ -178,10 +178,25 @@ class PerStepReasoner:
 
         self._consecutive_failures: int = 0
 
-        if self._supports_thinking:
+        # ── DualModeReasoner: Intelligent SGLang tier routing (Blueprint §4.3)
+        # Replaces the manual with_thinking() heuristic with reversibility-aware
+        # routing: REVERSIBLE→fast/instruct, CAUTION/IRREVERSIBLE→deep/thinking,
+        # unknown app→deep, stagnant≥3→deep, shell/script→coder, GUI→vision.
+        self._dual_mode_reasoner = None
+        try:
+            from core.cognition.dual_mode_reasoner import get_dual_mode_reasoner
+            self._dual_mode_reasoner = get_dual_mode_reasoner(llm_callable=llm_callable)
+        except Exception as _dmr_exc:
+            _logger.debug("[PerStepReasoner] DualModeReasoner unavailable (non-fatal): %s", _dmr_exc)
+
+        # GWT context injected by GIILoop before each decide call
+        self._gwt_context: str = ""
+
+        if self._supports_thinking or self._dual_mode_reasoner is not None:
             _logger.info(
                 "[PerStepReasoner] Dual-mode reasoning active. "
-                "World model: %s. Self model: %s.",
+                "DualModeReasoner=%s. World model: %s. Self model: %s.",
+                self._dual_mode_reasoner is not None,
                 "yes" if world_model else "no",
                 "yes" if self_model else "no",
             )
@@ -803,15 +818,85 @@ class PerStepReasoner:
     def _select_callable_for_action(
         self, world_state: Optional[Dict[str, Any]]
     ) -> Callable:
-        if not self._supports_thinking:
-            return self._llm
+        """
+        Select the optimal LLM callable for the current action context.
 
+        Priority:
+        1. DualModeReasoner (reversibility-aware tier routing) — if available
+        2. Legacy with_thinking() heuristic — if DualModeReasoner unavailable
+        3. Base llm_callable — fallback
+
+        DualModeReasoner routes:
+        - REVERSIBLE + low stagnant → fast/instruct (Qwen3-32B)
+        - CAUTION/IRREVERSIBLE → deep/thinking (Qwen3-235B-Thinking)
+        - Unknown app → deep/thinking (Blender Test)
+        - Shell/script → coder (Qwen3-Coder-480B)
+        - GUI click/navigate → vision (UI-TARS-2)
+        """
         with self._lock:
             recent = list(self._history[-3:])
             consec = self._consecutive_failures
 
-        use_thinking = False
+        # ── Path 1: DualModeReasoner ─────────────────────────────────────────
+        if self._dual_mode_reasoner is not None and world_state is not None:
+            try:
+                from core.cognition.dual_mode_reasoner import Reversibility
+                # Derive operation from last action in world_state hints
+                operation = ""
+                action_hint = world_state.get("_active_inference_top_action") or {}
+                if isinstance(action_hint, dict):
+                    operation = str(action_hint.get("operation", ""))
 
+                # Derive reversibility from consequence reasoner hint or heuristic
+                rev_hint = world_state.get("_consequence_reversibility", "")
+                try:
+                    reversibility = Reversibility(rev_hint) if rev_hint else Reversibility.UNKNOWN
+                except ValueError:
+                    reversibility = Reversibility.UNKNOWN
+
+                # Check if app is known
+                focused_app = world_state.get("focused_app", "")
+                known_app = bool(focused_app and focused_app != "__unknown_app__")
+
+                stagnant_hint = int(world_state.get("_stagnant_count", 0))
+
+                mode_decision = self._dual_mode_reasoner.select_mode(
+                    operation=operation,
+                    reversibility=reversibility,
+                    stagnant_count=max(consec, stagnant_hint),
+                    known_app=known_app,
+                    is_script=operation in ("command", "exec", "bash", "script"),
+                )
+
+                # Build a wrapped callable that routes through DualModeReasoner
+                _dmr = self._dual_mode_reasoner
+                _mode = mode_decision
+
+                def _dual_mode_callable(messages, **kwargs):
+                    return _dmr.call(
+                        messages=messages,
+                        mode_decision=_mode,
+                        **kwargs,
+                    )
+
+                with self._lock:
+                    if mode_decision.mode.value in ("deep", "coder"):
+                        self._thinking_calls += 1
+                    else:
+                        self._instruct_calls += 1
+
+                return _dual_mode_callable
+            except Exception as _dmr_exc:
+                _logger.debug(
+                    "[PerStepReasoner] DualModeReasoner routing failed (fallback): %s",
+                    _dmr_exc,
+                )
+
+        # ── Path 2: Legacy with_thinking() heuristic ─────────────────────────
+        if not self._supports_thinking:
+            return self._llm
+
+        use_thinking = False
         for h in recent:
             if h["outcome"] == "failure" and h["action"].get("operation") in _THINKING_MODE_OPS:
                 use_thinking = True
