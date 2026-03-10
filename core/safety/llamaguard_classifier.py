@@ -11,10 +11,6 @@ from typing import Dict, List, Optional, Tuple
 
 _logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Safety categories
-# ---------------------------------------------------------------------------
-
 class HazardCategory(str, Enum):
     VIOLENT_CRIMES            = "S1"
     NON_VIOLENT_CRIMES        = "S2"
@@ -31,8 +27,6 @@ class HazardCategory(str, Enum):
     ELECTIONS_MISINFORMATION  = "S13"
     CODE_CYBERATTACKS         = "S14"
 
-
-# Categories that cause immediate BLOCK (no human confirmation possible)
 _BLOCK_CATEGORIES: frozenset = frozenset({
     HazardCategory.VIOLENT_CRIMES,
     HazardCategory.CHILD_EXPLOITATION,
@@ -41,14 +35,12 @@ _BLOCK_CATEGORIES: frozenset = frozenset({
     HazardCategory.CODE_CYBERATTACKS,
 })
 
-# Categories that require human confirmation
 _CONFIRM_CATEGORIES: frozenset = frozenset({
     HazardCategory.NON_VIOLENT_CRIMES,
     HazardCategory.SPECIALIZED_ADVICE,
     HazardCategory.PRIVACY_VIOLATIONS,
 })
 
-# Categories that log a warning but allow execution
 _WARN_CATEGORIES: frozenset = frozenset({
     HazardCategory.DEFAMATION,
     HazardCategory.IP_VIOLATIONS,
@@ -56,28 +48,17 @@ _WARN_CATEGORIES: frozenset = frozenset({
     HazardCategory.ELECTIONS_MISINFORMATION,
 })
 
-
-# ---------------------------------------------------------------------------
-# Result dataclass
-# ---------------------------------------------------------------------------
-
 @dataclass
 class LlamaGuardResult:
-    """Result from LlamaGuard3 classification."""
 
-    # "safe" | "unsafe"
     verdict: str
 
-    # List of triggered hazard categories (empty when safe)
     categories: List[str]
 
-    # "BLOCK" | "REQUIRE_HUMAN_CONFIRMATION" | "WARN" | "ALLOW"
     action: str
 
-    # Human-readable explanation
     reason: str
 
-    # Time spent on classification
     latency_seconds: float = 0.0
 
     @property
@@ -91,11 +72,6 @@ class LlamaGuardResult:
     @property
     def requires_confirmation(self) -> bool:
         return self.action == "REQUIRE_HUMAN_CONFIRMATION"
-
-
-# ---------------------------------------------------------------------------
-# LlamaGuard prompt builder
-# ---------------------------------------------------------------------------
 
 _LLAMAGUARD_SYSTEM = """[INST] Task: Check if there is unsafe content in the 'Agent' messages in conversations according our safety policy with the below categories.
 
@@ -124,12 +100,9 @@ Provide your safety assessment for the Agent message.
 First line must be "safe" or "unsafe".
 If unsafe, list triggered categories on the second line (comma-separated S codes). [/INST]"""
 
-
 def _build_llamaguard_prompt(action_dict: Dict) -> str:
-    """Build a LlamaGuard3 classification prompt for a ProjectZeo action dict."""
     op = str(action_dict.get("operation", "unknown"))
 
-    # Build a human-readable description of the action to classify
     if op == "command":
         content = f"Execute shell command: {action_dict.get('command', '')}"
     elif op == "file_create":
@@ -158,24 +131,18 @@ def _build_llamaguard_prompt(action_dict: Dict) -> str:
 
     return _LLAMAGUARD_SYSTEM.format(agent_content=content)
 
-
-# ---------------------------------------------------------------------------
-# Main classifier class
-# ---------------------------------------------------------------------------
-
 class LlamaGuardClassifier:
     
     _instance: Optional["LlamaGuardClassifier"] = None
     _instance_lock = threading.Lock()
 
     def __init__(self) -> None:
-        self._backend: Optional[str] = None   # "sglang" | "llamacpp" | "hf" | "disabled"
+        self._backend: Optional[str] = None
         self._model = None
         self._client = None
         self._url: Optional[str] = None
         self._timeout: float = 30.0
 
-        # Statistics
         self._total_classifications: int = 0
         self._total_blocks: int = 0
         self._total_confirms: int = 0
@@ -195,7 +162,6 @@ class LlamaGuardClassifier:
 
     @classmethod
     def get_instance(cls) -> "LlamaGuardClassifier":
-        """Return the process-global LlamaGuardClassifier (singleton)."""
         if cls._instance is not None:
             return cls._instance
         with cls._instance_lock:
@@ -241,7 +207,6 @@ class LlamaGuardClassifier:
             _logger.warning(
                 "[LlamaGuardClassifier] Classification error (fail-open): %s", exc
             )
-            # Fail-open: classification error does not block execution
             return LlamaGuardResult(
                 verdict="safe", categories=[], action="ALLOW",
                 reason=f"Classification error (fail-open): {exc}",
@@ -249,17 +214,37 @@ class LlamaGuardClassifier:
             )
 
     def _run_inference(self, prompt: str) -> str:
-        """Route inference to the configured backend."""
         if self._backend == "sglang":
             return self._infer_sglang(prompt)
         elif self._backend == "llamacpp":
             return self._infer_llamacpp(prompt)
         elif self._backend == "hf":
             return self._infer_hf(prompt)
+        elif self._backend == "ollama":
+            return self._call_backend(prompt)
         return "safe"
 
+    def _call_backend(self, prompt: str) -> str:
+        model_tag = getattr(self, "_ollama_model_tag", "llama-guard3:8b")
+        ollama_host = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+        try:
+            import httpx as _hx
+            payload = {
+                "model": model_tag,
+                "messages": [{"role": "user", "content": prompt}],
+                "stream": False,
+            }
+            r = _hx.post(
+                f"{ollama_host}/api/chat",
+                json=payload,
+                timeout=_hx.Timeout(connect=5.0, read=30.0, write=5.0, pool=5.0),
+            )
+            r.raise_for_status()
+            return r.json()["message"]["content"]
+        except Exception as exc:
+            raise RuntimeError(f"LlamaGuard Ollama call failed: {exc}") from exc
+
     def _infer_sglang(self, prompt: str) -> str:
-        """Call SGLang server OpenAI-compatible endpoint."""
         import json as _json
         payload = {
             "model": "meta-llama/Llama-Guard-3-8B",
@@ -278,7 +263,6 @@ class LlamaGuardClassifier:
         return data["choices"][0]["message"]["content"]
 
     def _infer_llamacpp(self, prompt: str) -> str:
-        """Run inference via llama-cpp-python (local GGUF)."""
         output = self._model(
             prompt,
             max_tokens=64,
@@ -288,18 +272,12 @@ class LlamaGuardClassifier:
         return output["choices"][0]["text"]
 
     def _infer_hf(self, prompt: str) -> str:
-        """Run inference via HuggingFace transformers pipeline."""
         output = self._model(prompt, max_new_tokens=64, temperature=None, do_sample=False)
         if isinstance(output, list) and output:
             return output[0].get("generated_text", "")[-64:]
         return str(output)
 
     def _parse_output(self, raw: str) -> LlamaGuardResult:
-        """
-        Parse LlamaGuard3 output format:
-            Line 1: "safe" or "unsafe"
-            Line 2 (if unsafe): "S1,S9,S14" etc.
-        """
         lines = [l.strip() for l in raw.strip().splitlines() if l.strip()]
         if not lines:
             return LlamaGuardResult(
@@ -313,7 +291,6 @@ class LlamaGuardClassifier:
                 verdict="safe", categories=[], action="ALLOW", reason="Safe",
             )
 
-        # Parse categories from second line
         categories: List[str] = []
         if len(lines) > 1:
             raw_cats = lines[1].upper()
@@ -322,7 +299,6 @@ class LlamaGuardClassifier:
                 if tok.startswith("S") and tok[1:].isdigit():
                     categories.append(tok)
 
-        # Determine action based on categories
         cat_enums = set()
         for c in categories:
             try:
@@ -375,13 +351,11 @@ class LlamaGuardClassifier:
         )
 
     def _init_backend(self) -> None:
-        """Attempt to initialise a backend in priority order."""
 
-        # Priority 1: SGLang server
         url = os.environ.get("PROJECTZEO_LLAMAGUARD_URL", "").strip()
         if url:
             try:
-                import httpx  # noqa: PLC0415
+                import httpx
                 self._client = httpx.Client(
                     headers={"Content-Type": "application/json"},
                     timeout=httpx.Timeout(connect=5.0, read=30.0, write=5.0, pool=5.0),
@@ -395,11 +369,10 @@ class LlamaGuardClassifier:
             except Exception as exc:
                 _logger.debug("[LlamaGuardClassifier] SGLang check failed: %s", exc)
 
-        # Priority 2: llama-cpp-python (local GGUF)
         gguf_path = os.environ.get("PROJECTZEO_LLAMAGUARD_GGUF", "").strip()
         if gguf_path and os.path.exists(gguf_path):
             try:
-                from llama_cpp import Llama  # noqa: PLC0415
+                from llama_cpp import Llama
                 n_gpu = int(os.environ.get("PROJECTZEO_LLAMAGUARD_GPU_LAYERS", "0"))
                 self._model = Llama(
                     model_path=gguf_path,
@@ -414,10 +387,9 @@ class LlamaGuardClassifier:
             except Exception as exc:
                 _logger.debug("[LlamaGuardClassifier] llama-cpp-python init failed: %s", exc)
 
-        # Priority 3: HuggingFace transformers
         if os.environ.get("PROJECTZEO_LLAMAGUARD_HF", "0").strip() == "1":
             try:
-                from transformers import pipeline  # noqa: PLC0415
+                from transformers import pipeline
                 self._model = pipeline(
                     "text-generation",
                     model="meta-llama/Llama-Guard-3-8B",
@@ -429,7 +401,23 @@ class LlamaGuardClassifier:
             except Exception as exc:
                 _logger.debug("[LlamaGuardClassifier] HuggingFace init failed: %s", exc)
 
-        # No backend available
+        ollama_model = os.environ.get("PROJECTZEO_LLAMAGUARD_OLLAMA", "").strip()
+        if ollama_model:
+            try:
+                import httpx as _hx
+                r = _hx.get("http://localhost:11434/api/tags", timeout=3.0)
+                if r.status_code == 200:
+                    tags = [m.get("name", "") for m in r.json().get("models", [])]
+                    if any(ollama_model.split(":")[0] in t for t in tags):
+                        self._ollama_model_tag = ollama_model
+                        self._backend = "ollama"
+                        _logger.info(
+                            "[LlamaGuardClassifier] Using Ollama backend: %s", ollama_model
+                        )
+                        return
+            except Exception as exc:
+                _logger.debug("[LlamaGuardClassifier] Ollama check failed: %s", exc)
+
         self._backend = "disabled"
         _logger.info(
             "[LlamaGuardClassifier] No backend configured — Tier 4 disabled. "
@@ -454,14 +442,5 @@ class LlamaGuardClassifier:
             "avg_latency_seconds": round(avg, 3),
         }
 
-
-# ---------------------------------------------------------------------------
-# Module-level convenience function
-# ---------------------------------------------------------------------------
-
 def classify_with_llamaguard(action_dict: Dict) -> LlamaGuardResult:
-    """
-    Classify an action using the process-global LlamaGuardClassifier.
-    This is the function called from operate.py _execute_decision() as Tier 4.
-    """
     return LlamaGuardClassifier.get_instance().classify(action_dict)
