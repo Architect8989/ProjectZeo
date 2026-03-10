@@ -220,6 +220,31 @@ class RestoreProvider:
     def mark_agent_opened_browser(self, snapshot_id: str) -> None:
         self._task_opened_browser[snapshot_id] = True
 
+    # GII-FIX: capture_browser_session() — called from main.py line 507 via
+    # snapshot_provider.set_browser_capture_fn(restore_provider.capture_browser_session)
+    # The method was missing entirely, causing a silent AttributeError at startup.
+    def capture_browser_session(self) -> Optional[Any]:
+        """
+        Capture the current browser session state.
+        Used as the browser_capture_fn callback by SnapshotProvider.
+        Returns a BrowserSnapshot object or None if browser not available/open.
+        """
+        if not _BROWSER_AVAILABLE:
+            return None
+        try:
+            brow_snap = _browser_capture()
+            if brow_snap:
+                _logger.debug("[RestoreProvider] Browser session captured: %s", type(brow_snap).__name__)
+            return brow_snap
+        except Exception as exc:
+            _logger.debug("[RestoreProvider] Browser capture failed (non-fatal): %s", exc)
+            return None
+
+    def list_snapshots(self) -> List[str]:
+        """Return list of all snapshot IDs currently tracked."""
+        return list(self._win_snaps.keys() | self._brow_snaps.keys() |
+                    self._fs_snaps.keys() | self._criu_snaps.keys())
+
     # =========================================================================
     # CORE RESTORE
     # =========================================================================
