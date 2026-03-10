@@ -12,33 +12,22 @@ from adapters.apis_safety_layer import apply_patches
 
 _logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Local model registry
-# ---------------------------------------------------------------------------
-
 _LOCAL_REGISTRY: Dict[str, str] = {
-    # Qwen2.5-VL (vision-language) via Ollama — primary local model
     "qwen2.5-vl":   "adapters.qwen_ollama_adapter.QwenOllamaAdapter",
     "llava":         "adapters.llava_ollama_adapter.LLaVAOllamaAdapter",
     "llava-llama3":  "adapters.llava_ollama_adapter.LLaVAOllamaAdapter",
     "llava-phi3":    "adapters.llava_ollama_adapter.LLaVAOllamaAdapter",
-    # Qwen3-VL (GII Blueprint Phase 0.1 — arXiv:2505.09388)
-    # 256K context, built-in GUI agent training, thinking mode
     "qwen3-vl":      "adapters.qwen3_vl_adapter.Qwen3VLAdapter",
     "qwen3-vl:8b":   "adapters.qwen3_vl_adapter.Qwen3VLAdapter",
     "qwen3-vl:32b":  "adapters.qwen3_vl_adapter.Qwen3VLAdapter",
     "qwen3-vl:2b":   "adapters.qwen3_vl_adapter.Qwen3VLAdapter",
     "qwen3-vl:30b":  "adapters.qwen3_vl_adapter.Qwen3VLAdapter",
-    # Qwen3 text-only variants
     "qwen3-32b":     "adapters.qwen_ollama_adapter.QwenOllamaAdapter",
     "qwen3-235b":    "adapters.qwen_ollama_adapter.QwenOllamaAdapter",
-    # GUI-Actor (GII Blueprint Phase 0.2 — arXiv:2506.03143)
-    # Coordinate-free grounding via attention peaks
     "gui-actor":     "adapters.gui_actor_adapter.GUIActorAdapter",
     "gui-actor-7b":  "adapters.gui_actor_adapter.GUIActorAdapter",
 }
 
-# SGLang tier aliases: "sglang/<tier>" maps to a tier name
 _SGLANG_TIER_PREFIX = "sglang/"
 _VALID_SGLANG_TIERS = frozenset({"fast", "deep", "vision", "coder", "local"})
 
@@ -58,17 +47,12 @@ _CLOUD_REGISTRY = frozenset({
     "qwen-vl",
 })
 
-# ---------------------------------------------------------------------------
-# Internals
-# ---------------------------------------------------------------------------
-
 _PATCHES_APPLIED = False
 _PATCH_LOCK = threading.Lock()
 
-# Allows: letters, digits, dots, hyphens, underscores, colons, forward-slash.
 _MODEL_PATTERN = re.compile(r"^[a-zA-Z0-9.\-_:/]+$")
 
-_ADAPTER_CACHE_MAX_SIZE: int = 20   # raised from 10 to accommodate sglang tiers
+_ADAPTER_CACHE_MAX_SIZE: int = 20
 _BUILD_LOCKS_MAX_SIZE: int = _ADAPTER_CACHE_MAX_SIZE * 2
 
 from collections import OrderedDict as _OrderedDict
@@ -76,7 +60,6 @@ _ADAPTER_CACHE: "_OrderedDict[str, Any]" = _OrderedDict()
 _ADAPTER_CACHE_LOCK = threading.Lock()
 _ADAPTER_BUILD_LOCKS: "_OrderedDict[str, threading.Lock]" = _OrderedDict()
 _BUILD_LOCKS_LOCK = threading.Lock()
-
 
 def _cache_put(model_name: str, instance: Any) -> None:
     _ADAPTER_CACHE[model_name] = instance
@@ -89,20 +72,17 @@ def _cache_put(model_name: str, instance: Any) -> None:
                 _evicted_executor.shutdown(wait=False)
             except Exception:
                 pass
-        # Also close SGLang adapters cleanly
         if hasattr(evicted, "close"):
             try:
                 evicted.close()
             except Exception:
                 pass
 
-
 def _cache_get(model_name: str) -> "Any | None":
     instance = _ADAPTER_CACHE.get(model_name)
     if instance is not None:
         _ADAPTER_CACHE.move_to_end(model_name)
     return instance
-
 
 import os as _os_module
 
@@ -119,7 +99,6 @@ if _ollama_only_set and _CLOUD_ACCESS_PERMITTED:
 _OLLAMA_ONLY_FROZEN: bool = _ollama_only_set
 del _raw_ollama_only, _ollama_only_set
 
-
 def _get_model_build_lock(model_name: str) -> threading.Lock:
     with _BUILD_LOCKS_LOCK:
         if model_name in _ADAPTER_BUILD_LOCKS:
@@ -132,7 +111,6 @@ def _get_model_build_lock(model_name: str) -> threading.Lock:
             _ADAPTER_BUILD_LOCKS.popitem(last=False)
         return lock
 
-
 def _ensure_patches() -> None:
     global _PATCHES_APPLIED
     if _PATCHES_APPLIED:
@@ -141,7 +119,6 @@ def _ensure_patches() -> None:
         if not _PATCHES_APPLIED:
             apply_patches()
             _PATCHES_APPLIED = True
-
 
 def _import_class(path: str) -> Type:
     try:
@@ -156,7 +133,6 @@ def _import_class(path: str) -> Type:
             f"Adapter class '{class_name}' not found in '{module_path}'"
         )
 
-
 def _validate_model_name(model_name: str) -> str:
     if not isinstance(model_name, str) or not model_name.strip():
         raise ModelNotRecognizedException("Model name must be a non-empty string.")
@@ -169,16 +145,13 @@ def _validate_model_name(model_name: str) -> str:
         )
     return model_name
 
-
 def _resolve_base_model(model_name: str) -> str:
     if model_name.startswith("ollama/"):
         model_name = model_name[len("ollama/"):]
     return model_name.split(":", 1)[0]
 
-
 def _is_cloud_allowed() -> bool:
     return _CLOUD_ACCESS_PERMITTED
-
 
 def reconfigure_cloud_access(allow: bool) -> bool:
     
@@ -198,18 +171,12 @@ def reconfigure_cloud_access(allow: bool) -> bool:
 
     return previous
 
-
-# ---------------------------------------------------------------------------
-# SGLang routing
-# ---------------------------------------------------------------------------
-
 def _build_sglang_adapter(tier: str) -> Any:
     
     try:
-        from adapters.sglang_adapter import create_sglang_adapter_from_tier  # noqa: PLC0415
+        from adapters.sglang_adapter import create_sglang_adapter_from_tier
         adapter = create_sglang_adapter_from_tier(tier)
 
-        # Health check: warn if server is unreachable at build time
         if not adapter.health_check():
             _logger.warning(
                 "[AdapterFactory] SGLang server at %s is NOT reachable. "
@@ -231,11 +198,6 @@ def _build_sglang_adapter(tier: str) -> Any:
             f"SGLang adapter build failed for tier '{tier}': {exc}"
         ) from exc
 
-
-# ---------------------------------------------------------------------------
-# Main factory
-# ---------------------------------------------------------------------------
-
 class AdapterFactory:
 
     @staticmethod
@@ -256,108 +218,85 @@ class AdapterFactory:
                 if cached is not None:
                     return cached
 
-            # -------------------------------------------------------------------
-            # Route A: SGLang GPU inference (sglang/fast, sglang/deep, etc.)
-            # -------------------------------------------------------------------
-            if model_name.startswith(_SGLANG_TIER_PREFIX):
-                tier = model_name[len(_SGLANG_TIER_PREFIX):]
-                if tier not in _VALID_SGLANG_TIERS:
-                    raise ModelNotRecognizedException(
-                        f"Unknown SGLang tier '{tier}'. "
-                        f"Valid tiers: {sorted(_VALID_SGLANG_TIERS)}"
-                    )
-                instance = _build_sglang_adapter(tier)
-                with _ADAPTER_CACHE_LOCK:
-                    _cache_put(model_name, instance)
-                return instance
+            instance = AdapterFactory._build_raw(model_name)
 
-            # -------------------------------------------------------------------
-            # Route B: Explicit cloud prefix (anthropic:* / openai:*)
-            # -------------------------------------------------------------------
-            from adapters.cloud_adapter import is_cloud_model, create_cloud_adapter  # noqa: PLC0415
+            try:
+                from adapters.constitutional_wrapper import wrap_with_constitution
+                instance = wrap_with_constitution(instance)
+            except Exception as _cw_exc:
+                _logger.warning(
+                    "[AdapterFactory] ConstitutionalWrapper failed (running unconstrained): %s",
+                    _cw_exc,
+                )
 
-            if is_cloud_model(model_name):
-                instance = create_cloud_adapter(model_name)
-                instance_callable = _CloudCallable(instance)
-                with _ADAPTER_CACHE_LOCK:
-                    _cache_put(model_name, instance_callable)
-                return instance_callable
+            with _ADAPTER_CACHE_LOCK:
+                _cache_put(model_name, instance)
+            return instance
 
-            base_model = _resolve_base_model(model_name)
+    @staticmethod
+    def _build_raw(model_name: str):
+        if model_name.startswith(_SGLANG_TIER_PREFIX):
+            tier = model_name[len(_SGLANG_TIER_PREFIX):]
+            if tier not in _VALID_SGLANG_TIERS:
+                raise ModelNotRecognizedException(
+                    f"Unknown SGLang tier '{tier}'. "
+                    f"Valid tiers: {sorted(_VALID_SGLANG_TIERS)}"
+                )
+            return _build_sglang_adapter(tier)
 
-            # -------------------------------------------------------------------
-            # Route C1: Qwen3-VL — special constructor (no model_name arg)
-            # -------------------------------------------------------------------
-            if base_model in ("qwen3-vl", "qwen3-vl:8b", "qwen3-vl:32b",
-                              "qwen3-vl:2b", "qwen3-vl:30b"):
-                try:
-                    from adapters.qwen3_vl_adapter import get_qwen3_vl  # noqa: PLC0415
-                    vl_instance = get_qwen3_vl()
-                    vl_callable = _Qwen3VLCallable(vl_instance)
-                    with _ADAPTER_CACHE_LOCK:
-                        _cache_put(model_name, vl_callable)
-                    return vl_callable
-                except ImportError as exc:
-                    _logger.warning("[AdapterFactory] Qwen3VL import failed: %s", exc)
+        from adapters.cloud_adapter import is_cloud_model, create_cloud_adapter
 
-            # -------------------------------------------------------------------
-            # Route C2: GUI-Actor — special constructor (no model_name arg)
-            # -------------------------------------------------------------------
-            if base_model in ("gui-actor", "gui-actor-7b"):
-                try:
-                    from adapters.gui_actor_adapter import get_gui_actor  # noqa: PLC0415
-                    actor_instance = get_gui_actor()
-                    actor_callable = _GUIActorCallable(actor_instance)
-                    with _ADAPTER_CACHE_LOCK:
-                        _cache_put(model_name, actor_callable)
-                    return actor_callable
-                except ImportError as exc:
-                    _logger.warning("[AdapterFactory] GUIActor import failed: %s", exc)
+        if is_cloud_model(model_name):
+            instance = create_cloud_adapter(model_name)
+            return _CloudCallable(instance)
 
-            # -------------------------------------------------------------------
-            # Route C: Local adapter (Ollama)
-            # -------------------------------------------------------------------
-            local_path = _LOCAL_REGISTRY.get(base_model)
-            if local_path is not None:
-                AdapterClass = _import_class(local_path)
-                instance = AdapterClass(model_name=model_name)
-                with _ADAPTER_CACHE_LOCK:
-                    _cache_put(model_name, instance)
-                return instance
+        base_model = _resolve_base_model(model_name)
 
-            # -------------------------------------------------------------------
-            # Route D: Legacy cloud via PureLLMWrapper
-            # -------------------------------------------------------------------
-            if base_model in _CLOUD_REGISTRY:
-                if not _is_cloud_allowed():
-                    raise ModelNotRecognizedException(
-                        f"Model '{model_name}' is a cloud model, but OLLAMA_ONLY is "
-                        "enforced (default). To enable cloud models, start the system "
-                        "with OLLAMA_ONLY=0 in the environment BEFORE importing this "
-                        "module, or use an explicit 'anthropic:<model>' / "
-                        f"'openai:<model>' prefix.\n"
-                        f"  Local models: {sorted(_LOCAL_REGISTRY.keys())}\n"
-                        f"  SGLang tiers: {sorted(_VALID_SGLANG_TIERS)} (prefix: sglang/)"
-                    )
+        if base_model in ("qwen3-vl", "qwen3-vl:8b", "qwen3-vl:32b",
+                          "qwen3-vl:2b", "qwen3-vl:30b"):
+            try:
+                from adapters.qwen3_vl_adapter import get_qwen3_vl
+                vl_instance = get_qwen3_vl()
+                return _Qwen3VLCallable(vl_instance)
+            except ImportError as exc:
+                _logger.warning("[AdapterFactory] Qwen3VL import failed: %s", exc)
 
-                from adapters.pure_llm_wrapper import PureLLMWrapper  # noqa: PLC0415
+        if base_model in ("gui-actor", "gui-actor-7b"):
+            try:
+                from adapters.gui_actor_adapter import get_gui_actor
+                actor_instance = get_gui_actor()
+                return _GUIActorCallable(actor_instance)
+            except ImportError as exc:
+                _logger.warning("[AdapterFactory] GUIActor import failed: %s", exc)
 
-                instance = PureLLMWrapper(model_name=base_model)
-                with _ADAPTER_CACHE_LOCK:
-                    _cache_put(model_name, instance)
-                return instance
+        local_path = _LOCAL_REGISTRY.get(base_model)
+        if local_path is not None:
+            AdapterClass = _import_class(local_path)
+            return AdapterClass(model_name=model_name)
 
-            # -------------------------------------------------------------------
-            # Route E: Unknown
-            # -------------------------------------------------------------------
-            raise ModelNotRecognizedException(
-                f"Model '{model_name}' is not registered.\n"
-                f"  SGLang tiers:  sglang/{{fast|deep|vision|coder}} (set PROJECTZEO_USE_SGLANG=1)\n"
-                f"  Local models:  {sorted(_LOCAL_REGISTRY.keys())}\n"
-                f"  Cloud prefix:  anthropic:<model> | openai:<model>\n"
-                f"  Legacy cloud:  {sorted(_CLOUD_REGISTRY)} (require OLLAMA_ONLY=0)\n"
-                "Add the model to the appropriate registry in adapters/factory.py."
-            )
+        if base_model in _CLOUD_REGISTRY:
+            if not _is_cloud_allowed():
+                raise ModelNotRecognizedException(
+                    f"Model '{model_name}' is a cloud model, but OLLAMA_ONLY is "
+                    "enforced (default). To enable cloud models, start the system "
+                    "with OLLAMA_ONLY=0 in the environment BEFORE importing this "
+                    "module, or use an explicit 'anthropic:<model>' / "
+                    f"'openai:<model>' prefix.\n"
+                    f"  Local models: {sorted(_LOCAL_REGISTRY.keys())}\n"
+                    f"  SGLang tiers: {sorted(_VALID_SGLANG_TIERS)} (prefix: sglang/)"
+                )
+
+            from adapters.pure_llm_wrapper import PureLLMWrapper
+            return PureLLMWrapper(model_name=base_model)
+
+        raise ModelNotRecognizedException(
+            f"Model '{model_name}' is not registered.\n"
+            f"  SGLang tiers:  sglang/{{fast|deep|vision|coder}} (set PROJECTZEO_USE_SGLANG=1)\n"
+            f"  Local models:  {sorted(_LOCAL_REGISTRY.keys())}\n"
+            f"  Cloud prefix:  anthropic:<model> | openai:<model>\n"
+            f"  Legacy cloud:  {sorted(_CLOUD_REGISTRY)} (require OLLAMA_ONLY=0)\n"
+            "Add the model to the appropriate registry in adapters/factory.py."
+        )
 
     @staticmethod
     async def get_action(
@@ -373,14 +312,9 @@ class AdapterFactory:
             session_id=session_id,
         )
 
-
-# ---------------------------------------------------------------------------
-# Public tier-routing accessor used by ConsequenceReasoner
-# ---------------------------------------------------------------------------
-
 def get_reasoning_client(tier: str = "fast") -> Any:
     
-    from config.model_config import is_gpu_mode  # noqa: PLC0415
+    from config.model_config import is_gpu_mode
 
     if is_gpu_mode():
         try:
@@ -391,7 +325,6 @@ def get_reasoning_client(tier: str = "fast") -> Any:
                 "tier=%s, falling back to local: %s", tier, exc,
             )
 
-    # CPU fallback: local Ollama model
     local_model = os.environ.get("PROJECTZEO_LOCAL_MODEL", "qwen2.5-vl")
     try:
         return AdapterFactory.build_llm(local_model)
@@ -401,13 +334,7 @@ def get_reasoning_client(tier: str = "fast") -> Any:
         )
         raise
 
-
-# ---------------------------------------------------------------------------
-# Callable wrappers
-# ---------------------------------------------------------------------------
-
 class _CloudCallable:
-    """Wrap a cloud adapter so it satisfies the llm_callable protocol."""
 
     def __init__(self, adapter) -> None:
         self._adapter = adapter
@@ -422,10 +349,8 @@ class _CloudCallable:
     def __getattr__(self, name: str):
         return getattr(self._adapter, name)
 
-
 class _SGLangCallable:
     
-
     def __init__(self, adapter) -> None:
         self._adapter = adapter
         self.model_name: str = getattr(adapter, "_model_id", "sglang")
@@ -437,7 +362,6 @@ class _SGLangCallable:
         return self
 
     def with_thinking(self, enabled: bool) -> "_SGLangCallable":
-        """Return a thinking-mode toggled copy of this callable."""
         return _SGLangCallable(self._adapter.with_thinking(enabled))
 
     def health_check(self) -> bool:
@@ -449,13 +373,9 @@ class _SGLangCallable:
     def __getattr__(self, name: str):
         return getattr(self._adapter, name)
 
-
-# Module-level aliases for backward compatibility
 build_llm = AdapterFactory.build_llm
 
-
 class _Qwen3VLCallable:
-    """Wrap Qwen3VLAdapter so it satisfies the llm_callable protocol."""
 
     def __init__(self, adapter) -> None:
         self._adapter = adapter
@@ -470,7 +390,6 @@ class _Qwen3VLCallable:
         return self
 
     def with_thinking(self, enabled: bool) -> "_Qwen3VLCallable":
-        """Toggle thinking mode on the underlying adapter."""
         try:
             self._adapter._thinking = enabled
         except Exception:
@@ -486,16 +405,13 @@ class _Qwen3VLCallable:
     def __getattr__(self, name: str):
         return getattr(self._adapter, name)
 
-
 class _GUIActorCallable:
-    """Wrap GUIActorAdapter so it satisfies the llm_callable protocol."""
 
     def __init__(self, adapter) -> None:
         self._adapter = adapter
         self.model_name: str = getattr(adapter, "_model", "gui-actor-7b")
 
     def __call__(self, messages, objective=None, session_id=None):
-        # GUI-Actor is a grounding tool, not an LLM — return empty for text calls
         _logger.debug("[GUIActorCallable] text-only call — GUI-Actor is a grounding tool")
         return ""
 
