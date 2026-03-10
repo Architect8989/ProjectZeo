@@ -19,76 +19,59 @@ _MAX_PROFILES = 500
 _MAX_SHORTCUTS_PER_APP = 200
 _MAX_WORKFLOWS_PER_APP = 50
 
-
-# ---------------------------------------------------------------------------
-# Data model
-# ---------------------------------------------------------------------------
-
 @dataclass
 class InstallRecord:
-    """Result of an installation attempt."""
-    method: str           # e.g. "apt", "pip", "npm", "manual_download"
-    command: str          # The actual install command used
+    method: str
+    command: str
     success: bool
-    os_name: str          # "Linux", "Darwin", "Windows"
-    os_version: str       # e.g. "Ubuntu 22.04"
+    os_name: str
+    os_version: str
     timestamp: float = field(default_factory=time.time)
     error_message: str = ""
     installed_version: str = ""
 
-
 @dataclass
 class WorkflowStep:
-    """A single step in a known application workflow."""
     step_index: int
     description: str
-    action_type: str      # "click", "hotkey", "command", "type", etc.
-    action_detail: str    # The specific text/keys/command
+    action_type: str
+    action_detail: str
     success_rate: float = 1.0
-
 
 @dataclass
 class ApplicationProfile:
     
-    app_name: str                             # Normalised process name
-    display_name: str = ""                    # Human-readable name (e.g. "Blender 4.1")
+    app_name: str
+    display_name: str = ""
     first_seen: float = field(default_factory=time.time)
     last_seen: float = field(default_factory=time.time)
-    task_count: int = 0                       # Number of tasks run against this app
+    task_count: int = 0
 
-    # Shortcuts: {"action_name": {"keys": "Ctrl+T", "confidence": 0.9, "confirmed_count": 3}}
     shortcuts: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
-    # Menu paths: {"action": "File > Export > Export as PNG"}
     menu_paths: Dict[str, str] = field(default_factory=dict)
 
-    # Known workflows: {"workflow_name": [WorkflowStep, ...]}
     workflows: Dict[str, List[WorkflowStep]] = field(default_factory=dict)
 
-    # Installation history across OS/method combinations
     install_records: List[InstallRecord] = field(default_factory=list)
 
-    # Free-text quirks and notes
     quirks: List[str] = field(default_factory=list)
 
-    # Required setup steps (env vars, permissions, display setup, etc.)
     required_setup: List[str] = field(default_factory=list)
 
-    # Error → solution mappings: {"error_text_snippet": "solution_description"}
     error_solutions: Dict[str, str] = field(default_factory=dict)
 
-    # Metadata
+    attempt_history: List[Dict[str, Any]] = field(default_factory=list)
+
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     def is_known(self) -> bool:
-        """Return True if we have any substantive knowledge about this app."""
         return bool(
             self.shortcuts or self.menu_paths or self.workflows
             or self.install_records or self.quirks or self.required_setup
         )
 
     def best_install_method(self, os_name: str = "") -> Optional[InstallRecord]:
-        """Return the most recent successful install record for the given OS."""
         candidates = [
             r for r in self.install_records
             if r.success and (not os_name or r.os_name == os_name)
@@ -97,14 +80,43 @@ class ApplicationProfile:
             return None
         return max(candidates, key=lambda r: r.timestamp)
 
+    def add_attempt(
+        self,
+        objective: str,
+        success: bool,
+        lesson: str = "",
+        outcome_summary: str = "",
+        *,
+        max_history: int = 20,
+    ) -> None:
+        import time as _time
+        entry = {
+            "ts": _time.time(),
+            "objective": objective[:200],
+            "success": success,
+            "lesson": lesson[:300],
+            "outcome": outcome_summary[:200],
+        }
+        self.attempt_history.append(entry)
+        if len(self.attempt_history) > max_history:
+            self.attempt_history = self.attempt_history[-max_history:]
 
-# ---------------------------------------------------------------------------
-# ApplicationMemory
-# ---------------------------------------------------------------------------
+    def format_hindsight_for_prompt(self, max_entries: int = 5) -> str:
+        if not self.attempt_history:
+            return ""
+        entries = self.attempt_history[-max_entries:]
+        lines = ["[Chain of Hindsight — Prior Attempts]"]
+        for i, e in enumerate(entries, 1):
+            status = "✓ SUCCESS" if e.get("success") else "✗ FAILURE"
+            obj = e.get("objective", "")[:80]
+            lesson = e.get("lesson", "")[:120]
+            lines.append(f"  {i}. {status}: {obj}")
+            if lesson:
+                lines.append(f"     → Lesson: {lesson}")
+        return "\n".join(lines)
 
 class ApplicationMemory:
     
-
     def __init__(
         self,
         memory_dir: Optional[str] = None,
@@ -126,10 +138,6 @@ class ApplicationMemory:
             "[ApplicationMemory] Initialised. profiles=%d", len(self._profiles)
         )
 
-    # =========================================================================
-    # Profile access
-    # =========================================================================
-
     def get_profile(self, app_name: str) -> ApplicationProfile:
         
         key = self._normalize(app_name)
@@ -142,15 +150,10 @@ class ApplicationMemory:
             return self._profiles[key]
 
     def has_profile(self, app_name: str) -> bool:
-        """Return True if a profile with substantive knowledge exists."""
         key = self._normalize(app_name)
         with self._lock:
             p = self._profiles.get(key)
         return p is not None and p.is_known()
-
-    # =========================================================================
-    # Recording API
-    # =========================================================================
 
     def record_shortcut(
         self,
@@ -160,7 +163,6 @@ class ApplicationMemory:
         *,
         confirmed: bool = True,
     ) -> None:
-        """Record a keyboard shortcut for an application action."""
         profile = self.get_profile(app_name)
         action_key = action.strip().lower()
 
@@ -186,7 +188,6 @@ class ApplicationMemory:
         action: str,
         menu_path: str,
     ) -> None:
-        """Record a menu navigation path for an action."""
         profile = self.get_profile(app_name)
         profile.menu_paths[action.strip().lower()] = menu_path.strip()
         self._mark_dirty_and_update_seen(profile)
@@ -201,7 +202,6 @@ class ApplicationMemory:
         os_version: str = "",
         installed_version: str = "",
     ) -> None:
-        """Record a successful installation."""
         import platform as _plat
         profile = self.get_profile(app_name)
         record = InstallRecord(
@@ -226,7 +226,6 @@ class ApplicationMemory:
         os_name: str = "",
         os_version: str = "",
     ) -> None:
-        """Record a failed installation attempt."""
         import platform as _plat
         profile = self.get_profile(app_name)
         record = InstallRecord(
@@ -245,7 +244,6 @@ class ApplicationMemory:
         )
 
     def record_quirk(self, app_name: str, quirk: str) -> None:
-        """Record a UI quirk or gotcha for an application."""
         profile = self.get_profile(app_name)
         quirk_norm = quirk.strip()
         if quirk_norm and quirk_norm not in profile.quirks:
@@ -255,13 +253,11 @@ class ApplicationMemory:
     def record_error_solution(
         self, app_name: str, error_snippet: str, solution: str
     ) -> None:
-        """Record an error → solution mapping."""
         profile = self.get_profile(app_name)
         profile.error_solutions[error_snippet.strip()[:200]] = solution.strip()[:500]
         self._mark_dirty_and_update_seen(profile)
 
     def record_required_setup(self, app_name: str, setup_step: str) -> None:
-        """Record a required setup step (e.g. 'export DISPLAY=:0')."""
         profile = self.get_profile(app_name)
         step_norm = setup_step.strip()
         if step_norm and step_norm not in profile.required_setup:
@@ -269,14 +265,9 @@ class ApplicationMemory:
             self._mark_dirty_and_update_seen(profile)
 
     def increment_task_count(self, app_name: str) -> None:
-        """Increment the task count for the given application."""
         profile = self.get_profile(app_name)
         profile.task_count += 1
         self._mark_dirty_and_update_seen(profile)
-
-    # =========================================================================
-    # Prompt formatting
-    # =========================================================================
 
     def format_profile_for_prompt(
         self,
@@ -293,7 +284,6 @@ class ApplicationMemory:
         profile = self.get_profile(app_name)
         lines = [f"Application knowledge for: {profile.display_name or app_name}"]
 
-        # Install info
         best_install = profile.best_install_method()
         if best_install:
             lines.append(
@@ -302,13 +292,11 @@ class ApplicationMemory:
                 f"verified on {best_install.os_name})"
             )
 
-        # Required setup
         if profile.required_setup:
             lines.append("  Required setup before use:")
             for step in profile.required_setup[:3]:
                 lines.append(f"    - {step}")
 
-        # Top shortcuts
         if profile.shortcuts:
             top_shortcuts = sorted(
                 profile.shortcuts.items(),
@@ -319,23 +307,24 @@ class ApplicationMemory:
             for action, info in top_shortcuts:
                 lines.append(f"    {action}: {info['keys']}")
 
-        # Menu paths
         if profile.menu_paths:
             lines.append("  Menu paths:")
             for action, path in list(profile.menu_paths.items())[:5]:
                 lines.append(f"    {action}: {path}")
 
-        # Quirks
         if profile.quirks:
             lines.append("  Known quirks:")
             for quirk in profile.quirks[:max_quirks]:
                 lines.append(f"    - {quirk}")
 
-        # Error solutions
         if profile.error_solutions:
             lines.append("  Known errors and solutions:")
             for error, solution in list(profile.error_solutions.items())[:max_errors]:
                 lines.append(f"    If you see '{error}': {solution}")
+
+        hindsight = profile.format_hindsight_for_prompt(max_entries=5)
+        if hindsight:
+            lines.append(hindsight)
 
         lines.append(
             f"  (Profile from {profile.task_count} prior task(s). "
@@ -344,7 +333,6 @@ class ApplicationMemory:
         return "\n".join(lines)
 
     def list_known_apps(self) -> List[str]:
-        """Return sorted list of all apps with substantive profiles."""
         with self._lock:
             return sorted(
                 key for key, p in self._profiles.items() if p.is_known()
@@ -361,12 +349,7 @@ class ApplicationMemory:
         }
 
     def save(self) -> None:
-        """Force-save all profiles to disk."""
         self._persist()
-
-    # =========================================================================
-    # Persistence
-    # =========================================================================
 
     def _load(self) -> None:
         if not os.path.exists(self._memory_path):
@@ -376,11 +359,9 @@ class ApplicationMemory:
                 data = json.loads(f.read().decode("utf-8"))
             for raw in data.get("profiles", []):
                 try:
-                    # Deserialize install_records sub-list
                     raw["install_records"] = [
                         InstallRecord(**r) for r in raw.get("install_records", [])
                     ]
-                    # Deserialize workflows
                     workflows_raw = raw.pop("workflows", {})
                     workflows = {}
                     for wf_name, steps in workflows_raw.items():
@@ -441,7 +422,6 @@ class ApplicationMemory:
         except Exception:
             pass
 
-
 def _fmt_time(ts: float) -> str:
     import datetime
     try:
@@ -449,17 +429,10 @@ def _fmt_time(ts: float) -> str:
     except Exception:
         return "unknown"
 
-
-# ---------------------------------------------------------------------------
-# Module-level singleton
-# ---------------------------------------------------------------------------
-
 _global_app_memory: Optional[ApplicationMemory] = None
 _global_lock = threading.Lock()
 
-
 def get_global_application_memory(memory_dir: Optional[str] = None) -> ApplicationMemory:
-    """Return the process-singleton ApplicationMemory instance."""
     global _global_app_memory
     with _global_lock:
         if _global_app_memory is None:
