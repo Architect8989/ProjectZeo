@@ -250,6 +250,34 @@ class AgentOrchestrator:
         """Build the GIIGoalDirectedLoop as the final fallback."""
         try:
             from core.gii.gii_loop import GIIGoalDirectedLoop
+
+            # ── Build optional safety components ─────────────────────────────
+            vsa_verifier = None
+            try:
+                from core.safety.verisafe_agent import get_verisafe_agent
+                vsa_verifier = get_verisafe_agent()
+                _logger.info("[AgentOrchestrator] VeriSafe Agent wired to GIIGoalDirectedLoop.")
+            except Exception as exc:
+                _logger.debug("[AgentOrchestrator] VeriSafe Agent unavailable: %s", exc)
+
+            piguard = None
+            try:
+                from core.safety.piguard import get_piguard
+                piguard = get_piguard()
+                _logger.info("[AgentOrchestrator] PIGuard wired to GIIGoalDirectedLoop.")
+            except Exception as exc:
+                _logger.debug("[AgentOrchestrator] PIGuard unavailable: %s", exc)
+
+            # AT-SPI window registry for suspicious popup detection
+            atspi_window_registry = set()
+            try:
+                if self._atspi_bridge is not None:
+                    atspi_window_registry = getattr(
+                        self._atspi_bridge, "_window_registry", set()
+                    ) or set()
+            except Exception:
+                pass
+
             self._gii_loop = GIIGoalDirectedLoop(
                 gii_controller=self._gii_controller,
                 os_backend=self._os_backend,
@@ -262,11 +290,17 @@ class AgentOrchestrator:
                 watchdog=self._watchdog,
                 execute_decision_fn=self._execute_decision_fn,
                 on_action_executed=self._on_action_executed,
+                vsa_verifier=vsa_verifier,
+                piguard=piguard,
+                atspi_window_registry=atspi_window_registry,
+                use_process_fence=True,
             )
             self._backend_name = "gii_loop"
             _logger.info(
-                "[AgentOrchestrator] GIIGoalDirectedLoop ready (fallback). "
-                "Backend: gii_loop"
+                "[AgentOrchestrator] GIIGoalDirectedLoop ready. "
+                "vsa=%s piguard=%s atspi_registry=%d",
+                vsa_verifier is not None, piguard is not None,
+                len(atspi_window_registry),
             )
         except Exception as exc:
             _logger.error(
