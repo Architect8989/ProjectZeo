@@ -408,6 +408,37 @@ class OperatorCycle:
         if mem_context:
             user_content += f"\nPROCEDURAL MEMORY HINT:\n{mem_context}\n"
 
+        # ── NL2GenSym: Inject dynamic SOAR operator rules ──────────────────
+        # Generated once per task/milestone; cached for performance.
+        # Blueprint §3.1 — Yuan et al., arXiv:2510.09355
+        try:
+            from core.cognition.nl2gensym import get_nl2gensym
+            _nl2g = get_nl2gensym(llm_caller=None)  # Use existing singleton
+            if _nl2g._llm is None and hasattr(self, "_llm"):
+                _nl2g._llm = self._llm
+            _nl2g_rules = _nl2g.generate_operator_rules(
+                objective   = goal_desc or "",
+                world_state = wm.raw_world_state if hasattr(wm, "raw_world_state") else None,
+                app_context = wm.focused_app if hasattr(wm, "focused_app") else "",
+            )
+            if _nl2g_rules:
+                user_content += f"\n{_nl2g.rules_to_prompt_block(_nl2g_rules)}\n"
+        except Exception as _nl2g_exc:
+            _logger.debug("[OperatorCycle] NL2GenSym inject error: %s", _nl2g_exc)
+
+        # ── Inject DICP addendum from world_state if present ───────────────
+        if hasattr(wm, "raw_world_state") and isinstance(getattr(wm, "raw_world_state", None), dict):
+            _dicp_add = wm.raw_world_state.get("_dicp_policy_addendum", "")
+            if _dicp_add:
+                user_content += f"\n{_dicp_add}\n"
+            _tom_intent = wm.raw_world_state.get("_tom_user_intent", "")
+            if _tom_intent:
+                user_content += f"\n{_tom_intent}\n"
+            _s2_guidance = wm.raw_world_state.get("_agent_s2_guidance", "")
+            if _s2_guidance:
+                user_content += f"\n{_s2_guidance}\n"
+
+
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_content},
