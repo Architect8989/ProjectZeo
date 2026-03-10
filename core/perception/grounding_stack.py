@@ -212,6 +212,21 @@ class GroundingStack:
         with self._lock:
             self._stats.total_escalations += 1
 
+        # ── Tier 4b: Aguvis Pure-Vision Grounding ─────────────────────────────
+        # Fallback when GroundingDINO failed: pure screenshot-based grounding
+        # without accessibility tree. Useful in locked-down environments.
+        # Blueprint §6.4 — Xu et al., arXiv:2412.16177
+        r = self._tier4b_aguvis(screenshot, element_description, goal_context)
+        if r:
+            if r.confidence >= _T4_CONF:
+                r.latency_ms = (time.monotonic() - t_start) * 1000
+                self._record_hit(4)
+                return r
+            self._record_miss(4)
+
+        with self._lock:
+            self._stats.total_escalations += 1
+
         # ── Tier 5: Cloud VLM fallback ────────────────────────────────────────
         if _CLOUD_ENABLED:
             r = self._tier5_cloud(
@@ -462,10 +477,59 @@ class GroundingStack:
             _logger.debug("[GroundingStack] Tier-4 GDINO: %s", exc)
         return None
 
+    def _tier4b_aguvis(
+        self,
+        screenshot,
+        description: str,
+        goal_context: str = "",
+    ):
+        """
+        Tier 4b: Aguvis pure-vision grounding.
+        Blueprint §6.4 — Falls back to this when GroundingDINO unavailable.
+        Operates on screenshot alone without accessibility tree.
+        """
+        try:
+            from core.vision.aguvis_adapter import get_aguvis_adapter
+            aguvis = get_aguvis_adapter(
+                screen_width  = self._screen_width  if hasattr(self, "_screen_width")  else 1920,
+                screen_height = self._screen_height if hasattr(self, "_screen_height") else 1080,
+                llm_caller    = self._llm_callable  if hasattr(self, "_llm_callable")  else None,
+            )
+            if not aguvis.is_available():
+                return None
+            # Convert screenshot to b64 if needed
+            import base64, io
+            if hasattr(screenshot, "tobytes"):
+                buf = io.BytesIO()
+                screenshot.save(buf, format="PNG")
+                b64 = base64.b64encode(buf.getvalue()).decode()
+            elif isinstance(screenshot, (bytes, bytearray)):
+                b64 = base64.b64encode(screenshot).decode()
+            else:
+                b64 = str(screenshot)
+
+            instruction = f"{description} — {goal_context}" if goal_context else description
+            ag_result = aguvis.ground(b64, instruction[:200])
+            if ag_result.success and ag_result.pixel_coordinate:
+                from core.perception.grounding_stack import GroundingResult as GR
+                return GR(
+                    element_description = ag_result.element_description or description,
+                    coordinate          = ag_result.pixel_coordinate,
+                    confidence          = ag_result.confidence,
+                    tier_used           = 4,
+                    tier_name           = "Aguvis",
+                    source              = "aguvis_pure_vision",
+                    bbox                = None,
+                )
+        except Exception as exc:
+            _logger.debug("[GroundingStack] Tier-4b Aguvis: %s", exc)
+        return None
+
     def _tier5_cloud(
         self,
         screenshot,
         description: str,
+
         *,
         goal_context: str = "",
         current_app: str = "",
