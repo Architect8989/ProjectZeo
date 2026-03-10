@@ -82,6 +82,8 @@ class UserModel:
       - on_approval(app, operation)
       - on_denial(app, operation)
       - on_task_complete(success, duration_s)
+      - urgency → float [0,1]       Blueprint §12: urgency signal for PSR skip
+      - frustration → float [0,1]   Blueprint §12: frustration signal
     """
 
     def __init__(self, state_path: Optional[str] = None) -> None:
@@ -91,6 +93,16 @@ class UserModel:
         self._apps:       Dict[str, AppExpertise] = {}
         self._task_hist:  List[Dict[str, Any]]    = []
         self._goal_vocab: Dict[str, int]           = {}
+
+        # ── Urgency / Frustration (Blueprint §12 — Social Layer) ─────────────
+        # urgency: 0=patient, 1=urgent. Inferred from rapid repeated denials
+        # or explicit "hurry" / "quick" language in objectives.
+        # frustration: 0=calm, 1=frustrated. High denial rate + failure streak.
+        # Both decay over time toward neutral (0.5 baseline).
+        self._urgency:      float = 0.0
+        self._frustration:  float = 0.0
+        self._last_emo_update: float = time.time()
+
         self._load()
         _logger.debug("[UserModel] Loaded. apps=%d", len(self._apps))
 
@@ -116,7 +128,48 @@ class UserModel:
             # User wants more control
             self._update_pref("interruption_tolerance", +0.03)
             self._update_pref("autonomy_preference", -0.04)
+            # Repeated denials → frustration signal
+            self._frustration = min(1.0, self._frustration + 0.1)
         self._save_async()
+
+    def on_objective_received(self, objective: str) -> None:
+        """
+        Blueprint §12: Infer urgency from objective language.
+        Keywords like "quickly", "urgent", "now", "asap", "hurry" trigger
+        urgency signal which causes PSR to skip the Self-Refine critique pass.
+        """
+        urgency_keywords = {
+            "urgent", "urgently", "quickly", "quick", "asap", "hurry",
+            "immediately", "now", "fast", "right away", "as soon as",
+        }
+        obj_lower = objective.lower()
+        if any(kw in obj_lower for kw in urgency_keywords):
+            with self._lock:
+                self._urgency = min(1.0, self._urgency + 0.4)
+                self._last_emo_update = time.time()
+            _logger.debug("[UserModel] Urgency signal detected in objective: %.2f", self._urgency)
+
+    @property
+    def urgency(self) -> float:
+        """
+        Current urgency level [0,1].
+        Decays toward 0 at 0.05/minute. PSR skips Self-Refine when >= 0.7.
+        """
+        with self._lock:
+            elapsed_min = (time.time() - self._last_emo_update) / 60.0
+            decayed = max(0.0, self._urgency - 0.05 * elapsed_min)
+            return decayed
+
+    @property
+    def frustration(self) -> float:
+        """
+        Current frustration level [0,1].
+        Decays toward 0 at 0.02/minute. Used for empathetic prompt framing.
+        """
+        with self._lock:
+            elapsed_min = (time.time() - self._last_emo_update) / 60.0
+            decayed = max(0.0, self._frustration - 0.02 * elapsed_min)
+            return decayed
 
     def on_task_complete(
         self,
@@ -138,8 +191,13 @@ class UserModel:
 
             if success:
                 self._update_pref("autonomy_preference", +0.01)
+                # Task success resets frustration
+                self._frustration = max(0.0, self._frustration - 0.3)
+                self._urgency = max(0.0, self._urgency - 0.5)
             else:
                 self._update_pref("autonomy_preference", -0.02)
+                # Task failure increases frustration slightly
+                self._frustration = min(1.0, self._frustration + 0.05)
 
             if objective:
                 for word in objective.lower().split()[:10]:
