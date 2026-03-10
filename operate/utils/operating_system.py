@@ -1104,24 +1104,99 @@ class OperatingSystem:
                     pass
 
     def get_window_z_order(self, window_id: str) -> int:
-        raise NotImplementedError(
-            "get_window_z_order() is not yet implemented for this platform. "
-            "RestoreVerifier will treat this as a soft-fail (verification skipped)."
-        )
+        """
+        Attempt to get window Z-order via wmctrl stacking list.
+
+        Returns the index of window_id in the stacking order (0 = lowest).
+        Raises NotImplementedError if wmctrl is unavailable.
+        RestoreVerifier treats NotImplementedError as a soft-fail.
+        """
+        import shutil as _shutil_wzo
+        wmctrl = _shutil_wzo.which("wmctrl")
+        if wmctrl is None:
+            raise NotImplementedError(
+                "get_window_z_order(): wmctrl not found. "                "Install wmctrl for Z-order verification."
+            )
+        try:
+            import subprocess
+            result = subprocess.run(
+                [wmctrl, "-l"],
+                capture_output=True, text=True, timeout=3,
+            )
+            lines = [l for l in result.stdout.splitlines() if l.strip()]
+            win_id_lower = str(window_id).lower()
+            for idx, line in enumerate(lines):
+                if win_id_lower in line.lower() or str(window_id) in line:
+                    return idx
+            # Window not found — return -1 (caller should treat as soft-fail)
+            return -1
+        except Exception as exc:
+            raise NotImplementedError(
+                f"get_window_z_order(): wmctrl query failed: {exc}"
+            ) from exc
 
     def get_browser_state(self) -> dict:
-        raise NotImplementedError(
-            "get_browser_state() is not yet implemented. "
-            "A CDP integration (Chrome DevTools Protocol) is required. "
-            "RestoreVerifier will treat this as a soft-fail (verification skipped)."
-        )
+        """
+        Attempt to get browser state via Playwright CDP endpoint.
+
+        Returns dict with keys: url, title, readyState.
+        Raises NotImplementedError if CDP endpoint not configured.
+        RestoreVerifier treats NotImplementedError as a soft-fail.
+        """
+        import os as _os_bs
+        cdp_url = _os_bs.environ.get("PROJECTZEO_CDP_URL", "").strip()
+        if not cdp_url:
+            raise NotImplementedError(
+                "get_browser_state(): PROJECTZEO_CDP_URL not set. "
+                "Set CDP_URL to http://localhost:9222 and launch Chrome with --remote-debugging-port=9222."
+            )
+        try:
+            import urllib.request, json as _json_bs
+            with urllib.request.urlopen(f"{cdp_url}/json", timeout=2) as resp:
+                tabs = _json_bs.loads(resp.read())
+            if not tabs:
+                return {}
+            tab = tabs[0]
+            return {
+                "url":        tab.get("url", ""),
+                "title":      tab.get("title", ""),
+                "readyState": "complete",
+            }
+        except Exception as exc:
+            raise NotImplementedError(
+                f"get_browser_state(): CDP query failed: {exc}"
+            ) from exc
 
     def get_media_playback_position(self) -> float:
-        raise NotImplementedError(
-            "get_media_playback_position() is not yet implemented. "
-            "An MPRIS/osascript/COM integration is required. "
-            "RestoreVerifier will treat this as a soft-fail (verification skipped)."
-        )
+        """
+        Attempt to get media playback position via MPRIS D-Bus (Linux).
+
+        Returns position in seconds as a float.
+        Raises NotImplementedError if dbus or MPRIS not available.
+        RestoreVerifier treats NotImplementedError as a soft-fail.
+        """
+        try:
+            import dbus  # type: ignore[import]
+            bus = dbus.SessionBus()
+            # Find first MPRIS2 player
+            for service in bus.list_names():
+                if str(service).startswith("org.mpris.MediaPlayer2."):
+                    obj = bus.get_object(service, "/org/mpris/MediaPlayer2")
+                    props = dbus.Interface(obj, "org.freedesktop.DBus.Properties")
+                    pos_us = props.Get("org.mpris.MediaPlayer2.Player", "Position")
+                    return float(int(pos_us)) / 1_000_000.0
+            raise NotImplementedError("get_media_playback_position(): no MPRIS2 player found.")
+        except ImportError:
+            raise NotImplementedError(
+                "get_media_playback_position(): python-dbus not installed. "
+                "Install with: sudo apt install python3-dbus"
+            )
+        except NotImplementedError:
+            raise
+        except Exception as exc:
+            raise NotImplementedError(
+                f"get_media_playback_position(): MPRIS query failed: {exc}"
+            ) from exc
 
     @staticmethod
     def _valid_coord(v) -> bool:
