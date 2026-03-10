@@ -723,6 +723,13 @@ class ConsequenceReasoner:
 
         self._is_evaluating: threading.Event = threading.Event()
 
+        # GII-WIRE: V-JEPA World Model integration (Blueprint §13.2)
+        # When set, evaluate() calls vjepa.predict_and_score() for CAUTION/
+        # IRREVERSIBLE actions.  A high surprise score (> SURPRISE_THRESHOLD)
+        # upgrades CAUTION → IRREVERSIBLE before Tier 2/3 runs.
+        # Set via set_vjepa_world_model() from GIIController.
+        self._vjepa_world_model: Optional[Any] = None
+
         _logger.info(
             "[ConsequenceReasoner] Initialised. tier2=%s tier3=%s "
             "tier2_callable=%s tier3_callable=%s cpu_only=%s",
@@ -765,6 +772,21 @@ class ConsequenceReasoner:
             _logger.debug(
                 "[ConsequenceReasoner] Auto-wire tiered endpoints skipped: %s", exc
             )
+
+    def set_vjepa_world_model(self, vjepa: Any) -> None:
+        """
+        GII-WIRE: Register VJEPAWorldModel for surprise-signal integration.
+
+        When set, evaluate() calls vjepa.predict_and_score() on CAUTION and
+        IRREVERSIBLE actions.  If surprise_score > SURPRISE_THRESHOLD the
+        reversibility is upgraded to IRREVERSIBLE before Tier 2/3 runs,
+        forcing deeper safety evaluation on high-uncertainty actions.
+
+        Called by GIIController after both are initialised:
+            cr.set_vjepa_world_model(self._vjepa_world_model)
+        """
+        self._vjepa_world_model = vjepa
+        _logger.info("[ConsequenceReasoner] VJEPAWorldModel registered for surprise-signal integration.")
 
     @property
     def is_evaluating(self) -> bool:
@@ -838,6 +860,46 @@ class ConsequenceReasoner:
                 "forcing Tier 3 evaluation regardless of reversibility."
             )
             reversibility = Reversibility.IRREVERSIBLE
+
+        # ── TIER 1.5: V-JEPA Surprise Signal (Blueprint §13.2) ──────────────
+        # If V-JEPA world model is available and the action is CAUTION or
+        # IRREVERSIBLE, query V-JEPA to predict side effects.  High surprise
+        # (prediction uncertainty / unexpected side effects) upgrades
+        # CAUTION → IRREVERSIBLE so the action receives Tier 3 deep evaluation.
+        #
+        # This closes the "prediction error as surprise signal → dangerous
+        # action" loop described in Blueprint §13.2 — the loop that was
+        # completely absent before this patch.
+        _vjepa_prediction: Optional[dict] = None
+        if (
+            self._vjepa_world_model is not None
+            and reversibility != Reversibility.REVERSIBLE
+        ):
+            try:
+                _screenshot_b64 = str(action.get("_screenshot_b64") or "")
+                _vjepa_prediction = self._vjepa_world_model.predict_and_score(
+                    screenshot_b64=_screenshot_b64,
+                    action=action,
+                    context=objective[:200],
+                    current_world_state=action.get("_world_state_snapshot") or {},
+                )
+                _surprise = float(_vjepa_prediction.get("surprise_score", 0.0))
+                from adapters.vjepa_adapter import SURPRISE_THRESHOLD as _ST
+                if reversibility == Reversibility.CAUTION and _surprise > _ST:
+                    _logger.info(
+                        "[ConsequenceReasoner] V-JEPA surprise=%.3f > %.3f for %s — "
+                        "upgrading CAUTION → IRREVERSIBLE (forces Tier 3).",
+                        _surprise, _ST, op,
+                    )
+                    reversibility = Reversibility.IRREVERSIBLE
+                    action = dict(action)  # copy before mutating
+                    action["_vjepa_surprise"] = _surprise
+                    action["_vjepa_predicted"] = str(
+                        _vjepa_prediction.get("predicted_state", "")
+                    )[:200]
+                    action["_vjepa_side_effects"] = _vjepa_prediction.get("side_effects", [])
+            except Exception as _vj_exc:
+                _logger.debug("[ConsequenceReasoner] V-JEPA surprise check failed (non-fatal): %s", _vj_exc)
 
         if reversibility == Reversibility.REVERSIBLE:
             external_source = bool(action.get("_external_content_source"))
