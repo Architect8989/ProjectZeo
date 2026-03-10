@@ -105,6 +105,10 @@ class GIIController:
 
         self._htn_planner        = None
 
+        # GII-WIRE: VJEPAWorldModel initialised in _initialise_phase1_components
+        # and wired to both ConsequenceReasoner and HTNPlanner
+        self._vjepa_world_model  = None
+
         self._trajectory_flywheel = None
         self._algorithm_distiller = None
         self._soar_chunker        = None
@@ -295,6 +299,16 @@ class GIIController:
             _logger.info(
                 "[GIIController] ConsequenceReasoner: tier2=True tier3=%s", enable_tier3
             )
+            # Late-wire VJEPAWorldModel if it was already initialised
+            # (phase1 runs after _initialise_components, so this handles the
+            # case where phase1 runs first in a different init order)
+            if self._vjepa_world_model is not None:
+                try:
+                    self._consequence_reasoner.set_vjepa_world_model(self._vjepa_world_model)
+                    self._vjepa_world_model.set_consequence_reasoner(self._consequence_reasoner)
+                    _logger.info("[GIIController] V-JEPA ↔ CR late-wired in _initialise_components.")
+                except Exception as _lw_exc:
+                    _logger.debug("[GIIController] V-JEPA late-wire failed: %s", _lw_exc)
         except Exception as exc:
             _logger.warning("[GIIController] ConsequenceReasoner init failed: %s", exc)
 
@@ -402,12 +416,15 @@ class GIIController:
 
         try:
             from core.cognition.user_model import UserModel
+            # GII-FIX: Old code called UserModel(memory_dir=memory_dir) but
+            # UserModel.__init__ only accepted state_path.  UserModel is now
+            # patched to accept memory_dir= as well, deriving state_path from it.
             self._user_model = UserModel(memory_dir=memory_dir)
             # WIRE: Notify UserModel of new objective for urgency/frustration detection
             # Blueprint §12 — urgency signal skips expensive Self-Refine critique
             # when user says quickly / asap / hurry etc. in task description.
             try:
-                self._user_model.on_objective_received(objective)
+                self._user_model.on_objective_received(self._objective)
             except Exception:
                 pass
             _logger.info("[GIIController] UserModel (ToM + urgency-adapt) active.")
@@ -506,6 +523,37 @@ class GIIController:
         except Exception as exc:
             _logger.warning("[GIIController] OpenMemoryStore init failed: %s", exc)
 
+        # GII-WIRE: VJEPAWorldModel (Blueprint §13.2)
+        # Initialise BEFORE ConsequenceReasoner and HTNPlanner so it can be
+        # wired into both.  Also sets back-reference for notification flow.
+        try:
+            from adapters.vjepa_adapter import get_vjepa_world_model
+            self._vjepa_world_model = get_vjepa_world_model(llm_callable=self._llm)
+            _logger.info(
+                "[GIIController] VJEPAWorldModel active. mode=%s",
+                self._vjepa_world_model._mode,
+            )
+            # Wire to ConsequenceReasoner if already initialised
+            if self._consequence_reasoner is not None:
+                try:
+                    self._consequence_reasoner.set_vjepa_world_model(self._vjepa_world_model)
+                    self._vjepa_world_model.set_consequence_reasoner(self._consequence_reasoner)
+                    _logger.info("[GIIController] V-JEPA ↔ ConsequenceReasoner cross-wired.")
+                except Exception as _w_exc:
+                    _logger.debug("[GIIController] V-JEPA→CR wire failed: %s", _w_exc)
+        except Exception as exc:
+            _logger.warning("[GIIController] VJEPAWorldModel init failed: %s", exc)
+            self._vjepa_world_model = None
+
+        # GII-WIRE: Wire SemanticMemory ACT-R active goal to root objective
+        # so every memory query during planning gets spreading activation boost.
+        if self._semantic_memory is not None:
+            try:
+                self._semantic_memory.set_active_goal(self._objective)
+                _logger.debug("[GIIController] SemanticMemory.set_active_goal seeded at init.")
+            except Exception as _sam_exc:
+                _logger.debug("[GIIController] SemanticMemory.set_active_goal failed: %s", _sam_exc)
+
         try:
             from core.cognition.goal_representation import GoalRepresentation
             self._goal_repr = GoalRepresentation(
@@ -551,8 +599,13 @@ class GIIController:
             self._htn_planner = HTNPlanner(
                 llm_call=self._llm,
                 objective=self._objective,
+                consequence_reasoner=self._consequence_reasoner,
+                # GII-WIRE: ACT-R spreading activation — HTNPlanner calls
+                # semantic_memory.set_active_goal() for each sub-task during
+                # decompose() so memory queries auto-boost task-relevant facts.
+                semantic_memory=self._semantic_memory,
             )
-            _logger.info("[GIIController] HTNPlanner active.")
+            _logger.info("[GIIController] HTNPlanner active (with ACT-R SemanticMemory wiring).")
         except Exception as exc:
             _logger.warning("[GIIController] HTNPlanner init failed: %s", exc)
 

@@ -1049,6 +1049,54 @@ class GIIGoalDirectedLoop:
 
             exec_success = False
             exec_output = ""
+
+            # ── GII-WIRE: V-JEPA Pre-Action World Prediction (Blueprint §13.2) ──
+            # Before dispatching, ask V-JEPA to predict the post-action screen
+            # state.  If surprise is high we inject a warning into world_state
+            # for the PSR to consider, and store the prediction for post-action
+            # mismatch detection.
+            _vjepa_prediction_pre: Optional[dict] = None
+            _vjepa = getattr(self._gii, "_vjepa_world_model", None)
+            if _vjepa is not None and _screenshot_b64 is not None:
+                try:
+                    _vjepa_prediction_pre = _vjepa.predict_and_score(
+                        screenshot_b64=_screenshot_b64,
+                        action=action,
+                        context=self._current_milestone or self._objective,
+                        current_world_state=world_state,
+                    )
+                    _surprise = float(_vjepa_prediction_pre.get("surprise_score", 0.0))
+                    from adapters.vjepa_adapter import SURPRISE_THRESHOLD as _ST
+                    if _surprise > _ST:
+                        world_state["_vjepa_high_surprise_warning"] = (
+                            f"V-JEPA predicts HIGH surprise ({_surprise:.2f}) for "
+                            f"{action.get('operation','?')}: "
+                            f"{_vjepa_prediction_pre.get('surprise_reason', '')}. "
+                            f"Predicted side effects: {_vjepa_prediction_pre.get('side_effects', [])}. "
+                            "Review carefully before proceeding."
+                        )
+                        self._journal.record({
+                            "event": "vjepa_high_surprise_pre_dispatch",
+                            "iteration": self._iteration,
+                            "operation": action.get("operation"),
+                            "surprise_score": _surprise,
+                            "side_effects": _vjepa_prediction_pre.get("side_effects", []),
+                        })
+                        _logger.info(
+                            "[GIILoop] V-JEPA pre-dispatch surprise=%.3f for %s (iter=%d)",
+                            _surprise, action.get("operation","?"), self._iteration,
+                        )
+                    # Attach screenshot + world_state snapshot to action so
+                    # ConsequenceReasoner can reuse them without re-capturing
+                    action = dict(action)
+                    action["_screenshot_b64"] = _screenshot_b64
+                    action["_world_state_snapshot"] = {
+                        k: v for k, v in world_state.items()
+                        if not k.startswith("_") and isinstance(v, (str, int, float, bool))
+                    }
+                except Exception as _vj_loop_exc:
+                    _logger.debug("[GIILoop] V-JEPA pre-dispatch failed (non-fatal): %s", _vj_loop_exc)
+
             try:
                 if self._use_process_fence:
                     try:
@@ -1130,6 +1178,35 @@ class GIIGoalDirectedLoop:
                 _next_ws = self._get_world_state()
                 self._update_ai_from_outcome(_prev_ws, action, _next_ws, exec_success)
                 self._prev_world_state_for_ai = _next_ws
+
+                # GII-WIRE: V-JEPA Post-Action Mismatch Detection (Blueprint §13.2)
+                # Compare V-JEPA's pre-action prediction against actual world state.
+                # High mismatch → world behaved differently than expected → force
+                # re-observe and inject replan signal into world_state.
+                if _vjepa is not None and _vjepa_prediction_pre is not None:
+                    try:
+                        _mismatch = _vjepa.compute_mismatch_signal(_vjepa_prediction_pre, _next_ws)
+                        if _mismatch > 0.6:
+                            _logger.info(
+                                "[GIILoop] V-JEPA mismatch=%.3f post-action — "
+                                "world differs from prediction. Forcing re-observe (iter=%d)",
+                                _mismatch, self._iteration,
+                            )
+                            self._journal.record({
+                                "event": "vjepa_mismatch_replan",
+                                "iteration": self._iteration,
+                                "mismatch_score": _mismatch,
+                                "predicted": str(_vjepa_prediction_pre.get("predicted_state",""))[:80],
+                                "actual_app": _next_ws.get("focused_app","?"),
+                            })
+                            world_state["_vjepa_mismatch_replan"] = (
+                                f"V-JEPA world mismatch detected ({_mismatch:.2f}): "
+                                f"expected '{str(_vjepa_prediction_pre.get('predicted_state','?'))[:60]}' "
+                                f"but actual state is different. Re-evaluate your plan."
+                            )
+                            self._last_reasoning_phash = None  # force re-observe
+                    except Exception as _vj_mm_exc:
+                        _logger.debug("[GIILoop] V-JEPA mismatch check failed: %s", _vj_mm_exc)
 
                 # WIRE-NEW: DICP observe — record outcome for in-context policy
                 self._dicp_observe(action, exec_success, exec_output)
