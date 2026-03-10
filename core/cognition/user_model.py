@@ -123,7 +123,20 @@ class UserModel:
     Blueprint §17: Theory of Mind + Social Modeling.
     """
 
-    def __init__(self, state_path: Optional[str] = None) -> None:
+    def __init__(
+        self,
+        state_path: Optional[str] = None,
+        *,
+        memory_dir: Optional[str] = None,  # GII-FIX: accept memory_dir from GIIController
+    ) -> None:
+        # GII-FIX: GIIController calls UserModel(memory_dir=memory_dir) but the
+        # old __init__ only accepted state_path.  Derive state_path from memory_dir
+        # if state_path is not explicitly given, so the file lands in the right
+        # location alongside the other memory stores.
+        if state_path is None and memory_dir is not None:
+            import pathlib
+            state_path = str(pathlib.Path(memory_dir) / "user_model.json")
+
         self._path = state_path or _STATE_PATH
         self._lock = threading.Lock()
         self._prefs      = UserPreferences()
