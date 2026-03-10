@@ -205,6 +205,28 @@ class ARPOTrainer:
             "training_dir":          self._dir,
         }
 
+    def export_fisher_state(self) -> Optional[Dict[str, Any]]:
+        """
+        Export the current EWC Fisher matrix for import by GRPOTrainer.
+        Blueprint §9.2: The EWC Fisher penalty should be shared between
+        ARPO and GRPO to prevent either trainer from overwriting the other's
+        skills (catastrophic forgetting).
+
+        Returns: {"fisher": {...}, "theta_star": {...}} or None if not computed.
+        """
+        try:
+            from core.learning.grpo_trainer import get_grpo_trainer
+            grpo = get_grpo_trainer()
+            ewc = grpo._ewc
+            if ewc._computed and ewc._fisher:
+                return {
+                    "fisher": dict(ewc._fisher),
+                    "theta_star": dict(ewc._theta_star),
+                }
+        except Exception as exc:
+            _logger.debug("[ARPO] export_fisher_state failed: %s", exc)
+        return None
+
 
 class UIEvol:
 

@@ -11,7 +11,10 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 _logger = logging.getLogger(__name__)
 
-_ENABLED     = os.environ.get("PROJECTZEO_GRPO_ENABLED", "0").strip() == "1"
+# ── GRPO default changed to "1" (Blueprint §9.2) ────────────────────────────
+# Previous default was "0" (disabled), which meant GRPO fine-tuning never ran.
+# Set PROJECTZEO_GRPO_ENABLED=0 to disable if hardware is insufficient.
+_ENABLED     = os.environ.get("PROJECTZEO_GRPO_ENABLED", "1").strip() == "1"
 _GROUP_SIZE  = int(os.environ.get("PROJECTZEO_GRPO_GROUP_SIZE", "4"))
 _BETA        = float(os.environ.get("PROJECTZEO_GRPO_BETA", "0.01"))
 _OUTPUT_DIR  = os.path.expanduser(os.environ.get("PROJECTZEO_GRPO_OUTPUT_DIR", "~/.projectzeo/grpo"))
@@ -93,6 +96,36 @@ class GRPOTrainer:
     def init_ewc(self, model_state: Dict[str, Any], calibration_data: List[Dict]) -> None:
         self._ewc.compute_fisher(model_state, calibration_data)
 
+    def sync_ewc_from_arpo(self) -> bool:
+        """
+        Blueprint §9.2: Import EWC Fisher matrix from ARPOTrainer.
+        GRPO training should be protected by the same catastrophic-forgetting
+        penalty that ARPO uses — otherwise GRPO can overwrite skills that
+        ARPO preserved.
+
+        Calls this before run_training_pass() to ensure the EWC penalty
+        reflects the most recent Fisher matrix computed after the last
+        ARPO training batch.
+
+        Returns True if Fisher was successfully imported, False otherwise.
+        """
+        try:
+            from core.learning.arpo_trainer import get_arpo_trainer
+            arpo = get_arpo_trainer()
+            fisher_export = arpo.export_fisher_state()
+            if fisher_export:
+                self._ewc._fisher     = fisher_export.get("fisher", {})
+                self._ewc._theta_star = fisher_export.get("theta_star", {})
+                self._ewc._computed   = bool(self._ewc._fisher)
+                _logger.info(
+                    "[GRPO] EWC synced from ARPOTrainer: %d parameters.",
+                    len(self._ewc._fisher),
+                )
+                return True
+        except Exception as exc:
+            _logger.debug("[GRPO] EWC sync from ARPO failed (non-fatal): %s", exc)
+        return False
+
     def run_training_pass(
         self,
         tasks: List[Dict[str, Any]],
@@ -101,6 +134,9 @@ class GRPOTrainer:
         if not _ENABLED:
             _logger.info("[GRPO] Disabled — skipping training pass.")
             return ""
+
+        # Auto-sync EWC Fisher from ARPOTrainer to prevent catastrophic forgetting
+        self.sync_ewc_from_arpo()
 
         tasks = tasks[:max_tasks]
         samples: List[GRPOSample] = []
