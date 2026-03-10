@@ -785,6 +785,33 @@ def main(llm_callable: Callable, model_name: str) -> None:
                         f"enabled={gii_controller.enabled}",
                         file=sys.stderr,
                     )
+                    # ── UnifiedMemory: ensure startup reconciliation ran ────────
+                    # Handles FAISS→Qdrant migration and cross-backend sync.
+                    # Already started async in GIIController._initialise_phase3_components().
+                    # Log the memory health dashboard at startup.
+                    try:
+                        _unified_mem = getattr(gii_controller, "_unified_memory", None)
+                        if _unified_mem is not None:
+                            _mem_health = _unified_mem.health_report()
+                            _active_backends = [k for k, v in _mem_health.items() if v.get("usable")]
+                            print(
+                                f"[MAIN] UnifiedMemory active backends: {_active_backends}",
+                                file=sys.stderr,
+                            )
+                        # ── DualModeReasoner: log tier routing status ──────────
+                        _dmr = getattr(gii_controller, "_dual_mode_reasoner", None)
+                        if _dmr is not None:
+                            _dmr_stats = _dmr.get_stats()
+                            print(
+                                f"[MAIN] DualModeReasoner: SGLang={_dmr_stats.get('sglang_available', False)}",
+                                file=sys.stderr,
+                            )
+                        # ── ReasoningEngine: confirm active for stagnation recovery
+                        _re = getattr(gii_controller, "_reasoning_engine", None)
+                        if _re is not None:
+                            print("[MAIN] ReasoningEngine stagnation recovery: ACTIVE", file=sys.stderr)
+                    except Exception as _health_exc:
+                        pass
                 except Exception as _gii_err:
                     _gii_degraded_msg = (
                         f"\n[MAIN] ⚠  CAPABILITY DEGRADED — GIIController FAILED TO INIT\n"
