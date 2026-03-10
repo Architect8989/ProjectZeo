@@ -1,30 +1,3 @@
-"""
-core/gii/gii_controller.py — Central GII orchestrator.
-
-GII UPGRADES (v3 — March 2026):
-  ✅ PROJECTZEO_USE_MILESTONES now defaults to 1 (enabled).
-     Milestone decomposition is the key difference between scripted and GII.
-     The original default of 0 (disabled) meant the system never used its own
-     goal decomposer. Fixed.
-
-  ✅ WorldModel integration — persistent world model built from perception
-     and injected into PerStepReasoner for every reasoning call.
-
-  ✅ SelfModel integration — agent tracks its own capabilities, error rates,
-     and learns what it does/doesn't know.
-
-  ✅ Continuous vision during execution — after every action dispatch,
-     PerStepReasoner.push_screenshot() is called with a fresh screen capture
-     so the VL model always reasons on current visual state.
-
-  ✅ PerStepReasoner failure escalation — if PSR fails to initialize,
-     operator gets a LOUD error (not a silent degraded-mode warning).
-
-  ✅ Mid-task episodic checkpoints every 50 iterations (configurable).
-  ✅ LLM lesson synthesis post-task. 
-  ✅ Denied action key tracking.
-  ✅ Full Mem0 + Cognee memory integration.
-"""
 from __future__ import annotations
 
 import logging
@@ -36,45 +9,33 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 _logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-
 _EPISODIC_CHECKPOINT_INTERVAL: int = max(
     1,
     int(os.environ.get("PROJECTZEO_EPISODIC_CHECKPOINT_INTERVAL", "50") or "50"),
 )
 
-# ARCH FIX: Milestones NOW DEFAULT TO ENABLED.
-# Set PROJECTZEO_USE_MILESTONES=0 to disable.
 _USE_MILESTONES: bool = (
     os.environ.get("PROJECTZEO_USE_MILESTONES", "1").strip() != "0"
 )
 
-# World model: persist facts about the environment across actions
 _USE_WORLD_MODEL: bool = (
     os.environ.get("PROJECTZEO_USE_WORLD_MODEL", "1").strip() != "0"
 )
 
-# Self model: agent tracks its own capabilities
 _USE_SELF_MODEL: bool = (
     os.environ.get("PROJECTZEO_USE_SELF_MODEL", "1").strip() != "0"
 )
-
 
 class GIIMode:
     DISABLED = 0
     BASIC    = 1
     FULL     = 2
 
-
 def get_gii_mode() -> int:
-    """Default is FULL (2). Consequence reasoning is not opt-in."""
     try:
         return int(os.environ.get("PROJECTZEO_GII_MODE", str(GIIMode.FULL)))
     except (ValueError, TypeError):
         return GIIMode.FULL
-
 
 def _print_startup_safety_banner(
     gii_mode: int,
@@ -107,7 +68,6 @@ def _print_startup_safety_banner(
             file=sys.stderr,
         )
 
-
 class GIIController:
 
     def __init__(
@@ -125,44 +85,41 @@ class GIIController:
         self._gii_mode  = gii_mode
         self._enabled   = gii_mode > GIIMode.DISABLED
 
-        # Core reasoning components
         self._per_step_reasoner    = None
         self._consequence_reasoner = None
 
-        # Memory tiers
         self._semantic_memory    = None
         self._application_memory = None
         self._mem0_store         = None
         self._cognee_store       = None
         self._episodic_synthesizer = None
 
-        # NEW GII modules
-        self._world_model        = None   # Persistent world model
-        self._self_model         = None   # Agent self-model
+        self._world_model        = None
+        self._self_model         = None
 
-        # Phase 1: SOAR Cognitive Loop (blueprint §3.3)
-        self._operator_cycle     = None   # SOAR operator-selection cycle
-        self._goal_repr          = None   # Structured goal representation
-        self._global_workspace   = None   # GWT broadcaster (§2.3.4)
+        self._operator_cycle     = None
+        self._goal_repr          = None
+        self._global_workspace   = None
 
-        # Phase 1: HTN Planning (blueprint §2.4.1)
         self._htn_planner        = None
 
-        # Phase 3: Self-improving (blueprint §3.1, §3.2)
-        self._trajectory_flywheel = None  # GUI-Owl self-evolution
-        self._algorithm_distiller = None  # Algorithm Distillation (Laskin 2023)
-        self._soar_chunker        = None  # SOAR chunking
+        self._trajectory_flywheel = None
+        self._algorithm_distiller = None
+        self._soar_chunker        = None
 
-        # Phase 0: OpenMemory 5-sector store (blueprint §2.5.2)
         self._openmemory_store   = None
 
-        # Planning
+        self._active_inference   = None
+
+        self._user_model         = None
+
+        self._atspi_bridge       = None
+
         self._milestone_decomposer  = None
         self._milestones: list       = []
         self._current_milestone_idx: int = 0
         self._milestones_active: bool    = False
 
-        # Telemetry
         self._task_start: float = time.time()
         self._lock = threading.Lock()
         self._denied_action_keys: set = set()
@@ -179,7 +136,6 @@ class GIIController:
             world_model_active=self._world_model is not None,
             self_model_active=self._self_model is not None,
         )
-        # Phase 1 and Phase 3 components (non-blocking: failures are warnings)
         if self._enabled:
             self._initialise_phase1_components()
             self._initialise_phase3_components()
@@ -212,10 +168,6 @@ class GIIController:
             memory_dir=memory_dir,
         )
 
-    # =========================================================================
-    # Properties
-    # =========================================================================
-
     @property
     def enabled(self) -> bool:
         return self._enabled
@@ -236,27 +188,20 @@ class GIIController:
     def self_model(self):
         return self._self_model
 
-    # =========================================================================
-    # Initialisation
-    # =========================================================================
-
     def _initialise_components(self, memory_dir: Optional[str]) -> None:
 
-        # ── 1. SemanticMemory (universal fallback) ───────────────────────────
         try:
             from core.memory.semantic_memory import SemanticMemory
             self._semantic_memory = SemanticMemory(memory_dir=memory_dir)
         except Exception as exc:
             _logger.warning("[GIIController] SemanticMemory init failed: %s", exc)
 
-        # ── 2. ApplicationMemory ─────────────────────────────────────────────
         try:
             from core.memory.application_memory import ApplicationMemory
             self._application_memory = ApplicationMemory(memory_dir=memory_dir)
         except Exception as exc:
             _logger.warning("[GIIController] ApplicationMemory init failed: %s", exc)
 
-        # ── 3. Mem0Store — cross-session working memory ──────────────────────
         try:
             from core.memory.mem0_store import Mem0Store
             self._mem0_store = Mem0Store.get_instance()
@@ -266,7 +211,6 @@ class GIIController:
         except Exception as exc:
             _logger.warning("[GIIController] Mem0Store init failed: %s", exc)
 
-        # ── 4. CogneeStore — knowledge-graph memory ──────────────────────────
         try:
             from core.memory.cognee_store import CogneeStore
             self._cognee_store = CogneeStore.get_instance()
@@ -276,7 +220,6 @@ class GIIController:
         except Exception as exc:
             _logger.warning("[GIIController] CogneeStore init failed: %s", exc)
 
-        # ── 5. ConsequenceReasoner ───────────────────────────────────────────
         try:
             from core.safety.consequence_reasoner import ConsequenceReasoner
             enable_tier3 = self._gii_mode >= GIIMode.FULL
@@ -292,7 +235,6 @@ class GIIController:
         except Exception as exc:
             _logger.warning("[GIIController] ConsequenceReasoner init failed: %s", exc)
 
-        # ── 6. WorldModel (NEW) ──────────────────────────────────────────────
         if _USE_WORLD_MODEL:
             try:
                 from core.vision.world_graph import WorldGraph
@@ -301,7 +243,6 @@ class GIIController:
             except Exception as exc:
                 _logger.warning("[GIIController] WorldModel init failed: %s", exc)
 
-        # ── 7. SelfModel (NEW) ───────────────────────────────────────────────
         if _USE_SELF_MODEL:
             try:
                 from core.cognition.self_model import SelfModel
@@ -313,7 +254,6 @@ class GIIController:
             except Exception as exc:
                 _logger.warning("[GIIController] SelfModel init failed (non-fatal): %s", exc)
 
-        # ── 8. PerStepReasoner ───────────────────────────────────────────────
         scaffold_dicts = []
         for step in self._scaffold_steps:
             if isinstance(step, dict):
@@ -337,7 +277,6 @@ class GIIController:
             )
             _logger.info("[GIIController] PerStepReasoner active.")
         except Exception as exc:
-            # ARCH FIX: PSR failure is now a LOUD error, not a silent degradation.
             _logger.error(
                 "[GIIController] CRITICAL: PerStepReasoner init FAILED: %s. "
                 "GII will be DISABLED for this session. Check LLM adapter configuration.",
@@ -351,9 +290,8 @@ class GIIController:
                 file=sys.stderr,
             )
             self._enabled = False
-            return  # Stop initialisation — no point continuing
+            return
 
-        # ── 9. EpisodicSynthesizer ───────────────────────────────────────────
         try:
             from core.memory.episodic_synthesizer import EpisodicSynthesizer
             self._episodic_synthesizer = EpisodicSynthesizer(llm_callable=self._llm)
@@ -364,13 +302,35 @@ class GIIController:
         except Exception as exc:
             _logger.warning("[GIIController] EpisodicSynthesizer init failed: %s", exc)
 
-        # ── 10. MilestoneDecomposer (NOW DEFAULT-ON) ─────────────────────────
+        try:
+            from core.cognition.active_inference import ActiveInferenceAgent
+            self._active_inference = ActiveInferenceAgent(n_states=16, n_obs=32)
+            _logger.info("[GIIController] ActiveInferenceAgent (FEP) active.")
+        except Exception as exc:
+            _logger.warning("[GIIController] ActiveInferenceAgent init failed: %s", exc)
+
+        try:
+            from core.cognition.user_model import UserModel
+            self._user_model = UserModel(memory_dir=memory_dir)
+            _logger.info("[GIIController] UserModel (ToM) active.")
+        except Exception as exc:
+            _logger.warning("[GIIController] UserModel init failed: %s", exc)
+
+        try:
+            from core.perception.atspi_bridge import ATSPIBridge
+            self._atspi_bridge = ATSPIBridge()
+            _logger.info("[GIIController] ATSPIBridge active.")
+        except Exception as exc:
+            _logger.debug("[GIIController] ATSPIBridge unavailable (non-fatal): %s", exc)
+
         if _USE_MILESTONES:
             try:
                 from core.planner.milestone_decomposer import MilestoneDecomposer
                 self._milestone_decomposer = MilestoneDecomposer(llm_callable=self._llm)
+                partial = self._assess_partial_completion(self._objective)
                 self._milestones = self._milestone_decomposer.decompose(
-                    objective=self._objective
+                    objective=self._objective,
+                    partial_completion=partial,
                 )
                 if self._milestones:
                     self._milestones_active = True
@@ -426,12 +386,6 @@ class GIIController:
                 _logger.debug("[GIIController] update_objective failed: %s", exc)
 
     def advance_milestone(self) -> bool:
-        """
-        Advance to the next milestone. Returns True if there are more
-        milestones, False if all are complete.
-        Called by operate.py when a 'done' action is received while
-        milestones are still pending.
-        """
         if not self._milestones_active:
             return False
         with self._lock:
@@ -446,20 +400,7 @@ class GIIController:
         )
         return True
 
-    # =========================================================================
-    # Phase 1: SOAR Cognitive Loop + GoalAct + GlobalWorkspace
-    # =========================================================================
-
     def _initialise_phase1_components(self) -> None:
-        """
-        Initialise Phase 1 GII components:
-          - GoalRepresentation (GoalAct structured goals)
-          - OperatorCycle (SOAR operator selection)
-          - GlobalWorkspace (GWT broadcaster)
-          - HTNPlanner (hierarchical task network)
-          - OpenMemoryStore (5-sector memory)
-        """
-        # OpenMemory 5-sector store (Phase 0.3)
         try:
             from core.memory.openmemory_store import OpenMemoryStore
             self._openmemory_store = OpenMemoryStore()
@@ -467,7 +408,6 @@ class GIIController:
         except Exception as exc:
             _logger.warning("[GIIController] OpenMemoryStore init failed: %s", exc)
 
-        # GoalRepresentation — structured, verifiable goal decomposition
         try:
             from core.cognition.goal_representation import GoalRepresentation
             self._goal_repr = GoalRepresentation(
@@ -479,10 +419,8 @@ class GIIController:
         except Exception as exc:
             _logger.warning("[GIIController] GoalRepresentation init failed: %s", exc)
 
-        # SOAR OperatorCycle — replaces scripted plan with per-step reasoning
         try:
             from core.cognition.operator_cycle import OperatorCycle
-            # Try Qwen3-VL as TSWM if available
             tswm = None
             try:
                 from adapters.qwen3_vl_adapter import get_qwen3_vl, is_qwen3_vl_preferred
@@ -492,7 +430,6 @@ class GIIController:
             except Exception:
                 pass
 
-            # Try GUI-Actor for grounding
             gui_actor = None
             try:
                 from adapters.gui_actor_adapter import get_gui_actor
@@ -511,7 +448,6 @@ class GIIController:
         except Exception as exc:
             _logger.warning("[GIIController] OperatorCycle init failed: %s", exc)
 
-        # HTN Planner
         try:
             from core.planner.htn_planner import HTNPlanner
             self._htn_planner = HTNPlanner(
@@ -522,7 +458,6 @@ class GIIController:
         except Exception as exc:
             _logger.warning("[GIIController] HTNPlanner init failed: %s", exc)
 
-        # Global Workspace Theory broadcaster
         try:
             from core.cognition.global_workspace import (
                 GlobalWorkspace, PerceptionModule, MemoryModule, ReflectionModule
@@ -534,18 +469,7 @@ class GIIController:
         except Exception as exc:
             _logger.warning("[GIIController] GlobalWorkspace init failed: %s", exc)
 
-    # =========================================================================
-    # Phase 3: Self-improving Flywheel + Algorithm Distillation + SOAR Chunking
-    # =========================================================================
-
     def _initialise_phase3_components(self) -> None:
-        """
-        Initialise Phase 3 self-improvement components:
-          - TrajectoryFlywheel (GUI-Owl self-evolution)
-          - AlgorithmDistiller (Laskin 2023 in-context RL)
-          - SOARChunking (procedural memory from success)
-        """
-        # TrajectoryFlywheel
         try:
             from core.learning.trajectory_flywheel import TrajectoryFlywheel
             self._trajectory_flywheel = TrajectoryFlywheel(
@@ -556,7 +480,6 @@ class GIIController:
         except Exception as exc:
             _logger.warning("[GIIController] TrajectoryFlywheel init failed: %s", exc)
 
-        # Algorithm Distillation
         try:
             from core.learning.algorithm_distillation import AlgorithmDistiller
             self._algorithm_distiller = AlgorithmDistiller(llm_call=self._llm)
@@ -564,7 +487,6 @@ class GIIController:
         except Exception as exc:
             _logger.warning("[GIIController] AlgorithmDistiller init failed: %s", exc)
 
-        # SOAR Chunking
         try:
             from core.learning.soar_chunking import SOARChunking as SOARChunker
             self._soar_chunker = SOARChunker(
@@ -575,28 +497,17 @@ class GIIController:
         except Exception as exc:
             _logger.warning("[GIIController] SOARChunker init failed: %s", exc)
 
-    # =========================================================================
-    # Phase 1: Operator-based action decision
-    # =========================================================================
-
     def decide_next_action_operator_cycle(
         self,
         world_state: Dict[str, Any],
         *,
         screenshot=None,
     ) -> Tuple[Optional[Dict[str, Any]], str]:
-        """
-        SOAR operator-selection cycle action decision.
-        Used when OperatorCycle is active (Phase 1+).
-
-        Returns the selected operator's action dict.
-        """
         if self._operator_cycle is None or self._goal_repr is None:
             return None, "OperatorCycle not initialised"
 
         from core.cognition.operator_cycle import WorkingMemory
 
-        # Build WorkingMemory from world_state
         wm = WorkingMemory(
             entities=world_state.get("entities", []),
             focused_app=world_state.get("focused_app", "unknown"),
@@ -608,7 +519,6 @@ class GIIController:
             ),
         )
 
-        # Update GlobalWorkspace with current observation
         if self._global_workspace is not None:
             try:
                 gws_broadcast = self._global_workspace.run_cycle(
@@ -616,7 +526,6 @@ class GIIController:
                                     "focused_app": wm.focused_app,
                                     "objective": self._objective}
                 )
-                # Inject GWT reflection insights into world_state
                 if gws_broadcast and gws_broadcast.winner:
                     from core.cognition.global_workspace import ModuleType
                     if gws_broadcast.winner.module_type == ModuleType.REFLECTION:
@@ -630,13 +539,11 @@ class GIIController:
             except Exception as gws_exc:
                 _logger.debug("[GIIController] GWT cycle error: %s", gws_exc)
 
-        # Run SOAR operator cycle
         operator, impasse = self._operator_cycle.step(
             wm, self._goal_repr, screenshot=screenshot
         )
 
         if impasse is not None:
-            # Resolve impasse — may create subgoal or require human confirmation
             resolution = self._operator_cycle.resolve_impasse(impasse, wm)
             if resolution:
                 if resolution.get("operation") == "require_human_confirmation":
@@ -647,7 +554,6 @@ class GIIController:
         if operator is None:
             return None, "OperatorCycle returned no operator"
 
-        # GoalAct check: update goal progress
         if self._goal_repr is not None:
             try:
                 self._goal_repr.evaluate_from_screen(world_state)
@@ -660,7 +566,6 @@ class GIIController:
             except Exception:
                 pass
 
-        # HTN GoalAct anti-stall check
         if self._htn_planner is not None:
             try:
                 goalact = self._htn_planner.goalact_check(world_state)
@@ -679,11 +584,6 @@ class GIIController:
         executed_operators: list,
         focused_app: str = "",
     ) -> None:
-        """
-        Called after successful task completion to trigger SOAR chunking
-        and Algorithm Distillation episode recording.
-        """
-        # SOAR chunking — store operator sequence as procedural memory
         if self._operator_cycle and executed_operators:
             try:
                 self._operator_cycle.on_success(
@@ -696,16 +596,39 @@ class GIIController:
             except Exception as exc:
                 _logger.debug("[GIIController] SOAR chunking error: %s", exc)
 
-        # Force goal complete
         if self._goal_repr is not None:
             try:
                 self._goal_repr.force_complete()
             except Exception:
                 pass
 
-    # =========================================================================
-    # Primary action decision
-    # =========================================================================
+    def _assess_partial_completion(self, objective: str) -> Optional[Dict[str, Any]]:
+        if not objective:
+            return None
+        partial: Dict[str, Any] = {}
+        if self._semantic_memory is not None:
+            try:
+                facts = self._semantic_memory.query(objective, max_results=5)
+                if facts:
+                    partial["semantic_context"] = [
+                        {"s": f.subject, "p": f.predicate, "o": f.object_}
+                        for f in facts[:5]
+                        if hasattr(f, "subject")
+                    ]
+            except Exception:
+                pass
+        if self._mem0_store is not None:
+            try:
+                agent_id = getattr(self._mem0_store, "make_agent_id", lambda x: x)(objective)
+                memories = self._mem0_store.search_memory(objective, agent_id, limit=3)
+                if memories:
+                    partial["cross_session_memories"] = [
+                        str(m.get("memory") or m.get("text", ""))[:200]
+                        for m in memories[:3]
+                    ]
+            except Exception:
+                pass
+        return partial if partial else None
 
     def decide_next_action(
         self,
@@ -715,6 +638,32 @@ class GIIController:
     ) -> Tuple[Optional[Dict[str, Any]], str]:
         if not self._enabled or self._per_step_reasoner is None:
             return None, "GII disabled"
+
+        if self._active_inference is not None:
+            try:
+                _candidates: List[Dict[str, Any]] = world_state.get("_candidate_actions", [])
+                if _candidates:
+                    _ranked = self._active_inference.select_action(
+                        _candidates,
+                        world_state=world_state,
+                        goal_desc=self._objective,
+                    )
+                    if _ranked:
+                        world_state = dict(world_state)
+                        world_state["_active_inference_top_action"] = _ranked[0].action
+                        world_state["_active_inference_efe"] = _ranked[0].efe
+            except Exception as ai_exc:
+                _logger.debug("[GIIController] ActiveInference error (non-fatal): %s", ai_exc)
+
+        if self._user_model is not None:
+            try:
+                user_ctx = self._user_model.format_context()
+                if user_ctx:
+                    world_state = dict(world_state) if not isinstance(world_state, dict) else world_state
+                    world_state.setdefault("_user_model_context", user_ctx[:400])
+            except Exception:
+                pass
+
         try:
             return self._per_step_reasoner.next_action(
                 world_state, perception=perception
@@ -724,19 +673,11 @@ class GIIController:
             return None, f"GII reasoning error: {exc}"
 
     def push_screenshot_for_grounding(self, screenshot_b64: str) -> None:
-        """
-        NEW: Push a fresh screenshot into the multi-frame grounding buffer.
-        Called by operate.py after every action dispatch.
-        """
         if self._per_step_reasoner is not None:
             try:
                 self._per_step_reasoner.push_screenshot(screenshot_b64)
             except Exception:
                 pass
-
-    # =========================================================================
-    # Denied action tracking
-    # =========================================================================
 
     def is_action_denied(self, action_key: str) -> bool:
         return action_key in self._denied_action_keys
@@ -744,10 +685,6 @@ class GIIController:
     def record_denial(self, action_key: str) -> None:
         with self._lock:
             self._denied_action_keys.add(action_key)
-
-    # =========================================================================
-    # Outcome recording + episodic checkpoints
-    # =========================================================================
 
     def record_outcome(
         self,
@@ -770,7 +707,6 @@ class GIIController:
             except Exception:
                 pass
 
-        # Self-model update
         if self._self_model is not None:
             try:
                 self._self_model.record_action_result(
@@ -779,7 +715,16 @@ class GIIController:
             except Exception:
                 pass
 
-        # Episodic mid-task checkpoint
+        if self._user_model is not None:
+            try:
+                self._user_model.record_action_result(
+                    action=action,
+                    success=success,
+                    focused_app=focused_app or "",
+                )
+            except Exception:
+                pass
+
         _should_checkpoint = (
             self._episodic_synthesizer is not None
             and execution_log is not None
@@ -804,10 +749,6 @@ class GIIController:
                 )
             except Exception as cp_exc:
                 _logger.warning("[GIIController] Checkpoint failed: %s", cp_exc)
-
-    # =========================================================================
-    # Planning context for prompt injection
-    # =========================================================================
 
     def get_planning_context(self, focused_app: Optional[str] = None) -> str:
         if not self._enabled:
@@ -861,7 +802,6 @@ class GIIController:
             except Exception:
                 pass
 
-        # World model context
         if self._world_model is not None:
             try:
                 wm_ctx = self._world_model.get_context_for_objective(self._objective)
@@ -870,7 +810,6 @@ class GIIController:
             except Exception:
                 pass
 
-        # Self model context
         if self._self_model is not None:
             try:
                 sm_ctx = self._self_model.format_context()
@@ -880,10 +819,6 @@ class GIIController:
                 pass
 
         return "\n\n".join(parts)
-
-    # =========================================================================
-    # Task completion
-    # =========================================================================
 
     def on_task_complete(
         self,
@@ -898,10 +833,27 @@ class GIIController:
         if self._application_memory and focused_app:
             try:
                 self._application_memory.increment_task_count(focused_app)
+                lesson = ""
+                if execution_log and isinstance(execution_log, dict):
+                    outcomes = []
+                    for _step_data in list(execution_log.values())[:5]:
+                        if isinstance(_step_data, dict):
+                            for _out in _step_data.get("outputs", [])[:2]:
+                                _op = _out.get("operation", "")
+                                _ok = _out.get("success", True)
+                                outcomes.append(f"{'✓' if _ok else '✗'} {_op}")
+                    lesson = "; ".join(outcomes[:5])
+                profile = self._application_memory.get_profile(focused_app)
+                if profile is not None:
+                    profile.add_attempt(
+                        objective=self._objective,
+                        success=success,
+                        lesson=lesson,
+                        outcome_summary="success" if success else "failed",
+                    )
             except Exception:
                 pass
 
-        # Self-model: record task outcome
         if self._self_model is not None:
             try:
                 self._self_model.record_task_outcome(
@@ -912,7 +864,6 @@ class GIIController:
             except Exception:
                 pass
 
-        # Mem0 post-task storage (background)
         if self._mem0_store is not None and execution_log is not None:
             def _store_mem0():
                 try:
@@ -934,7 +885,6 @@ class GIIController:
                     _logger.debug("[GIIController] Mem0 post-task error: %s", exc)
             threading.Thread(target=_store_mem0, daemon=True).start()
 
-        # CogneeStore knowledge graph update (background)
         if (self._cognee_store is not None
                 and self._cognee_store._available
                 and execution_log is not None):
@@ -951,7 +901,6 @@ class GIIController:
                     _logger.debug("[GIIController] CogneeStore post-task error: %s", exc)
             threading.Thread(target=_store_cognee, daemon=True).start()
 
-        # LLM lesson synthesis → semantic memory
         if self._semantic_memory and execution_log:
             llm_succeeded = False
             try:
@@ -975,7 +924,6 @@ class GIIController:
                 except Exception:
                     pass
 
-        # Persist memories
         for mem in (self._semantic_memory, self._application_memory):
             if mem:
                 try:
@@ -1106,10 +1054,6 @@ class GIIController:
                     )
         except Exception as parse_err:
             _logger.debug("[GIIController] Lesson parse failed: %s", parse_err)
-
-    # =========================================================================
-    # Stats
-    # =========================================================================
 
     def get_stats(self) -> dict:
         stats = {
