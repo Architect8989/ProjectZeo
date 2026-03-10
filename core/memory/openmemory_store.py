@@ -329,6 +329,13 @@ class OpenMemoryStore:
         # Attempt Qdrant connection for vector search
         self._init_qdrant()
 
+        # ── FAISS local vector search (Tier 2 fallback when Qdrant unavailable)
+        # Blueprint §10: Memory Backends — always-available semantic search
+        self._faiss = None
+        self._faiss_available = False
+        if not self._qdrant_available:
+            self._init_faiss()
+
         # In-memory fast cache for recent retrievals
         self._cache: Dict[str, Tuple[List[MemoryEntry], float]] = {}
         self._cache_lock = threading.Lock()
@@ -375,6 +382,60 @@ class OpenMemoryStore:
         except Exception as exc:
             _logger.info("[OpenMemory] Qdrant not available: %s — using SQLite only", exc)
             self._qdrant_available = False
+
+    def _init_faiss(self) -> None:
+        """
+        Initialise FAISS local vector store as Tier-2 fallback.
+        Called when Qdrant is unavailable. Solves the memory split-brain bug:
+        If previous sessions used FAISS and Qdrant is now available, the
+        UnifiedMemoryOrchestrator.startup_reconciliation() will migrate entries.
+        """
+        try:
+            from core.memory.faiss_vector_store import get_faiss_store
+            self._faiss = get_faiss_store()
+            if getattr(self._faiss, "_available", False):
+                self._faiss_available = True
+                _logger.info(
+                    "[OpenMemory] FAISS local vector store active "
+                    "(Qdrant unavailable). Semantic search quality: MEDIUM. "
+                    "Start Qdrant for best quality: docker-compose up -d"
+                )
+            else:
+                _logger.info(
+                    "[OpenMemory] FAISS not available — using SQLite keyword search only."
+                )
+        except Exception as exc:
+            _logger.info("[OpenMemory] FAISS init failed: %s — SQLite only", exc)
+            self._faiss_available = False
+
+    def list_faiss_entries(self):
+        """
+        Return all entries stored in FAISS (for startup reconciliation migration).
+        Returns empty list if FAISS is not available.
+        """
+        if not self._faiss_available or self._faiss is None:
+            return []
+        try:
+            return self._faiss.list_all() or []
+        except Exception:
+            return []
+
+    def upsert_to_qdrant(self, faiss_entry) -> bool:
+        """
+        Upsert a FAISS entry to Qdrant (for startup reconciliation migration).
+        Returns True if successful, False otherwise.
+        """
+        if not self._qdrant_available:
+            return False
+        try:
+            content = str(getattr(faiss_entry, "content", str(faiss_entry)))
+            sector = str(getattr(faiss_entry, "sector", "episodic"))
+            subject = str(getattr(faiss_entry, "subject", ""))
+            self.store(sector, content, subject=subject, importance=0.6)
+            return True
+        except Exception as exc:
+            _logger.debug("[OpenMemory] upsert_to_qdrant failed: %s", exc)
+            return False
 
     # =========================================================================
     # Storage API
@@ -423,9 +484,18 @@ class OpenMemoryStore:
 
         self._sqlite.store(entry)
 
-        # Optionally store embedding in Qdrant
+        # Optionally store embedding in Qdrant (Tier 1) or FAISS (Tier 2)
         if self._qdrant_available:
             self._store_qdrant(entry)
+        elif self._faiss_available and self._faiss is not None:
+            try:
+                self._faiss.add(
+                    memory_id=getattr(entry, "memory_id", str(id(entry))),
+                    content=getattr(entry, "content", ""),
+                    sector=getattr(entry, "sector", "episodic"),
+                )
+            except Exception as _faiss_store_exc:
+                _logger.debug("[OpenMemory] FAISS store failed: %s", _faiss_store_exc)
 
         # Vacuum if over capacity (non-blocking, with error handling)
         def _vacuum():
@@ -539,7 +609,33 @@ class OpenMemoryStore:
                 _logger.debug("[OpenMemory] Qdrant retrieve failed: %s", exc)
                 results = None
 
-        # Fallback: SQLite keyword search
+        # Fallback Tier 2: FAISS local vector search
+        if not results and self._faiss_available and self._faiss is not None:
+            try:
+                faiss_hits = self._faiss.search(query, top_k=top_k)
+                if faiss_hits:
+                    results = []
+                    for hit in faiss_hits:
+                        mem_id = getattr(hit, "memory_id", str(id(hit)))
+                        content = getattr(hit, "content", str(hit))
+                        hit_sector = getattr(hit, "sector", sector or "episodic")
+                        if sector and hit_sector != sector:
+                            continue
+                        results.append(MemoryEntry(
+                            memory_id=mem_id,
+                            sector=hit_sector,
+                            content=content,
+                            subject="",
+                            importance=getattr(hit, "score", 0.5),
+                            created_at=time.time(),
+                            last_accessed=time.time(),
+                        ))
+                    _logger.debug("[OpenMemory] FAISS retrieved %d results", len(results))
+            except Exception as _faiss_ret_exc:
+                _logger.debug("[OpenMemory] FAISS retrieve failed: %s", _faiss_ret_exc)
+                results = None
+
+        # Fallback Tier 3: SQLite keyword search
         if not results:
             results = self._sqlite.retrieve_by_text(query, sector, top_k, at_time)
 
