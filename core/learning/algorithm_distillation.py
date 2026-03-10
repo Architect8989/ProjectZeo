@@ -188,6 +188,18 @@ class TrajectoryStore:
         safe = "".join(c if c.isalnum() else "_" for c in task_type[:40])
         return f"{safe}_{h}"
 
+    def list_task_types(self) -> List[str]:
+        """Return all known task type keys from disk."""
+        try:
+            if os.path.isdir(self._dir):
+                return [
+                    d for d in os.listdir(self._dir)
+                    if os.path.isdir(os.path.join(self._dir, d))
+                ]
+        except OSError:
+            pass
+        return list(self._cache.keys())
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Algorithm Distillation context builder
@@ -348,3 +360,60 @@ class AlgorithmDistiller:
             "max_episodes":     _MAX_CONTEXT_EPISODES,
             "trajectory_dir":   _TRAJECTORY_DIR,
         }
+
+    def get_prompt_injection(
+        self,
+        task_type: str,
+        app_context: str = "",
+        max_episodes: int = 3,
+    ) -> str:
+        """
+        GII-FIX: Extract cross-task learned patterns as a compact prompt string
+        for injection into PerStepReasoner.
+
+        This closes the Algorithm Distillation in-context RL feedback loop
+        (Blueprint §9). The output is injected into the per-step decision prompt
+        via set_algorithm_distillation_context() so that the current-task
+        reasoner benefits from patterns learned across ALL prior tasks.
+
+        Returns empty string if insufficient trajectory history.
+        """
+        if not _AD_ENABLED:
+            return ""
+
+        episodes = self._store.get_improving_sequence(task_type)
+        if not episodes:
+            # Also try to find relevant episodes from same app
+            all_types = self._store.list_task_types() if hasattr(self._store, "list_task_types") else []
+            for other_type in all_types:
+                if app_context and app_context.lower() in other_type.lower():
+                    episodes = self._store.get_improving_sequence(other_type)
+                    if episodes:
+                        break
+
+        if not episodes:
+            return ""
+
+        # Select up to max_episodes best-performing episodes
+        best = sorted(episodes, key=lambda e: e.final_reward, reverse=True)[:max_episodes]
+
+        lines = ["[Algorithm Distillation — Learned Patterns]"]
+        for ep in best:
+            success_steps = [
+                s for s in ep.steps if s.outcome == "success"
+            ]
+            if not success_steps:
+                continue
+            lines.append(
+                f"Task: {ep.task_type[:60]} | App: {ep.app_context} "
+                f"| Reward: {ep.final_reward:.1f}"
+            )
+            for s in success_steps[:3]:
+                op = s.action.get("operation", "?")
+                detail = (
+                    s.action.get("command") or s.action.get("text") or
+                    s.action.get("content") or ""
+                )[:50]
+                lines.append(f"  ✓ {op}: {detail}")
+
+        return "\n".join(lines) if len(lines) > 1 else ""
