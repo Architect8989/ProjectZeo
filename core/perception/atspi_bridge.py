@@ -1,21 +1,7 @@
-"""
-core/perception/atspi_bridge.py — AT-SPI Event Bridge
-
-PATCH HISTORY:
-  GAP-2     : Fix trigger method name. create_atspi_triggered_capture() called
-              vision_runtime._capture_and_analyse() (underscore-prefixed private
-              method) but the actual method name in VisionRuntime is
-              capture_and_analyze() (public, American spelling). This caused
-              AT-SPI events to silently fail to trigger VLM inference — the
-              event fired but no capture happened.
-  LAYER-5   : AT-SPI window registry for popup attack detection (Research §6.3).
-              Maintains a set of legitimate window IDs opened during the task.
-              Windows that appear without a corresponding window:create event
-              are flagged as SUSPICIOUS by the GIILoop.
-"""
 from __future__ import annotations
 
 import logging
+import queue
 import sys
 import threading
 import time
@@ -23,11 +9,8 @@ from typing import Callable, Dict, List, Optional, Set
 
 _logger = logging.getLogger(__name__)
 
-
 class ATSPIUnavailableError(RuntimeError):
-    """Raised when pyatspi2 is not available on this platform."""
     pass
-
 
 _TRIGGER_EVENTS = [
     "window:activate",
@@ -40,6 +23,11 @@ _TRIGGER_EVENTS = [
 
 _MIN_TRIGGER_INTERVAL_SECONDS = 0.05
 
+_INTERRUPT_EVENTS = frozenset({
+    "window:activate",
+    "window:create",
+    "window:destroy",
+})
 
 class ATSPIBridge:
 
@@ -58,28 +46,55 @@ class ATSPIBridge:
         self._running = False
         self._thread: Optional[threading.Thread] = None
         self._atspi_available = False
-        self._atspi_registry = None
 
-        # LAYER-5: Window registry for popup attack detection (Research §6.3)
-        # Maps window_id → creation_timestamp. Populated from window:create events.
+        self._interrupt_queue: queue.Queue = queue.Queue(maxsize=32)
+
         self._window_registry: Dict[int, float] = {}
         self._window_registry_lock = threading.Lock()
 
     @property
     def window_registry(self) -> Set[int]:
-        """Return the set of legitimate window IDs seen during this task."""
         with self._window_registry_lock:
             return set(self._window_registry.keys())
 
     def reset_window_registry(self) -> None:
-        """Clear the window registry at task start."""
+        with self._window_registry_lock:
+            self._window_registry.clear()
+
+    def is_available(self) -> bool:
+        return self._atspi_available
+
+    def get_interrupt_queue(self) -> queue.Queue:
+        return self._interrupt_queue
+
+    def drain_interrupts(self) -> List[Dict]:
+        interrupts = []
+        try:
+            while True:
+                interrupts.append(self._interrupt_queue.get_nowait())
+        except queue.Empty:
+            pass
+        return interrupts
+
+    def start(self) -> bool:
+        self._atspi_registry = None
+
+        self._window_registry: Dict[int, float] = {}
+        self._window_registry_lock = threading.Lock()
+
+    @property
+    def window_registry(self) -> Set[int]:
+        with self._window_registry_lock:
+            return set(self._window_registry.keys())
+
+    def reset_window_registry(self) -> None:
         with self._window_registry_lock:
             self._window_registry.clear()
         _logger.debug("[ATSPIBridge] Window registry cleared for new task.")
 
     def is_available(self) -> bool:
         try:
-            import pyatspi  # noqa: F401
+            import pyatspi
             return True
         except ImportError:
             return False
@@ -159,7 +174,6 @@ class ATSPIBridge:
         try:
             source_name = str(event.source.name or "") if event.source else ""
             source_role = str(event.source.getRole() if event.source else "")
-            # Try to get a stable window identifier
             if hasattr(event.source, "getApplication"):
                 app = event.source.getApplication()
                 if app is not None:
@@ -167,11 +181,21 @@ class ATSPIBridge:
         except Exception:
             pass
 
-        # LAYER-5: Track window:create events in the registry
         if "window:create" in event_type and window_id is not None:
             with self._window_registry_lock:
                 self._window_registry[window_id] = now
             _logger.debug("[ATSPIBridge] Window registry: added window_id=%d", window_id)
+
+        if event_type.split(":")[0] + ":" + event_type.split(":")[1] if ":" in event_type else event_type in _INTERRUPT_EVENTS or any(e in event_type for e in ("window:activate", "window:create", "window:destroy")):
+            try:
+                self._interrupt_queue.put_nowait({
+                    "event_type": event_type,
+                    "source_name": source_name[:80],
+                    "window_id": window_id,
+                    "ts": now,
+                })
+            except queue.Full:
+                pass
 
         event_info = {
             "event_type": event_type,
@@ -191,22 +215,15 @@ class ATSPIBridge:
         except Exception as cb_exc:
             _logger.warning("[ATSPIBridge] Callback error: %s", cb_exc)
 
-
 def create_atspi_triggered_capture(
     vision_runtime,
     world_graph,
     *,
     min_trigger_interval: float = _MIN_TRIGGER_INTERVAL_SECONDS,
 ) -> ATSPIBridge:
-    """Wire ATSPIBridge into VisionRuntime with corrected method name."""
 
     def _on_ui_change(event_type: str, event_info: dict) -> None:
-        """Trigger VisionRuntime capture when UI changes are detected."""
         try:
-            # GAP-2 FIX: Method name corrected.
-            # Original code called:   vision_runtime._capture_and_analyse()
-            # Actual method name is:  vision_runtime.capture_and_analyze()  (public, US spelling)
-            # Also try trigger_capture() for implementations that expose a public trigger API.
             if hasattr(vision_runtime, "trigger_capture"):
                 vision_runtime.trigger_capture(reason=f"atspi:{event_type}")
             elif hasattr(vision_runtime, "capture_and_analyze"):
@@ -228,24 +245,16 @@ def create_atspi_triggered_capture(
         min_trigger_interval=min_trigger_interval,
     )
 
-
-
 class ATSPIUnavailableError(RuntimeError):
-    """Raised when pyatspi2 is not available on this platform."""
     pass
 
-
-# ---------------------------------------------------------------------------
-# AT-SPI event types that trigger VLM inference
-# ---------------------------------------------------------------------------
 _TRIGGER_EVENTS = [
-    "window:activate",              # Window brought to foreground
-    "window:create",                # New window appeared
-    "window:destroy",               # Window closed
-    "object:state-changed:focused", # Focus changed (button, field, etc.)
-    "object:state-changed:showing", # Element became visible
-    "object:children-changed",      # UI tree structure changed
+    "window:activate",
+    "window:create",
+    "window:destroy",
+    "object:state-changed:focused",
+    "object:state-changed:showing",
+    "object:children-changed",
 ]
 
-# Minimum interval between trigger events to prevent inference flooding
-_MIN_TRIGGER_INTERVAL_SECONDS = 0.05  # 50ms — matches human reaction time threshold
+_MIN_TRIGGER_INTERVAL_SECONDS = 0.05
