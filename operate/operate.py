@@ -709,9 +709,17 @@ def _execute_autonomous_loop(
 
     _loop_scaffold_audit = None
     try:
-        from core.safety.scaffold_audit import build_scaffold_audit_from_plan as _bsap2
-        _loop_scaffold_audit = _bsap2(execution_plan, journal=journal)
-        _loop_scaffold_audit.arm()
+        from core.safety.scaffold_audit import (
+            build_scaffold_audit_from_plan as _bsap2,
+            get_global_scaffold_audit as _get_gsa,
+        )
+        if execution_plan is not None:
+            _loop_scaffold_audit = _bsap2(execution_plan, journal=journal)
+            _loop_scaffold_audit.arm()
+        else:
+            # FIX: When no execution_plan, fall back to global singleton
+            # so scaffold protection is always active
+            _loop_scaffold_audit = _get_gsa(journal=journal)
     except Exception as _sa2_exc:
         import logging as _sa2_log
         _sa2_log.getLogger(__name__).debug(
@@ -929,6 +937,20 @@ def _execute_autonomous_loop(
 
                 if gii_controller is not None and gii_controller.enabled:
                     _ws_for_gii = world_snapshot if isinstance(world_snapshot, dict) else {}
+
+                    # WIRE (FILE 11): inject GWT broadcast context into world_snapshot
+                    # before passing to decide_next_action so PSR gets safety alerts,
+                    # planning milestone status, and memory snippets from GWT.
+                    try:
+                        _gwt = getattr(gii_controller, "_global_workspace", None)
+                        if _gwt is not None:
+                            _gwt_ctx = _gwt.get_context_for_psr()
+                            if _gwt_ctx:
+                                _ws_for_gii = dict(_ws_for_gii)
+                                _ws_for_gii["_gwt_context"] = _gwt_ctx
+                    except Exception:
+                        pass  # non-fatal
+
                     _gii_action, _gii_reason = gii_controller.decide_next_action(
                         _ws_for_gii,
                         perception=perception_snapshot if isinstance(perception_snapshot, dict) else None,
