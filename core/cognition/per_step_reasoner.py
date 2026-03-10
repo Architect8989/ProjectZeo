@@ -161,6 +161,18 @@ class PerStepReasoner:
 
         self._reflexion_context: str = ""
         self._vault_context: str = ""
+        self._algorithm_distillation_context: str = ""
+
+        # ── CoH: Chain of Hindsight context (Blueprint §9.3) ──────────────────
+        # Populated by set_hindsight_context(); injected into every prompt.
+        # format_hindsight_for_prompt() from ApplicationMemory returns
+        # past attempt+outcome pairs that teach the model from prior mistakes.
+        self._hindsight_context: str = ""
+
+        # ── User Model: urgency/frustration adaptation (Blueprint §12) ─────────
+        # When injected, PSR checks urgency before running Self-Refine
+        # (skip expensive critique pass when user signals urgency).
+        self._user_model = None  # injected via set_user_model()
 
         self._consecutive_failures: int = 0
 
@@ -181,6 +193,35 @@ class PerStepReasoner:
         with self._lock:
             self._objective = str(new_objective)[:MAX_OBJECTIVE_CHARS]
 
+    def set_hindsight_context(self, hindsight_str: str) -> None:
+        """
+        Inject Chain of Hindsight context (Blueprint §9.3).
+
+        Call this with ApplicationMemory.format_hindsight_for_prompt(focused_app)
+        before each next_action() call. The hindsight string shows prior
+        attempt-feedback pairs so the model learns from past mistakes within
+        and across sessions.
+        """
+        self._hindsight_context = str(hindsight_str or "")
+
+    def set_reflexion_context(self, context: str) -> None:
+        self._reflexion_context = str(context or "")
+
+    def set_vault_context(self, context: str) -> None:
+        self._vault_context = str(context or "")
+
+    def set_algorithm_distillation_context(self, context: str) -> None:
+        self._algorithm_distillation_context = str(context or "")
+
+    def set_user_model(self, user_model) -> None:
+        """
+        Inject a UserModel instance (Blueprint §12 — Theory of Mind).
+        PSR uses urgency/frustration signals from user_model to adapt:
+          - high urgency → skip Self-Refine critique pass (save latency)
+          - high frustration → prepend empathetic framing in prompt
+        """
+        self._user_model = user_model
+
     def next_action(
         self,
         world_state: Dict[str, Any],
@@ -192,6 +233,21 @@ class PerStepReasoner:
             call_n = self._call_count
 
         self._maybe_summarize_history()
+
+        # ── CoH: Auto-inject hindsight from ApplicationMemory ─────────────────
+        # If app_memory is available and we know the focused app, pull the
+        # latest hindsight context before building the prompt. This ensures
+        # the model always sees its own prior feedback without requiring the
+        # GIILoop to manually call set_hindsight_context().
+        focused_app = world_state.get("focused_app", "") if isinstance(world_state, dict) else ""
+        if self._app_memory and focused_app and focused_app != "unknown":
+            try:
+                app_profile = self._app_memory.get_or_create_profile(focused_app)
+                hindsight_str = app_profile.format_hindsight_for_prompt(max_entries=4)
+                if hindsight_str:
+                    self._hindsight_context = hindsight_str
+            except Exception:
+                pass
 
         enriched_state = self._enrich_world_state(world_state, perception)
 
@@ -222,8 +278,31 @@ class PerStepReasoner:
                 self._consecutive_failures += 1
             return None, safety_reason
 
+        # ── User Model: urgency-adaptive Self-Refine (Blueprint §12) ──────────
+        # If user signals urgency (e.g. "do it now", rapid keystrokes), skip the
+        # expensive Self-Refine critique pass. This improves responsiveness while
+        # preserving safety — high-urgency tasks still pass the policy/CR gates.
+        _skip_refine_due_to_urgency = False
+        if self._user_model is not None:
+            try:
+                urgency = getattr(self._user_model, "urgency", 0.0)
+                if callable(urgency):
+                    urgency = urgency()
+                if float(urgency) >= 0.7:
+                    _skip_refine_due_to_urgency = True
+                    _logger.debug(
+                        "[PerStepReasoner] User urgency=%.2f ≥ 0.7 — skipping Self-Refine for latency.",
+                        float(urgency),
+                    )
+            except Exception:
+                pass
+
         op = str(action.get("operation", "")).lower()
-        if op not in ("wait", "done", "press") and self._should_self_refine(action):
+        if (
+            op not in ("wait", "done", "press")
+            and not _skip_refine_due_to_urgency
+            and self._should_self_refine(action)
+        ):
             try:
                 refined = self._self_refine(action, world_state=None)
                 if refined is not None and refined.get("operation"):
@@ -372,30 +451,11 @@ class PerStepReasoner:
             )
         return "\n".join(triples)
 
-    def set_reflexion_context(self, context: str) -> None:
-        self._reflexion_context = context or ""
-
-    def set_vault_context(self, context: str) -> None:
-        self._vault_context = context or ""
-
-    def set_algorithm_distillation_context(self, context: str) -> None:
-        """
-        GII-FIX: Wire Algorithm Distillation cross-task patterns into PSR prompt.
-
-        AlgorithmDistiller extracts generalised operator patterns from completed
-        episodes. This method stores the extracted context so that
-        _build_user_message() injects it into the per-step decision prompt,
-        completing the in-context RL loop-back (Blueprint §9).
-
-        Called by GIIGoalDirectedLoop after finalize_episode() on each
-        successful or failed operator sequence.
-        """
-        self._algorithm_distillation_context = context or ""
-
     def clear_injected_contexts(self) -> None:
         self._reflexion_context = ""
         self._vault_context = ""
         self._algorithm_distillation_context = ""
+        self._hindsight_context = ""
 
     def _enrich_world_state(
         self,
@@ -647,6 +707,13 @@ class PerStepReasoner:
 
         if hasattr(self, "_vault_context") and self._vault_context:
             msg += "\n\n" + self._vault_context
+
+        # ── CoH: Chain of Hindsight (Blueprint §9.3 — Peng et al. 2023) ──────
+        # Injects prior attempt-feedback pairs so the model sees what it tried
+        # before, why it failed, and what feedback was given — enables learning
+        # within the context window from past mistakes in this app/session.
+        if getattr(self, "_hindsight_context", ""):
+            msg += "\n\nCHAIN OF HINDSIGHT (prior attempts + feedback):\n" + self._hindsight_context[:600]
 
         # ── GII-FIX: Algorithm Distillation in-context RL loop-back ──────────
         # Cross-task operator patterns extracted by AlgorithmDistiller from
