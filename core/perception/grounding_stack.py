@@ -337,6 +337,35 @@ class GroundingStack:
                 if score > best_score:
                     best_score, best = score, elem
 
+                # GII-WIRE: ProNC novel element observation (Blueprint §11.5)
+                # When OmniParser reports low confidence for an element, feed
+                # its label + embedding to ProNC so it can learn the class
+                # incrementally without retraining.
+                _label = str(elem.get("label", "")).strip()
+                _elem_conf = float(elem.get("confidence", 0.5))
+                if _label and _elem_conf < 0.45:
+                    try:
+                        from core.learning.progressive_neural_collapse import get_pronc_engine
+                        _pronc = get_pronc_engine()
+                        # Use bbox center as a simple positional feature vector
+                        _bbox = elem.get("bbox", [])
+                        if len(_bbox) >= 4:
+                            _feat = [
+                                (_bbox[0] + _bbox[2]) / 2.0,  # cx
+                                (_bbox[1] + _bbox[3]) / 2.0,  # cy
+                                float(_bbox[2] - _bbox[0]),    # width
+                                float(_bbox[3] - _bbox[1]),    # height
+                                _elem_conf,
+                            ]
+                            _pronc.observe_element(
+                                label=_label,
+                                features=_feat,
+                                app_context=str(elem.get("source", "")),
+                                confidence=_elem_conf,
+                            )
+                    except Exception as _pronc_exc:
+                        _logger.debug("[GroundingStack] ProNC observe failed: %s", _pronc_exc)
+
             if best and best_score > 0.25:
                 bbox = best.get("bbox", [])
                 if len(bbox) >= 4:
