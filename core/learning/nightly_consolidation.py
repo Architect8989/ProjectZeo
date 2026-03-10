@@ -152,6 +152,10 @@ class NightlyConsolidator:
         # Step 7: Tripwire suite — capability regression detection
         self._step_tripwire_suite(result)
 
+        # Step 8: ProNC consolidation — recompute class centroids + evict stale
+        # classes (Blueprint §11.5 class-incremental GUI grounding)
+        self._step_pronc_consolidation(result)
+
         result.finished_at = time.time()
         _logger.info(
             "[Consolidation] Done in %.1fs. dpo_pairs=%d grpo=%s pruned=%d grounding_flushed=%s errors=%d",
@@ -313,6 +317,32 @@ class NightlyConsolidator:
         except Exception as e:
             result.errors.append(f"tripwire_suite: {e}")
             _logger.warning("[Consolidation] Tripwire suite failed: %s", e)
+
+    def _step_pronc_consolidation(self, result: ConsolidationResult) -> None:
+        """
+        Step 8: ProNC class-incremental consolidation.
+
+        Recomputes all class centroids from the exemplar buffer, evicts stale
+        classes (not seen in 30 days with < 10 observations), and enforces the
+        max-class limit.  This prevents the registry from growing unboundedly
+        and keeps centroids accurate as new exemplars accumulate.
+
+        Blueprint §11.5 — Progressive Neural Collapse for novel GUI elements.
+        """
+        try:
+            from core.learning.progressive_neural_collapse import get_pronc_engine
+            pronc = get_pronc_engine()
+            stats = pronc.consolidate()
+            _logger.info(
+                "[Consolidation] ProNC: classes=%d evicted=%d updated_centroids=%d elapsed=%.2fs",
+                stats.get("classes_total", 0),
+                stats.get("evicted_classes", 0),
+                stats.get("updated_centroids", 0),
+                stats.get("elapsed_s", 0.0),
+            )
+        except Exception as e:
+            result.errors.append(f"pronc_consolidation: {e}")
+            _logger.warning("[Consolidation] ProNC consolidation failed: %s", e)
 
 
 
