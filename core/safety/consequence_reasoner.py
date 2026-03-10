@@ -67,7 +67,7 @@ class ConsequenceResult:
     __slots__ = (
         "decision", "reversibility", "coherence", "consequence",
         "tier_reached", "reason", "latency_ms", "action_snippet",
-        "numeric_score",
+        "numeric_score", "evaluated_at",  # FIX (FILE 9): timestamp for GWT TTL
     )
 
     def __init__(
@@ -100,6 +100,8 @@ class ConsequenceResult:
             self.numeric_score = 0.40
         else:  # DENY
             self.numeric_score = 0.05
+        # FIX (FILE 9): record evaluation timestamp for GWT SafetyModule TTL
+        self.evaluated_at = time.monotonic()
 
     def to_dict(self) -> dict:
         return {
@@ -714,7 +716,11 @@ class ConsequenceReasoner:
         self._confirm_count = 0
         self._lock          = threading.Lock()
 
-        
+        # FIX (FILE 9): Cache last result for GWT SafetyModule polling.
+        # SafetyModule reads _last_result to re-broadcast deny/confirm signals
+        # into GWT without waiting for the next evaluation cycle.
+        self._last_result: Optional["ConsequenceResult"] = None
+
         self._is_evaluating: threading.Event = threading.Event()
 
         _logger.info(
@@ -780,14 +786,18 @@ class ConsequenceReasoner:
 
         self._is_evaluating.set()
         try:
-            return self._evaluate_inner(
+            result = self._evaluate_inner(
                 action, objective, step_description, snippet, focused_app=focused_app
             )
+            # FIX (FILE 9): cache for GWT SafetyModule polling
+            with self._lock:
+                self._last_result = result
+            return result
         except Exception as exc:
             _logger.error(
                 "[ConsequenceReasoner] Unexpected error (fail-closed): %s", exc
             )
-            return ConsequenceResult(
+            err_result = ConsequenceResult(
                 decision=SafetyDecision.REQUIRE_HUMAN_CONFIRMATION,
                 reversibility=Reversibility.CAUTION,
                 tier_reached=1,
@@ -795,6 +805,9 @@ class ConsequenceReasoner:
                 latency_ms=(time.monotonic() - start) * 1000,
                 action_snippet=snippet,
             )
+            with self._lock:
+                self._last_result = err_result
+            return err_result
         finally:
             self._is_evaluating.clear()
             with self._lock:
