@@ -162,6 +162,8 @@ class PerStepReasoner:
         self._reflexion_context: str = ""
         self._vault_context: str = ""
         self._algorithm_distillation_context: str = ""
+        self._session_context: str = ""    # SessionReflector injection
+        self._pnn_context: str = ""        # PNN lateral transfer injection
 
         # ── CoH: Chain of Hindsight context (Blueprint §9.3) ──────────────────
         # Populated by set_hindsight_context(); injected into every prompt.
@@ -212,6 +214,24 @@ class PerStepReasoner:
 
     def set_algorithm_distillation_context(self, context: str) -> None:
         self._algorithm_distillation_context = str(context or "")
+
+    def set_session_context(self, session_plan_block: str) -> None:
+        """
+        Inject session-start reflection (SessionReflector output) into PSR.
+        Called once per session from gii_controller after session_reflector
+        generates a plan. This injects prior experience hints (patterns,
+        pitfalls, app quirks) into every subsequent reasoning call.
+        Blueprint §10 — Session Reflection.
+        """
+        self._session_context = str(session_plan_block or "")
+
+    def set_pnn_context(self, lateral_transfer_block: str) -> None:
+        """
+        Inject PNN lateral transfer context from similar prior tasks.
+        Called by gii_controller when a similar column is found in the PNN.
+        Blueprint §11.3 — Progressive Neural Network lateral connections.
+        """
+        self._pnn_context = str(lateral_transfer_block or "")
 
     def set_gwt_context(self, gwt_summary: str) -> None:
         """
@@ -720,6 +740,16 @@ class PerStepReasoner:
 
         if hasattr(self, "_vault_context") and self._vault_context:
             msg += "\n\n" + self._vault_context
+
+        # ── Session Reflection (Blueprint §10) ────────────────────────────────
+        # Inject session-start plan: proven patterns, known pitfalls, app quirks.
+        if getattr(self, "_session_context", ""):
+            msg += "\n\n" + self._session_context[:800]
+
+        # ── PNN Lateral Transfer (Blueprint §11.3) ────────────────────────────
+        # Inject knowledge transferred from similar prior task columns.
+        if getattr(self, "_pnn_context", ""):
+            msg += "\n\nPROGRESSIVE NEURAL NETWORK — LATERAL TRANSFER:\n" + self._pnn_context[:500]
 
         # ── CoH: Chain of Hindsight (Blueprint §9.3 — Peng et al. 2023) ──────
         if getattr(self, "_hindsight_context", ""):
