@@ -600,46 +600,127 @@ def main(llm_callable: Callable, model_name: str) -> None:
                         mode.update_observer_health(observer.is_healthy())
                         mode.update_vision_status(vision_runtime.is_healthy())
 
+                # ── GII-ARCH FIX: "The Script Must Die. The Loop Must Live." ──────
+                # When GII_MODE=2 (FULL), we bypass create_plan() and instead call
+                # create_scaffold() to produce milestone-level goal descriptors only.
+                # GIIController / OperatorCycle (SOAR) then selects concrete actions
+                # dynamically from world state — no pre-generated step array.
+                #
+                # When GII_MODE < 2 (BASIC or DISABLED) OR scaffold generation fails,
+                # we fall back to create_plan() to preserve backward compatibility.
+                # ─────────────────────────────────────────────────────────────────────
+                _gii_mode_val = int(os.environ.get("PROJECTZEO_GII_MODE", "2"))
+                _use_scaffold_only = (_gii_mode_val >= 2)
+
+                _scaffold_milestones: list = []
+                execution_plan = None
+
                 _PLAN_MAX_RETRIES = 3
                 _plan_attempt = 0
-                while True:
-                    _plan_attempt += 1
-                    try:
-                        watchdog.pause_cpu()
-                        execution_plan = planner.create_plan(
-                            objective=intent,
-                            requirements={
-                                "environment": env_fingerprint,
-                                "tools": env_fingerprint.get("tools", []),
-                            },
-                            high_level_steps=[{"goal": intent}],
-                        )
-                        break
-                    except Exception as _plan_err:
-                        watchdog.resume_cpu()
-                        if _plan_attempt >= _PLAN_MAX_RETRIES:
+
+                if _use_scaffold_only:
+                    # GII-ARCH PATH: milestone scaffold only — no step-level plan
+                    print(
+                        "[MAIN] GII_MODE=2 — using create_scaffold() (milestone-only). "
+                        "OperatorCycle will drive dynamic operator selection.",
+                        file=sys.stderr,
+                    )
+                    _scaffold_attempt = 0
+                    while True:
+                        _scaffold_attempt += 1
+                        try:
+                            watchdog.pause_cpu()
+                            _scaffold_milestones = planner.create_scaffold(
+                                objective=intent,
+                                environment=env_fingerprint,
+                            )
                             print(
-                                f"[MAIN] Planning failed after {_plan_attempt} "
-                                f"attempt(s): {_plan_err}. Propagating error.",
+                                f"[MAIN] create_scaffold() produced "
+                                f"{len(_scaffold_milestones)} milestones: "
+                                + str([m.get("milestone", "?")[:50]
+                                       for m in _scaffold_milestones]),
                                 file=sys.stderr,
                             )
-                            raise
-                        _plan_delay = min(2.0 ** _plan_attempt, 30.0)
-                        print(
-                            f"[MAIN] Planning attempt {_plan_attempt}/{_PLAN_MAX_RETRIES} "
-                            f"failed: {type(_plan_err).__name__}: {_plan_err}. "
-                            f"Retrying in {_plan_delay:.1f}s...",
-                            file=sys.stderr,
-                        )
-                        time.sleep(_plan_delay)
-                    finally:
-                        try:
+                            break
+                        except Exception as _sc_err:
                             watchdog.resume_cpu()
-                        except Exception:
-                            pass
+                            if _scaffold_attempt >= _PLAN_MAX_RETRIES:
+                                print(
+                                    f"[MAIN] create_scaffold() failed after "
+                                    f"{_scaffold_attempt} attempt(s): {_sc_err}. "
+                                    "Falling back to create_plan().",
+                                    file=sys.stderr,
+                                )
+                                _use_scaffold_only = False
+                                break
+                            _plan_delay = min(2.0 ** _scaffold_attempt, 15.0)
+                            print(
+                                f"[MAIN] scaffold attempt {_scaffold_attempt}/"
+                                f"{_PLAN_MAX_RETRIES} failed: {_sc_err}. "
+                                f"Retrying in {_plan_delay:.1f}s...",
+                                file=sys.stderr,
+                            )
+                            time.sleep(_plan_delay)
+                        finally:
+                            try:
+                                watchdog.resume_cpu()
+                            except Exception:
+                                pass
+
+                if not _use_scaffold_only:
+                    # LEGACY PATH: static step-array plan (GII_MODE<2 or scaffold failed)
+                    print(
+                        "[MAIN] Using create_plan() (legacy scripted path). "
+                        "Set GII_MODE=2 for fully dynamic GII loop.",
+                        file=sys.stderr,
+                    )
+                    while True:
+                        _plan_attempt += 1
+                        try:
+                            watchdog.pause_cpu()
+                            execution_plan = planner.create_plan(
+                                objective=intent,
+                                requirements={
+                                    "environment": env_fingerprint,
+                                    "tools": env_fingerprint.get("tools", []),
+                                },
+                                high_level_steps=[{"goal": intent}],
+                            )
+                            break
+                        except Exception as _plan_err:
+                            watchdog.resume_cpu()
+                            if _plan_attempt >= _PLAN_MAX_RETRIES:
+                                print(
+                                    f"[MAIN] Planning failed after {_plan_attempt} "
+                                    f"attempt(s): {_plan_err}. Propagating error.",
+                                    file=sys.stderr,
+                                )
+                                raise
+                            _plan_delay = min(2.0 ** _plan_attempt, 30.0)
+                            print(
+                                f"[MAIN] Planning attempt {_plan_attempt}/{_PLAN_MAX_RETRIES} "
+                                f"failed: {type(_plan_err).__name__}: {_plan_err}. "
+                                f"Retrying in {_plan_delay:.1f}s...",
+                                file=sys.stderr,
+                            )
+                            time.sleep(_plan_delay)
+                        finally:
+                            try:
+                                watchdog.resume_cpu()
+                            except Exception:
+                                pass
 
                 mode.attach_execution_plan(f"plan_{int(time.time())}")
                 mode.mark_planning_complete()
+
+                # Resolve scaffold_steps for GIIController:
+                #   GII path  → milestone dicts (no "operation" key)
+                #   Legacy    → execution_plan.steps (ExecutionStep objects)
+                _scaffold_steps_for_gii = (
+                    _scaffold_milestones
+                    if _use_scaffold_only and _scaffold_milestones
+                    else (execution_plan.steps if execution_plan else [])
+                )
 
                 gii_controller = None
                 try:
@@ -647,7 +728,7 @@ def main(llm_callable: Callable, model_name: str) -> None:
                     gii_controller = GIIController.create(
                         llm_callable=mode.get_llm_callable(),
                         objective=intent,
-                        scaffold_steps=execution_plan.steps,
+                        scaffold_steps=_scaffold_steps_for_gii,
                         memory_dir=_auth_dir,
                     )
                     print(
