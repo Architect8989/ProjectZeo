@@ -54,10 +54,12 @@ class NightlyConsolidator:
         knowledge_vault=None,
         episodic_synthesizer=None,
         on_complete: Optional[Callable[[ConsolidationResult], None]] = None,
+        llm_call: Optional[Callable] = None,
     ) -> None:
         self._vault          = knowledge_vault
         self._synthesizer    = episodic_synthesizer
         self._on_complete    = on_complete
+        self._llm_call       = llm_call  # For tripwire tasks
         self._thread: Optional[threading.Thread] = None
         self._stop           = threading.Event()
         self._last_run_date  = ""
@@ -142,10 +144,13 @@ class NightlyConsolidator:
         self._step_vault_pruning(result)
 
         # Step 5: Grounding trainer batch flush (Blueprint §9.5 — UI-AGILE)
-        # Writes accumulated click-level grounding data to JSONL batches for
-        # offline vision model fine-tuning. This is the nightly integration
-        # point for the UI-AGILE continuous grounding reward loop.
         self._step_grounding_flush(result)
+
+        # Step 6: A-MEM Zettelkasten consolidation — merge near-duplicate notes
+        self._step_amem_consolidation(result)
+
+        # Step 7: Tripwire suite — capability regression detection
+        self._step_tripwire_suite(result)
 
         result.finished_at = time.time()
         _logger.info(
@@ -255,6 +260,60 @@ class NightlyConsolidator:
         except Exception as e:
             result.errors.append(f"grounding_flush: {e}")
             _logger.warning("[Consolidation] Grounding flush failed: %s", e)
+
+    def _step_amem_consolidation(self, result: ConsolidationResult) -> None:
+        """
+        Step 6: A-MEM Zettelkasten consolidation.
+        Merge near-duplicate atomic notes, strengthen link graph.
+        Blueprint §8 — Memory Systems.
+        """
+        try:
+            from core.memory.amem_store import get_amem_store
+            amem = get_amem_store()
+            merged = amem.consolidate()
+            result.amem_notes_merged = merged  # type: ignore[attr-defined]
+            if merged:
+                _logger.info("[Consolidation] A-MEM: merged %d duplicate notes.", merged)
+            else:
+                _logger.debug("[Consolidation] A-MEM: no duplicates to merge.")
+        except Exception as e:
+            result.errors.append(f"amem_consolidation: {e}")
+            _logger.warning("[Consolidation] A-MEM consolidation failed: %s", e)
+
+    def _step_tripwire_suite(self, result: ConsolidationResult) -> None:
+        """
+        Step 7: Run tripwire canary tasks to detect capability regression.
+        Blueprint §16.2 — Safety Monitoring.
+        Only runs if an LLM callable is available (injected at construction time).
+        """
+        _llm = getattr(self, "_llm_call", None)
+        if _llm is None:
+            _logger.debug("[Consolidation] Tripwire: no LLM callable — skipping.")
+            return
+        try:
+            from core.safety.tripwire_tasks import TripwireTaskRunner
+
+            def _on_regression(suite_result) -> None:
+                _logger.warning(
+                    "[Consolidation] *** TRIPWIRE REGRESSION *** %s",
+                    suite_result.alert_message,
+                )
+
+            runner = TripwireTaskRunner(
+                llm_call=_llm,
+                on_regression=_on_regression,
+            )
+            suite = runner.run_suite(timeout_per_task=20.0)
+            result.tripwire_pass_rate = suite.pass_rate  # type: ignore[attr-defined]
+            result.tripwire_regression = suite.regression_detected  # type: ignore[attr-defined]
+            _logger.info(
+                "[Consolidation] Tripwire suite done: pass_rate=%.2f regression=%s",
+                suite.pass_rate, suite.regression_detected,
+            )
+        except Exception as e:
+            result.errors.append(f"tripwire_suite: {e}")
+            _logger.warning("[Consolidation] Tripwire suite failed: %s", e)
+
 
 
 _instance: Optional[NightlyConsolidator] = None
