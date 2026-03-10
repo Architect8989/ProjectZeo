@@ -52,6 +52,7 @@ class Episode:
         action: Dict[str, Any],
         reward: float,
         outcome: str = "unknown",
+        screenshot_b64: str = "",   # Optional: enables V-JEPA visual enrichment
     ) -> None:
         self.steps.append(TrajectoryStep(
             step_idx=len(self.steps),
@@ -60,6 +61,13 @@ class Episode:
             reward=reward,
             outcome=outcome,
         ))
+        # Store screenshot_b64 in metadata for V-JEPA enrichment at retrieval time
+        if screenshot_b64:
+            if "screenshots" not in self.metadata:
+                self.metadata["screenshots"] = []
+            # Keep at most 5 screenshots per episode (memory bound)
+            if len(self.metadata["screenshots"]) < 5:
+                self.metadata["screenshots"].append(screenshot_b64[:50_000])
 
     def to_context_string(self, max_steps: int = _MAX_STEPS_PER_EPISODE) -> str:
         """Format episode as AD context string."""
@@ -253,6 +261,14 @@ class AlgorithmDistiller:
     into LLM context and queries for the next best action.
 
     Zero-shot adaptation: no gradient update required.
+
+    V-JEPA Integration (Blueprint §9.4 — DICP):
+        When V-JEPA adapter is available, screen observations are enriched
+        with visual representation embeddings before storing in episodes.
+        This enables visual-similarity matching between episodes — the
+        distiller can find similar past tasks using visual context, not just
+        text labels. Implements the DICP (Direct In-Context Policy) concept
+        from the Blueprint.
     """
 
     def __init__(
@@ -262,6 +278,52 @@ class AlgorithmDistiller:
     ) -> None:
         self._llm = llm_call
         self._store = trajectory_store or TrajectoryStore()
+
+        # ── V-JEPA visual adapter (Blueprint §9.4) ────────────────────────────
+        # Lazy-init to avoid startup cost. Enables visual-similarity retrieval
+        # for Algorithm Distillation — finding structurally similar past tasks
+        # even when task descriptions differ textually.
+        self._vjepa = None
+        self._vjepa_init_attempted = False
+
+    def _get_vjepa(self):
+        """Lazy-init V-JEPA adapter. Returns None if unavailable."""
+        if self._vjepa_init_attempted:
+            return self._vjepa
+        self._vjepa_init_attempted = True
+        _use_vjepa = os.environ.get("PROJECTZEO_USE_VJEPA", "0").strip()
+        if _use_vjepa != "1":
+            return None
+        try:
+            from adapters.vjepa_adapter import VJEPAAdapter
+            self._vjepa = VJEPAAdapter()
+            _logger.info("[AlgorithmDistiller] V-JEPA adapter loaded for visual trajectory enrichment.")
+        except Exception as exc:
+            _logger.debug("[AlgorithmDistiller] V-JEPA not available (non-fatal): %s", exc)
+        return self._vjepa
+
+    def _enrich_observation_with_vjepa(
+        self,
+        observation: str,
+        screenshot_b64: Optional[str] = None,
+    ) -> str:
+        """
+        If V-JEPA is available and screenshot provided, prepend a visual
+        context tag to the observation string. This enriches the trajectory
+        step so future retrieval can match on visual similarity.
+        """
+        vjepa = self._get_vjepa()
+        if vjepa is None or not screenshot_b64:
+            return observation
+        try:
+            # Extract top-5 visual concept labels from V-JEPA feature vector
+            visual_concepts = vjepa.describe_visual_context(screenshot_b64, top_k=5)
+            if visual_concepts:
+                visual_tag = f"[VISUAL:{','.join(visual_concepts[:5])}] "
+                return visual_tag + observation
+        except Exception as exc:
+            _logger.debug("[AlgorithmDistiller] V-JEPA observation enrichment failed: %s", exc)
+        return observation
 
     def predict_action(
         self,

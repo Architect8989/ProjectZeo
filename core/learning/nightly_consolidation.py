@@ -141,11 +141,19 @@ class NightlyConsolidator:
         # Step 4: Knowledge vault pruning
         self._step_vault_pruning(result)
 
+        # Step 5: Grounding trainer batch flush (Blueprint §9.5 — UI-AGILE)
+        # Writes accumulated click-level grounding data to JSONL batches for
+        # offline vision model fine-tuning. This is the nightly integration
+        # point for the UI-AGILE continuous grounding reward loop.
+        self._step_grounding_flush(result)
+
         result.finished_at = time.time()
         _logger.info(
-            "[Consolidation] Done in %.1fs. dpo_pairs=%d grpo=%s pruned=%d errors=%d",
+            "[Consolidation] Done in %.1fs. dpo_pairs=%d grpo=%s pruned=%d grounding_flushed=%s errors=%d",
             result.duration_s, result.dpo_pairs_found,
-            bool(result.grpo_dataset_path), result.memories_pruned, len(result.errors),
+            bool(result.grpo_dataset_path), result.memories_pruned,
+            getattr(result, "grounding_batch_path", None),
+            len(result.errors),
         )
         return result
 
@@ -222,6 +230,31 @@ class NightlyConsolidator:
         except Exception as e:
             result.errors.append(f"vault_pruning: {e}")
             _logger.warning("[Consolidation] Vault pruning failed: %s", e)
+
+    def _step_grounding_flush(self, result: ConsolidationResult) -> None:
+        """
+        Step 5: Flush accumulated grounding trainer data (Blueprint §9.5).
+        Writes UI-AGILE training batches so the vision model can be fine-tuned
+        on grounding errors discovered during the previous day's task execution.
+        """
+        try:
+            from core.learning.grounding_trainer import get_global_grounding_trainer
+            gt = get_global_grounding_trainer()
+            stats = gt.get_stats()
+            pending = stats.get("pending_steps", 0)
+            if pending == 0:
+                _logger.debug("[Consolidation] Grounding trainer: no pending steps to flush.")
+                return
+            batch_path = gt.flush_batch()
+            if batch_path:
+                result.grounding_batch_path = batch_path  # type: ignore[attr-defined]
+                _logger.info(
+                    "[Consolidation] Grounding batch flushed: %d steps → %s",
+                    pending, batch_path,
+                )
+        except Exception as e:
+            result.errors.append(f"grounding_flush: {e}")
+            _logger.warning("[Consolidation] Grounding flush failed: %s", e)
 
 
 _instance: Optional[NightlyConsolidator] = None
