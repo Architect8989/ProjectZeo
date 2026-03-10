@@ -213,6 +213,19 @@ class PerStepReasoner:
     def set_algorithm_distillation_context(self, context: str) -> None:
         self._algorithm_distillation_context = str(context or "")
 
+    def set_gwt_context(self, gwt_summary: str) -> None:
+        """
+        WIRE (FILE 8): Inject GWT broadcast summary for next reasoning call.
+        Called by gii_controller.decide_next_action() after running a GWT cycle.
+        The summary is injected into the PSR user message as high-priority
+        context before action selection.
+
+        In most cases gii_controller injects via world_state['_gwt_context'],
+        but this method provides an explicit API for callers that don't go
+        through world_state (e.g. operator cycle in decide_next_action_operator_cycle).
+        """
+        self._gwt_context = str(gwt_summary or "")
+
     def set_user_model(self, user_model) -> None:
         """
         Inject a UserModel instance (Blueprint §12 — Theory of Mind).
@@ -709,20 +722,35 @@ class PerStepReasoner:
             msg += "\n\n" + self._vault_context
 
         # ── CoH: Chain of Hindsight (Blueprint §9.3 — Peng et al. 2023) ──────
-        # Injects prior attempt-feedback pairs so the model sees what it tried
-        # before, why it failed, and what feedback was given — enables learning
-        # within the context window from past mistakes in this app/session.
         if getattr(self, "_hindsight_context", ""):
             msg += "\n\nCHAIN OF HINDSIGHT (prior attempts + feedback):\n" + self._hindsight_context[:600]
 
         # ── GII-FIX: Algorithm Distillation in-context RL loop-back ──────────
-        # Cross-task operator patterns extracted by AlgorithmDistiller from
-        # prior successful episodes are injected here, completing the AD
-        # feedback loop (Blueprint §9: in-context self-improvement).
-        # This gives the per-step reasoner awareness of generalised strategies
-        # learned across all previous tasks, not just the current one.
         if hasattr(self, "_algorithm_distillation_context") and self._algorithm_distillation_context:
             msg += "\n\nIN-CONTEXT LEARNED PATTERNS (Algorithm Distillation):\n" + self._algorithm_distillation_context[:600]
+
+        # WIRE: GWT broadcast context injection (FILE 8)
+        # Injects the Global Workspace broadcast winner summary so PSR sees:
+        # - current planning milestone status
+        # - safety alerts from ConsequenceReasoner
+        # - memory snippets from last GWT cycle
+        # - Active Inference top-action hint
+        gwt_ctx = world_state.get("_gwt_context", "") if isinstance(world_state, dict) else ""
+        if gwt_ctx:
+            msg += "\n\nGLOBAL WORKSPACE CONTEXT (GWT broadcast):\n" + str(gwt_ctx)[:600]
+
+        # WIRE: Active Inference top-action hint
+        ai_top = world_state.get("_active_inference_top_action") if isinstance(world_state, dict) else None
+        ai_efe = world_state.get("_active_inference_efe") if isinstance(world_state, dict) else None
+        if ai_top and isinstance(ai_top, dict):
+            ai_op = ai_top.get("operation", "?")
+            ai_tgt = str(ai_top.get("target", "") or ai_top.get("rationale", ""))[:80]
+            efe_str = f" (EFE={ai_efe:.3f})" if ai_efe is not None else ""
+            msg += (
+                f"\n\nACTIVE INFERENCE HINT{efe_str}: "
+                f"Free Energy minimisation suggests '{ai_op}' → {ai_tgt}. "
+                "Consider this as a strong prior; override if evidence contradicts it."
+            )
 
         return msg
 
