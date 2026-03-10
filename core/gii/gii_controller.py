@@ -479,15 +479,11 @@ class GIIController:
 
         try:
             from core.cognition.global_workspace import (
-                GlobalWorkspace, PerceptionModule, MemoryModule, ReflectionModule
+                GlobalWorkspace, PerceptionModule, MemoryModule, ReflectionModule,
+                PlanningModule, SafetyModule,  # WIRE: new modules from FILE 2
             )
             self._global_workspace = GlobalWorkspace(objective=self._objective)
             # ── GWT FIX: Register PerceptionModule with the active vision runtime ──
-            # Previously imported but never instantiated or registered.
-            # PerceptionModule is critical for GWT attention competition:
-            # perception evidence must compete with memory and reflection to
-            # determine which information is broadcast to all modules.
-            # We lazily import vision_runtime here to avoid circular deps.
             _vision_rt = None
             try:
                 from core.vision.vision_runtime import get_vision_runtime
@@ -500,9 +496,29 @@ class GIIController:
             self._global_workspace.register(PerceptionModule(_vision_rt))
             self._global_workspace.register(MemoryModule(self._openmemory_store))
             self._global_workspace.register(ReflectionModule(self._goal_repr))
+
+            # WIRE: PlanningModule — broadcasts HTN milestone transitions so GWT
+            # can interrupt PSR when the planner advances or stalls.
+            try:
+                self._global_workspace.register(PlanningModule(self))
+                _logger.debug("[GIIController] PlanningModule registered in GWT.")
+            except Exception as _pm_exc:
+                _logger.warning("[GIIController] PlanningModule registration failed (non-fatal): %s", _pm_exc)
+
+            # WIRE: SafetyModule — re-broadcasts ConsequenceReasoner deny/confirm
+            # results at high activation so safety signals win GWT competition
+            # before the next PSR reasoning cycle begins.
+            try:
+                _cr = getattr(self, "_consequence_reasoner", None)
+                self._global_workspace.register(SafetyModule(_cr))
+                _logger.debug("[GIIController] SafetyModule registered in GWT (cr=%s).", _cr is not None)
+            except Exception as _sm_exc:
+                _logger.warning("[GIIController] SafetyModule registration failed (non-fatal): %s", _sm_exc)
+
             _logger.info(
                 "[GIIController] GlobalWorkspace (GWT) active. "
-                "Modules: PerceptionModule vision=%s, MemoryModule, ReflectionModule",
+                "Modules: PerceptionModule vision=%s, MemoryModule, ReflectionModule, "
+                "PlanningModule, SafetyModule",
                 _vision_rt is not None,
             )
         except Exception as exc:
@@ -667,6 +683,24 @@ class GIIController:
                     ]
             except Exception:
                 pass
+
+        # WIRE: AT-SPI screen state snapshot for WorldGUI-style completion check.
+        # Queries the AT-SPI bridge for the current focused app and top-level
+        # accessible text so the planner can cross-reference against the objective.
+        try:
+            from core.perception.atbridge import get_atbridge
+            _bridge = get_atbridge()
+            if _bridge is not None:
+                _snap = _bridge.get_screen_state()
+                if _snap:
+                    partial["screen_state"] = {
+                        "focused_app": _snap.get("focused_app", ""),
+                        "visible_text_sample": str(_snap.get("text", ""))[:300],
+                        "entities_count": len(_snap.get("entities", [])),
+                    }
+        except Exception:
+            pass  # AT-SPI unavailable — non-fatal
+
         return partial if partial else None
 
     def decide_next_action(
@@ -680,17 +714,21 @@ class GIIController:
 
         if self._active_inference is not None:
             try:
+                # WIRE: update belief from current world_state every decide cycle
+                self._active_inference.update_belief(world_state)
+
                 _candidates: List[Dict[str, Any]] = world_state.get("_candidate_actions", [])
                 if _candidates:
                     _ranked = self._active_inference.select_action(
                         _candidates,
                         world_state=world_state,
-                        goal_desc=self._objective,
+                        goal_description=self._objective,  # FIX: was goal_desc
                     )
                     if _ranked:
                         world_state = dict(world_state)
                         world_state["_active_inference_top_action"] = _ranked[0].action
                         world_state["_active_inference_efe"] = _ranked[0].efe
+                        world_state["_active_inference_softmax"] = _ranked[0].softmax_prob
             except Exception as ai_exc:
                 _logger.debug("[GIIController] ActiveInference error (non-fatal): %s", ai_exc)
 
@@ -702,6 +740,16 @@ class GIIController:
                     world_state.setdefault("_user_model_context", user_ctx[:400])
             except Exception:
                 pass
+
+        # WIRE: inject GWT broadcast context into world_state for PSR
+        if self._global_workspace is not None:
+            try:
+                gwt_ctx = self._global_workspace.get_context_for_psr()
+                if gwt_ctx:
+                    world_state = dict(world_state) if not isinstance(world_state, dict) else world_state
+                    world_state["_gwt_context"] = gwt_ctx
+            except Exception as _gwt_exc:
+                _logger.debug("[GIIController] GWT context injection failed (non-fatal): %s", _gwt_exc)
 
         try:
             return self._per_step_reasoner.next_action(
