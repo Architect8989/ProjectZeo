@@ -252,3 +252,124 @@ def get_agent_q() -> AgentQ:
             if _instance is None:
                 _instance = AgentQ()
     return _instance
+
+
+# =============================================================================
+# AgentQStore — public interface used by GIIController._on_task_complete()
+# This is a thin wrapper around AgentQ with a more ergonomic API for the
+# auto-trigger mechanism every N tasks.
+# =============================================================================
+
+class AgentQStore:
+    """
+    GIIController-facing interface for AgentQ.
+
+    Usage:
+        store = AgentQStore()
+        # Auto-triggered every 50 tasks:
+        store.ingest_dpo_pairs(lats.get_dpo_pairs(), app_name="chrome")
+        store.register_task_outcome(success=True, objective="...", steps=[...])
+    """
+
+    def __init__(self, store_dir: Optional[str] = None) -> None:
+        self._q = AgentQ(store_dir=store_dir)
+        self._session_tasks: int = 0
+        self._session_successes: int = 0
+        self._lock = threading.Lock()
+
+    def ingest_dpo_pairs(
+        self,
+        dpo_pairs: List[Dict[str, Any]],
+        app_name: str = "unknown",
+    ) -> int:
+        """Ingest DPO pairs from LATSPlanner.get_dpo_pairs(). Returns count stored."""
+        if not dpo_pairs:
+            return 0
+        # Tag each pair with app_name if missing
+        tagged = []
+        for p in dpo_pairs:
+            p2 = dict(p)
+            if not p2.get("app_name"):
+                p2["app_name"] = app_name
+            tagged.append(p2)
+        count = self._q.ingest_lats_pairs(tagged)
+        _logger.info(
+            "[AgentQStore] Ingested %d/%d DPO pairs (app=%r).",
+            count, len(dpo_pairs), app_name,
+        )
+        return count
+
+    def register_task_outcome(
+        self,
+        success: bool,
+        objective: str,
+        steps: Optional[List[Dict[str, Any]]] = None,
+        app_name: str = "unknown",
+        reward: float = 1.0,
+    ) -> None:
+        """
+        Register a completed task trajectory as a potential MCTS rollout.
+        If both a success and failure trajectory are available for the same
+        objective, they become a DPO preference pair automatically.
+        """
+        with self._lock:
+            self._session_tasks += 1
+            if success:
+                self._session_successes += 1
+
+        if not steps:
+            return
+
+        rollout = MCTSRollout(
+            rollout_id=_make_id(f"{objective}{time.time()}"),
+            objective=objective[:200],
+            app_name=app_name[:50],
+            nodes=[
+                TrajectoryNode(
+                    node_id=_make_id(f"{objective}{i}"),
+                    depth=i,
+                    observation=str(s.get("observation", ""))[:300],
+                    action=s.get("action", {}),
+                    reward=float(s.get("reward", reward if success else 0.0)),
+                )
+                for i, s in enumerate(steps[:50])
+            ],
+            final_reward=reward if success else 0.0,
+            outcome="success" if success else "failure",
+        )
+
+        # Store for potential future pairing
+        _rollout_key = f"__rollout_{_make_id(objective)}"
+        _pending = getattr(self, "_pending_rollouts", None)
+        if _pending is None:
+            self._pending_rollouts: Dict[str, List] = {}
+            _pending = self._pending_rollouts
+
+        _pending.setdefault(_rollout_key, []).append(rollout)
+
+        # If we have both success and failure for this objective, create pair
+        rolls = _pending[_rollout_key]
+        successes = [r for r in rolls if r.outcome == "success"]
+        failures  = [r for r in rolls if r.outcome == "failure"]
+        if successes and failures:
+            n = self._q.ingest_rollouts(
+                [successes[-1], failures[-1]],
+                objective=objective,
+                app_name=app_name,
+            )
+            if n:
+                _logger.info(
+                    "[AgentQStore] Auto-created preference pair for objective=%r",
+                    objective[:60],
+                )
+            # Clear pending to avoid unbounded accumulation
+            _pending[_rollout_key] = _pending[_rollout_key][-10:]
+
+    def get_stats(self) -> Dict[str, Any]:
+        stats = self._q.get_stats()
+        stats["session_tasks"] = self._session_tasks
+        stats["session_successes"] = self._session_successes
+        return stats
+
+    def load_pairs(self, limit: int = 200) -> List[PreferencePair]:
+        return self._q.load_pairs(limit=limit)
