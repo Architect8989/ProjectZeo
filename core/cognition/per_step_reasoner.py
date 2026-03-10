@@ -1,25 +1,3 @@
-"""
-core/cognition/per_step_reasoner.py
-====================================
-Dynamic per-step action selection with full GII reasoning chain.
-
-GII UPGRADES (v3 — March 2026):
-  ✅ WAIT operation support — emits {"operation":"wait","seconds":N} for
-     long-running ops instead of triggering stagnation.
-  ✅ Continuous world-model integration — SemanticResolver result injected
-     into every prompt so the model sees semantic roles, not just pixel coords.
-  ✅ Closed-loop plan correction — if last action was a failure and the
-     scaffold said to do X, PSR rewrites the local goal before reasoning.
-  ✅ Multi-frame visual grounding — last N screenshots embedded in prompt
-     when VL model is active (removes VL hallucination of button labels).
-  ✅ Self-model awareness — PSR knows its own error rate and adapts
-     confidence thresholds accordingly.
-  ✅ History summarization — compresses every 20 actions into 3-sentence
-     narrative. Zero silent truncation.
-  ✅ Dual-mode thinking — irreversible/risky ops use thinking=True.
-  ✅ Injection marker scan on thought field.
-  ✅ Denied-signature tracking to block plan-step fallback.
-"""
 from __future__ import annotations
 
 import json
@@ -31,17 +9,13 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 _logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-
 MAX_REASONING_HISTORY   = 30
 _SUMMARIZATION_TRIGGER  = 20
 _ENTRIES_TO_SUMMARIZE   = 10
 MAX_HISTORY_TEXT_CHARS  = 300
 MAX_OBJECTIVE_CHARS     = 800
 MAX_ENTITY_COUNT        = 30
-_MAX_SCREENSHOTS_IN_PROMPT = 2   # max screenshots to embed in multi-frame grounding
+_MAX_SCREENSHOTS_IN_PROMPT = 2
 
 try:
     from config.timeouts import LLM_CALL_TIMEOUT_SECONDS as REASONING_TIMEOUT_SECONDS
@@ -51,19 +25,13 @@ except ImportError:
 _SUMMARIZATION_TIMEOUT = 60.0
 _USE_PER_STEP_ENV = "PROJECTZEO_USE_PER_STEP_REASONING"
 
-# Operations that warrant deep thinking-mode reasoning
 _THINKING_MODE_OPS: frozenset = frozenset({
     "command", "file_create", "install",
 })
 
-# Operations that are safe to WAIT on (no state change required)
 _WAITABLE_OPS: frozenset = frozenset({
     "command", "install", "verify",
 })
-
-# ---------------------------------------------------------------------------
-# System prompt — includes security boundary AND self-awareness instructions
-# ---------------------------------------------------------------------------
 
 _PER_STEP_SYSTEM_PROMPT = """\
 === SECURITY BOUNDARY ===
@@ -149,11 +117,6 @@ Be factual. Keep important details (file names, commands, error messages).
 Return ONLY plain-text — no JSON, no headers.
 """
 
-
-# ---------------------------------------------------------------------------
-# PerStepReasoner
-# ---------------------------------------------------------------------------
-
 class PerStepReasoner:
 
     def __init__(
@@ -166,8 +129,8 @@ class PerStepReasoner:
         semantic_memory=None,
         consequence_reasoner=None,
         timeout_seconds: float = REASONING_TIMEOUT_SECONDS,
-        world_model=None,          # NEW: WorldModel for continuous grounding
-        self_model=None,           # NEW: SelfModel for introspection
+        world_model=None,
+        self_model=None,
     ) -> None:
         self._llm = llm_callable
         self._objective = objective[:MAX_OBJECTIVE_CHARS]
@@ -179,7 +142,6 @@ class PerStepReasoner:
         self._world_model = world_model
         self._self_model = self_model
 
-        # Dual-mode thinking support
         self._supports_thinking: bool = callable(getattr(llm_callable, "with_thinking", None))
 
         self._history: List[Dict[str, Any]] = []
@@ -194,15 +156,12 @@ class PerStepReasoner:
         self._summarization_count = 0
         self._recently_denied_signatures: set = set()
 
-        # Multi-frame screenshot buffer
-        self._screenshot_buffer: List[str] = []  # base64 encoded
+        self._screenshot_buffer: List[str] = []
         self._screenshot_lock = threading.Lock()
 
-        # ── ReAct / Reflexion / KnowledgeVault injection (Blueprint §7.2, §8.1, §10.4)
         self._reflexion_context: str = ""
         self._vault_context: str = ""
 
-        # Track consecutive failures for adaptive thresholds
         self._consecutive_failures: int = 0
 
         if self._supports_thinking:
@@ -219,13 +178,8 @@ class PerStepReasoner:
         return os.environ.get(_USE_PER_STEP_ENV, "0").strip() == "1"
 
     def update_objective(self, new_objective: str) -> None:
-        """Allow GIIController to inject milestone sub-objectives."""
         with self._lock:
             self._objective = str(new_objective)[:MAX_OBJECTIVE_CHARS]
-
-    # =========================================================================
-    # Primary API
-    # =========================================================================
 
     def next_action(
         self,
@@ -237,10 +191,8 @@ class PerStepReasoner:
             self._call_count += 1
             call_n = self._call_count
 
-        # Trigger history summarization before building the prompt
         self._maybe_summarize_history()
 
-        # Enrich world_state with world model if available
         enriched_state = self._enrich_world_state(world_state, perception)
 
         user_msg = self._build_user_message(enriched_state, perception)
@@ -250,7 +202,6 @@ class PerStepReasoner:
             _logger.warning("[PerStepReasoner] LLM returned no valid action (call %d).", call_n)
             return None, "LLM reasoning returned no valid action"
 
-        # Scan thought field for injection markers
         thought_text = str(action.get("thought", ""))
         if thought_text:
             try:
@@ -265,20 +216,77 @@ class PerStepReasoner:
                 if "ignore previous instructions" in _lower or "ignore all previous" in _lower:
                     return None, "Injection marker detected (inline check)"
 
-        # Apply safety gate
         safety_reason = self._apply_safety(action)
         if safety_reason:
             with self._lock:
                 self._consecutive_failures += 1
             return None, safety_reason
 
-        # Track consecutive failures via history
+        op = str(action.get("operation", "")).lower()
+        if op not in ("wait", "done", "press") and self._should_self_refine(action):
+            try:
+                refined = self._self_refine(action, world_state=None)
+                if refined is not None and refined.get("operation"):
+                    _logger.debug(
+                        "[PerStepReasoner] Self-Refine: %s → %s",
+                        action.get("operation"), refined.get("operation"),
+                    )
+                    action = refined
+            except Exception as sr_exc:
+                _logger.debug("[PerStepReasoner] Self-Refine error (non-fatal): %s", sr_exc)
+
         op = str(action.get("operation", "")).lower()
         if op != "wait" and op != "done":
             with self._lock:
-                self._consecutive_failures = 0  # Reset on non-wait non-done
+                self._consecutive_failures = 0
 
         return action, "Per-step GII decision"
+
+    def _should_self_refine(self, action: Dict[str, Any]) -> bool:
+        with self._lock:
+            failures = self._consecutive_failures
+        op = str(action.get("operation", "")).lower()
+        return failures >= 1 or op in ("command", "write", "type", "navigate")
+
+    def _self_refine(
+        self,
+        action: Dict[str, Any],
+        world_state: Optional[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        import json as _json
+        action_json = _json.dumps({k: v for k, v in action.items() if k != "thought"}, indent=2)
+        objective_short = (self._objective or "")[:300]
+        reflexion_ctx = getattr(self, "_reflexion_context", "") or ""
+        critique_prompt = (
+            f"TASK: {objective_short}\n\n"
+            f"PROPOSED ACTION:\n{action_json}\n\n"
+            f"{('PRIOR CONTEXT:\n' + reflexion_ctx[:300] + chr(10)) if reflexion_ctx else ''}"
+            "CRITIQUE: Is this action correct, safe, and the best next step?\n"
+            "If it can be improved, output an improved version as JSON.\n"
+            "If it is already optimal, output EXACTLY the same action JSON.\n"
+            "Respond ONLY with a single valid JSON object (no markdown)."
+        )
+        try:
+            raw = self._llm(
+                messages=[{"role": "user", "content": critique_prompt}],
+                objective=self._objective,
+                session_id="self_refine",
+            )
+            raw_text = ""
+            if isinstance(raw, list) and raw:
+                raw_text = str(raw[0].get("content", "") if isinstance(raw[0], dict) else raw[0])
+            elif isinstance(raw, str):
+                raw_text = raw
+            if not raw_text:
+                return None
+            import re as _re
+            raw_text = _re.sub(r"```(?:json)?", "", raw_text).strip()
+            refined = _json.loads(raw_text)
+            if isinstance(refined, dict) and refined.get("operation"):
+                return refined
+        except Exception:
+            pass
+        return None
 
     def record_outcome(
         self,
@@ -303,7 +311,6 @@ class PerStepReasoner:
             if len(self._history) > MAX_REASONING_HISTORY:
                 self._history = self._history[-MAX_REASONING_HISTORY:]
 
-        # Update self-model if available
         if self._self_model is not None:
             try:
                 self._self_model.record_action_result(
@@ -312,7 +319,6 @@ class PerStepReasoner:
             except Exception:
                 pass
 
-        # Update world model if available
         if self._world_model is not None and output:
             try:
                 self._world_model.ingest_command_output(
@@ -324,12 +330,10 @@ class PerStepReasoner:
                 pass
 
     def push_screenshot(self, screenshot_b64: str) -> None:
-        """Push a screenshot into the multi-frame buffer for grounding."""
         if not isinstance(screenshot_b64, str) or not screenshot_b64:
             return
         with self._screenshot_lock:
             self._screenshot_buffer.append(screenshot_b64)
-            # Keep only last N screenshots
             if len(self._screenshot_buffer) > _MAX_SCREENSHOTS_IN_PROMPT:
                 self._screenshot_buffer = self._screenshot_buffer[-_MAX_SCREENSHOTS_IN_PROMPT:]
 
@@ -351,18 +355,7 @@ class PerStepReasoner:
                 "summarization_count":  self._summarization_count,
             }
 
-    # =========================================================================
-    # ReAct Context Injection (Blueprint §7.2)
-    # =========================================================================
-
     def _build_react_context(self, recent_history: List[Dict[str, Any]]) -> str:
-        """
-        Build ReAct (Thought, Action, Observation) triples from recent history.
-
-        Blueprint §7.2: PSR generates reasoning but does NOT inject the
-        reasoning back as context for the next step's reasoning.
-        Fix: inject last 3 (Thought, Action, Observation) triples.
-        """
         if not recent_history:
             return ""
         triples = []
@@ -380,46 +373,25 @@ class PerStepReasoner:
         return "\n".join(triples)
 
     def set_reflexion_context(self, context: str) -> None:
-        """
-        Set Reflexion context to inject in next reasoning call (Blueprint §8.1).
-        Called by gii_loop.py before each step after a milestone failure.
-        """
         self._reflexion_context = context or ""
 
     def set_vault_context(self, context: str) -> None:
-        """
-        Set Knowledge Vault context to inject in next reasoning call (Blueprint §10.4).
-        Called by gii_loop.py with relevant lessons for current milestone.
-        """
         self._vault_context = context or ""
 
     def clear_injected_contexts(self) -> None:
-        """Clear all injected contexts after a step completes."""
         self._reflexion_context = ""
         self._vault_context = ""
-
-    # =========================================================================
-    # World-state enrichment (GII continuous grounding)
-    # =========================================================================
 
     def _enrich_world_state(
         self,
         world_state: Dict[str, Any],
         perception: Optional[Dict[str, Any]],
     ) -> Dict[str, Any]:
-        """
-        Enrich raw world_state with:
-          1. SemanticResolver roles for each entity (so the model knows
-             "this is a password field", "this is a submit button")
-          2. WorldModel predictions about what will happen next
-          3. Last-command output injection if available
-        """
         if not isinstance(world_state, dict):
             return world_state
 
         enriched = dict(world_state)
 
-        # WorldModel enrichment
         if self._world_model is not None:
             try:
                 wm_context = self._world_model.get_context_for_objective(self._objective)
@@ -428,7 +400,6 @@ class PerStepReasoner:
             except Exception:
                 pass
 
-        # SemanticResolver enrichment — adds 'semantic_role' to entities
         entities = list(enriched.get("entities", []))
         if entities:
             try:
@@ -444,10 +415,6 @@ class PerStepReasoner:
                 pass
 
         return enriched
-
-    # =========================================================================
-    # History Summarization
-    # =========================================================================
 
     def _maybe_summarize_history(self) -> None:
         with self._lock:
@@ -543,16 +510,11 @@ class PerStepReasoner:
             raise TimeoutError(f"Summarization timed out after {_SUMMARIZATION_TIMEOUT}s")
         return result_holder[0]
 
-    # =========================================================================
-    # Prompt construction
-    # =========================================================================
-
     def _build_user_message(
         self,
         world_state: Dict[str, Any],
         perception: Optional[Dict[str, Any]],
     ) -> str:
-        # Scaffold block
         scaffold_lines = []
         for i, step in enumerate(self._scaffold[:10], 1):
             desc = str(step.get("description") or step.get("goal") or "")[:120]
@@ -580,7 +542,6 @@ class PerStepReasoner:
 
         entities_block = "\n".join(entity_lines) if entity_lines else "    (no entities visible)"
 
-        # Memory context
         mem_parts = []
 
         if self._app_memory and focused_app and focused_app != "unknown":
@@ -608,7 +569,6 @@ class PerStepReasoner:
         if gii_mem:
             mem_parts.append(f"[Cross-session Memory]\n{gii_mem[:400]}")
 
-        # History block
         with self._lock:
             history = list(self._history[-10:])
             call_n      = self._call_count
@@ -635,7 +595,6 @@ class PerStepReasoner:
 
         history_block = "\n".join(history_lines) if history_lines else "  (no actions yet)"
 
-        # Stagnation hint
         loop_note = world_state.get("_gii_loop_note", "")
         if consec_fail >= 3:
             stagnation_hint = f"⚠ {consec_fail} consecutive failures — try a DIFFERENT approach"
@@ -664,27 +623,17 @@ class PerStepReasoner:
         if mem_parts:
             msg += "\n\nMEMORY CONTEXT:\n" + "\n\n".join(mem_parts)
 
-        # ── ReAct: inject last 3 (Thought, Action, Observation) triples (Blueprint §7.2)
-        # Critical missing piece: PSR generates reasoning but does NOT inject
-        # the reasoning back as context for the next step's reasoning.
-        # Fix: inject last 3 ReAct triples as context into each new reasoning call.
         react_triples = self._build_react_context(history[-3:] if history else [])
         if react_triples:
             msg += "\n\nReAct CONTEXT (last 3 thought-action-observation triples):\n" + react_triples
 
-        # ── Reflexion: inject failure reflections for current milestone (Blueprint §8.1)
         if hasattr(self, "_reflexion_context") and self._reflexion_context:
             msg += "\n\n" + self._reflexion_context
 
-        # ── Knowledge Vault: inject relevant lessons (Blueprint §10.4)
         if hasattr(self, "_vault_context") and self._vault_context:
             msg += "\n\n" + self._vault_context
 
         return msg
-
-    # =========================================================================
-    # LLM call with dual-mode thinking routing
-    # =========================================================================
 
     def _select_callable_for_action(
         self, world_state: Optional[Dict[str, Any]]
@@ -698,17 +647,14 @@ class PerStepReasoner:
 
         use_thinking = False
 
-        # Failure recovery
         for h in recent:
             if h["outcome"] == "failure" and h["action"].get("operation") in _THINKING_MODE_OPS:
                 use_thinking = True
                 break
 
-        # Stagnation signal
         if world_state and world_state.get("_gii_loop_note"):
             use_thinking = True
 
-        # Multiple consecutive failures
         if consec >= 2:
             use_thinking = True
 
@@ -740,12 +686,10 @@ class PerStepReasoner:
                     {"role": "system", "content": _PER_STEP_SYSTEM_PROMPT},
                 ]
 
-                # Multi-frame visual grounding
                 with self._screenshot_lock:
                     screenshots = list(self._screenshot_buffer)
 
                 if screenshots:
-                    # Build a multi-modal user message
                     content_parts: List[Dict] = []
                     for sc_b64 in screenshots:
                         content_parts.append({
@@ -824,10 +768,6 @@ class PerStepReasoner:
             except json.JSONDecodeError:
                 pass
         return None
-
-    # =========================================================================
-    # Safety gate
-    # =========================================================================
 
     def _apply_safety(self, action: Dict[str, Any]) -> Optional[str]:
         if self._consequence_reasoner is None:
