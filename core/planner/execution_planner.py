@@ -626,6 +626,215 @@ class ExecutionPlanner:
 
         return plan
 
+    # ──────────────────────────────────────────────────────────────────────────
+    # GII-ARCH FIX: create_scaffold() — milestone-level scaffold for GII loop
+    #
+    # This is the central fix for "Sin 1 — Static Plan Generation".
+    # When GII_MODE=2 (FULL), main.py calls create_scaffold() instead of
+    # create_plan(). The output is a list of milestone dicts — high-level goal
+    # descriptors with no step-level action keys. GIIGoalDirectedLoop +
+    # OperatorCycle (SOAR) then fills in the concrete operator actions
+    # dynamically from world state, eliminating the pre-execution blindness.
+    #
+    # Milestone schema (no "operation" key — these are goals, not actions):
+    #   {
+    #     "milestone": "<human-readable goal phrase>",
+    #     "success_criteria": "<observable condition that signals completion>",
+    #     "estimated_minutes": <int>,
+    #     "reversible": <bool>,
+    #     "milestone_index": <int>,
+    #   }
+    # ──────────────────────────────────────────────────────────────────────────
+
+    _SCAFFOLD_SYSTEM_PROMPT = """\
+You are a task decomposer for an autonomous desktop agent.
+Break the given OBJECTIVE into 3–8 high-level MILESTONES.
+
+Each milestone must be:
+  - A GOAL (what state to reach), NOT an action sequence
+  - Observable: the agent can tell when it is complete by looking at the screen
+  - Independent: each milestone can be pursued with dynamic operator decisions
+  - Atomic enough that one milestone = one coherent activity cluster
+
+Return ONLY a valid JSON array. No prose, no markdown fences.
+
+Schema for each element:
+{
+  "milestone": "<goal phrase, e.g. 'Chrome is open and loaded'>",
+  "success_criteria": "<observable condition, e.g. 'Chrome window visible, address bar present'>",
+  "estimated_minutes": <integer 1-120>,
+  "reversible": <true|false>
+}
+
+RULES:
+  - 3 milestones minimum, 8 maximum
+  - No step-level actions (no click/type/command fields)
+  - success_criteria must be visually verifiable from a screenshot
+  - estimated_minutes must be realistic
+"""
+
+    def create_scaffold(
+        self,
+        objective: str,
+        *,
+        environment: Optional[Dict[str, Any]] = None,
+        max_retries: int = 3,
+    ) -> List[Dict[str, Any]]:
+        """
+        GII-ARCH FIX: Generate milestone-level scaffold for GII goal-directed loop.
+
+        Returns a list of milestone dicts that GIIController passes to
+        GIIGoalDirectedLoop as high-level guidance. Each milestone is a GOAL
+        descriptor, not a step sequence. OperatorCycle (SOAR) selects concrete
+        actions dynamically.
+
+        This replaces the static create_plan() → step-array flow when
+        PROJECTZEO_GII_MODE=2.
+
+        Args:
+            objective:   The full task objective string.
+            environment: Optional env fingerprint for context.
+            max_retries: LLM retry attempts on parse failure.
+
+        Returns:
+            List of milestone dicts with keys:
+              milestone, success_criteria, estimated_minutes, reversible,
+              milestone_index
+        """
+        import json as _json
+        import re as _re
+        import logging as _lg
+        _log = _lg.getLogger(__name__)
+
+        if not isinstance(objective, str) or not objective.strip():
+            raise PlanningError("create_scaffold: objective must be non-empty string")
+
+        objective = objective.strip()
+
+        env_summary = ""
+        if isinstance(environment, dict):
+            os_name = environment.get("os", "unknown")
+            tools   = ", ".join(environment.get("tools", [])[:6]) or "none"
+            env_summary = f"\nEnvironment: OS={os_name}, available_tools=[{tools}]"
+
+        user_prompt = (
+            f"OBJECTIVE: {objective[:800]}"
+            f"{env_summary}\n\n"
+            "Return 3-8 milestones as a JSON array."
+        )
+
+        messages = [
+            {"role": "system", "content": self._SCAFFOLD_SYSTEM_PROMPT},
+            {"role": "user",   "content": user_prompt},
+        ]
+
+        raw_text = ""
+        last_err: Optional[Exception] = None
+
+        for attempt in range(1, max_retries + 1):
+            try:
+                raw_text = self._call_llm_text(user_prompt)
+                break
+            except Exception as exc:
+                last_err = exc
+                _log.warning(
+                    "[create_scaffold] LLM call attempt %d/%d failed: %s",
+                    attempt, max_retries, exc,
+                )
+                import time as _t
+                _t.sleep(min(2.0 ** attempt, 10.0))
+
+        if not raw_text:
+            _log.error(
+                "[create_scaffold] All LLM attempts failed. "
+                "Falling back to single-milestone scaffold. Last error: %s",
+                last_err,
+            )
+            return self._scaffold_fallback(objective)
+
+        # Parse JSON array from LLM response
+        text = _re.sub(r"```(?:json)?", "", raw_text).strip()
+        milestones_raw: Optional[List[Dict]] = None
+
+        # Try direct parse
+        try:
+            result = _json.loads(text)
+            if isinstance(result, list):
+                milestones_raw = result
+            elif isinstance(result, dict) and "milestones" in result:
+                milestones_raw = result["milestones"]
+        except _json.JSONDecodeError:
+            pass
+
+        # Try extracting embedded array
+        if milestones_raw is None:
+            m = _re.search(r"(\[[\s\S]*\])", text)
+            if m:
+                try:
+                    milestones_raw = _json.loads(m.group(1))
+                except _json.JSONDecodeError:
+                    pass
+
+        if not milestones_raw:
+            _log.warning(
+                "[create_scaffold] Could not parse milestone array — fallback. "
+                "Raw (first 200): %r", raw_text[:200]
+            )
+            return self._scaffold_fallback(objective)
+
+        validated = []
+        for i, m in enumerate(milestones_raw):
+            if not isinstance(m, dict):
+                continue
+            milestone_text = str(m.get("milestone", "")).strip()
+            if not milestone_text:
+                continue
+            success_criteria = str(m.get("success_criteria", "")).strip()
+            if not success_criteria:
+                success_criteria = f"{milestone_text} — visually confirmed on screen"
+            try:
+                estimated_minutes = max(1, int(m.get("estimated_minutes", 5)))
+            except (TypeError, ValueError):
+                estimated_minutes = 5
+            reversible = bool(m.get("reversible", True))
+            validated.append({
+                "milestone":          milestone_text,
+                "success_criteria":   success_criteria,
+                "estimated_minutes":  estimated_minutes,
+                "reversible":         reversible,
+                "milestone_index":    i,
+            })
+
+        if not validated:
+            _log.warning("[create_scaffold] Zero valid milestones after validation — fallback.")
+            return self._scaffold_fallback(objective)
+
+        # Cap at 8 milestones
+        validated = validated[:8]
+
+        # Re-index after capping
+        for i, m in enumerate(validated):
+            m["milestone_index"] = i
+
+        _log.info(
+            "[create_scaffold] Generated %d milestones for objective %r",
+            len(validated), objective[:60],
+        )
+        return validated
+
+    def _scaffold_fallback(self, objective: str) -> List[Dict[str, Any]]:
+        """
+        Single-milestone fallback when LLM fails to produce a parseable scaffold.
+        This ensures the GII loop always gets at least one milestone to work with.
+        """
+        return [{
+            "milestone":         objective.strip()[:300],
+            "success_criteria":  "Objective visually confirmed complete on screen",
+            "estimated_minutes": 30,
+            "reversible":        True,
+            "milestone_index":   0,
+        }]
+
     def _decompose_if_complex(
         self, objective: str
     ) -> List[Dict[str, Any]]:
