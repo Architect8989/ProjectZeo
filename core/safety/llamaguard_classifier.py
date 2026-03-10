@@ -11,6 +11,10 @@ from typing import Dict, List, Optional, Tuple
 
 _logger = logging.getLogger(__name__)
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Hazard taxonomy
+# ─────────────────────────────────────────────────────────────────────────────
+
 class HazardCategory(str, Enum):
     VIOLENT_CRIMES            = "S1"
     NON_VIOLENT_CRIMES        = "S2"
@@ -27,6 +31,7 @@ class HazardCategory(str, Enum):
     ELECTIONS_MISINFORMATION  = "S13"
     CODE_CYBERATTACKS         = "S14"
 
+# Categories that must be immediately blocked regardless of context
 _BLOCK_CATEGORIES: frozenset = frozenset({
     HazardCategory.VIOLENT_CRIMES,
     HazardCategory.CHILD_EXPLOITATION,
@@ -35,30 +40,58 @@ _BLOCK_CATEGORIES: frozenset = frozenset({
     HazardCategory.CODE_CYBERATTACKS,
 })
 
+# Categories that require human confirmation
 _CONFIRM_CATEGORIES: frozenset = frozenset({
     HazardCategory.NON_VIOLENT_CRIMES,
     HazardCategory.SPECIALIZED_ADVICE,
     HazardCategory.PRIVACY_VIOLATIONS,
 })
 
+# Categories that produce a warning but allow execution
 _WARN_CATEGORIES: frozenset = frozenset({
     HazardCategory.DEFAMATION,
     HazardCategory.IP_VIOLATIONS,
     HazardCategory.HATE_SPEECH,
     HazardCategory.ELECTIONS_MISINFORMATION,
+    HazardCategory.SEXUAL_CONTENT,
+    HazardCategory.SEX_RELATED_CRIMES,
 })
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FAIL-CLOSED: operation categories when LlamaGuard is required but unavailable
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Operations blocked outright when classifier is down (can cause irreversible harm)
+_FAIL_CLOSED_BLOCK_OPS: frozenset = frozenset({
+    "file_delete", "file_move", "file_write", "file_modify",
+    "rm", "rmdir", "format", "wipe",
+})
+
+# Operations requiring human confirmation when classifier is down
+_FAIL_CLOSED_CONFIRM_OPS: frozenset = frozenset({
+    "command", "install", "file_create", "navigate", "submit",
+    "send", "post", "upload", "download",
+})
+
+# Operations allowed even when classifier is down (inherently observable/reversible)
+_FAIL_CLOSED_ALLOW_OPS: frozenset = frozenset({
+    "click", "scroll", "move_mouse", "focus", "screenshot",
+    "observe", "wait", "done", "verify", "read", "type", "write",
+})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Result type
+# ─────────────────────────────────────────────────────────────────────────────
 
 @dataclass
 class LlamaGuardResult:
+    """Result of a LlamaGuard classification call."""
 
-    verdict: str
-
-    categories: List[str]
-
-    action: str
-
+    verdict: str                     # "safe" | "unsafe"
+    categories: List[str]            # Triggered S-codes e.g. ["S1", "S14"]
+    action: str                      # "ALLOW" | "BLOCK" | "REQUIRE_HUMAN_CONFIRMATION" | "WARN"
     reason: str
-
     latency_seconds: float = 0.0
 
     @property
@@ -73,7 +106,13 @@ class LlamaGuardResult:
     def requires_confirmation(self) -> bool:
         return self.action == "REQUIRE_HUMAN_CONFIRMATION"
 
-_LLAMAGUARD_SYSTEM = """[INST] Task: Check if there is unsafe content in the 'Agent' messages in conversations according our safety policy with the below categories.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Prompt construction
+# ─────────────────────────────────────────────────────────────────────────────
+
+_LLAMAGUARD_SYSTEM = """\
+[INST] Task: Check if there is unsafe content in the 'Agent' messages in conversations according our safety policy with the below categories.
 
 <BEGIN UNSAFE CONTENT CATEGORIES>
 S1: Violent Crimes
@@ -100,6 +139,7 @@ Provide your safety assessment for the Agent message.
 First line must be "safe" or "unsafe".
 If unsafe, list triggered categories on the second line (comma-separated S codes). [/INST]"""
 
+
 def _build_llamaguard_prompt(action_dict: Dict) -> str:
     op = str(action_dict.get("operation", "unknown"))
 
@@ -109,6 +149,8 @@ def _build_llamaguard_prompt(action_dict: Dict) -> str:
         path = action_dict.get("path", "")
         file_content = str(action_dict.get("content", ""))[:500]
         content = f"Create file at {path} with content:\n{file_content}"
+    elif op == "file_delete":
+        content = f"Delete file or directory: {action_dict.get('path', '')}"
     elif op in ("write", "type"):
         typed = str(action_dict.get("content") or action_dict.get("text", ""))[:300]
         content = f"Type/write text: {typed}"
@@ -122,8 +164,10 @@ def _build_llamaguard_prompt(action_dict: Dict) -> str:
     elif op == "click":
         text = str(action_dict.get("text", ""))
         content = f"Click UI element: {text}"
+    elif op in ("navigate", "browse"):
+        content = f"Navigate to URL/path: {action_dict.get('url', action_dict.get('path', ''))}"
     else:
-        content = f"Perform action: {op} — {json.dumps(action_dict)[:200]}"
+        content = f"Perform action: {op} — {json.dumps(action_dict, default=str)[:200]}"
 
     thought = str(action_dict.get("thought", ""))
     if thought:
@@ -131,33 +175,81 @@ def _build_llamaguard_prompt(action_dict: Dict) -> str:
 
     return _LLAMAGUARD_SYSTEM.format(agent_content=content)
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LlamaGuardClassifier
+# ─────────────────────────────────────────────────────────────────────────────
+
 class LlamaGuardClassifier:
-    
+    """
+    LlamaGuard-3-8B classifier for Tier 4 safety gate.
+
+    Supports four backends (in priority order):
+      1. SGLang server  (PROJECTZEO_LLAMAGUARD_ENDPOINT or PROJECTZEO_LLAMAGUARD_URL)
+      2. llama-cpp-python GGUF  (PROJECTZEO_LLAMAGUARD_GGUF)
+      3. HuggingFace transformers  (PROJECTZEO_LLAMAGUARD_HF=1)
+      4. Ollama  (PROJECTZEO_LLAMAGUARD_OLLAMA)
+
+    FAIL-CLOSED behaviour:
+      When PROJECTZEO_REQUIRE_LLAMAGUARD=1 (default) and no backend is
+      available, the classifier denies destructive operations and requires
+      human confirmation for irreversible ones instead of silently allowing
+      everything.
+    """
+
     _instance: Optional["LlamaGuardClassifier"] = None
     _instance_lock = threading.Lock()
+
+    # Startup warning emitted at most once per process
+    _FAILCLOSED_WARNING_EMITTED = False
 
     def __init__(self) -> None:
         self._backend: Optional[str] = None
         self._model = None
         self._client = None
         self._url: Optional[str] = None
-        self._timeout: float = 30.0
+        self._timeout: float = float(os.environ.get("PROJECTZEO_LLAMAGUARD_TIMEOUT", "30"))
 
         self._total_classifications: int = 0
         self._total_blocks: int = 0
         self._total_confirms: int = 0
+        self._total_failclosed: int = 0
         self._total_latency: float = 0.0
 
+        # Whether this classifier is enabled at all
         self._enabled = (
-            os.environ.get("PROJECTZEO_LLAMAGUARD_ENABLED", "1").strip() not in ("0", "false", "no")
+            os.environ.get("PROJECTZEO_LLAMAGUARD_ENABLED", "1").strip()
+            not in ("0", "false", "no")
+        )
+
+        # Whether absence of a backend should be fail-closed (default: YES)
+        self._require = (
+            os.environ.get("PROJECTZEO_REQUIRE_LLAMAGUARD", "1").strip()
+            not in ("0", "false", "no")
         )
 
         if self._enabled:
             self._init_backend()
 
+        if self._enabled and self._backend == "disabled" and self._require:
+            if not LlamaGuardClassifier._FAILCLOSED_WARNING_EMITTED:
+                LlamaGuardClassifier._FAILCLOSED_WARNING_EMITTED = True
+                import sys
+                print(
+                    "\n[SAFETY WARNING] LlamaGuard-3 Tier 4 classifier is REQUIRED "
+                    "(PROJECTZEO_REQUIRE_LLAMAGUARD=1) but NO backend is configured.\n"
+                    "  → Destructive operations (file_delete, file_move, file_write) will be DENIED.\n"
+                    "  → Command/install operations will require human confirmation.\n"
+                    "  → Set one of: PROJECTZEO_LLAMAGUARD_ENDPOINT, PROJECTZEO_LLAMAGUARD_GGUF,\n"
+                    "                PROJECTZEO_LLAMAGUARD_HF=1, or PROJECTZEO_LLAMAGUARD_OLLAMA\n"
+                    "    to restore full Tier 4 coverage.",
+                    file=sys.stderr,
+                )
+
         _logger.info(
-            "[LlamaGuardClassifier] Initialised. backend=%s enabled=%s",
-            self._backend, self._enabled,
+            "[LlamaGuardClassifier] Initialised. backend=%s enabled=%s require=%s fail_closed=%s",
+            self._backend, self._enabled, self._require,
+            (self._enabled and self._backend == "disabled" and self._require),
         )
 
     @classmethod
@@ -169,13 +261,28 @@ class LlamaGuardClassifier:
                 cls._instance = cls()
         return cls._instance
 
+    # ─────────────────────────────────────────────────────────────────────────
+    # Public API
+    # ─────────────────────────────────────────────────────────────────────────
+
     def classify(self, action_dict: Dict) -> LlamaGuardResult:
-        
-        if not self._enabled or self._backend == "disabled":
+        """
+        Classify an action dict.
+
+        Returns a LlamaGuardResult with verdict, categories, and recommended action.
+        Fail-closed when backend unavailable and REQUIRE_LLAMAGUARD=1.
+        """
+        # Classifier entirely disabled — pass through
+        if not self._enabled:
             return LlamaGuardResult(
                 verdict="safe", categories=[], action="ALLOW",
-                reason="LlamaGuard disabled", latency_seconds=0.0,
+                reason="LlamaGuard disabled (PROJECTZEO_LLAMAGUARD_ENABLED=0)",
+                latency_seconds=0.0,
             )
+
+        # Backend unavailable: apply fail-closed policy
+        if self._backend in (None, "disabled"):
+            return self._fail_closed_result(action_dict)
 
         start = time.monotonic()
         self._total_classifications += 1
@@ -190,8 +297,8 @@ class LlamaGuardClassifier:
             if result.is_blocked:
                 self._total_blocks += 1
                 _logger.warning(
-                    "[LlamaGuardClassifier] BLOCK: op=%s categories=%s",
-                    action_dict.get("operation"), result.categories,
+                    "[LlamaGuardClassifier] BLOCK: op=%s categories=%s reason=%s",
+                    action_dict.get("operation"), result.categories, result.reason[:80],
                 )
             elif result.requires_confirmation:
                 self._total_confirms += 1
@@ -204,14 +311,120 @@ class LlamaGuardClassifier:
 
         except Exception as exc:
             latency = time.monotonic() - start
+            op = str(action_dict.get("operation", "")).lower()
             _logger.warning(
-                "[LlamaGuardClassifier] Classification error (fail-open): %s", exc
+                "[LlamaGuardClassifier] Classification error for op=%s: %s",
+                op, exc,
             )
+
+            # FAIL-CLOSED on exception for destructive operations
+            if op in _FAIL_CLOSED_BLOCK_OPS:
+                self._total_blocks += 1
+                return LlamaGuardResult(
+                    verdict="unsafe",
+                    categories=[],
+                    action="BLOCK",
+                    reason=(
+                        f"LlamaGuard classification failed ({type(exc).__name__}). "
+                        f"Fail-closed BLOCK for destructive op '{op}'."
+                    ),
+                    latency_seconds=latency,
+                )
+
+            if op in _FAIL_CLOSED_CONFIRM_OPS:
+                self._total_confirms += 1
+                return LlamaGuardResult(
+                    verdict="unsafe",
+                    categories=[],
+                    action="REQUIRE_HUMAN_CONFIRMATION",
+                    reason=(
+                        f"LlamaGuard classification failed ({type(exc).__name__}). "
+                        f"Fail-closed CONFIRM for op '{op}'."
+                    ),
+                    latency_seconds=latency,
+                )
+
+            # Harmless op — allow with warning
             return LlamaGuardResult(
-                verdict="safe", categories=[], action="ALLOW",
-                reason=f"Classification error (fail-open): {exc}",
+                verdict="safe",
+                categories=[],
+                action="ALLOW",
+                reason=f"Classification error (fail-open for non-destructive op): {exc}",
                 latency_seconds=latency,
             )
+
+    def _fail_closed_result(self, action_dict: Dict) -> LlamaGuardResult:
+        """
+        Called when the classifier is required but no backend is available.
+        Applies a conservative policy based on operation type.
+        """
+        op = str(action_dict.get("operation", "")).lower()
+        self._total_failclosed += 1
+
+        if not self._require:
+            # Fail-open allowed — return ALLOW with a debug note
+            return LlamaGuardResult(
+                verdict="safe",
+                categories=[],
+                action="ALLOW",
+                reason="LlamaGuard backend unavailable (REQUIRE_LLAMAGUARD=0, failing open)",
+                latency_seconds=0.0,
+            )
+
+        # REQUIRE_LLAMAGUARD=1: enforce conservative policy
+        if op in _FAIL_CLOSED_BLOCK_OPS:
+            _logger.warning(
+                "[LlamaGuardClassifier] FAIL-CLOSED DENY: op=%s (no backend, require=True)",
+                op,
+            )
+            return LlamaGuardResult(
+                verdict="unsafe",
+                categories=[],
+                action="BLOCK",
+                reason=(
+                    f"LlamaGuard Tier 4 backend unavailable. "
+                    f"Fail-closed: op '{op}' is categorised as destructive — BLOCKED. "
+                    "Configure PROJECTZEO_LLAMAGUARD_ENDPOINT to restore Tier 4 coverage."
+                ),
+                latency_seconds=0.0,
+            )
+
+        if op in _FAIL_CLOSED_CONFIRM_OPS:
+            _logger.info(
+                "[LlamaGuardClassifier] FAIL-CLOSED CONFIRM: op=%s (no backend, require=True)",
+                op,
+            )
+            return LlamaGuardResult(
+                verdict="unsafe",
+                categories=[],
+                action="REQUIRE_HUMAN_CONFIRMATION",
+                reason=(
+                    f"LlamaGuard Tier 4 backend unavailable. "
+                    f"Fail-closed: op '{op}' requires human confirmation. "
+                    "Configure PROJECTZEO_LLAMAGUARD_ENDPOINT to restore Tier 4 coverage."
+                ),
+                latency_seconds=0.0,
+            )
+
+        # Explicitly allowed ops or unknown ops → ALLOW with warning
+        _logger.debug(
+            "[LlamaGuardClassifier] FAIL-CLOSED ALLOW: op=%s (no backend, allow-listed op)",
+            op,
+        )
+        return LlamaGuardResult(
+            verdict="safe",
+            categories=[],
+            action="ALLOW",
+            reason=(
+                f"LlamaGuard backend unavailable. Op '{op}' allowed by fail-closed "
+                "allow-list (observational/reversible). Tier 4 is degraded."
+            ),
+            latency_seconds=0.0,
+        )
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Backend dispatch
+    # ─────────────────────────────────────────────────────────────────────────
 
     def _run_inference(self, prompt: str) -> str:
         if self._backend == "sglang":
@@ -221,10 +434,10 @@ class LlamaGuardClassifier:
         elif self._backend == "hf":
             return self._infer_hf(prompt)
         elif self._backend == "ollama":
-            return self._call_backend(prompt)
-        return "safe"
+            return self._call_ollama(prompt)
+        raise RuntimeError(f"Unknown backend: {self._backend!r}")
 
-    def _call_backend(self, prompt: str) -> str:
+    def _call_ollama(self, prompt: str) -> str:
         model_tag = getattr(self, "_ollama_model_tag", "llama-guard3:8b")
         ollama_host = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
         try:
@@ -237,7 +450,7 @@ class LlamaGuardClassifier:
             r = _hx.post(
                 f"{ollama_host}/api/chat",
                 json=payload,
-                timeout=_hx.Timeout(connect=5.0, read=30.0, write=5.0, pool=5.0),
+                timeout=_hx.Timeout(connect=5.0, read=self._timeout, write=5.0, pool=5.0),
             )
             r.raise_for_status()
             return r.json()["message"]["content"]
@@ -258,7 +471,7 @@ class LlamaGuardClassifier:
             timeout=self._timeout,
         )
         if response.status_code != 200:
-            raise RuntimeError(f"SGLang returned {response.status_code}")
+            raise RuntimeError(f"SGLang returned {response.status_code}: {response.text[:200]}")
         data = response.json()
         return data["choices"][0]["message"]["content"]
 
@@ -277,6 +490,10 @@ class LlamaGuardClassifier:
             return output[0].get("generated_text", "")[-64:]
         return str(output)
 
+    # ─────────────────────────────────────────────────────────────────────────
+    # Output parsing
+    # ─────────────────────────────────────────────────────────────────────────
+
     def _parse_output(self, raw: str) -> LlamaGuardResult:
         lines = [l.strip() for l in raw.strip().splitlines() if l.strip()]
         if not lines:
@@ -288,9 +505,10 @@ class LlamaGuardClassifier:
         verdict = lines[0].lower()
         if "unsafe" not in verdict:
             return LlamaGuardResult(
-                verdict="safe", categories=[], action="ALLOW", reason="Safe",
+                verdict="safe", categories=[], action="ALLOW", reason="LlamaGuard: safe",
             )
 
+        # Parse triggered categories from second line
         categories: List[str] = []
         if len(lines) > 1:
             raw_cats = lines[1].upper()
@@ -299,12 +517,12 @@ class LlamaGuardClassifier:
                 if tok.startswith("S") and tok[1:].isdigit():
                     categories.append(tok)
 
-        cat_enums = set()
+        cat_enums: set = set()
         for c in categories:
             try:
                 cat_enums.add(HazardCategory(c))
             except ValueError:
-                pass
+                pass  # Unknown category code — ignore
 
         if cat_enums & _BLOCK_CATEGORIES:
             blocked = sorted(str(c.value) for c in (cat_enums & _BLOCK_CATEGORIES))
@@ -333,8 +551,8 @@ class LlamaGuardClassifier:
         if cat_enums & _WARN_CATEGORIES:
             warn_cats = sorted(str(c.value) for c in (cat_enums & _WARN_CATEGORIES))
             _logger.warning(
-                "[LlamaGuardClassifier] WARN: op contains potentially sensitive "
-                "content categories %s — allowing with warning.", warn_cats,
+                "[LlamaGuardClassifier] WARN: action contains potentially sensitive "
+                "content in categories %s — allowing with warning.", warn_cats,
             )
             return LlamaGuardResult(
                 verdict="unsafe",
@@ -347,28 +565,54 @@ class LlamaGuardClassifier:
             verdict="unsafe",
             categories=categories,
             action="ALLOW",
-            reason=f"LlamaGuard3 unsafe but non-critical categories: {categories}",
+            reason=f"LlamaGuard3 unsafe but non-actionable categories: {categories}",
         )
 
-    def _init_backend(self) -> None:
+    # ─────────────────────────────────────────────────────────────────────────
+    # Backend initialisation
+    # ─────────────────────────────────────────────────────────────────────────
 
-        url = os.environ.get("PROJECTZEO_LLAMAGUARD_URL", "").strip()
+    def _init_backend(self) -> None:
+        # 1. SGLang / OpenAI-compatible endpoint
+        # Accept both ENDPOINT and URL env vars (ENDPOINT takes priority)
+        url = (
+            os.environ.get("PROJECTZEO_LLAMAGUARD_ENDPOINT", "").strip()
+            or os.environ.get("PROJECTZEO_LLAMAGUARD_URL", "").strip()
+        )
         if url:
             try:
                 import httpx
                 self._client = httpx.Client(
                     headers={"Content-Type": "application/json"},
-                    timeout=httpx.Timeout(connect=5.0, read=30.0, write=5.0, pool=5.0),
+                    timeout=httpx.Timeout(connect=5.0, read=self._timeout, write=5.0, pool=5.0),
                 )
-                resp = self._client.get(f"{url}/health", timeout=5.0)
-                if resp.status_code == 200:
+                # Try /health endpoint first; fall back to /v1/models
+                healthy = False
+                for health_path in ("/health", "/v1/models"):
+                    try:
+                        resp = self._client.get(f"{url}{health_path}", timeout=5.0)
+                        if resp.status_code in (200, 404):  # 404 = server alive, wrong path
+                            healthy = True
+                            break
+                    except Exception:
+                        pass
+
+                if healthy:
                     self._url = url
                     self._backend = "sglang"
-                    _logger.info("[LlamaGuardClassifier] Using SGLang backend at %s", url)
+                    _logger.info(
+                        "[LlamaGuardClassifier] SGLang/OpenAI backend active at %s", url
+                    )
                     return
+                else:
+                    _logger.warning(
+                        "[LlamaGuardClassifier] Endpoint %s is not reachable. "
+                        "Trying other backends.", url,
+                    )
             except Exception as exc:
-                _logger.debug("[LlamaGuardClassifier] SGLang check failed: %s", exc)
+                _logger.debug("[LlamaGuardClassifier] SGLang init failed: %s", exc)
 
+        # 2. llama-cpp-python GGUF
         gguf_path = os.environ.get("PROJECTZEO_LLAMAGUARD_GGUF", "").strip()
         if gguf_path and os.path.exists(gguf_path):
             try:
@@ -382,11 +626,15 @@ class LlamaGuardClassifier:
                     verbose=False,
                 )
                 self._backend = "llamacpp"
-                _logger.info("[LlamaGuardClassifier] Using llama-cpp-python backend: %s", gguf_path)
+                _logger.info(
+                    "[LlamaGuardClassifier] llama-cpp-python backend: %s (gpu_layers=%d)",
+                    gguf_path, n_gpu,
+                )
                 return
             except Exception as exc:
-                _logger.debug("[LlamaGuardClassifier] llama-cpp-python init failed: %s", exc)
+                _logger.debug("[LlamaGuardClassifier] llama-cpp init failed: %s", exc)
 
+        # 3. HuggingFace transformers
         if os.environ.get("PROJECTZEO_LLAMAGUARD_HF", "0").strip() == "1":
             try:
                 from transformers import pipeline
@@ -396,11 +644,12 @@ class LlamaGuardClassifier:
                     device_map="auto",
                 )
                 self._backend = "hf"
-                _logger.info("[LlamaGuardClassifier] Using HuggingFace transformers backend.")
+                _logger.info("[LlamaGuardClassifier] HuggingFace transformers backend active.")
                 return
             except Exception as exc:
                 _logger.debug("[LlamaGuardClassifier] HuggingFace init failed: %s", exc)
 
+        # 4. Ollama
         ollama_model = os.environ.get("PROJECTZEO_LLAMAGUARD_OLLAMA", "").strip()
         if ollama_model:
             try:
@@ -412,21 +661,43 @@ class LlamaGuardClassifier:
                         self._ollama_model_tag = ollama_model
                         self._backend = "ollama"
                         _logger.info(
-                            "[LlamaGuardClassifier] Using Ollama backend: %s", ollama_model
+                            "[LlamaGuardClassifier] Ollama backend: %s", ollama_model
                         )
                         return
+                    else:
+                        _logger.warning(
+                            "[LlamaGuardClassifier] Ollama model '%s' not found in tags. "
+                            "Run: ollama pull %s", ollama_model, ollama_model,
+                        )
             except Exception as exc:
                 _logger.debug("[LlamaGuardClassifier] Ollama check failed: %s", exc)
 
+        # No backend found
         self._backend = "disabled"
         _logger.info(
-            "[LlamaGuardClassifier] No backend configured — Tier 4 disabled. "
-            "Set PROJECTZEO_LLAMAGUARD_URL, PROJECTZEO_LLAMAGUARD_GGUF, "
-            "or PROJECTZEO_LLAMAGUARD_HF=1 to enable."
+            "[LlamaGuardClassifier] No backend configured — Tier 4 in fail-%s mode.\n"
+            "  Configure with one of:\n"
+            "    PROJECTZEO_LLAMAGUARD_ENDPOINT=http://<host>:<port>  (SGLang server)\n"
+            "    PROJECTZEO_LLAMAGUARD_GGUF=/path/to/llama-guard-3-8b.gguf\n"
+            "    PROJECTZEO_LLAMAGUARD_HF=1  (HuggingFace transformers, GPU recommended)\n"
+            "    PROJECTZEO_LLAMAGUARD_OLLAMA=llama-guard3:8b  (Ollama)",
+            "closed" if self._require else "open",
         )
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Utility / stats
+    # ─────────────────────────────────────────────────────────────────────────
 
     def is_enabled(self) -> bool:
         return self._enabled and self._backend not in (None, "disabled")
+
+    def is_fail_closed(self) -> bool:
+        """True when the classifier is degraded but still applying fail-closed policy."""
+        return (
+            self._enabled
+            and self._backend in (None, "disabled")
+            and self._require
+        )
 
     def get_stats(self) -> Dict:
         avg = (
@@ -435,12 +706,27 @@ class LlamaGuardClassifier:
         )
         return {
             "backend": self._backend,
-            "enabled": self.is_enabled(),
+            "enabled": self._enabled,
+            "require": self._require,
+            "fail_closed": self.is_fail_closed(),
             "total_classifications": self._total_classifications,
             "total_blocks": self._total_blocks,
             "total_confirms": self._total_confirms,
+            "total_failclosed_intercepts": self._total_failclosed,
             "avg_latency_seconds": round(avg, 3),
         }
 
+    def __repr__(self) -> str:
+        return (
+            f"<LlamaGuardClassifier backend={self._backend!r} "
+            f"enabled={self._enabled} fail_closed={self.is_fail_closed()}>"
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Module-level convenience function
+# ─────────────────────────────────────────────────────────────────────────────
+
 def classify_with_llamaguard(action_dict: Dict) -> LlamaGuardResult:
+    """Classify an action dict using the global LlamaGuard singleton."""
     return LlamaGuardClassifier.get_instance().classify(action_dict)
