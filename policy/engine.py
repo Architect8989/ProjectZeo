@@ -1,27 +1,3 @@
-"""
-policy/engine.py — Stateful policy gate for all agent actions.
-
-FIXES (v3 — March 2026 production hardening):
-  CRITICAL-1: check_human_approval() and check_human_approval_legacy()
-    DELETED entirely.  Both had inverted semantics (returned True when the
-    signal file was ABSENT — approving every unconfirmed action).  The only
-    safe approval pattern is the canonical .APPROVE polling loop in operate.py.
-    Any call site that still references these methods will fail at import time
-    (AttributeError) rather than silently approving everything.
-
-  HIGH-4: allowed_write_paths no longer defaults to "/home/" (all users).
-    Default is now the current user's home directory only.  Multi-user systems
-    no longer get cross-user write access by default.
-
-  ARCH: Consequence-first hierarchy.  Unknown applications now receive a
-    REQUIRE_HUMAN_CONFIRMATION result that routes through consequence
-    evaluation BEFORE the allowlist check (not after it).  This inverts the
-    original allowlist-gated architecture toward true GII design where
-    consequence reasoning is the primary safety gate.
-
-  THREAD SAFETY: All mutable state protected by a single RLock.
-  SYMLINK DEFENSE: os.path.realpath() applied before all path comparisons.
-"""
 from __future__ import annotations
 
 try:
@@ -135,22 +111,7 @@ class PolicyViolationError(RuntimeError):
 
 
 class PolicyEngine:
-    """
-    Stateful policy gate.
-
-    Evaluation hierarchy (consequence-first GII design):
-      1. Hard-denied apps       → DENY  (immediate, no LLM)
-      2. Unknown apps           → REQUIRE_HUMAN_CONFIRMATION (consequence eval)
-      3. High-risk apps         → REQUIRE_HUMAN_CONFIRMATION
-      4. Denied roles           → DENY
-      5. Semantic role checks   → DENY
-      6. Filesystem path check  → DENY / REQUIRE_HUMAN_CONFIRMATION
-      7. Network policy check   → DENY
-      8. Content/command check  → REQUIRE_HUMAN_CONFIRMATION
-      9.                        → ALLOW
-
-    Thread safety: all mutable state protected by _apps_lock (RLock).
-    """
+    
 
     ALLOW                    = "ALLOW"
     DENY                     = "DENY"
