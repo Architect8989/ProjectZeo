@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-
 import concurrent.futures
 import hashlib
 import os
@@ -34,24 +33,19 @@ from policy.engine import PolicyEngine, PolicyViolationError
 
 from config.timeouts import MAX_STAGNANT_ITERS_UI, MAX_STAGNANT_ITERS_COMMAND
 
-# AUDIT HIGH FIX: Pre-dispatch screen change detection.
-# Imported here (not inside the loop) to fail fast at import time if missing.
 try:
     from core.safety.predispatch_screen_check import PreDispatchScreenChecker as _PreDispatchScreenChecker
     _PREDISPATCH_AVAILABLE = True
 except ImportError:
-    _PreDispatchScreenChecker = None  # type: ignore[assignment,misc]
+    _PreDispatchScreenChecker = None
     _PREDISPATCH_AVAILABLE = False
 
-
-# pyautogui is optional — import once at module level
 try:
     import pyautogui as _pyautogui
     _PYAUTOGUI_AVAILABLE: bool = True
 except ImportError:
-    _pyautogui = None  # type: ignore[assignment]
+    _pyautogui = None
     _PYAUTOGUI_AVAILABLE: bool = False
-
 
 MAX_PERCEPTION_ENTITIES = 20
 MAX_PERCEPTION_JSON_BYTES = 10_000
@@ -59,7 +53,6 @@ MAX_PERCEPTION_JSON_BYTES = 10_000
 REPLAN_SIGNAL: str = "REPLAN_REQUIRED"
 
 WAIT_RETRY_SECONDS = 0.5
-
 
 def _resolve_confirm_timeout() -> int:
     
@@ -72,7 +65,6 @@ def _resolve_confirm_timeout() -> int:
         pass
     return 60
 
-
 _CONFIRM_TIMEOUT_SECONDS: int = _resolve_confirm_timeout()
 MAX_WAIT_RETRIES: int = max(int(_CONFIRM_TIMEOUT_SECONDS / WAIT_RETRY_SECONDS), 1)
 
@@ -80,7 +72,6 @@ _CONFIRM_TIMEOUT_LOGGED: list = [False]
 
 MAX_COMMAND_OUTPUT_BYTES = 4096
 
-# AUDIT-HIGH-6 FIX: Module-level credential scrubbing regex (compiled once at import).
 import re as _re_module
 _CRED_SCRUB_RE = _re_module.compile(
     r"(?:password|passwd|secret|token|api[_\-]?key|auth[_\-]?token"
@@ -92,23 +83,19 @@ _CRED_SCRUB_RE = _re_module.compile(
     _re_module.IGNORECASE,
 )
 
-
 _TYPED_CREDENTIAL_RE = _re_module.compile(
     r"(?:password|passwd|secret|token|api.?key|bearer|private.?key"
     r"|aws.?secret|access.?key|auth.?token)\s*[:=]?\s*\S+",
     _re_module.IGNORECASE,
 )
 
-
 def _scrub_credentials(text: str) -> str:
-    """Replace credential values with <REDACTED> in command output."""
     if not isinstance(text, str) or not text:
         return text
     return _CRED_SCRUB_RE.sub(
         lambda m: m.group(0).split(":")[0].split("=")[0] + "=<REDACTED>",
         text,
     )
-
 
 def _scrub_write_type_content(action: dict) -> dict:
     
@@ -118,9 +105,7 @@ def _scrub_write_type_content(action: dict) -> dict:
     content = str(action.get("content") or action.get("text") or "")
     if not content:
         return action
-    # Scrub if content matches credential patterns
     scrubbed = _scrub_credentials(content)
-    # Also scrub if action context indicates password role
     role = str(action.get("role") or action.get("field_type") or "").lower()
     if "password" in role or "secret" in role or "token" in role:
         scrubbed = "<REDACTED:password_field>"
@@ -133,13 +118,11 @@ def _scrub_write_type_content(action: dict) -> dict:
         return action_copy
     return action
 
-
 MAX_DYNAMIC_CANDIDATES = 3
 
 import os as _os_sig
 import secrets as _secrets_mod
 
-# H-08 FIX: Per-session secure signal directory.
 _SESSION_TOKEN: str = _secrets_mod.token_hex(16)
 _SIGNAL_DIR_BASE: str = tempfile.gettempdir()
 _SIGNAL_DIR: str = _os_sig.path.join(
@@ -154,18 +137,15 @@ except OSError:
 
 _SIGNAL_PREFIX: str = "approve_"
 
-
 def _approval_signal_path(action_key: str) -> str:
     return _os_sig.path.join(
         _SIGNAL_DIR,
         f"{_SIGNAL_PREFIX}{action_key}.signal",
     )
 
-
 def _write_approval_signal(action_key: str, action: dict, reason: str) -> str:
     path = _approval_signal_path(action_key)
     try:
-        # SEC-4 FIX: Scrub write/type content before writing to approval signal
         safe_action = _scrub_write_type_content(action)
         content = json.dumps(
             {
@@ -192,23 +172,14 @@ def _write_approval_signal(action_key: str, action: dict, reason: str) -> str:
         )
     return path
 
-
 def _remove_approval_signal(path: str) -> None:
-    """Remove the signal file; ignore errors."""
     try:
         os.remove(path)
     except OSError:
         pass
 
-
 class AuthorityAbortError(RuntimeError):
-    """Raised when a human-authority decision requires immediate task termination."""
     pass
-
-
-# =========================================================================
-# PUBLIC ENTRY POINT
-# =========================================================================
 
 def operate_main(
     *,
@@ -222,7 +193,7 @@ def operate_main(
     watchdog=None,
     prior_belief_state: Optional[dict] = None,
     belief_state_out: Optional[list] = None,
-    prior_step_index: Optional[int] = None,   # DEPRECATED — kept for API compat; ignored
+    prior_step_index: Optional[int] = None,
     prior_execution_log: Optional[dict] = None,
     gii_controller=None,
 ) -> None:
@@ -248,12 +219,11 @@ def operate_main(
 
     os_backend = os_backend or OperatingSystem()
 
-    # AUDIT-BLOCKER-5 FIX: Missing policy.yaml must be a FATAL startup error.
     _allow_default_policy = os.environ.get("PROJECTZEO_ALLOW_DEFAULT_POLICY", "0").strip() == "1"
     policy_engine = PolicyEngine()
     try:
         import os as _os_mod
-        import yaml as _yaml  # type: ignore[import]
+        import yaml as _yaml
         _policy_path = _os_mod.path.join(
             _os_mod.path.dirname(__file__), "..", "policy.yaml"
         )
@@ -304,7 +274,6 @@ def operate_main(
         if not _allow_default_policy:
             raise RuntimeError(f"FATAL: policy.yaml load failed: {_policy_err}") from _policy_err
 
-    # Process fingerprint
     _auto_discovered_names: list = []
     try:
         import psutil as _psutil_ad
@@ -333,7 +302,6 @@ def operate_main(
     except Exception as _disc_err:
         print(f"[operate_main] WARNING: process fingerprint failed: {_disc_err}.", file=sys.stderr)
 
-    # Environment fingerprint tools
     try:
         _fp_tools = (
             (world_graph.snapshot().get("environment", {}) if world_graph else {})
@@ -347,7 +315,6 @@ def operate_main(
     except Exception:
         pass
 
-    # Bayesian likelihood ratios
     _LIKELIHOOD_DEFAULTS: dict = {
         "app_match_with_delta":  0.95,
         "app_match_no_delta":    0.75,
@@ -416,7 +383,6 @@ def operate_main(
     except Exception:
         accessibility_backend = None
 
-    # AUDIT-BLOCKER-3 FIX: Pre-task restoration scope disclosure.
     _task_involves_browser = any(
         kw in terminal_prompt.lower()
         for kw in ("browser", "firefox", "chrome", "chromium", "web", "url", "http", "download")
@@ -468,7 +434,6 @@ def operate_main(
             file=sys.stderr,
         )
 
-    # SI-03 FIX: Use public get_llm_callable() — never reach into private _llm_call
     if hasattr(planner, "get_llm_callable"):
         llm_callable = planner.get_llm_callable()
     else:
@@ -500,20 +465,6 @@ def operate_main(
         thread_name_prefix="ui_timeout_worker",
     )
 
-    # -------------------------------------------------------------------------
-    # AGENT-1 FIX: AgentOrchestrator integration.
-    #
-    # When PROJECTZEO_USE_AGENT_ORCHESTRATOR=1 (or PROJECTZEO_USE_LANGGRAPH=1),
-    # the task is executed via AgentOrchestrator which selects the best
-    # available backend:
-    #   1. LangGraph StateGraph  (PROJECTZEO_USE_LANGGRAPH=1)
-    #   2. AgentPipeline         (specialist-agent direct loop)
-    #   3. GIIGoalDirectedLoop   (always-available fallback)
-    #
-    # When PROJECTZEO_USE_AGENT_ORCHESTRATOR is not set (default), the
-    # original _execute_autonomous_loop is used.  This preserves 100% of
-    # existing behaviour for operators who have not opted in.
-    # -------------------------------------------------------------------------
     _use_orchestrator = (
         os.environ.get("PROJECTZEO_USE_AGENT_ORCHESTRATOR", "0").strip()
         in ("1", "true", "yes")
@@ -525,11 +476,8 @@ def operate_main(
         _created_files_ledger: List[str] = []
 
         if _use_orchestrator:
-            # -----------------------------------------------------------------
-            # Path A: AgentOrchestrator (LangGraph / AgentPipeline / GII loop)
-            # -----------------------------------------------------------------
             try:
-                from agent_orchestrator import AgentOrchestrator as _AO  # noqa: PLC0415
+                from agent_orchestrator import AgentOrchestrator as _AO
                 _consequence_r = (
                     gii_controller.consequence_reasoner
                     if gii_controller and hasattr(gii_controller, "consequence_reasoner")
@@ -570,7 +518,6 @@ def operate_main(
                     reason = _orch_result.get("reason", "unknown")
                     raise RuntimeError(f"TASK_FAILED:{reason}")
             except ImportError as _ao_import_err:
-                # AgentOrchestrator not available — fall back gracefully
                 print(
                     f"[operate_main] WARNING: AgentOrchestrator import failed "
                     f"({_ao_import_err}). Falling back to _execute_autonomous_loop.",
@@ -602,9 +549,6 @@ def operate_main(
                     likelihood_cfg=_likelihood_cfg,
                 )
         else:
-            # -----------------------------------------------------------------
-            # Path B: Original _execute_autonomous_loop (default)
-            # -----------------------------------------------------------------
             _execute_autonomous_loop(
                 terminal_prompt=terminal_prompt,
                 execution_plan=execution_plan,
@@ -643,12 +587,10 @@ def operate_main(
         except Exception as _pb_save_err:
             print(f"[operate_main] WARNING: playbook save failed: {_pb_save_err}.", file=sys.stderr)
 
-        
         try:
-            from core.memory.mem0_store import Mem0Store as _Mem0StorePost  # noqa: PLC0415
+            from core.memory.mem0_store import Mem0Store as _Mem0StorePost
             _mem0_post = _Mem0StorePost.get_instance()
             _agent_id_post = _Mem0StorePost.make_agent_id(terminal_prompt)
-            # Build a compact conversation representing this task for memory extraction
             _task_messages = [
                 {"role": "user", "content": f"Task: {terminal_prompt}"},
                 {"role": "assistant", "content": (
@@ -665,7 +607,7 @@ def operate_main(
             _mem_thread = _mem_threading.Thread(target=_store_memory, daemon=True)
             _mem_thread.start()
         except Exception as _mem_post_err:
-            pass  # Non-fatal
+            pass
 
         try:
             from core.safety.checkpoint_store import clear_checkpoint as _clear_cp
@@ -681,13 +623,10 @@ def operate_main(
             _t.join(timeout=2.0)
         _task_ui_executor.shutdown(wait=False)
 
-
-
-
 def _execute_autonomous_loop(
     *,
     terminal_prompt: str,
-    execution_plan: ExecutionPlan,           # Used as scaffold only — NOT iterated
+    execution_plan: ExecutionPlan,
     observer,
     world_graph,
     os_backend: OperatingSystem,
@@ -728,9 +667,6 @@ def _execute_autonomous_loop(
         "note": "current_step_index removed — pure goal-directed loop",
     })
 
-    # ------------------------------------------------------------------
-    # BeliefState — reconstruct from prior replan if available
-    # ------------------------------------------------------------------
     belief: BeliefState
     if prior_belief_state is not None:
         try:
@@ -747,7 +683,6 @@ def _execute_autonomous_loop(
     else:
         belief = BeliefState(intent_hash=terminal_prompt)
 
-    # Scaffold phases from the execution plan (guidance, not iteration targets)
     scaffold_phases: List[Dict[str, Any]] = []
     for _step in execution_plan.steps:
         _stype = str(getattr(getattr(_step, "type", None), "value", getattr(_step, "type", "")))
@@ -760,10 +695,20 @@ def _execute_autonomous_loop(
     _plan_real_steps = max(len(scaffold_phases), 1)
     belief.set_plan_horizon(_plan_real_steps)
 
+    _loop_scaffold_audit = None
+    try:
+        from core.safety.scaffold_audit import build_scaffold_audit_from_plan as _bsap2
+        _loop_scaffold_audit = _bsap2(execution_plan, journal=journal)
+        _loop_scaffold_audit.arm()
+    except Exception as _sa2_exc:
+        import logging as _sa2_log
+        _sa2_log.getLogger(__name__).debug(
+            "[_execute_autonomous_loop] ScaffoldAudit init skipped: %s", _sa2_exc
+        )
+
     action_ranker = ActionRanker()
     action_ranker.set_plan_horizon(_plan_real_steps)
 
-    # Restore execution log from checkpoint
     execution_log: Dict[int, Dict[str, Any]] = {}
     if prior_execution_log and isinstance(prior_execution_log, dict):
         try:
@@ -780,7 +725,6 @@ def _execute_autonomous_loop(
             print(f"[OPERATE] execution_log restore failed ({_el_err}); starting fresh.", file=sys.stderr)
             execution_log = {}
 
-    # Visited action keys — persisted across replans
     _visited_action_keys: dict = {}
     if prior_belief_state is not None:
         try:
@@ -789,18 +733,12 @@ def _execute_autonomous_loop(
                 _visited_action_keys = {k: True for k in _persisted_visited if isinstance(k, str)}
         except Exception:
             _visited_action_keys = {}
-    # AUDIT-MEDIUM FIX: Cap raised from 200 → 1000
     _VISITED_ACTION_MAX = 1000
     _PERMANENT_DENY_ACTION_KEYS: set = set()
 
-    # ------------------------------------------------------------------
-    # AUDIT FIX: Initialise MCP tool registry for this task session.
-    # MCPToolRegistry is a singleton — this call is idempotent.
-    # Tools are available to ExecutorAgent and the GII loop action dispatch.
-    # ------------------------------------------------------------------
     _mcp_registry = None
     try:
-        from core.tools.mcp_tools import get_registry as _get_mcp_registry  # noqa: PLC0415
+        from core.tools.mcp_tools import get_registry as _get_mcp_registry
         _mcp_registry = _get_mcp_registry()
         if _mcp_registry.is_enabled():
             _mcp_registry.set_policy_engine(policy_engine)
@@ -816,10 +754,6 @@ def _execute_autonomous_loop(
     except Exception as _mcp_init_err:
         log_warn(f"[MCP] Registry init failed (non-fatal): {_mcp_init_err}")
 
-    # ------------------------------------------------------------------
-    # Initialize PerStepReasoner for the GII reasoning loop.
-    # GIIController has its own internal PSR; fall back to standalone.
-    # ------------------------------------------------------------------
     _per_step_reasoner = None
     if gii_controller is not None and gii_controller.enabled:
         _per_step_reasoner = getattr(gii_controller, "_per_step_reasoner", None)
@@ -851,28 +785,16 @@ def _execute_autonomous_loop(
         except Exception as _psr_err:
             log_warn(f"[LOOP] PerStepReasoner init failed: {_psr_err}. Will use GII/fallback.")
 
-    # ------------------------------------------------------------------
-    # Loop state
-    # ------------------------------------------------------------------
     iteration: int = 0
     stagnant_iterations: int = 0
     goal_complete: bool = False
 
-    # Max iterations based on scaffold complexity
     max_iterations: int = max(_plan_real_steps * (MAX_STAGNANT_ITERS_COMMAND + 1), 25)
-    # In the GII loop, stagnation limit is fixed (no per-step-type variation)
     stagnant_limit: int = MAX_STAGNANT_ITERS_COMMAND
 
     previous_snapshot: Optional[dict] = None
     previous_perception = None
 
-    # ── AUDIT HIGH FIX: Pre-dispatch screen change detector ────────────────
-    # One instance per task. record_reasoning_frame() is called before LLM
-    # reasoning; check_screen_changed() is called before action dispatch.
-    # On CPU inference (40–90s), the screen may have changed since the
-    # observer snapshot was taken — acting on a stale world model risks
-    # clicking a non-existent element or dismissing an unexpected dialog.
-    # If changed beyond threshold: re-run the observation loop (continue).
     _predispatch_checker = (
         _PreDispatchScreenChecker()
         if _PREDISPATCH_AVAILABLE
@@ -882,9 +804,6 @@ def _execute_autonomous_loop(
     try:
         while not goal_complete and iteration < max_iterations:
 
-            # ----------------------------------------------------------------
-            # Wall-clock timeout
-            # ----------------------------------------------------------------
             if time.time() - start_ts > max_wallclock_seconds:
                 journal.record({"event": "execution_timeout"})
                 raise RuntimeError("TASK_FAILED:timeout")
@@ -892,15 +811,11 @@ def _execute_autonomous_loop(
             if watchdog is not None:
                 watchdog.check()
 
-            # Heartbeat
             input_arbitrator.soc_action_started()
             input_arbitrator.clear_emergency_reclaim()
 
             iteration += 1
 
-            # ================================================================
-            # STEP 1: OBSERVE — Capture current world state
-            # ================================================================
             perception_snapshot = None
             if observer:
                 try:
@@ -920,7 +835,6 @@ def _execute_autonomous_loop(
             try:
                 world_snapshot = world_graph.snapshot() if world_graph else {}
 
-                # Bayesian belief update from world delta
                 delta = None
                 if previous_snapshot and world_graph:
                     try:
@@ -967,11 +881,10 @@ def _execute_autonomous_loop(
 
                 previous_snapshot = world_snapshot
 
-                
                 _memory_context_for_reasoning: str = ""
-                if iteration == 1 or iteration % 10 == 0:  # refresh every 10 iters
+                if iteration == 1 or iteration % 10 == 0:
                     try:
-                        from core.memory.mem0_store import Mem0Store as _Mem0Store  # noqa: PLC0415
+                        from core.memory.mem0_store import Mem0Store as _Mem0Store
                         _mem0 = _Mem0Store.get_instance()
                         _agent_id = _Mem0Store.make_agent_id(terminal_prompt)
                         _memories = _mem0.search(terminal_prompt, _agent_id, limit=5)
@@ -981,7 +894,7 @@ def _execute_autonomous_loop(
                         log_warn(f"[MEMORY] Mem0 retrieval failed (non-fatal): {_mem_err}")
 
                     try:
-                        from core.memory.cognee_store import CogneeStore as _CogneeStore  # noqa: PLC0415
+                        from core.memory.cognee_store import CogneeStore as _CogneeStore
                         _cognee = _CogneeStore.get_instance()
                         _cognee_facts = _cognee.query(terminal_prompt, max_results=5)
                         if _cognee_facts:
@@ -990,27 +903,18 @@ def _execute_autonomous_loop(
                                 _memory_context_for_reasoning + "\n" + _cognee_ctx
                             ).strip()
                     except Exception as _cog_err:
-                        pass  # Cognee is optional
+                        pass
 
                     if _memory_context_for_reasoning and world_snapshot is not None:
                         if isinstance(world_snapshot, dict):
                             world_snapshot["_gii_memory_context"] = _memory_context_for_reasoning[:2000]
 
-                # ────────────────────────────────────────────────────────────
-                # AUDIT HIGH FIX: Record screen state BEFORE reasoning starts.
-                # On CPU inference (40–90s), the screen may change. This hash
-                # is compared against a fresh capture after reasoning returns.
-                # ────────────────────────────────────────────────────────────
                 if _predispatch_checker is not None:
                     _predispatch_checker.record_reasoning_frame()
 
-                # ============================================================
-                # STEP 2: REASON — Get next action from GII reasoning chain
-                # ============================================================
                 selected_action: Optional[Dict[str, Any]] = None
                 action_source: str = "unknown"
 
-                # Primary: GIIController.decide_next_action()
                 if gii_controller is not None and gii_controller.enabled:
                     _ws_for_gii = world_snapshot if isinstance(world_snapshot, dict) else {}
                     _gii_action, _gii_reason = gii_controller.decide_next_action(
@@ -1018,7 +922,6 @@ def _execute_autonomous_loop(
                         perception=perception_snapshot if isinstance(perception_snapshot, dict) else None,
                     )
                     if _gii_action is not None:
-                        # D-12 FIX: Scan GII reasoning output for injection markers
                         _gii_text_to_scan = " ".join(
                             str(_gii_action.get(f, ""))
                             for f in ("thought", "command", "content", "path", "summary")
@@ -1042,7 +945,6 @@ def _execute_autonomous_loop(
                         selected_action = _gii_action
                         action_source = "gii_controller"
 
-                # Secondary: PerStepReasoner (when GII disabled or returned nothing)
                 if selected_action is None and _per_step_reasoner is not None:
                     _ws_for_psr = world_snapshot if isinstance(world_snapshot, dict) else {}
                     _psr_action, _psr_reason = _per_step_reasoner.next_action(
@@ -1053,7 +955,6 @@ def _execute_autonomous_loop(
                         selected_action = _psr_action
                         action_source = "per_step_reasoner"
 
-                # Tertiary: Playbook warm-start + ReasoningEngine dynamic candidates
                 if selected_action is None:
                     perception_for_reasoning: Dict[str, Any] = {}
                     if isinstance(perception_snapshot, dict):
@@ -1085,7 +986,6 @@ def _execute_autonomous_loop(
                                 k=MAX_DYNAMIC_CANDIDATES,
                             )
                             if _dc:
-                                # Injection marker scan on dynamic candidates
                                 try:
                                     from core.security.injection_markers import contains_injection_marker as _cim
                                     _safe_dc: list = []
@@ -1115,10 +1015,8 @@ def _execute_autonomous_loop(
                         except Exception as re_err:
                             log_warn(f"ReasoningEngine fallback failed: {re_err}")
 
-                    # Merge: playbook first (warm-start), then dynamic
                     candidate_actions = _playbook_candidates + _dynamic_candidates
 
-                    # H-03 FIX: Injection marker scan on ALL candidate actions
                     if candidate_actions:
                         try:
                             from core.security.injection_markers import contains_injection_marker as _cim_plan
@@ -1149,18 +1047,6 @@ def _execute_autonomous_loop(
                 if selected_action is None:
                     raise RuntimeError("TASK_FAILED:no_candidate_actions")
 
-                # ────────────────────────────────────────────────────────────
-                # AUDIT HIGH FIX: Pre-dispatch screen change check.
-                # Now that reasoning is complete and we have a selected_action,
-                # capture a fresh screenshot and compare against the frame that
-                # was recorded before reasoning started. If the screen changed
-                # significantly (dialog appeared, window switched, error overlay)
-                # we must NOT dispatch the stale action — re-run the observation
-                # loop instead to build a fresh world model.
-                # This is the critical path where the fix is actually exercised:
-                # _execute_autonomous_loop is the default execution path used
-                # for 100% of tasks unless PROJECTZEO_USE_AGENT_ORCHESTRATOR=1.
-                # ────────────────────────────────────────────────────────────
                 if _predispatch_checker is not None:
                     _proposed_op = str(selected_action.get("operation", "")).lower()
                     _screen_changed, _screen_diff = _predispatch_checker.check_screen_changed(
@@ -1179,8 +1065,6 @@ def _execute_autonomous_loop(
                             f"since reasoning started (op={_proposed_op!r}). "
                             "Discarding stale action — re-running observation loop."
                         )
-                        # Do NOT increment stagnant_iterations: this is not
-                        # a failure, it is a safety re-cycle.
                         previous_perception = perception_snapshot
                         continue
 
@@ -1213,13 +1097,11 @@ def _execute_autonomous_loop(
 
                 action_key = action_ranker.action_key(selected_action)
 
-                # Record as visited (evict oldest when at cap)
                 if len(_visited_action_keys) >= _VISITED_ACTION_MAX:
                     _oldest = next(iter(_visited_action_keys))
                     del _visited_action_keys[_oldest]
                 _visited_action_keys[action_key] = True
 
-                # Semantic loop detection (A→B→A cycle)
                 if hasattr(belief, "record_action_key_for_loop_detection"):
                     belief.record_action_key_for_loop_detection(action_key)
                 if (
@@ -1237,9 +1119,6 @@ def _execute_autonomous_loop(
                     )
                     raise RuntimeError(REPLAN_SIGNAL)
 
-                # ============================================================
-                # STEP 3: POLICY — Validate against PolicyEngine
-                # ============================================================
                 _policy_decision: str = PolicyEngine.DENY
                 _policy_reason: str = "not_evaluated"
 
@@ -1271,23 +1150,58 @@ def _execute_autonomous_loop(
                     previous_perception = perception_snapshot
                     continue
 
-                
                 _op_for_cr = str(selected_action.get("operation", "")).lower()
                 _consequence_reasoner_instance = None
                 if gii_controller is not None and hasattr(gii_controller, "consequence_reasoner"):
                     _consequence_reasoner_instance = gii_controller.consequence_reasoner
 
-                # AUDIT HIGH FIX: Wire ConsequenceReasoner to write/type operations
-                # when _external_content_source=True (content from screen/VL/web).
-                # Previously write/type bypassed consequence evaluation entirely —
-                # a prompt injection via type("rm -rf ~" into terminal) was
-                # not evaluated. Now external-source write/type ops go through
-                # Tier 2 goal coherence check as an injection defence.
+                if _loop_scaffold_audit is not None:
+                    try:
+                        _sa_result = _loop_scaffold_audit.check_action(selected_action)
+                        if _sa_result.decision == "BLOCK":
+                            journal.record({
+                                "event": "scaffold_audit_block",
+                                "iteration": iteration,
+                                "reason": _sa_result.reason,
+                            })
+                            raise RuntimeError(
+                                f"[ScaffoldAudit] Scaffold modification blocked: {_sa_result.reason}"
+                            )
+                    except RuntimeError:
+                        raise
+                    except Exception as _sa_exc:
+                        import logging as _sa_log
+                        _sa_log.getLogger(__name__).debug(
+                            "[operate] ScaffoldAudit check error (non-fatal): %s", _sa_exc
+                        )
+                _IRREVERSIBLE_OPS = frozenset({
+                    "command", "file_create", "file_delete", "install",
+                    "file_move", "file_write", "navigate", "file_modify",
+                })
+                if _op_for_cr in _IRREVERSIBLE_OPS:
+                    try:
+                        from restoration.restore_provider import RestoreProvider as _RP
+                        _rp = _RP()
+                        _snap_id = _rp.capture_extended_state(
+                            label=f"pre_{_op_for_cr}_iter{iteration}"
+                        )
+                        if _snap_id:
+                            journal.record({
+                                "event": "pre_dispatch_snapshot",
+                                "iteration": iteration,
+                                "operation": _op_for_cr,
+                                "snapshot_id": str(_snap_id),
+                            })
+                    except Exception as _rp_exc:
+                        import logging as _rp_log
+                        _rp_log.getLogger(__name__).debug(
+                            "[operate] RestoreProvider pre-snapshot skipped (non-fatal): %s", _rp_exc
+                        )
+
                 _cr_apply_external = (
                     _op_for_cr in ("write", "type")
                     and bool(selected_action.get("_external_content_source"))
                 )
-                # Also flag terminal-context write/type operations
                 _focused_app_for_cr = str(world_snapshot.get("focused_app", "") or "").lower()
                 _terminal_names = frozenset({
                     "gnome-terminal", "konsole", "xterm", "xfce4-terminal", "alacritty",
@@ -1298,7 +1212,6 @@ def _execute_autonomous_loop(
                     and any(t in _focused_app_for_cr for t in _terminal_names)
                 )
                 if _cr_apply_external or _cr_apply_terminal:
-                    # Inject flags for ConsequenceReasoner Tier 1 classification
                     if "_external_content_source" not in selected_action:
                         selected_action = dict(selected_action)
                         selected_action["_external_content_source"] = True
@@ -1306,22 +1219,6 @@ def _execute_autonomous_loop(
                         selected_action = dict(selected_action)
                         selected_action["_terminal_context"] = True
 
-                # ─────────────────────────────────────────────────────────
-                # UNIVERSAL CONSEQUENCE GATE (Blueprint §13 / Sin #2 Fix)
-                # ─────────────────────────────────────────────────────────
-                # OLD (BROKEN): type-gated — only command/file_create/install
-                #   reach ConsequenceReasoner. All click operations bypass it.
-                #   A click on "Wipe All Data" was as unguarded as "OK".
-                #
-                # NEW (FIXED): consequence-gated for ALL operation types.
-                #   Fast-path: if PolicyEngine returns ALLOW and the op is
-                #   statically REVERSIBLE (scroll, move, focus), skip the
-                #   expensive LLM CR call. Every other operation — including
-                #   ALL clicks — goes through ConsequenceReasoner.
-                #
-                # 21 high-risk click patterns (from consequence_reasoner.py:911)
-                # are now evaluated because clicks reach this block.
-                # ─────────────────────────────────────────────────────────
                 _REVERSIBLE_FAST_PATH_OPS: frozenset = frozenset({
                     "scroll", "move_mouse", "focus", "screenshot",
                     "observe", "wait", "done",
@@ -1400,14 +1297,13 @@ def _execute_autonomous_loop(
                 previous_perception = perception_snapshot
                 continue
 
-            
             if (
                 _policy_decision != PolicyEngine.DENY
                 and str(selected_action.get("operation", "")).lower()
                     in ("command", "file_create", "install", "write", "type")
             ):
                 try:
-                    from core.safety.llamaguard_classifier import classify_with_llamaguard as _lgc  # noqa: PLC0415
+                    from core.safety.llamaguard_classifier import classify_with_llamaguard as _lgc
                     _lg_result = _lgc(selected_action)
                     if _lg_result.is_blocked:
                         belief.record_action(action_key, -1.0)
@@ -1442,8 +1338,7 @@ def _execute_autonomous_loop(
                             "categories": _lg_result.categories,
                         })
                 except ImportError:
-                    pass  # LlamaGuard not installed — skip Tier 4
-                    # AUDIT LOW FIX: Journal the skip and honor PROJECTZEO_REQUIRE_LLAMAGUARD
+                    pass
                     import os as _os_lg
                     if _os_lg.environ.get("PROJECTZEO_REQUIRE_LLAMAGUARD", "0").strip() == "1":
                         raise RuntimeError(
@@ -1476,9 +1371,6 @@ def _execute_autonomous_loop(
                 previous_perception = perception_snapshot
                 continue
 
-            # ================================================================
-            # Human confirmation gate (AUDIT-CRIT-3: create-to-approve)
-            # ================================================================
             if _policy_decision == PolicyEngine.REQUIRE_HUMAN_CONFIRMATION:
                 journal.record({
                     "event": "policy_human_confirmation_required",
@@ -1520,7 +1412,6 @@ def _execute_autonomous_loop(
                 except Exception:
                     pass
 
-                # AUDIT-CRITICAL-4 FIX: Create-to-approve (fail-closed)
                 _approve_path = _signal_path + ".APPROVE"
                 _phc_wait = 0
                 _phc_approved = False
@@ -1568,9 +1459,6 @@ def _execute_autonomous_loop(
                         "action_key": action_key,
                     })
 
-            # ================================================================
-            # Authority evaluation
-            # ================================================================
             is_high_risk = selected_action.get("operation") in {"command", "install", "file_create"}
             if is_high_risk:
                 soc_confident = belief.consecutive_high_stability_count >= 3
@@ -1615,10 +1503,6 @@ def _execute_autonomous_loop(
             if authority == AuthorityDecision.ABORT:
                 raise AuthorityAbortError("Human authority abort — task terminated")
 
-            # ================================================================
-            # AUDIT FIX: MCP tool routing — intercept "mcp_tool" operation
-            # and delegate to MCPToolRegistry instead of os_backend dispatch.
-            # ================================================================
             if (
                 _mcp_registry is not None
                 and _mcp_registry.is_enabled()
@@ -1653,7 +1537,6 @@ def _execute_autonomous_loop(
                         "output": _mcp_output,
                         "reward": 0.6 if action_success else -0.3,
                     }
-                    # Record outcome and continue to next iteration
                     if gii_controller is not None and gii_controller.enabled:
                         try:
                             gii_controller.record_outcome(
@@ -1682,15 +1565,12 @@ def _execute_autonomous_loop(
                             raise RuntimeError(REPLAN_SIGNAL)
                     else:
                         stagnant_iterations = 0
-                    continue  # MCP handled — skip normal dispatch
+                    continue
                 except RuntimeError:
                     raise
                 except Exception as _mcp_exc:
                     log_warn(f"[MCP] Tool call failed: {_mcp_exc} — falling through to normal dispatch")
 
-            # ================================================================
-            # STEP 5: EXECUTE — Dispatch action
-            # ================================================================
             _dispatch_action = selected_action
             if (
                 created_files_ledger is not None
@@ -1729,7 +1609,6 @@ def _execute_autonomous_loop(
                     "error": str(exec_exc),
                 })
 
-            # Store scrubbed command output
             if "output" in exec_result and exec_result.get("output"):
                 _raw_output = str(exec_result.get("output", ""))[:MAX_COMMAND_OUTPUT_BYTES]
                 output_text = _scrub_credentials(_raw_output)
@@ -1745,18 +1624,12 @@ def _execute_autonomous_loop(
                     _step_entry["last_output"] = output_text
                     execution_log[iteration] = _step_entry
 
-            # Record outcome to GIIController and PerStepReasoner for history
             if gii_controller is not None and gii_controller.enabled:
                 try:
                     gii_controller.record_outcome(
                         selected_action,
                         success=action_success,
                         output=str(exec_result.get("output", ""))[:500],
-                        # AUDIT MEDIUM-1 FIX: pass execution_log so GIIController
-                        # can trigger EpisodicSynthesizer.store_checkpoint() every
-                        # _EPISODIC_CHECKPOINT_INTERVAL iterations. Without this
-                        # the checkpoint is never triggered even though the
-                        # EpisodicSynthesizer and record_outcome() are both wired.
                         execution_log=execution_log,
                         focused_app=(
                             world_snapshot.get("focused_app")
@@ -1776,12 +1649,10 @@ def _execute_autonomous_loop(
                 except Exception:
                     pass
 
-            # Bandit update
             belief.record_action(action_key, raw_reward)
             best_reward = min(belief.global_best_reward() or 0.0, 0.9)
             belief.update_regret(action_key, raw_reward, best_reward)
 
-            # SEC-4 FIX: Scrub write/type content before journaling action
             _journal_op = str(selected_action.get("operation", "")).lower()
 
             journal.record({
@@ -1794,22 +1665,15 @@ def _execute_autonomous_loop(
                 "reward": raw_reward,
             })
 
-            # ================================================================
-            # STEP 6: Goal completion detection
-            # ================================================================
             if _journal_op == "done":
                 journal.record({"event": "execution_complete", "iteration": iteration})
                 goal_complete = True
                 break
 
-            # ================================================================
-            # Step verification and stagnation tracking
-            # ================================================================
             if action_success:
                 stagnant_iterations = 0
                 progress.advance_step()
 
-                # Save checkpoint
                 try:
                     from core.safety.checkpoint_store import save_checkpoint as _save_cp
                     _save_cp({
@@ -1823,7 +1687,6 @@ def _execute_autonomous_loop(
             else:
                 stagnant_iterations += 1
 
-            # Stagnation guard
             if stagnant_iterations >= stagnant_limit:
                 _entropy = belief.entropy() if hasattr(belief, "entropy") else 0.0
                 journal.record({
@@ -1838,7 +1701,6 @@ def _execute_autonomous_loop(
 
             previous_perception = perception_snapshot
 
-        # Loop exhausted without "done" action
         if not goal_complete:
             raise RuntimeError("TASK_FAILED:max_iterations_exceeded")
 
@@ -1846,7 +1708,6 @@ def _execute_autonomous_loop(
         raise
 
     finally:
-        # Persist final BeliefState on ALL exit paths
         if belief_state_out is not None:
             belief_state_out.clear()
             try:
@@ -1857,11 +1718,6 @@ def _execute_autonomous_loop(
                 belief_state_out.append(_bs_dict)
             except Exception:
                 pass
-
-
-# =========================================================================
-# ACTION DISPATCHER
-# =========================================================================
 
 def _execute_decision(
     *,
@@ -1883,16 +1739,14 @@ def _execute_decision(
     try:
         from pyautogui import FailSafeException as _FailSafeException
     except ImportError:
-        _FailSafeException = None  # type: ignore[assignment,misc]
+        _FailSafeException = None
 
-    # DONE sentinel
     if op == "done":
         return {"success": True, "reward": 1.0}
 
     if not op:
         return {"success": False, "reward": -0.5, "reason": "empty operation field"}
 
-    # Dispatch-time DANGEROUS_PATTERNS check (belt-and-suspenders)
     if op in ("command", "install", "file_create", "verify"):
         _dangerous_text = ""
         if op == "command":
@@ -1937,7 +1791,6 @@ def _execute_decision(
                 log_warn(f"[BUG-11] dispatch-time DANGEROUS_PATTERNS check failed: {_dp_err}")
 
     try:
-        # Browser routing via Playwright (when available and applicable)
         _BROWSER_OPS = {"click", "write", "type", "fill", "scroll", "navigate", "goto"}
         if op in _BROWSER_OPS and prefer_playwright and focused_app:
             try:
@@ -1965,9 +1818,6 @@ def _execute_decision(
                     "Falling back to pyautogui."
                 )
 
-        # ------------------------------------------------------------------
-        # CLICK
-        # ------------------------------------------------------------------
         if op == "click":
             x = action.get("x")
             y = action.get("y")
@@ -1992,7 +1842,6 @@ def _execute_decision(
                 return {"success": False, "reward": -0.5, "reason": "click: no x/y or label"}
             return {"success": True, "reward": 0.8}
 
-        
         elif op in ("write", "type"):
             content = str(action.get("content") or action.get("text") or "")
             if not content:
@@ -2005,9 +1854,6 @@ def _execute_decision(
             )
             return {"success": True, "reward": 0.8}
 
-        # ------------------------------------------------------------------
-        # PRESS / HOTKEY / KEY
-        # ------------------------------------------------------------------
         elif op in ("press", "hotkey", "key"):
             keys = action.get("keys") or action.get("key")
             if isinstance(keys, str):
@@ -2022,9 +1868,6 @@ def _execute_decision(
             )
             return {"success": True, "reward": 0.8}
 
-        # ------------------------------------------------------------------
-        # SCROLL
-        # ------------------------------------------------------------------
         elif op == "scroll":
             if not _PYAUTOGUI_AVAILABLE:
                 return {
@@ -2046,9 +1889,6 @@ def _execute_decision(
             )
             return {"success": True, "reward": 0.8}
 
-        # ------------------------------------------------------------------
-        # COMMAND
-        # ------------------------------------------------------------------
         elif op == "command":
             cmd = str(action.get("command") or "").strip()
             if not cmd:
@@ -2065,9 +1905,6 @@ def _execute_decision(
                 "returncode": result.returncode,
             }
 
-        # ------------------------------------------------------------------
-        # FILE CREATE
-        # ------------------------------------------------------------------
         elif op == "file_create":
             path = str(action.get("path") or "").strip()
             content_str = str(action.get("content") or "")
@@ -2080,9 +1917,6 @@ def _execute_decision(
                     _ledger.append(path)
             return {"success": True, "reward": 0.8}
 
-        # ------------------------------------------------------------------
-        # INSTALL
-        # ------------------------------------------------------------------
         elif op == "install":
             tool_spec = action.get("tool", {})
             install_cmds = (
@@ -2187,9 +2021,6 @@ def _execute_decision(
                     ),
                 }
 
-        # ------------------------------------------------------------------
-        # VERIFY
-        # ------------------------------------------------------------------
         elif op == "verify":
             method = action.get("method", "screenshot")
             if method == "command":
@@ -2230,9 +2061,6 @@ def _execute_decision(
                     }
             return {"success": True, "reward": 0.6}
 
-        # ------------------------------------------------------------------
-        # UNKNOWN OPERATION
-        # ------------------------------------------------------------------
         else:
             log_warn(f"_execute_decision: unknown operation {op!r}")
             return {
