@@ -143,6 +143,26 @@ class ReasonerAgent(BaseAgent):
             "_gii_loop_note": state.memory_context,
         }
 
+        # GII-FIX: Inject DICP policy addendum + ToM user intent into world_state
+        # so the GIIController's decide_next_action sees accumulated constraints
+        # and the user's emotional/intentional state before selecting an action.
+        try:
+            _dicp = getattr(self._gii, "_dicp_engine", None)
+            if _dicp is not None:
+                _addendum = _dicp.get_policy_addendum(context={"world_state": world_state_dict})
+                if _addendum:
+                    world_state_dict["_dicp_policy_addendum"] = _addendum
+        except Exception:
+            pass
+        try:
+            _tom = getattr(self._gii, "_tom_agent", None)
+            if _tom is not None:
+                _tom_ctx = _tom.get_context_for_psr()
+                if _tom_ctx:
+                    world_state_dict["_tom_user_intent"] = _tom_ctx
+        except Exception:
+            pass
+
         try:
             action, reason = self._gii.decide_next_action(world_state_dict)
             state.proposed_action = action
@@ -438,3 +458,81 @@ class AgentPipeline:
                 break
 
         return state
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GII-FIX: build_pipeline() — unified factory for both LangGraph and fallback
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_pipeline(
+    gii_controller,
+    *,
+    world_graph=None,
+    vision_runtime=None,
+    atspi_bridge=None,
+    policy_engine=None,
+    os_backend=None,
+    execute_decision_fn=None,
+    journal=None,
+    objective: str = "",
+    memory_dir: Optional[str] = None,
+):
+    """
+    Build the complete GII specialist-agent pipeline.
+
+    Tries LangGraph StateGraph first (if installed + PROJECTZEO_USE_LANGGRAPH=1).
+    Falls back to AgentPipeline (sequential, no graph state).
+
+    Returns:
+        compiled_graph  — LangGraph compiled StateGraph, or None
+        pipeline        — AgentPipeline fallback (always constructed)
+    """
+    # Wire individual agents
+    perceiver = PerceiverAgent(
+        world_graph=world_graph,
+        vision_runtime=vision_runtime,
+        atspi_bridge=atspi_bridge or getattr(gii_controller, "_atspi_bridge", None),
+    )
+    reasoner = ReasonerAgent(gii_controller=gii_controller)
+    safety = SafetyAgent(
+        consequence_reasoner=getattr(gii_controller, "consequence_reasoner", None),
+        policy_engine=policy_engine,
+    )
+    executor = ExecutorAgent(
+        os_backend=os_backend,
+        execute_decision_fn=execute_decision_fn,
+        journal=journal,
+    )
+    memory_agent = MemoryAgent(
+        gii_controller=gii_controller,
+        semantic_memory=getattr(gii_controller, "_semantic_memory", None),
+        application_memory=getattr(gii_controller, "_application_memory", None),
+        episodic_synthesizer=getattr(gii_controller, "_episodic_synthesizer", None),
+        objective=objective,
+    )
+
+    # Try LangGraph
+    compiled_graph = None
+    try:
+        from core.agents.langgraph_pipeline import build_langgraph_pipeline
+        compiled_graph = build_langgraph_pipeline(
+            perceiver, reasoner, safety, executor, memory_agent,
+        )
+    except Exception as _lg_exc:
+        _logger.debug("[build_pipeline] LangGraph build failed (fallback active): %s", _lg_exc)
+
+    # Always build AgentPipeline as fallback
+    pipeline = AgentPipeline(
+        perceiver=perceiver,
+        reasoner=reasoner,
+        safety=safety,
+        executor=executor,
+        memory=memory_agent,
+    )
+
+    _logger.info(
+        "[build_pipeline] Pipeline ready. langgraph=%s fallback=AgentPipeline",
+        compiled_graph is not None,
+    )
+    return compiled_graph, pipeline
+
