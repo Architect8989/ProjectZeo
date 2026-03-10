@@ -614,6 +614,20 @@ class GIIGoalDirectedLoop:
             # ── WIRE-NEW: Inject DICP policy addendum into world_state ─────
             world_state = self._dicp_inject_addendum(world_state)
 
+            # ── GII-FIX: Inject reconciled memory context into world_state ──
+            # Pull from MemoryManager (which now runs MemoryReconciler internally)
+            _mm = getattr(self._gii, "_memory_manager", None)
+            if _mm is not None:
+                try:
+                    _mem_ctx = _mm.get_context_string(
+                        objective=self._objective,
+                        max_chars=1500,
+                    )
+                    if _mem_ctx:
+                        world_state["_reconciled_memory_context"] = _mem_ctx
+                except Exception as _mm_exc:
+                    _logger.debug("[GIILoop] MemoryManager context inject failed: %s", _mm_exc)
+
             # ── WIRE-NL2GENSYM: Inject dynamic SOAR operator rules ─────────
             # NL2GenSym generates task-specific SOAR operator selection rules
             # from natural language. Injected before every decide call.

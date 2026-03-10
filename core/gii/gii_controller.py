@@ -240,7 +240,13 @@ class GIIController:
         """Ponder & Press divide-and-conquer planner (Blueprint §6.5)."""
         return getattr(self, "_ponder_press", None)
 
-
+    # GII-FIX: _initialise_components was called in __init__ but the def
+    # declaration was missing — the entire method body was unreachable orphan
+    # code (came after property definitions with no def header). This meant
+    # ALL memory stores, ConsequenceReasoner, PerStepReasoner, WorldModel,
+    # SelfModel, and MilestoneDecomposer were NEVER initialised despite the
+    # elaborate try/except blocks below. Fixed by restoring the def.
+    def _initialise_components(self, memory_dir: Optional[str] = None) -> None:
 
         try:
             from core.memory.semantic_memory import SemanticMemory
@@ -367,6 +373,20 @@ class GIIController:
             )
         except Exception as exc:
             _logger.warning("[GIIController] MemoryManager init failed: %s", exc)
+
+        # GII-FIX: Wire MemoryReconciler into MemoryManager so cross-store
+        # conflicts are resolved before results reach the LLM context window.
+        try:
+            from core.memory.memory_reconciler import get_memory_reconciler
+            _reconciler = get_memory_reconciler(llm_caller=self._llm)
+            if self._memory_manager is not None:
+                self._memory_manager._reconciler = _reconciler
+                # Late-bind LLM so LLM arbitration is available
+                _reconciler._llm = self._llm
+                _reconciler._enable_llm = True
+            _logger.info("[GIIController] MemoryReconciler wired into MemoryManager.")
+        except Exception as _rec_exc:
+            _logger.debug("[GIIController] MemoryReconciler wire failed (non-fatal): %s", _rec_exc)
 
         try:
             from core.cognition.active_inference import ActiveInferenceAgent
