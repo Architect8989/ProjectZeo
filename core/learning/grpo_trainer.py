@@ -87,11 +87,25 @@ class GRPOTrainer:
     ) -> None:
         self._dir      = output_dir or _OUTPUT_DIR
         self._lock     = threading.Lock()
-        self._rollout  = rollout_fn or self._null_rollout
         self._ewc      = EWCRegularizer()
         self._samples_written = 0
         os.makedirs(self._dir, exist_ok=True)
-        _logger.info("[GRPO] Trainer ready. enabled=%s group=%d beta=%.3f", _ENABLED, _GROUP_SIZE, _BETA)
+
+        # Blueprint §9.2 FIX: Wire VMManager sandbox rollout when no explicit
+        # rollout_fn is provided.  Previously this fell back to _null_rollout()
+        # which always returned reward=0.0, making GRPO a no-op.
+        # Now: try to build a vm_sandbox_rollout; fall back to null only if
+        # VMManager itself fails (e.g. no Docker/bwrap and subprocess disabled).
+        if rollout_fn is not None:
+            self._rollout = rollout_fn
+        else:
+            self._rollout = self._make_vm_rollout()
+
+        _logger.info(
+            "[GRPO] Trainer ready. enabled=%s group=%d beta=%.3f rollout=%s",
+            _ENABLED, _GROUP_SIZE, _BETA,
+            getattr(self._rollout, "__name__", repr(self._rollout)),
+        )
 
     def init_ewc(self, model_state: Dict[str, Any], calibration_data: List[Dict]) -> None:
         self._ewc.compute_fisher(model_state, calibration_data)
@@ -210,6 +224,40 @@ class GRPOTrainer:
         with self._lock:
             self._samples_written += len(samples)
         return path
+
+    def _make_vm_rollout(self) -> Callable:
+        """
+        Build a VM-sandbox-backed rollout function for GRPO group sampling.
+
+        This is the critical wire between GRPOTrainer and VMManager that was
+        missing in the original implementation.  Each call to this rollout
+        function runs the prompt in an isolated sandbox (docker/bwrap/subprocess)
+        and returns a reward signal derived from exit code + stdout JSON.
+        """
+        try:
+            from core.sandbox.vm_manager import get_vm_manager
+            vm = get_vm_manager()
+            if vm.health_check():
+                _logger.info("[GRPO] VMManager sandbox rollout active (backend=%s).", vm._backend)
+
+                def _vm_rollout(task_id: str, prompt: str) -> RolloutResult:
+                    return vm.run_grpo_rollout(task_id, prompt)
+
+                _vm_rollout.__name__ = f"vm_rollout_{vm._backend}"
+                return _vm_rollout
+            else:
+                _logger.warning(
+                    "[GRPO] VMManager health check failed — falling back to null rollout. "
+                    "GRPO training will produce zero-reward samples. "
+                    "Install Docker or bwrap for real sandbox rollouts."
+                )
+        except Exception as exc:
+            _logger.warning(
+                "[GRPO] VMManager unavailable (%s) — null rollout active. "
+                "GRPO training produces zero-reward baseline samples only.",
+                exc,
+            )
+        return self._null_rollout
 
     @staticmethod
     def _null_rollout(task_id: str, prompt: str) -> RolloutResult:
@@ -357,9 +405,18 @@ _instance: Optional[GRPOTrainer] = None
 _lock = threading.Lock()
 
 def get_grpo_trainer(rollout_fn: Optional[Callable] = None) -> GRPOTrainer:
+    """
+    Return the global GRPOTrainer singleton.
+
+    Blueprint §9.2: rollout_fn=None now triggers VMManager sandbox auto-wiring
+    instead of the null-rollout stub. Pass an explicit rollout_fn to override.
+    """
     global _instance
     if _instance is None:
         with _lock:
             if _instance is None:
                 _instance = GRPOTrainer(rollout_fn=rollout_fn)
+    elif rollout_fn is not None and getattr(_instance._rollout, "__name__", "") == "_null_rollout":
+        # Upgrade from null rollout to real rollout if one is provided later
+        _instance._rollout = rollout_fn
     return _instance
