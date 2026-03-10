@@ -209,6 +209,17 @@ class PerStepReasoner:
     def set_reflexion_context(self, context: str) -> None:
         self._reflexion_context = str(context or "")
 
+    def set_lats_active(self, active: bool) -> None:
+        """
+        Blueprint §9.2 conflict table: set True while LATS is recovering
+        so Self-Refine critique is suppressed (LATS already critiques its nodes).
+        """
+        self._lats_recovery_active = bool(active)
+
+    @property
+    def lats_recovery_active(self) -> bool:
+        return getattr(self, "_lats_recovery_active", False)
+
     def set_vault_context(self, context: str) -> None:
         self._vault_context = str(context or "")
 
@@ -330,10 +341,15 @@ class PerStepReasoner:
             except Exception:
                 pass
 
+        # WIRE: Block Self-Refine during LATS recovery (Blueprint §9.2 conflict table)
+        # LATS already critiques its own tree nodes internally; running Self-Refine
+        # on top of a LATS-selected action wastes latency and can contradict LATS.
+        _skip_refine_lats = bool(getattr(self, "_lats_recovery_active", False))
         op = str(action.get("operation", "")).lower()
         if (
             op not in ("wait", "done", "press")
             and not _skip_refine_due_to_urgency
+            and not _skip_refine_lats
             and self._should_self_refine(action)
         ):
             try:
