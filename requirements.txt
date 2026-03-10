@@ -73,7 +73,10 @@ cognee>=0.1.0
 # letta>=0.5.0
 
 # GPU inference — SGLang (primary, recommended for production)
-sglang[all]>=0.4.0
+# CUDA REQUIRED — do NOT install on CPU-only machines.
+# bootstrap.py installs this automatically on GPU16/GPU24 tiers.
+# Manual GPU install: pip install "sglang[all]>=0.4.0"
+# sglang[all]>=0.4.0
 
 # GPU inference — vLLM (alternative to SGLang, set PROJECTZEO_USE_VLLM=1)
 # Requires CUDA. Install ONLY on GPU machines:
@@ -138,3 +141,41 @@ httpx>=0.25.2    # preferred HTTP client for adapter calls
 # Safety
 # LlamaGuard (Tier 4 safety) — served via Ollama:
 # ollama pull llama-guard3:8b
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GII Audit 2 — Missing Dependencies (March 2026)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Phase 3: RLVR / GRPO fine-tuning (GPU required — CUDA 12.1+)
+# Uncomment on GPU machines only:
+# trl>=0.8.6                  # Transformer Reinforcement Learning (GRPO, DPO, PPO)
+# unsloth>=2024.3             # 2x faster fine-tuning with Unsloth optimisation
+# verl>=0.1.0                 # Volcano Engine RL (GRPO alternative, large-scale)
+
+# Phase 3: EWC (Elastic Weight Consolidation) — catastrophic forgetting prevention
+# torch>=2.2.0 is required (usually already installed with sglang/vllm)
+# avalanche-lib>=0.5.0        # Continual learning toolkit with built-in EWC
+
+# Phase 2: Active Inference / FEP (Algorithm 7)
+pymdp>=0.0.7.1               # Python active inference (FEP, EFE minimisation)
+# Spike Neural Networks (SNN event processor backend):
+# spikingjelly>=0.0.0.0.14   # SpikingJelly — SNN framework (GPU optional)
+
+# Phase 2: Self-Refine (Algorithm 6.1 — Madaan et al. 2023)
+# No additional deps — uses existing LLM callable
+
+# Phase 1: AT-SPI / pynput for Linux input monitoring
+pynput>=1.7.6                # Cross-platform input monitoring (used by AT-SPI bridge)
+
+# Memory — Graphiti temporal knowledge graph
+# graphiti-core>=0.3.0       # Temporal graph memory (optional — requires Neo4j)
+
+# Vision — Grounding DINO + SAM 2 (Tier 4 grounding; requires GPU)
+# groundingdino>=0.1.0       # Open-vocabulary object detection
+# segment-anything>=1.0      # SAM 2 segmentation
+
+# Evaluation
+# lm-eval>=0.4.0             # Language model evaluation harness (for GII benchmarks)
+
+# Misc utilities
+imagehash>=4.3.1             # Perceptual hashing (already declared above — dedup OK)
