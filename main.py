@@ -944,6 +944,10 @@ def main(llm_callable: Callable, model_name: str) -> None:
                                 prior_step_index=_prior_step_index,
                                 prior_execution_log=_crash_recovery_execution_log_for_task,
                                 gii_controller=gii_controller,
+                                # GII-FIX: pass the already-initialised restore_provider
+                                # so operate_main can call capture_extended_state()
+                                # correctly (previously it tried _RP() with no args).
+                                restore_provider=restore_provider,
                             )
                             _task_succeeded = True
                             _interactive_print(f"[MODE] TASK COMPLETED — {intent[:72]}")
