@@ -609,13 +609,68 @@ class GIIGoalDirectedLoop:
                 summary = action.get("summary", "Task complete")
                 self._journal.record({"event": "gii_goal_complete", "iteration": self._iteration, "summary": summary})
                 _logger.info("[GIILoop] Goal complete: %s (iter=%d)", summary, self._iteration)
+
+                # ── ValidatorAgent post-milestone verification ─────────────
+                # Independent validation prevents false-positive goal completion.
+                # If validator returns FAIL, we re-enter the loop with a hint.
+                if self._validator is not None:
+                    try:
+                        val_result = self._validator.verify_milestone(
+                            milestone_desc=self._current_milestone or self._objective,
+                            world_state=self._get_world_state(),
+                            objective=self._objective,
+                            iteration=self._iteration,
+                        )
+                        verdict = getattr(val_result, "verdict", None)
+                        verdict_str = verdict.value if hasattr(verdict, "value") else str(verdict)
+                        self._journal.record({
+                            "event": "validator_post_milestone",
+                            "iteration": self._iteration,
+                            "verdict": verdict_str,
+                            "confidence": getattr(val_result, "confidence", 0.0),
+                            "rationale": getattr(val_result, "rationale", "")[:200],
+                        })
+                        if verdict_str in ("fail", "uncertain"):
+                            _logger.warning(
+                                "[GIILoop] Validator says %s (conf=%.2f) — NOT marking complete. "
+                                "Re-entering loop with validation feedback.",
+                                verdict_str,
+                                getattr(val_result, "confidence", 0.0),
+                            )
+                            # Inject validation feedback and continue
+                            world_state["_validator_feedback"] = (
+                                f"VALIDATION {verdict_str.upper()}: "
+                                f"{getattr(val_result, 'rationale', 'Milestone not confirmed')[:300]}. "
+                                "The task is NOT yet complete. Continue working."
+                            )
+                            self._stagnant_count = 0  # Reset stagnant count
+                            self._iteration -= 1      # Don't count this as a wasted iteration
+                            continue
+                        _logger.info("[GIILoop] Validator confirmed PASS (conf=%.2f).", getattr(val_result, "confidence", 0.0))
+                    except Exception as val_exc:
+                        _logger.debug("[GIILoop] ValidatorAgent error (non-fatal): %s", val_exc)
+
                 if self._monitor is not None:
                     try: self._monitor.stop()
                     except Exception: pass
                 if self._grounding_trainer is not None:
                     try: self._grounding_trainer.on_episode_complete(success=True)
                     except Exception: pass
+
+                # ── AgentQ task-completion hook ────────────────────────────
+                _gii_ctrl = self._gii
+                if hasattr(_gii_ctrl, "_on_task_complete"):
+                    try:
+                        _gii_ctrl._on_task_complete(
+                            success=True,
+                            objective=self._objective[:200],
+                            app_context=self._current_app or "",
+                        )
+                    except Exception:
+                        pass
+
                 return self._result(True, summary)
+
 
             if self._piguard is not None and action.get("_external_content_source"):
                 external_content = str(action.get("content") or action.get("text") or "")

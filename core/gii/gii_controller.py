@@ -56,9 +56,10 @@ def _print_startup_safety_banner(
         f"[SAFETY] Milestone decomposition: {'ACTIVE' if milestones_active else 'INACTIVE'}\n"
         f"[SAFETY] Persistent world model: {'ACTIVE' if world_model_active else 'INACTIVE'}\n"
         f"[SAFETY] Agent self-model: {'ACTIVE' if self_model_active else 'INACTIVE'}\n"
-        "[SAFETY] Restoration scope: cursor + window focus ONLY\n"
-        "[SAFETY] NOTE: Restoration does NOT preserve browser tabs, clipboard,\n"
-        "         unsaved docs, or terminal session.",
+        "[SAFETY] Restoration scope: 5-TIER (CRIU process snapshot → BTRFS/rsync filesystem\n"
+        "         → Playwright browser CDP state → wmctrl/xdotool window geometry → cursor focus)\n"
+        "[SAFETY] NOTE: CRIU requires sudo/CAP_SYS_PTRACE. Browser snapshot requires Playwright.\n"
+        "         Clipboard contents are NOT preserved across CRIU restore boundaries.",
         file=sys.stderr,
     )
     if not consequence_active:
@@ -551,6 +552,87 @@ class GIIController:
             _logger.info("[GIIController] SOARChunker active.")
         except Exception as exc:
             _logger.warning("[GIIController] SOARChunker init failed: %s", exc)
+
+        # ── AgentQ: MCTS trajectory collection + DPO pair generation ─────────
+        # Auto-triggers every PROJECTZEO_AGENT_Q_TRIGGER_INTERVAL tasks (default 50).
+        self._agent_q = None
+        self._agent_q_task_count: int = 0
+        self._agent_q_trigger_interval: int = int(
+            os.environ.get("PROJECTZEO_AGENT_Q_TRIGGER_INTERVAL", "50")
+        )
+        try:
+            from core.learning.agent_q import AgentQStore
+            self._agent_q = AgentQStore()
+            _logger.info(
+                "[GIIController] AgentQ active. Auto-trigger every %d tasks.",
+                self._agent_q_trigger_interval,
+            )
+        except Exception as exc:
+            _logger.warning("[GIIController] AgentQ init failed: %s", exc)
+
+        # ── Session Reflector: daily plan reflection at session start ─────────
+        self._session_reflector = None
+        try:
+            from core.cognition.session_reflector import SessionReflector
+            self._session_reflector = SessionReflector(
+                llm_call=self._llm,
+                objective=self._objective,
+                episodic_synthesizer=self._episodic_synthesizer,
+                semantic_memory=self._semantic_memory,
+            )
+            # Run session-start reflection asynchronously (non-blocking)
+            import threading as _thr
+            _thr.Thread(
+                target=self._session_reflector.reflect_on_session_start,
+                daemon=True,
+                name="session-reflector",
+            ).start()
+            _logger.info("[GIIController] SessionReflector active (async session-start).")
+        except Exception as exc:
+            _logger.warning("[GIIController] SessionReflector init failed: %s", exc)
+
+        # ── Progressive Neural Network (PNN): continual learning anti-forgetting
+        self._pnn = None
+        try:
+            from core.learning.progressive_nn import ProgressiveNeuralNetwork
+            self._pnn = ProgressiveNeuralNetwork()
+            _logger.info("[GIIController] ProgressiveNeuralNetwork (PNN) active.")
+        except Exception as exc:
+            _logger.debug("[GIIController] PNN not available (non-fatal): %s", exc)
+
+    def _on_task_complete(self, success: bool, objective: str, app_context: str = "") -> None:
+        """
+        Called after every completed task. Triggers AgentQ auto-collection
+        every N tasks and updates PNN with new experience column if available.
+        """
+        self._agent_q_task_count += 1
+
+        if (
+            self._agent_q is not None
+            and self._agent_q_task_count % self._agent_q_trigger_interval == 0
+        ):
+            try:
+                from core.learning.lats_planner import LATSPlanner
+                lats = LATSPlanner(llm_caller=self._llm)
+                pairs = lats.get_dpo_pairs()
+                if pairs:
+                    self._agent_q.ingest_dpo_pairs(pairs, app_name=app_context)
+                    _logger.info(
+                        "[GIIController] AgentQ auto-triggered at task_count=%d: "
+                        "%d DPO pairs ingested from LATS.",
+                        self._agent_q_task_count, len(pairs),
+                    )
+            except Exception as exc:
+                _logger.debug("[GIIController] AgentQ auto-trigger error: %s", exc)
+
+        if self._pnn is not None and success:
+            try:
+                self._pnn.register_task_completion(
+                    task_description=objective[:200],
+                    app_context=app_context,
+                )
+            except Exception:
+                pass
 
     def decide_next_action_operator_cycle(
         self,
