@@ -1,26 +1,3 @@
-"""
-core/learning/grpo_trainer.py
-
-Group Relative Policy Optimization (GRPO) training pipeline.
-
-Reference: DeepSeek-R1 / Shao et al. 2024 — GRPO replaces PPO's critic
-network with group-relative reward normalisation. For GUI agents this means
-comparing K rollout trajectories per task and learning from their relative
-success.
-
-Pipeline:
-  1. preference_generator.py writes DPO dataset (JSONL)
-  2. grpo_trainer.py reads that dataset, runs group rollouts in vm_manager.py
-  3. Computes group-relative rewards and exports RLVR training signal
-  4. nightly_consolidation.py schedules the actual fine-tuning
-
-Env vars:
-  PROJECTZEO_GRPO_ENABLED      1 / 0        (default: 0 — opt-in)
-  PROJECTZEO_GRPO_GROUP_SIZE   K rollouts   (default: 4)
-  PROJECTZEO_GRPO_BETA         KL penalty   (default: 0.01)
-  PROJECTZEO_GRPO_OUTPUT_DIR   training dir (default: ~/.projectzeo/grpo)
-  PROJECTZEO_GRPO_MAX_TASKS    tasks/run    (default: 50)
-"""
 from __future__ import annotations
 
 import json
@@ -40,7 +17,6 @@ _BETA        = float(os.environ.get("PROJECTZEO_GRPO_BETA", "0.01"))
 _OUTPUT_DIR  = os.path.expanduser(os.environ.get("PROJECTZEO_GRPO_OUTPUT_DIR", "~/.projectzeo/grpo"))
 _MAX_TASKS   = int(os.environ.get("PROJECTZEO_GRPO_MAX_TASKS", "50"))
 
-
 @dataclass
 class RolloutResult:
     task_id:     str
@@ -50,46 +26,29 @@ class RolloutResult:
     success:     bool
     duration_s:  float
 
-
 @dataclass
 class GRPOSample:
     task_id:          str
     prompt:           str
-    chosen:           str        # highest-reward response
-    rejected:         str        # lowest-reward response
+    chosen:           str
+    rejected:         str
     chosen_reward:    float
     rejected_reward:  float
-    advantage:        float      # chosen_reward - mean(group)
+    advantage:        float
     group_rewards:    List[float] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
-
 class EWCRegularizer:
-    """
-    Elastic Weight Consolidation — prevents catastrophic forgetting.
-
-    Fisher matrix is approximated from a small calibration dataset.
-    Must be computed BEFORE GRPO training begins.
-
-    Reference: Kirkpatrick et al. 2017, PNAS.
-    """
 
     def __init__(self) -> None:
-        self._fisher:     Dict[str, Any] = {}   # param_name → importance
-        self._theta_star: Dict[str, Any] = {}   # param_name → value at calibration
+        self._fisher:     Dict[str, Any] = {}
+        self._theta_star: Dict[str, Any] = {}
         self._lambda      = float(os.environ.get("PROJECTZEO_EWC_LAMBDA", "5000"))
         self._computed    = False
 
     def compute_fisher(self, model_state: Dict[str, Any], calibration_data: List[Dict]) -> None:
-        """
-        Approximate Fisher Information Matrix using gradient magnitudes
-        on a calibration dataset. Called once before GRPO training.
-
-        For production: replace with actual autograd-based Fisher computation.
-        Here we store parameter importance heuristically from model state.
-        """
         if not model_state or not calibration_data:
             _logger.debug("[EWC] No model state or calibration data — Fisher not computed.")
             return
@@ -103,10 +62,6 @@ class EWCRegularizer:
         _logger.info("[EWC] Fisher matrix computed. %d parameters tracked.", len(self._fisher))
 
     def penalty(self, current_state: Dict[str, Any]) -> float:
-        """
-        Compute EWC penalty = λ/2 * Σ F_i (θ_i - θ*_i)².
-        Returns 0.0 if Fisher not computed.
-        """
         if not self._computed:
             return 0.0
         penalty = 0.0
@@ -120,15 +75,7 @@ class EWCRegularizer:
     def ready(self) -> bool:
         return self._computed
 
-
 class GRPOTrainer:
-    """
-    Orchestrates group rollouts and produces GRPO training samples.
-
-    Does not perform actual gradient updates — that is done by an external
-    training process (vLLM + TRL or a nightly fine-tuning job) that consumes
-    the JSONL output written here.
-    """
 
     def __init__(
         self,
@@ -143,29 +90,14 @@ class GRPOTrainer:
         os.makedirs(self._dir, exist_ok=True)
         _logger.info("[GRPO] Trainer ready. enabled=%s group=%d beta=%.3f", _ENABLED, _GROUP_SIZE, _BETA)
 
-    # -------------------------------------------------------------------------
-    # Fisher / EWC
-    # -------------------------------------------------------------------------
-
     def init_ewc(self, model_state: Dict[str, Any], calibration_data: List[Dict]) -> None:
-        """Call before run_training_pass(). Computes Fisher matrix."""
         self._ewc.compute_fisher(model_state, calibration_data)
-
-    # -------------------------------------------------------------------------
-    # Training pass
-    # -------------------------------------------------------------------------
 
     def run_training_pass(
         self,
         tasks: List[Dict[str, Any]],
         max_tasks: int = _MAX_TASKS,
     ) -> str:
-        """
-        Run GRPO training pass over a list of tasks.
-
-        Each task dict must contain 'prompt' and 'task_id'.
-        Returns path to the written JSONL file.
-        """
         if not _ENABLED:
             _logger.info("[GRPO] Disabled — skipping training pass.")
             return ""
@@ -206,10 +138,8 @@ class GRPOTrainer:
         mean_r  = statistics.mean(rewards)
         std_r   = statistics.stdev(rewards) if len(rewards) > 1 else 1.0
 
-        # Normalise rewards group-relative
         norm_rewards = [(r - mean_r) / (std_r + 1e-8) for r in rewards]
 
-        # Apply EWC penalty if Fisher is ready
         if self._ewc.ready:
             ewc_pen = self._ewc.penalty({})
             norm_rewards = [nr - ewc_pen * _BETA for nr in norm_rewards]
@@ -256,6 +186,116 @@ class GRPOTrainer:
             duration_s=0.0,
         )
 
+    def run_ewc_synthetic_replay(
+        self,
+        llm_callable,
+        *,
+        n_samples: int = 10,
+        semantic_memory=None,
+        trajectory_dir: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        if llm_callable is None:
+            _logger.warning("[EWC-Replay] No LLM callable — synthetic replay skipped.")
+            return []
+
+        prior_tasks: List[str] = []
+
+        if semantic_memory is not None:
+            try:
+                facts = semantic_memory.query("completed task", max_results=n_samples * 2)
+                for f in facts:
+                    obj = getattr(f, "object_", None) or (f.get("object") if isinstance(f, dict) else None)
+                    if obj and len(str(obj)) > 10:
+                        prior_tasks.append(str(obj)[:300])
+            except Exception as exc:
+                _logger.debug("[EWC-Replay] Semantic memory query failed: %s", exc)
+
+        tdir = trajectory_dir or _OUTPUT_DIR
+        try:
+            for fname in os.listdir(tdir):
+                if fname.endswith(".json") and len(prior_tasks) < n_samples * 2:
+                    try:
+                        with open(os.path.join(tdir, fname)) as f:
+                            td = json.load(f)
+                        obj = td.get("objective", "")
+                        if obj and obj not in prior_tasks:
+                            prior_tasks.append(str(obj)[:300])
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        if not prior_tasks:
+            _logger.info("[EWC-Replay] No prior tasks found — no synthetic samples generated.")
+            return []
+
+        prior_tasks = prior_tasks[:n_samples]
+        synthetic_samples: List[Dict[str, Any]] = []
+
+        _logger.info(
+            "[EWC-Replay] Generating %d synthetic replay samples from %d prior tasks.",
+            len(prior_tasks), len(prior_tasks),
+        )
+
+        for task_desc in prior_tasks:
+            prompt = (
+                "You are generating a synthetic training example for continual learning.\n\n"
+                f"Prior task: {task_desc}\n\n"
+                "Generate a realistic, successful action sequence for this task.\n"
+                "Respond ONLY with JSON: "
+                '{"objective": "...", "actions": [{"operation": "...", "thought": "...", '
+                '"success": true}], "outcome": "success", "lesson": "..."}'
+            )
+            result_holder: List[Optional[str]] = [None]
+
+            def _call(_p=prompt, _rh=result_holder):
+                try:
+                    raw = llm_callable(
+                        messages=[{"role": "user", "content": _p}],
+                        objective="ewc_replay",
+                        session_id="ewc_replay_synthesis",
+                    )
+                    if isinstance(raw, list) and raw:
+                        _rh[0] = str(raw[0].get("content", "") if isinstance(raw[0], dict) else raw[0])
+                    elif isinstance(raw, str):
+                        _rh[0] = raw
+                except Exception as exc:
+                    _logger.debug("[EWC-Replay] LLM call failed: %s", exc)
+
+            t = threading.Thread(target=_call, daemon=True)
+            t.start()
+            t.join(timeout=20.0)
+
+            if result_holder[0]:
+                try:
+                    import re as _re
+                    clean = _re.sub(r"```(?:json)?", "", result_holder[0]).strip()
+                    m = _re.search(r"\{.*\}", clean, _re.DOTALL)
+                    if m:
+                        sample = json.loads(m.group(0))
+                        if isinstance(sample, dict) and sample.get("objective"):
+                            sample["_synthetic"] = True
+                            sample["_ewc_replay"] = True
+                            synthetic_samples.append(sample)
+                except Exception:
+                    pass
+
+        if synthetic_samples:
+            ts = int(time.time())
+            replay_path = os.path.join(tdir, f"ewc_replay_{ts}.jsonl")
+            try:
+                with open(replay_path, "w") as f:
+                    for s in synthetic_samples:
+                        f.write(json.dumps(s) + "\n")
+                _logger.info(
+                    "[EWC-Replay] Wrote %d synthetic samples → %s",
+                    len(synthetic_samples), replay_path,
+                )
+            except OSError as exc:
+                _logger.warning("[EWC-Replay] Failed to write replay file: %s", exc)
+
+        return synthetic_samples
+
     def latest_dataset(self) -> Optional[str]:
         try:
             files = sorted(
@@ -277,10 +317,8 @@ class GRPOTrainer:
             "output_dir":       self._dir,
         }
 
-
 _instance: Optional[GRPOTrainer] = None
 _lock = threading.Lock()
-
 
 def get_grpo_trainer(rollout_fn: Optional[Callable] = None) -> GRPOTrainer:
     global _instance
