@@ -299,20 +299,44 @@ class SemanticMemory:
         min_confidence: float = _RETRIEVAL_THRESHOLD,
         category: Optional[str] = None,
         goal_context: str = "",   # ACT-R spreading activation context
-    ) -> List[SemanticFact]:
+    ) -> List["SemanticFact"]:
         """
-        Query semantic memory using ACT-R activation + spreading activation.
+        Query semantic memory using the full Generative Agents three-component
+        retrieval score (Park et al. 2023, §3.2) + ACT-R spreading activation.
+
+        GII-FIX: Previously only relevance was computed; recency and importance
+        were absent or implicit. This implements the complete formula:
+
+            score = α·recency + β·relevance + γ·importance
+
+        where:
+          recency    = exp(−λ · hours_since_last_access)  [0→1, exponential decay]
+          relevance  = token_overlap × ACT-R_activation   [0→1]
+          importance = confirmation_ratio × confidence    [0→1, proxy for significance]
+
+        Weights (tunable via env vars):
+          α = PROJECTZEO_RETRIEVAL_ALPHA  (default 0.3)
+          β = PROJECTZEO_RETRIEVAL_BETA   (default 0.5)
+          γ = PROJECTZEO_RETRIEVAL_GAMMA  (default 0.2)
 
         ACT-R Spreading Activation (Blueprint §3.2):
             If current goal is "save file in Blender", Blender-related memories
             get an activation bonus, increasing retrieval probability.
         """
+        import os as _os
+        _ALPHA = float(_os.environ.get("PROJECTZEO_RETRIEVAL_ALPHA", "0.3"))
+        _BETA  = float(_os.environ.get("PROJECTZEO_RETRIEVAL_BETA",  "0.5"))
+        _GAMMA = float(_os.environ.get("PROJECTZEO_RETRIEVAL_GAMMA", "0.2"))
+        _RECENCY_LAMBDA = float(_os.environ.get("PROJECTZEO_RECENCY_LAMBDA", "0.02"))  # per-hour decay
+
         query_tokens = set(re.sub(r"[^\w\s]", "", query_text.lower()).split())
         if not query_tokens:
             return []
 
+        now = time.time()
+
         with self._lock:
-            candidates: List[Tuple[float, SemanticFact]] = []
+            candidates: List[Tuple[float, "SemanticFact"]] = []
 
             for fact in self._facts.values():
                 conf = fact.current_confidence()
@@ -321,7 +345,7 @@ class SemanticMemory:
                 if category and fact.category != category:
                     continue
 
-                # Token overlap scoring
+                # ── Component 1: Token overlap relevance ──────────────────────
                 fact_tokens = set(
                     re.sub(r"[^\w\s]", "", f"{fact.subject} {fact.predicate}").split()
                 )
@@ -329,14 +353,41 @@ class SemanticMemory:
                 if overlap == 0:
                     continue
 
-                # Relevance = token overlap × ACT-R confidence
+                # Relevance = token overlap × ACT-R confidence [0→1]
                 relevance = (overlap / max(len(query_tokens), 1)) * conf
 
                 # ACT-R Spreading Activation bonus
                 if goal_context:
                     relevance += fact.spreading_activation(goal_context)
+                relevance = min(1.0, relevance)  # cap after spreading activation
 
-                candidates.append((relevance, fact))
+                # ── Component 2: Recency ──────────────────────────────────────
+                # exp(−λ · hours_since_last_access)
+                # Last access = most recent of access_history or last_confirmed_at
+                last_access = max(
+                    (max(fact.access_history) if fact.access_history else 0.0),
+                    fact.last_confirmed_at,
+                )
+                hours_since = max(0.0, (now - last_access) / 3600.0)
+                recency = math.exp(-_RECENCY_LAMBDA * hours_since)
+
+                # ── Component 3: Importance ───────────────────────────────────
+                # Proxy: confirmation_ratio × confidence
+                # High importance = confirmed many times AND high confidence
+                total_signals = max(
+                    fact.confirmation_count + fact.refutation_count + 1, 1
+                )
+                confirmation_ratio = fact.confirmation_count / total_signals
+                importance = confirmation_ratio * conf
+
+                # ── Composite score ───────────────────────────────────────────
+                composite = (
+                    _ALPHA * recency
+                    + _BETA  * relevance
+                    + _GAMMA * importance
+                )
+
+                candidates.append((composite, fact))
 
             candidates.sort(key=lambda x: x[0], reverse=True)
             top_facts = [fact for _, fact in candidates[:max_results]]
