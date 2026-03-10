@@ -35,6 +35,17 @@ from typing import Any, Dict, List, Optional, Tuple
 
 _logger = logging.getLogger(__name__)
 
+# GII-FIX: Memory Reconciler — deduplicates and resolves conflicts across the
+# 13-store memory stack before results are returned to the LLM context window.
+try:
+    from core.memory.memory_reconciler import (
+        MemoryReconciler, MemoryClaim, get_memory_reconciler,
+    )
+    _RECONCILER_AVAILABLE = True
+except ImportError:
+    _RECONCILER_AVAILABLE = False
+    _logger.debug("[MemoryManager] MemoryReconciler not available (will skip reconciliation)")
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Configuration
 # ─────────────────────────────────────────────────────────────────────────────
@@ -137,6 +148,15 @@ class MemoryManager:
         self._archive_conn: Optional[sqlite3.Connection] = None
         self._archive_lock = threading.Lock()
         self._init_archive_db()
+
+        # GII-FIX: Reconciler for cross-store deduplication/conflict resolution
+        self._reconciler: Optional[Any] = None
+        if _RECONCILER_AVAILABLE:
+            try:
+                self._reconciler = MemoryReconciler(llm_caller=None)
+                _logger.debug("[MemoryManager] MemoryReconciler active.")
+            except Exception as _rec_exc:
+                _logger.debug("[MemoryManager] MemoryReconciler init failed: %s", _rec_exc)
 
         # Stats
         self._query_count = 0
@@ -325,6 +345,55 @@ class MemoryManager:
                             )
             except Exception as exc:
                 _logger.debug("[MemoryManager] Episodic query failed: %s", exc)
+
+        # GII-FIX: Reconcile cross-store results to eliminate duplicates and
+        # resolve conflicts before building the final MemoryQueryResult.
+        if self._reconciler is not None and _RECONCILER_AVAILABLE:
+            try:
+                raw_claims: list = []
+                for h in working_hits:
+                    raw_claims.append(MemoryClaim(
+                        source="working_memory", key=query_text[:50] + "_wm",
+                        value=h, confidence=0.9,
+                    ))
+                for h in semantic_hits:
+                    raw_claims.append(MemoryClaim(
+                        source="semantic",
+                        key=str(h.get("key", query_text[:50])),
+                        value=str(h.get("content", "")),
+                        confidence=float(h.get("confidence", 0.6)),
+                    ))
+                for h in episodic_hits:
+                    raw_claims.append(MemoryClaim(
+                        source="episodic",
+                        key=str(h.get("key", query_text[:50] + "_ep")),
+                        value=str(h.get("content", h)),
+                        confidence=float(h.get("confidence", 0.5)),
+                    ))
+                if raw_claims:
+                    reconciled = self._reconciler.reconcile(
+                        raw_claims, context=objective, max_results=max_results,
+                    )
+                    # Rebuild typed results from reconciled facts
+                    working_hits = [
+                        f.value for f in reconciled.facts if f.source == "working_memory"
+                    ]
+                    semantic_hits = [
+                        {"key": f.key, "content": f.value, "confidence": f.confidence,
+                         "category": "reconciled"}
+                        for f in reconciled.facts if f.source not in ("working_memory", "episodic")
+                    ]
+                    episodic_hits = [
+                        {"key": f.key, "content": f.value}
+                        for f in reconciled.facts if f.source == "episodic"
+                    ]
+                    if reconciled.conflicts_resolved:
+                        _logger.debug(
+                            "[MemoryManager] Reconciler resolved %d conflict(s) in query=%r",
+                            reconciled.conflicts_resolved, query_text[:40],
+                        )
+            except Exception as _rec_err:
+                _logger.debug("[MemoryManager] Reconciler skipped (non-fatal): %s", _rec_err)
 
         total_chars = (
             sum(len(h) for h in working_hits)
