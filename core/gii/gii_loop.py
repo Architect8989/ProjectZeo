@@ -837,6 +837,32 @@ class GIIGoalDirectedLoop:
                     self._journal.record({"event": "gii_loop_screen_diff_skip", "iteration": self._iteration, "phash_distance": dist})
                     continue
 
+            # ── Scaffold Audit pre-dispatch check (Blueprint §16 wire) ──────────
+            # ScaffoldAudit was initialised and armed but never called from
+            # the live execution path. Now wired here: BLOCK before dispatch.
+            if self._gii_controller is not None:
+                try:
+                    _audit = self._gii_controller.scaffold_audit
+                    if _audit is not None:
+                        _audit_ok = self._gii_controller.check_action_with_scaffold_audit(action)
+                        if not _audit_ok:
+                            _logger.critical(
+                                "[GIILoop] ScaffoldAudit BLOCKED op=%s iter=%d",
+                                action.get("operation"), self._iteration,
+                            )
+                            self._journal.record({
+                                "event": "gii_loop_scaffold_audit_block",
+                                "iteration": self._iteration,
+                                "action_key": action_key,
+                                "operation": action.get("operation"),
+                            })
+                            self._stagnant_count += 1
+                            if self._stagnant_count >= self._max_stagnant:
+                                return self._result(False, "Stagnation: repeated scaffold-audit blocks")
+                            continue
+                except Exception as _sa_exc:
+                    _logger.debug("[GIILoop] ScaffoldAudit pre-check error: %s", _sa_exc)
+
             exec_success = False
             exec_output = ""
             try:

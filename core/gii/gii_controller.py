@@ -190,6 +190,21 @@ class GIIController:
     def self_model(self):
         return self._self_model
 
+    @property
+    def grounding_stack(self):
+        """Six-tier grounding dispatcher (Blueprint §6.7)."""
+        return getattr(self, "_grounding_stack", None)
+
+    @property
+    def sppo_trainer(self):
+        """SPPO Self-Play trainer (Blueprint §12.1)."""
+        return getattr(self, "_sppo_trainer", None)
+
+    @property
+    def scaffold_audit(self):
+        """ScaffoldAudit for live action path checking."""
+        return getattr(self, "_scaffold_audit", None)
+
     def _initialise_components(self, memory_dir: Optional[str]) -> None:
 
         try:
@@ -600,6 +615,45 @@ class GIIController:
         except Exception as exc:
             _logger.debug("[GIIController] PNN not available (non-fatal): %s", exc)
 
+        # ── SPPO Trainer: Self-Play Policy Optimization (Blueprint §12.1) ─────
+        # Algorithm 19/19 — previously ZERO implementation; now wired.
+        # Compares current-policy trajectories against reference-policy snapshots
+        # and generates DPO preference pairs for nightly fine-tuning.
+        self._sppo_trainer = None
+        try:
+            from core.learning.sppo_trainer import get_sppo_trainer
+            self._sppo_trainer = get_sppo_trainer(llm_callable=self._llm)
+            _logger.info("[GIIController] SPPO Trainer (Self-Play PO) active.")
+        except Exception as exc:
+            _logger.warning("[GIIController] SPPO Trainer init failed: %s", exc)
+
+        # ── Six-Tier Grounding Stack (Blueprint §6.7) ─────────────────────────
+        # Previously: Grounding DINO + SAM2 existed but was never called from
+        # the main GII loop. Now wired as the unified grounding backend.
+        self._grounding_stack = None
+        try:
+            from core.perception.grounding_stack import get_grounding_stack
+            self._grounding_stack = get_grounding_stack(
+                atspi_bridge=self._atspi_bridge,
+                omniparser=None,      # lazy-init inside GroundingStack
+                uitars_runtime=None,  # lazy-init inside GroundingStack
+                llm_callable=self._llm,
+            )
+            _logger.info("[GIIController] GroundingStack (6-tier) active.")
+        except Exception as exc:
+            _logger.warning("[GIIController] GroundingStack init failed: %s", exc)
+
+        # ── Scaffold Audit: arm it after components are ready ─────────────────
+        # Previously scaffold_audit.py existed but was never armed in the live path.
+        self._scaffold_audit = None
+        try:
+            from core.safety.scaffold_audit import ScaffoldAudit
+            self._scaffold_audit = ScaffoldAudit(journal=None)
+            self._scaffold_audit.arm()
+            _logger.info("[GIIController] ScaffoldAudit ARMED.")
+        except Exception as exc:
+            _logger.warning("[GIIController] ScaffoldAudit init failed: %s", exc)
+
     def _on_task_complete(self, success: bool, objective: str, app_context: str = "") -> None:
         """
         Called after every completed task. Triggers AgentQ auto-collection
@@ -794,6 +848,22 @@ class GIIController:
         if not self._enabled or self._per_step_reasoner is None:
             return None, "GII disabled"
 
+        # ── PNN lateral context injection (Blueprint §11.3) ───────────────────
+        # Per-step reasoner has set_pnn_context() wired but it was never called.
+        # Inject lateral transfer before reasoning so PSR can leverage prior columns.
+        if self._pnn is not None:
+            try:
+                focused_app = str(world_state.get("focused_app", ""))
+                lateral = self._pnn.get_lateral_context(
+                    task_description=self._objective[:200],
+                    app_context=focused_app,
+                )
+                if lateral and lateral.transfer_hints:
+                    block = "\n".join(lateral.transfer_hints[:5])
+                    self._per_step_reasoner.set_pnn_context(block)
+            except Exception as _pnn_exc:
+                _logger.debug("[GIIController] PNN lateral inject failed: %s", _pnn_exc)
+
         if self._active_inference is not None:
             try:
                 # WIRE: update belief from current world_state every decide cycle
@@ -854,6 +924,27 @@ class GIIController:
     def record_denial(self, action_key: str) -> None:
         with self._lock:
             self._denied_action_keys.add(action_key)
+
+    def check_action_with_scaffold_audit(self, action: Dict[str, Any]) -> bool:
+        """
+        Run ScaffoldAudit pre-dispatch check. Returns True=ALLOW, False=BLOCK.
+        Blueprint §16 — wires ScaffoldAudit to the live action path.
+        Previously ScaffoldAudit was never called from the GII loop.
+        """
+        if self._scaffold_audit is None:
+            return True
+        try:
+            from core.safety.scaffold_audit import AuditResult
+            result = self._scaffold_audit.check_action(action)
+            if result.decision == "BLOCK":
+                _logger.critical(
+                    "[GIIController] ScaffoldAudit BLOCKED action: op=%s reason=%s",
+                    action.get("operation"), result.reason,
+                )
+                return False
+        except Exception as _sa_exc:
+            _logger.debug("[GIIController] ScaffoldAudit check error: %s", _sa_exc)
+        return True
 
     def record_outcome(
         self,
@@ -1100,6 +1191,36 @@ class GIIController:
                 except Exception:
                     pass
 
+        # ── SPPO: record trajectory for self-play preference training ─────────
+        if self._sppo_trainer is not None:
+            try:
+                self._sppo_trainer.record_trajectory(
+                    objective=self._objective,
+                    app_context=focused_app or "",
+                    execution_log=execution_log or {},
+                    success=success,
+                    duration_s=time.time() - self._task_start,
+                )
+            except Exception as _sppo_exc:
+                _logger.debug("[GIIController] SPPO record failed: %s", _sppo_exc)
+
+        # ── GRPO EWC sync: ensure GRPO uses latest Fisher from ARPO ──────────
+        # Previously sync_ewc_from_arpo() existed in GRPOTrainer but was never
+        # triggered from the task lifecycle. Now called at task completion.
+        try:
+            from core.learning.grpo_trainer import get_grpo_trainer
+            _grpo = get_grpo_trainer()
+            _grpo.sync_ewc_from_arpo()
+        except Exception as _grpo_exc:
+            _logger.debug("[GIIController] GRPO EWC sync failed (non-fatal): %s", _grpo_exc)
+
+        # ── Grounding stack: update LLM callable if it changed ────────────────
+        if self._grounding_stack is not None:
+            try:
+                self._grounding_stack.update_llm(self._llm)
+            except Exception:
+                pass
+
         _logger.info("[GIIController] Task complete. success=%s mode=%d", success, self._gii_mode)
 
     def _extract_semantic_facts_from_log(
@@ -1264,4 +1385,14 @@ class GIIController:
             stats["algorithm_distillation_active"] = True
         if self._openmemory_store is not None:
             stats["openmemory_active"] = True
+        if getattr(self, "_sppo_trainer", None) is not None:
+            stats["sppo_active"] = True
+            stats["sppo"] = self._sppo_trainer.get_stats()
+        if getattr(self, "_grounding_stack", None) is not None:
+            stats["grounding_stack_active"] = True
+            stats["grounding_stack"] = self._grounding_stack.get_stats()
+        if getattr(self, "_scaffold_audit", None) is not None:
+            stats["scaffold_audit"] = self._scaffold_audit.get_stats()
+        if getattr(self, "_pnn", None) is not None:
+            stats["pnn_active"] = True
         return stats
