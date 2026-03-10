@@ -196,6 +196,10 @@ def operate_main(
     prior_step_index: Optional[int] = None,
     prior_execution_log: Optional[dict] = None,
     gii_controller=None,
+    # GII-FIX: restore_provider passed in from main.py so operate_main can
+    # call capture_extended_state() with the correct fully-initialised instance
+    # instead of constructing a broken _RP() with no arguments.
+    restore_provider=None,
 ) -> None:
     
     if not _CONFIRM_TIMEOUT_LOGGED[0]:
@@ -1213,24 +1217,33 @@ def _execute_autonomous_loop(
                     "file_move", "file_write", "navigate", "file_modify",
                 })
                 if _op_for_cr in _IRREVERSIBLE_OPS:
-                    try:
-                        from restoration.restore_provider import RestoreProvider as _RP
-                        _rp = _RP()
-                        _snap_id = _rp.capture_extended_state(
-                            label=f"pre_{_op_for_cr}_iter{iteration}"
-                        )
-                        if _snap_id:
+                    # GII-FIX: Use restore_provider passed from main.py.
+                    # Previously _RP() was called with no args (TypeError).
+                    # Also: capture_extended_state() returns None (side-effect
+                    # only) — the old "if _snap_id:" block never fired.
+                    _rp_active = restore_provider
+                    if _rp_active is not None:
+                        try:
+                            _snap_label = f"pre_{_op_for_cr}_iter{iteration}"
+                            _rp_active.capture_extended_state(
+                                snapshot_id=_snap_label,
+                                task_writes_files=(_op_for_cr in (
+                                    "file_create", "file_write", "file_modify",
+                                    "file_delete", "file_move",
+                                )),
+                            )
                             journal.record({
                                 "event": "pre_dispatch_snapshot",
                                 "iteration": iteration,
                                 "operation": _op_for_cr,
-                                "snapshot_id": str(_snap_id),
+                                "snapshot_id": _snap_label,
                             })
-                    except Exception as _rp_exc:
-                        import logging as _rp_log
-                        _rp_log.getLogger(__name__).debug(
-                            "[operate] RestoreProvider pre-snapshot skipped (non-fatal): %s", _rp_exc
-                        )
+                        except Exception as _rp_exc:
+                            import logging as _rp_log
+                            _rp_log.getLogger(__name__).debug(
+                                "[operate] RestoreProvider pre-snapshot skipped (non-fatal): %s",
+                                _rp_exc,
+                            )
 
                 _cr_apply_external = (
                     _op_for_cr in ("write", "type")
