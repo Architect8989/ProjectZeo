@@ -93,6 +93,7 @@ class GIIController:
         self._mem0_store         = None
         self._cognee_store       = None
         self._episodic_synthesizer = None
+        self._memory_manager     = None  # GII-FIX: MemGPT-style tier manager
 
         self._world_model        = None
         self._self_model         = None
@@ -302,6 +303,24 @@ class GIIController:
         except Exception as exc:
             _logger.warning("[GIIController] EpisodicSynthesizer init failed: %s", exc)
 
+        # GII-FIX: MemGPT-style tiered memory manager (Blueprint §10.6)
+        # Absent in previous versions; now wires all four memory tiers into
+        # a unified manager that enforces working-memory budget, handles
+        # episodic→semantic promotion, and semantic→archive demotion.
+        try:
+            from core.memory.memory_manager import MemoryManager
+            self._memory_manager = MemoryManager(
+                memory_dir=memory_dir,
+                episodic_synthesizer=self._episodic_synthesizer,
+                semantic_memory=self._semantic_memory,
+            )
+            _logger.info(
+                "[GIIController] MemoryManager (MemGPT tiers) active: %s",
+                self._memory_manager,
+            )
+        except Exception as exc:
+            _logger.warning("[GIIController] MemoryManager init failed: %s", exc)
+
         try:
             from core.cognition.active_inference import ActiveInferenceAgent
             self._active_inference = ActiveInferenceAgent(n_states=16, n_obs=32)
@@ -463,9 +482,29 @@ class GIIController:
                 GlobalWorkspace, PerceptionModule, MemoryModule, ReflectionModule
             )
             self._global_workspace = GlobalWorkspace(objective=self._objective)
+            # ── GWT FIX: Register PerceptionModule with the active vision runtime ──
+            # Previously imported but never instantiated or registered.
+            # PerceptionModule is critical for GWT attention competition:
+            # perception evidence must compete with memory and reflection to
+            # determine which information is broadcast to all modules.
+            # We lazily import vision_runtime here to avoid circular deps.
+            _vision_rt = None
+            try:
+                from core.vision.vision_runtime import get_vision_runtime
+                _vision_rt = get_vision_runtime()
+            except Exception as _vr_exc:
+                _logger.debug(
+                    "[GIIController] Could not acquire vision_runtime for "
+                    "PerceptionModule (non-fatal): %s", _vr_exc
+                )
+            self._global_workspace.register(PerceptionModule(_vision_rt))
             self._global_workspace.register(MemoryModule(self._openmemory_store))
             self._global_workspace.register(ReflectionModule(self._goal_repr))
-            _logger.info("[GIIController] GlobalWorkspace (GWT) active.")
+            _logger.info(
+                "[GIIController] GlobalWorkspace (GWT) active. "
+                "Modules: PerceptionModule vision=%s, MemoryModule, ReflectionModule",
+                _vision_rt is not None,
+            )
         except Exception as exc:
             _logger.warning("[GIIController] GlobalWorkspace init failed: %s", exc)
 

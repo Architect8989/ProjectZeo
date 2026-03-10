@@ -598,6 +598,28 @@ class GIIGoalDirectedLoop:
                     reward=1.0 if exec_success else 0.0,
                     outcome="success" if exec_success else "failure",
                 )
+
+                # ── GII-FIX: AD in-context RL loop-back ───────────────────────
+                # After each step, extract learned prompt patterns from the
+                # distiller and inject them into PerStepReasoner via
+                # set_algorithm_distillation_context(). This closes the
+                # in-context RL feedback loop (Blueprint §9).
+                # Previously: episodes were recorded but patterns were never
+                # injected back, leaving the learning loop open at the output end.
+                _psr = getattr(self._gii, "_per_step_reasoner", None)
+                if _psr is not None and hasattr(_psr, "set_algorithm_distillation_context"):
+                    try:
+                        _ad_context = self._algorithm_distiller.get_prompt_injection(
+                            task_type=self._objective[:80],
+                            app_context=focused_app,
+                        )
+                        if _ad_context:
+                            _psr.set_algorithm_distillation_context(_ad_context)
+                    except Exception as _ad_inj_exc:
+                        _logger.debug(
+                            "[GIILoop] AD prompt injection failed (non-fatal): %s",
+                            _ad_inj_exc,
+                        )
             except Exception:
                 pass
 
