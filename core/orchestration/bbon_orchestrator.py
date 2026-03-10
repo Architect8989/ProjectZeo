@@ -10,8 +10,13 @@ from typing import Any, Callable, Dict, List, Optional
 
 _logger = logging.getLogger(__name__)
 
-# Number of parallel rollouts (N=1 disables bBoN, falls through to single run)
-_BBON_N: int = int(os.environ.get("PROJECTZEO_BBON_N", "1"))
+# GII-FIX: Raise default N from 1→3.
+# N=1 disables bBoN entirely (single rollout, no best-of-N selection).
+# N=3 enables proper bBoN ensemble: 3 parallel rollouts at different
+# temperatures, with the Behavior Judge LLM selecting the best trajectory.
+# This directly implements Blueprint §12.3 (bBoN sampling strategy).
+# Users can override: PROJECTZEO_BBON_N=1 to disable, =5 for higher quality.
+_BBON_N: int = int(os.environ.get("PROJECTZEO_BBON_N", "3"))
 
 # Temperature variation for diversity
 _BBON_TEMPERATURES: List[float] = [0.7, 1.0, 1.2]
