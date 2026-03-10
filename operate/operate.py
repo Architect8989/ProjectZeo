@@ -1367,16 +1367,24 @@ def _execute_autonomous_loop(
                 except ImportError:
                     pass
                     import os as _os_lg
-                    if _os_lg.environ.get("PROJECTZEO_REQUIRE_LLAMAGUARD", "0").strip() == "1":
+                    # ── SAFETY FIX: REQUIRE_LLAMAGUARD now defaults to "1" ──────────────
+                    # Previous default was "0" (fail-open) which silently skipped Tier-4
+                    # when llama-guard was not installed. Production deployments should
+                    # NEVER silently skip the safety classifier. Default changed to "1".
+                    # To allow degraded operation without LlamaGuard, explicitly set:
+                    #   PROJECTZEO_REQUIRE_LLAMAGUARD=0
+                    # ──────────────────────────────────────────────────────────────────
+                    if _os_lg.environ.get("PROJECTZEO_REQUIRE_LLAMAGUARD", "1").strip() != "0":
                         raise RuntimeError(
                             "PROJECTZEO_REQUIRE_LLAMAGUARD=1 but llama-guard is not installed. "
-                            "Fix: pip install llama-guard OR unset PROJECTZEO_REQUIRE_LLAMAGUARD"
+                            "Fix: pip install llama-guard  OR set PROJECTZEO_REQUIRE_LLAMAGUARD=0 "
+                            "to allow degraded operation without Tier-4 classification."
                         )
-                    journal.record({"event": "tier4_skipped", "reason": "ImportError: llama-guard not installed"})
+                    journal.record({"event": "tier4_skipped", "reason": "ImportError: llama-guard not installed (REQUIRE_LLAMAGUARD=0 set)"})
                 except Exception as _lg_err:
                     log_warn(f"[SAFE-4] LlamaGuard3 check error (fail-open): {_lg_err}")
                     import os as _os_lg2
-                    if _os_lg2.environ.get("PROJECTZEO_REQUIRE_LLAMAGUARD", "0").strip() == "1":
+                    if _os_lg2.environ.get("PROJECTZEO_REQUIRE_LLAMAGUARD", "1").strip() != "0":
                         raise RuntimeError(f"PROJECTZEO_REQUIRE_LLAMAGUARD=1 but LlamaGuard failed: {_lg_err}")
                     journal.record({"event": "tier4_skipped", "reason": str(_lg_err)[:200]})
 
