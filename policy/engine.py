@@ -757,3 +757,130 @@ class PolicyEngine:
                 )
 
         return self.ALLOW, None
+
+    # =========================================================================
+    # GII-FIX: Policy hot-reload with file watcher (Blueprint §12.3)
+    # =========================================================================
+
+    def reload(self, policy_yaml_path: Optional[str] = None) -> bool:
+        """
+        Hot-reload policy configuration from policy.yaml without restarting.
+        Thread-safe: acquires _apps_lock before swapping all mutable state.
+        Returns True if reload succeeded.
+        """
+        try:
+            import yaml as _yaml_mod
+        except ImportError:
+            _logger.error("[PolicyEngine.reload] PyYAML not installed — cannot reload.")
+            return False
+
+        search_paths = []
+        if policy_yaml_path:
+            search_paths.append(policy_yaml_path)
+        search_paths += [
+            os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "policy.yaml"),
+            os.path.join(os.path.expanduser("~"), ".projectzeo", "policy.yaml"),
+            "/etc/projectzeo/policy.yaml",
+        ]
+
+        loaded_path = None
+        policy_cfg: dict = {}
+        for path in search_paths:
+            if path and os.path.isfile(path):
+                try:
+                    with open(path, "r", encoding="utf-8") as f:
+                        policy_cfg = _yaml_mod.safe_load(f) or {}
+                    loaded_path = path
+                    break
+                except Exception as exc:
+                    _logger.warning("[PolicyEngine.reload] Failed to load %r: %s", path, exc)
+
+        if not loaded_path or not isinstance(policy_cfg, dict):
+            _logger.error("[PolicyEngine.reload] No valid policy.yaml found.")
+            return False
+
+        # Parse new values
+        allowed_apps_raw = policy_cfg.get("allowed_apps")
+        new_allowed = ({str(a).lower() for a in allowed_apps_raw}
+                       if isinstance(allowed_apps_raw, list) else None)
+
+        denied_raw = policy_cfg.get("denied_apps")
+        new_denied = (frozenset(str(a).lower() for a in denied_raw if a)
+                      if isinstance(denied_raw, list) else self._denied_apps)
+
+        hr_raw = policy_cfg.get("high_risk_apps")
+        new_high_risk = (frozenset(str(a).lower() for a in hr_raw if a)
+                         if isinstance(hr_raw, list) else self._high_risk_apps)
+
+        fs_cfg = policy_cfg.get("filesystem", {}) or {}
+        aw_raw = fs_cfg.get("allowed_write_paths")
+        new_allowed_write = ([os.path.expanduser(str(p)) for p in aw_raw if p]
+                             if isinstance(aw_raw, list) else None)
+
+        dw_raw = fs_cfg.get("denied_write_paths")
+        extra_denied = (frozenset(os.path.expanduser(str(p)).rstrip("/") for p in dw_raw if p)
+                        if isinstance(dw_raw, list) else frozenset())
+        new_denied_write = _HARDCODED_DENIED_PATHS | extra_denied
+
+        with self._apps_lock:
+            if new_allowed is not None:
+                self._allowed_apps = new_allowed
+            self._denied_apps = new_denied
+            self._high_risk_apps = new_high_risk
+            if new_allowed_write is not None:
+                self._allowed_write_paths = new_allowed_write
+            self._denied_write_paths = new_denied_write
+
+        _logger.info(
+            "[PolicyEngine.reload] Reloaded from %r. allowed=%d denied=%d high_risk=%d",
+            loaded_path, len(self._allowed_apps),
+            len(self._denied_apps), len(self._high_risk_apps),
+        )
+        return True
+
+    def start_file_watcher(
+        self,
+        policy_yaml_path: Optional[str] = None,
+        poll_interval_seconds: float = 30.0,
+    ) -> None:
+        """
+        Start a background daemon thread that polls policy.yaml for mtime
+        changes and calls reload() automatically. No inotify dependency.
+        """
+        if not policy_yaml_path:
+            for path in [
+                os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "policy.yaml"),
+                os.path.join(os.path.expanduser("~"), ".projectzeo", "policy.yaml"),
+            ]:
+                if os.path.isfile(path):
+                    policy_yaml_path = path
+                    break
+
+        if not policy_yaml_path or not os.path.isfile(policy_yaml_path):
+            _logger.warning("[PolicyEngine] start_file_watcher: policy.yaml not found.")
+            return
+
+        watch_path = policy_yaml_path
+        _state: List[float] = [os.path.getmtime(watch_path)]
+
+        def _watcher() -> None:
+            while True:
+                try:
+                    import time as _t
+                    _t.sleep(poll_interval_seconds)
+                    mtime = os.path.getmtime(watch_path)
+                    if mtime != _state[0]:
+                        _logger.info(
+                            "[PolicyEngine] policy.yaml changed — hot-reloading..."
+                        )
+                        if self.reload(watch_path):
+                            _state[0] = mtime
+                except Exception as exc:
+                    _logger.warning("[PolicyEngine] File watcher error: %s", exc)
+
+        t = threading.Thread(target=_watcher, daemon=True, name="policy-watcher")
+        t.start()
+        _logger.info(
+            "[PolicyEngine] Policy watcher started: %r (every %.0fs).",
+            watch_path, poll_interval_seconds,
+        )
