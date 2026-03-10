@@ -200,6 +200,10 @@ class SemanticMemory:
         self._last_save: float = 0.0
         self._dirty: bool = False
 
+        # FIX: Active goal for auto-injection of goal_context in query()
+        # Set via set_active_goal() when the GIIController objective changes.
+        self._active_goal: str = ""
+
         # ── Optional vector backend (Blueprint §10.5) ─────────────────────────
         # ChromaDB (in-process, zero-config) is attempted first for semantic
         # similarity search. Falls back to Qdrant if configured via env var.
@@ -357,6 +361,15 @@ class SemanticMemory:
 
                 return fact
 
+    def set_active_goal(self, goal: str) -> None:
+        """
+        Register the current task objective so query() automatically injects
+        it as goal_context for ACT-R spreading activation — without callers
+        needing to pass goal_context= explicitly on every call.
+        """
+        self._active_goal = goal
+        _logger.debug("[SemanticMemory] Active goal updated: %r", goal[:80])
+
     def query(
         self,
         query_text: str,
@@ -366,6 +379,9 @@ class SemanticMemory:
         category: Optional[str] = None,
         goal_context: str = "",   # ACT-R spreading activation context
     ) -> List["SemanticFact"]:
+        # FIX: auto-inject active goal as goal_context if not explicitly supplied
+        if not goal_context and self._active_goal:
+            goal_context = self._active_goal
         """
         Query semantic memory using the full Generative Agents three-component
         retrieval score (Park et al. 2023, §3.2) + ACT-R spreading activation.
