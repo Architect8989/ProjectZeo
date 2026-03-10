@@ -130,6 +130,11 @@ class GIIController:
         self._denied_action_keys: set = set()
         self._outcome_call_count: int = 0
         self._last_checkpoint_call: int = 0
+        # WIRE: LATS active flag — prevents Self-Refine from running concurrently
+        # Blueprint §9.2 conflict table: LATS internally generates and critiques
+        # its own search nodes; running Self-Refine during LATS rollouts adds
+        # latency with no quality gain (both critique the same action space).
+        self._lats_recovery_active: bool = False
 
         if self._enabled:
             self._initialise_components(memory_dir)
@@ -398,7 +403,14 @@ class GIIController:
         try:
             from core.cognition.user_model import UserModel
             self._user_model = UserModel(memory_dir=memory_dir)
-            _logger.info("[GIIController] UserModel (ToM) active.")
+            # WIRE: Notify UserModel of new objective for urgency/frustration detection
+            # Blueprint §12 — urgency signal skips expensive Self-Refine critique
+            # when user says quickly / asap / hurry etc. in task description.
+            try:
+                self._user_model.on_objective_received(objective)
+            except Exception:
+                pass
+            _logger.info("[GIIController] UserModel (ToM + urgency-adapt) active.")
         except Exception as exc:
             _logger.warning("[GIIController] UserModel init failed: %s", exc)
 
@@ -722,11 +734,35 @@ class GIIController:
         except Exception as exc:
             _logger.warning("[GIIController] ScaffoldAudit init failed: %s", exc)
 
+        # ── SICA: Self-Improving Consequence Analysis (Blueprint §13.3) ────────
+        # Wire LLM caller into the SICA singleton so it can propose policy rules
+        # for UNCERTAIN consequence verdicts during this task.
+        self._sica_proposer = None
+        try:
+            from core.safety.sica_policy_proposer import get_sica_proposer
+            self._sica_proposer = get_sica_proposer(llm_caller=self._llm)
+            _logger.info("[GIIController] SICA policy proposer active.")
+        except Exception as exc:
+            _logger.debug("[GIIController] SICA init failed (non-fatal): %s", exc)
+
         # ── NL2GenSym: Dynamic SOAR Rule Generation (Blueprint §3.1) ──────────
         self._nl2gensym = None
         try:
             from core.cognition.nl2gensym import NL2GenSym
             self._nl2gensym = NL2GenSym(llm_caller=self._llm)
+            # WIRE: Pre-warm rule generation at task start (async, non-blocking)
+            # This caches rules for the objective+app so the first SOAR step
+            # doesn't incur rule-generation latency.
+            try:
+                import threading as _thr
+                _thr.Thread(
+                    target=self._nl2gensym.generate_operator_rules,
+                    kwargs=dict(objective=objective[:200], app_context=""),
+                    daemon=True,
+                    name="nl2gensym-prewarm",
+                ).start()
+            except Exception:
+                pass
             _logger.info("[GIIController] NL2GenSym (dynamic SOAR rules from NL) active.")
         except Exception as exc:
             _logger.warning("[GIIController] NL2GenSym init failed: %s", exc)
@@ -783,6 +819,9 @@ class GIIController:
         """
         self._agent_q_task_count += 1
 
+        # Reset LATS active flag on task boundary
+        self._lats_recovery_active = False
+
         if (
             self._agent_q is not None
             and self._agent_q_task_count % self._agent_q_trigger_interval == 0
@@ -809,6 +848,17 @@ class GIIController:
                 )
             except Exception:
                 pass
+
+        # ── SICA flush: write pending policy proposals for human review ─────
+        if self._sica_proposer is not None:
+            try:
+                n_flushed = self._sica_proposer.flush_pending_to_file()
+                if n_flushed:
+                    _logger.info(
+                        "[GIIController] SICA flushed %d pending rules to disk.", n_flushed
+                    )
+            except Exception as _sica_flush_exc:
+                _logger.debug("[GIIController] SICA flush error: %s", _sica_flush_exc)
 
         # ── DICP flush: reset intra-task policy accumulator on task boundary ──
         # Cross-session AD constraints are preserved; only within-task evidence
@@ -1111,11 +1161,14 @@ class GIIController:
 
         if self._user_model is not None:
             try:
-                self._user_model.record_action_result(
-                    action=action,
-                    success=success,
-                    focused_app=focused_app or "",
-                )
+                # Update UserModel on approval/denial based on action outcome
+                # on_approval / on_denial track per-app confidence for auto-approve
+                op_str = str(action.get("operation", "unknown"))
+                app_str = focused_app or ""
+                if success:
+                    self._user_model.on_approval(app_str, op_str)
+                else:
+                    self._user_model.on_denial(app_str, op_str)
             except Exception:
                 pass
 

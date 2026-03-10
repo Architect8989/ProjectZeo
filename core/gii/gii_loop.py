@@ -1029,6 +1029,15 @@ class GIIGoalDirectedLoop:
                         "output": exec_output[:100],
                     })
 
+                # WIRE: Reset LATS active flag after action dispatched
+                # Next step can use Self-Refine normally again
+                _psr_inner = getattr(self._gii, "_per_step_reasoner", None)
+                if _psr_inner is not None:
+                    try: _psr_inner.set_lats_active(False)
+                    except Exception: pass
+                if hasattr(self._gii, "_lats_recovery_active"):
+                    self._gii._lats_recovery_active = False
+
                 # UI-AGILE Grounding Data Recording
                 if self._grounding_trainer is not None:
                     _op = str(action.get("operation", "")).lower()
@@ -1141,6 +1150,15 @@ class GIIGoalDirectedLoop:
                         if self._reflexion and self._current_milestone:
                             reflex_ctx = self._reflexion.inject_context(self._current_milestone)
 
+                        # WIRE: Set LATS active flag → suppresses Self-Refine
+                        # on the LATS-selected action (Blueprint §9.2 conflict)
+                        _psr_ref = getattr(self._gii, "_per_step_reasoner", None)
+                        if _psr_ref is not None:
+                            try: _psr_ref.set_lats_active(True)
+                            except Exception: pass
+                        if hasattr(self._gii, "_lats_recovery_active"):
+                            self._gii._lats_recovery_active = True
+
                         lats_result = self._lats.recover(
                             milestone_desc=self._current_milestone,
                             world_snapshot=world_state,
@@ -1162,6 +1180,13 @@ class GIIGoalDirectedLoop:
                             })
                             world_state["_lats_recovery_action"] = lats_result.best_action
                             world_state["_lats_recovery_thought"] = lats_result.best_thought
+                        else:
+                            # LATS found nothing useful — reset active flag
+                            if _psr_ref is not None:
+                                try: _psr_ref.set_lats_active(False)
+                                except Exception: pass
+                            if hasattr(self._gii, "_lats_recovery_active"):
+                                self._gii._lats_recovery_active = False
                     except Exception as lats_exc:
                         _logger.debug("[GIILoop] LATS recovery failed: %s", lats_exc)
 
