@@ -17,6 +17,16 @@ Role in ProjectZeo:
 Integration:
   GIIController.decide_next_action() → calls ActiveInferenceAgent.select_action()
   to produce a ranked list of candidate actions before passing to the LLM.
+
+FIXES (2026-03):
+  - FIX-1: select_action() kwarg standardised to `goal_description` (was
+    called with `goal_desc` in gii_controller.py line 688 — now both sides
+    use `goal_description`).
+  - FIX-2: _last_result caching added for SafetyModule GWT integration.
+  - FIX-3: Precision-weighted softmax policy selection replaces raw argmin EFE
+    — avoids pathological greedy collapse when EFE values are near-equal.
+  - FIX-4: _generate_candidate_actions_from_world() added for world-state-aware
+    heuristic candidate generation used by gii_loop WIRE-1.
 """
 from __future__ import annotations
 
@@ -61,7 +71,23 @@ class ActiveInferenceAction:
     efe:         float            # expected free energy (lower = better)
     ambiguity:   float            # epistemic value (uncertainty reduction)
     risk:        float            # pragmatic value (goal divergence)
+    softmax_prob: float = 0.0     # FIX-3: policy probability under softmax
     rank:        int = 0
+
+
+# ---------------------------------------------------------------------------
+# FIX-2: LastResult — cached result struct for GWT SafetyModule integration
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ActiveInferenceResult:
+    """Snapshot of the last select_action() call, for GWT polling."""
+    top_action:   Optional[Dict[str, Any]]
+    top_efe:      float
+    top_softmax:  float
+    belief_entropy: float
+    goal_description: str
+    evaluated_at: float = field(default_factory=time.monotonic)
 
 
 class ActiveInferenceAgent:
@@ -101,6 +127,9 @@ class ActiveInferenceAgent:
         self._calls = 0
         self._last_efe: Optional[float] = None
 
+        # FIX-2: cached last result for GWT SafetyModule polling
+        self._last_result: Optional[ActiveInferenceResult] = None
+
     # -------------------------------------------------------------------------
     # Belief update (perception)
     # -------------------------------------------------------------------------
@@ -130,19 +159,96 @@ class ActiveInferenceAgent:
         return int(raw_idx)
 
     # -------------------------------------------------------------------------
+    # FIX-4: World-state-aware heuristic candidate generation
+    # -------------------------------------------------------------------------
+
+    def _generate_candidate_actions_from_world(
+        self,
+        world_state: Dict[str, Any],
+        goal_description: str,
+        n: int = 4,
+    ) -> List[Dict[str, Any]]:
+        """
+        Generate heuristic candidate actions from the current world state.
+
+        Used by gii_loop WIRE-1 to seed the Active Inference candidate list
+        before the LLM reasons. Returns up to `n` candidates ranked by
+        semantic plausibility heuristics.
+        """
+        candidates: List[Dict[str, Any]] = []
+
+        entities = world_state.get("entities", [])
+        focused  = world_state.get("focused_app", "")
+        goal_low = goal_description.lower()
+
+        # Heuristic 1 — if there are interactive entities, consider clicking
+        # the most prominent one
+        clickable = [
+            e for e in entities
+            if isinstance(e, dict) and e.get("role") in {
+                "button", "pushbutton", "link", "menuitem", "combobox", "entry"
+            }
+        ]
+        if clickable:
+            # prefer entities whose label appears in the goal
+            def _relevance(e: Dict) -> int:
+                label = str(e.get("name", "") + e.get("label", "")).lower()
+                return sum(tok in label for tok in goal_low.split())
+
+            clickable.sort(key=_relevance, reverse=True)
+            top = clickable[0]
+            candidates.append({
+                "operation": "click",
+                "target": top.get("name") or top.get("label", ""),
+                "rationale": f"[AIF heuristic] click most relevant entity",
+                "_aif_generated": True,
+            })
+
+        # Heuristic 2 — if goal mentions a file path or keyword, consider typing
+        import re as _re
+        path_match = _re.search(r'[\w./\\-]{4,}', goal_description)
+        if path_match:
+            candidates.append({
+                "operation": "type",
+                "value": path_match.group(0),
+                "target": "focused_element",
+                "rationale": "[AIF heuristic] type goal-referenced token",
+                "_aif_generated": True,
+            })
+
+        # Heuristic 3 — verify/observe current state (always epistemic value)
+        candidates.append({
+            "operation": "verify",
+            "target": "screen_state",
+            "rationale": "[AIF heuristic] observe and reduce uncertainty",
+            "_aif_generated": True,
+        })
+
+        # Heuristic 4 — done signal (low-cost check)
+        candidates.append({
+            "operation": "done",
+            "rationale": "[AIF heuristic] check if goal already met",
+            "_aif_generated": True,
+        })
+
+        return candidates[:n]
+
+    # -------------------------------------------------------------------------
     # Action selection (active inference)
     # -------------------------------------------------------------------------
 
     def select_action(
         self,
         candidate_actions: List[Dict[str, Any]],
-        goal_description: str,
+        goal_description: str,          # FIX-1: standardised kwarg (was goal_desc)
         world_state: Dict[str, Any],
     ) -> List[ActiveInferenceAction]:
         """
         Rank candidate actions by expected free energy.
 
-        Lower EFE = better action. Returns list sorted ascending by EFE.
+        Lower EFE = better action.  Returns list sorted ascending by EFE.
+        FIX-3: also populates softmax_prob using precision-weighted softmax
+        so downstream callers can sample rather than always greedy-select.
         """
         if not candidate_actions:
             return []
@@ -161,12 +267,31 @@ class ActiveInferenceAgent:
             ))
 
         scored.sort(key=lambda a: a.efe)
+
+        # FIX-3: precision-weighted softmax over negative EFE
+        # π(a) ∝ exp(-γ · G(a))
+        neg_efe = np.array([-a.efe for a in scored], dtype=float)
+        precision = float(self._precision)
+        logits = precision * neg_efe
+        logits -= logits.max()           # numerical stability
+        probs = np.exp(logits)
+        probs /= probs.sum()
         for i, a in enumerate(scored):
+            a.softmax_prob = float(probs[i])
             a.rank = i
 
         with self._lock:
             self._calls += 1
             self._last_efe = scored[0].efe if scored else None
+
+            # FIX-2: cache result for GWT SafetyModule polling
+            self._last_result = ActiveInferenceResult(
+                top_action=scored[0].action if scored else None,
+                top_efe=scored[0].efe if scored else float("inf"),
+                top_softmax=float(probs[0]) if len(probs) > 0 else 0.0,
+                belief_entropy=self._belief.entropy(),
+                goal_description=goal_description,
+            )
 
         return scored
 

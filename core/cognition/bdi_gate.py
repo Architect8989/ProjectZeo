@@ -203,9 +203,11 @@ class BDIGate:
         self._min_commit_steps = min_commit_steps
 
         self._expected_state: Optional[BeliefStateSnapshot] = None
+        self._last_actual_snapshot: Optional[BeliefStateSnapshot] = None  # FIX: stored per update
         self._last_reconsider_time: float = 0.0
         self._steps_since_replan: int = 0
         self._user_model = UserIntentModel()
+        self._external_user_model: Optional[Any] = None   # FIX: full UserModel from GIIController
         self._original_goal: str = ""
 
     # =========================================================================
@@ -233,8 +235,29 @@ class BDIGate:
         )
 
     def update_actual_state(self, world_snapshot: Dict[str, Any]) -> None:
-        """Called after each observation — tracks actual world state."""
+        """
+        Called after each observation — tracks actual world state.
+        FIX: Now stores a BeliefStateSnapshot so should_reconsider() can do
+        a proper Jaccard comparison against the snapshot from the time the
+        current plan was formed. Previously only incremented a counter.
+        """
         self._steps_since_replan += 1
+        self._last_actual_snapshot = BeliefStateSnapshot.from_world_snapshot(
+            world_snapshot,
+            active_goal=self._original_goal,
+        )
+
+    def set_external_user_model(self, user_model: Any) -> None:
+        """
+        Wire the full GIIController UserModel for online preference learning.
+        Called by gii_controller after _user_model is initialised so BDIGate
+        uses the same model rather than its internal stub.
+        The external model must expose:
+            - format_context() -> str
+            - update_from_feedback(success: bool, action: dict) (optional)
+        """
+        self._external_user_model = user_model
+        _logger.debug("[BDIGate] External UserModel wired: %s", type(user_model).__name__)
 
     def update_user_model(self, utterance: str) -> None:
         """Update Theory of Mind user model from new utterance."""
@@ -273,9 +296,14 @@ class BDIGate:
             )
 
         # ── Check 1: World state divergence (Jaccard)
-        actual_snapshot = BeliefStateSnapshot.from_world_snapshot(
-            actual_state, active_goal=active_goal
-        )
+        # FIX: use stored _last_actual_snapshot if available (from update_actual_state),
+        # otherwise build from passed actual_state dict
+        if self._last_actual_snapshot is not None:
+            actual_snapshot = self._last_actual_snapshot
+        else:
+            actual_snapshot = BeliefStateSnapshot.from_world_snapshot(
+                actual_state, active_goal=active_goal
+            )
         jaccard = self._expected_state.jaccard_similarity(actual_snapshot)
         jaccard_threshold = 1.0 - self._div_threshold
 
@@ -305,8 +333,23 @@ class BDIGate:
             )
 
         # ── Check 2: User intent drift (Theory of Mind)
-        if self._original_goal and self._user_model.recent_utterances:
+        # FIX: use external UserModel if wired, else fall back to internal stub
+        _effective_utterances = self._user_model.recent_utterances
+        if self._external_user_model is not None:
+            try:
+                _ext_ctx = self._external_user_model.format_context()
+                if _ext_ctx:
+                    # Treat external context string as a synthesised utterance for drift calc
+                    _effective_utterances = [_ext_ctx[:500]]
+            except Exception:
+                pass
+
+        if self._original_goal and _effective_utterances:
+            # Temporarily patch internal model's utterances for drift calc
+            _saved = self._user_model.recent_utterances
+            self._user_model.recent_utterances = _effective_utterances
             drift = self._user_model.intent_drift_from(self._original_goal)
+            self._user_model.recent_utterances = _saved
             if drift > self._tom_threshold:
                 reason = (
                     f"User intent drift detected: drift={drift:.2f} > threshold={self._tom_threshold:.2f}. "
