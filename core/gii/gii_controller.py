@@ -812,6 +812,78 @@ class GIIController:
         except Exception as exc:
             _logger.warning("[GIIController] PonderPress init failed: %s", exc)
 
+        # ── UnifiedMemoryOrchestrator (Blueprint §10 — NEW) ───────────────────
+        # Coordinates all memory backends with startup reconciliation,
+        # write fanout, RRF read fusion, and per-backend health monitoring.
+        # Solves the split-brain bug when FAISS data exists but Qdrant starts.
+        self._unified_memory = None
+        try:
+            from core.memory.unified_memory_orchestrator import UnifiedMemoryOrchestrator
+            self._unified_memory = UnifiedMemoryOrchestrator(
+                memory_dir=memory_dir,
+                llm_callable=self._llm,
+            )
+            # Non-blocking startup reconciliation (FAISS→Qdrant migration)
+            import threading as _um_thr
+            _um_thr.Thread(
+                target=self._unified_memory.startup_reconciliation,
+                daemon=True,
+                name="unified-memory-reconciliation",
+            ).start()
+            _logger.info("[GIIController] UnifiedMemoryOrchestrator active (startup reconciliation async).")
+        except Exception as exc:
+            _logger.warning("[GIIController] UnifiedMemoryOrchestrator init failed: %s", exc)
+
+        # ── DualModeReasoner (Blueprint §4.3 — NEW) ───────────────────────────
+        # Routes LLM calls to fast/instruct or deep/thinking tier based on
+        # action reversibility, stagnation, and known-app status.
+        self._dual_mode_reasoner = None
+        try:
+            from core.cognition.dual_mode_reasoner import DualModeReasoner
+            _factory = None
+            try:
+                from adapters.factory import get_adapter_factory
+                _factory = get_adapter_factory()
+            except Exception:
+                pass
+            self._dual_mode_reasoner = DualModeReasoner(
+                llm_callable=self._llm,
+                adapter_factory=_factory,
+            )
+            _logger.info("[GIIController] DualModeReasoner (fast/deep tier routing) active.")
+        except Exception as exc:
+            _logger.warning("[GIIController] DualModeReasoner init failed: %s", exc)
+
+        # ── ReasoningEngine (Blueprint §3 stagnation recovery — FIXED) ────────
+        # Previously never triggered (dead code). Now activated at 50% of
+        # max_stagnant threshold via GIILoop.should_activate() gate.
+        # Wired here so GIILoop can find it via getattr(gii_controller, "_reasoning_engine").
+        self._reasoning_engine = None
+        try:
+            from core.cognition.reasoning_engine import ReasoningEngine
+            self._reasoning_engine = ReasoningEngine(
+                llm_callable=self._llm,
+            )
+            _logger.info("[GIIController] ReasoningEngine (stagnation recovery) active.")
+        except Exception as exc:
+            _logger.warning("[GIIController] ReasoningEngine init failed: %s", exc)
+
+        # ── UnifiedSafetyOrchestrator (Blueprint §13 — NEW) ──────────────────
+        # Single dispatch for all 8 safety tiers with per-tier health tracking,
+        # timing instrumentation, and fail-closed semantics.
+        self._unified_safety = None
+        try:
+            from core.safety.unified_safety_orchestrator import UnifiedSafetyOrchestrator
+            self._unified_safety = UnifiedSafetyOrchestrator(
+                llm_callable=self._llm,
+                policy_engine=None,  # wired in GIILoop via policy_engine param
+                consequence_reasoner=self._consequence_reasoner,
+                journal=None,
+            )
+            _logger.info("[GIIController] UnifiedSafetyOrchestrator active.")
+        except Exception as exc:
+            _logger.warning("[GIIController] UnifiedSafetyOrchestrator init failed: %s", exc)
+
     def _on_task_complete(self, success: bool, objective: str, app_context: str = "") -> None:
         """
         Called after every completed task. Triggers AgentQ auto-collection,
@@ -869,6 +941,26 @@ class GIIController:
                 _logger.debug("[GIIController] DICP engine flushed for new task.")
             except Exception as _dicp_flush_exc:
                 _logger.debug("[GIIController] DICP flush error: %s", _dicp_flush_exc)
+
+        # ── UnifiedMemory task lifecycle hook ─────────────────────────────────
+        # Stores task outcome in ALL backends and triggers HippoRAG/Graphiti sync
+        if hasattr(self, "_unified_memory") and self._unified_memory is not None:
+            try:
+                self._unified_memory.on_task_complete(
+                    objective=objective,
+                    success=success,
+                    app_name=app_context,
+                    duration_sec=time.time() - self._task_start,
+                )
+            except Exception as _um_exc:
+                _logger.debug("[GIIController] UnifiedMemory task hook error: %s", _um_exc)
+
+        # ── Reset ReasoningEngine activation state for new task ───────────────
+        if hasattr(self, "_reasoning_engine") and self._reasoning_engine is not None:
+            try:
+                self._reasoning_engine.reset_for_new_task()
+            except Exception:
+                pass
 
     def decide_next_action_operator_cycle(
         self,

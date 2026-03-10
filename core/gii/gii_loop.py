@@ -155,6 +155,23 @@ class GIIGoalDirectedLoop:
         self._last_reasoning_phash: Optional[int] = None
 
         self._goal_repr = getattr(gii_controller, "_goal_repr", None)
+
+        # ── ReasoningEngine stagnation recovery (WIRE-RE — DEAD-CODE FIX) ───
+        # Previously this was NEVER reached (schema validation prevents empty
+        # candidate_actions). Now activated via stagnant-count threshold trigger.
+        self._reasoning_engine = None
+        try:
+            from core.cognition.reasoning_engine import ReasoningEngine
+            _llm_re = getattr(gii_controller, "_llm_callable", None)
+            if _llm_re is not None:
+                self._reasoning_engine = ReasoningEngine(
+                    llm_callable=_llm_re,
+                    ollama_client=None,
+                )
+                self._reasoning_engine.reset_for_new_task()
+                _logger.info("[GIILoop] ReasoningEngine stagnation recovery: ACTIVE.")
+        except Exception as _re_exc:
+            _logger.debug("[GIILoop] ReasoningEngine unavailable (non-fatal): %s", _re_exc)
         self._operator_cycle = getattr(gii_controller, "_operator_cycle", None)
         self._algorithm_distiller = getattr(gii_controller, "_algorithm_distiller", None)
         self._executed_operators: list = []
@@ -705,6 +722,55 @@ class GIIGoalDirectedLoop:
 
             if action is None:
                 self._stagnant_count += 1
+
+                # ── WIRE-RE: ReasoningEngine stagnation recovery ────────────
+                # Activate at 50% of max_stagnant to get fresh candidates
+                # BEFORE the loop gives up entirely (CRITICAL DEAD-CODE FIX)
+                if (
+                    self._reasoning_engine is not None
+                    and self._reasoning_engine.should_activate(
+                        self._stagnant_count, self._max_stagnant
+                    )
+                ):
+                    self._reasoning_engine.mark_activated(self._stagnant_count)
+                    _logger.info(
+                        "[GIILoop] WIRE-RE: ReasoningEngine activated at "
+                        "stagnant=%d/%d — proposing novel candidates.",
+                        self._stagnant_count, self._max_stagnant,
+                    )
+                    try:
+                        re_candidates = self._reasoning_engine.propose_actions(
+                            objective=self._objective,
+                            belief_summary={
+                                "iteration": self._iteration,
+                                "stagnant_count": self._stagnant_count,
+                                "current_milestone": self._current_milestone or "",
+                                "app": self._current_app or "",
+                            },
+                            perception=world_state,
+                            k=5,
+                        )
+                        if re_candidates:
+                            world_state["_reasoning_engine_candidates"] = re_candidates
+                            world_state["_reasoning_engine_top"] = re_candidates[0]
+                            world_state["_gii_loop_note"] = (
+                                "STAGNATION RECOVERY: ReasoningEngine provided "
+                                f"{len(re_candidates)} novel candidates. "
+                                "Consider the first candidate as your next action."
+                            )
+                            self._journal.record({
+                                "event": "gii_loop_reasoning_engine_activated",
+                                "iteration": self._iteration,
+                                "stagnant_count": self._stagnant_count,
+                                "candidates": len(re_candidates),
+                            })
+                            self._stagnant_count = max(0, self._stagnant_count - 1)
+                            continue
+                    except Exception as _re_exc:
+                        _logger.warning(
+                            "[GIILoop] ReasoningEngine recovery failed: %s", _re_exc
+                        )
+
                 if self._stagnant_count >= self._max_stagnant:
                     return self._result(False, f"Stagnation: GII returned no action. Last: {reason}")
                 continue
