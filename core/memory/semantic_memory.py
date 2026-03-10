@@ -200,13 +200,73 @@ class SemanticMemory:
         self._last_save: float = 0.0
         self._dirty: bool = False
 
+        # ── Optional vector backend (Blueprint §10.5) ─────────────────────────
+        # ChromaDB (in-process, zero-config) is attempted first for semantic
+        # similarity search. Falls back to Qdrant if configured via env var.
+        # If neither is available, ACT-R token-overlap scoring is used (existing).
+        #
+        # Enable: pip install chromadb        → auto-detected
+        #         PROJECTZEO_QDRANT_URL=http://localhost:6333 → Qdrant mode
+        # Disable: PROJECTZEO_VECTOR_BACKEND=none
+        self._vector_client = None
+        self._vector_collection = None
+        _vb = os.environ.get("PROJECTZEO_VECTOR_BACKEND", "auto").strip().lower()
+        if _vb != "none":
+            self._init_vector_backend()
+
         os.makedirs(self._memory_dir, exist_ok=True)
         self._load()
 
         _logger.info(
-            "[SemanticMemory] Initialised. dir=%r facts_loaded=%d",
+            "[SemanticMemory] Initialised. dir=%r facts_loaded=%d vector_backend=%s",
             self._memory_dir, len(self._facts),
+            "chromadb" if self._vector_collection is not None else "none (token-overlap ACT-R)",
         )
+
+    def _init_vector_backend(self) -> None:
+        """Try to initialise ChromaDB (in-process) or Qdrant vector backend."""
+        qdrant_url = os.environ.get("PROJECTZEO_QDRANT_URL", "").strip()
+        if qdrant_url:
+            try:
+                from qdrant_client import QdrantClient
+                from qdrant_client.models import Distance, VectorParams
+                _qc = QdrantClient(url=qdrant_url)
+                collection_name = "projectzeo_semantic"
+                existing = [c.name for c in _qc.get_collections().collections]
+                if collection_name not in existing:
+                    _qc.create_collection(
+                        collection_name=collection_name,
+                        vectors_config=VectorParams(size=384, distance=Distance.COSINE),
+                    )
+                self._vector_client = _qc
+                self._vector_collection = collection_name
+                self._vector_backend = "qdrant"
+                _logger.info("[SemanticMemory] Qdrant vector backend: %s", qdrant_url)
+                return
+            except Exception as exc:
+                _logger.debug("[SemanticMemory] Qdrant init failed: %s", exc)
+
+        # ChromaDB fallback (in-process, no server needed)
+        try:
+            import chromadb
+            _persist_dir = os.path.join(self._memory_dir, "chromadb")
+            os.makedirs(_persist_dir, exist_ok=True)
+            _chroma_client = chromadb.PersistentClient(path=_persist_dir)
+            _collection = _chroma_client.get_or_create_collection(
+                name="projectzeo_semantic",
+                metadata={"hnsw:space": "cosine"},
+            )
+            self._vector_client = _chroma_client
+            self._vector_collection = _collection
+            self._vector_backend = "chromadb"
+            _logger.info("[SemanticMemory] ChromaDB vector backend initialised: %s", _persist_dir)
+        except ImportError:
+            _logger.debug(
+                "[SemanticMemory] chromadb not installed — using ACT-R token-overlap scoring. "
+                "For vector search: pip install chromadb"
+            )
+        except Exception as exc:
+            _logger.debug("[SemanticMemory] ChromaDB init failed: %s", exc)
 
     # =========================================================================
     # Public API
@@ -289,6 +349,12 @@ class SemanticMemory:
                     self._evict_lowest_confidence_locked()
 
                 self._maybe_auto_save()
+
+                # ── Vector backend upsert (Blueprint §10.5) ────────────────────
+                # Upsert new fact into ChromaDB/Qdrant for semantic similarity
+                # search. Falls back gracefully if vector backend unavailable.
+                self._vector_upsert(fact)
+
                 return fact
 
     def query(
@@ -391,6 +457,19 @@ class SemanticMemory:
 
             candidates.sort(key=lambda x: x[0], reverse=True)
             top_facts = [fact for _, fact in candidates[:max_results]]
+
+            # ── Vector search augmentation (Blueprint §10.5) ───────────────────
+            # If ChromaDB/Qdrant is available, run semantic similarity search
+            # to surface facts the token-overlap pass may have missed (synonyms,
+            # paraphrases, cross-domain references). Deduplicate and merge.
+            vector_extras = self._vector_query(query_text, max_results=max_results // 2)
+            if vector_extras:
+                existing_ids = {f.fact_id for f in top_facts}
+                for vfact in vector_extras:
+                    if vfact.fact_id not in existing_ids:
+                        top_facts.append(vfact)
+                        existing_ids.add(vfact.fact_id)
+                top_facts = top_facts[:max_results]
 
             # Record access for ACT-R activation update
             for fact in top_facts:
@@ -562,6 +641,99 @@ class SemanticMemory:
         for fid in sorted_ids[:evict_count]:
             del self._facts[fid]
         _logger.debug("[SemanticMemory] Evicted %d low-confidence facts.", evict_count)
+
+    # =========================================================================
+    # Vector Backend Helpers (ChromaDB / Qdrant)
+    # =========================================================================
+
+    def _vector_upsert(self, fact: "SemanticFact") -> None:
+        """
+        Upsert a fact into the vector backend for semantic similarity search.
+        The fact text is the concatenation of subject + predicate + object.
+        Uses sentence-transformers 'all-MiniLM-L6-v2' (384-dim) if available,
+        falls back to a simple hash-based stub that disables vector search.
+        """
+        if self._vector_collection is None:
+            return
+        try:
+            doc_text = f"{fact.subject} {fact.predicate} {fact.object}"
+            _vb = getattr(self, "_vector_backend", "chromadb")
+
+            if _vb == "chromadb":
+                self._vector_collection.upsert(
+                    ids=[fact.fact_id],
+                    documents=[doc_text],
+                    metadatas=[{
+                        "subject": fact.subject,
+                        "predicate": fact.predicate,
+                        "category": fact.category,
+                        "confidence": str(round(fact.confidence, 3)),
+                    }],
+                )
+            elif _vb == "qdrant":
+                # Qdrant requires explicit embeddings
+                embedding = self._embed(doc_text)
+                if embedding:
+                    from qdrant_client.models import PointStruct
+                    self._vector_client.upsert(
+                        collection_name=self._vector_collection,
+                        points=[PointStruct(
+                            id=abs(hash(fact.fact_id)) % (2**31),
+                            vector=embedding,
+                            payload={"fact_id": fact.fact_id, "text": doc_text},
+                        )],
+                    )
+        except Exception as exc:
+            _logger.debug("[SemanticMemory] Vector upsert failed (non-fatal): %s", exc)
+
+    def _vector_query(self, query_text: str, max_results: int = 5) -> List["SemanticFact"]:
+        """
+        Query the vector backend for semantically similar facts.
+        Returns SemanticFact objects for IDs that exist in self._facts.
+        """
+        if self._vector_collection is None:
+            return []
+        try:
+            _vb = getattr(self, "_vector_backend", "chromadb")
+            if _vb == "chromadb":
+                results = self._vector_collection.query(
+                    query_texts=[query_text],
+                    n_results=min(max_results, max(self._vector_collection.count(), 1)),
+                )
+                ids = results.get("ids", [[]])[0]
+            elif _vb == "qdrant":
+                embedding = self._embed(query_text)
+                if not embedding:
+                    return []
+                hits = self._vector_client.search(
+                    collection_name=self._vector_collection,
+                    query_vector=embedding,
+                    limit=max_results,
+                )
+                ids = [h.payload.get("fact_id", "") for h in hits]
+            else:
+                return []
+
+            found = []
+            with self._lock:
+                for fid in ids:
+                    fact = self._facts.get(fid)
+                    if fact and fact.is_usable():
+                        found.append(fact)
+            return found
+        except Exception as exc:
+            _logger.debug("[SemanticMemory] Vector query failed (non-fatal): %s", exc)
+            return []
+
+    def _embed(self, text: str) -> Optional[list]:
+        """Generate embedding using sentence-transformers (if available)."""
+        try:
+            from sentence_transformers import SentenceTransformer
+            if not hasattr(self, "_st_model"):
+                self._st_model = SentenceTransformer("all-MiniLM-L6-v2")
+            return self._st_model.encode(text, show_progress_bar=False).tolist()
+        except Exception:
+            return None
 
     def __del__(self):
         try:
