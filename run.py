@@ -1,23 +1,65 @@
 import os
 import sys
 import subprocess
+from pathlib import Path
 
+def _load_dotenv() -> None:
+    env_path = Path(__file__).parent / ".env"
+    if not env_path.exists():
+        return
+    for line in env_path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, _, v = line.partition("=")
+        k = k.strip()
+        if k and k not in os.environ:
+            os.environ[k] = v.strip()
+
+def _services_healthy() -> bool:
+    try:
+        import urllib.request
+        urllib.request.urlopen("http://localhost:11434/api/tags", timeout=2)
+        return True
+    except Exception:
+        return False
+
+def _run_bootstrap(skip_install: bool = False, skip_models: bool = False) -> None:
+    bootstrap_py = Path(__file__).parent / "bootstrap.py"
+    if not bootstrap_py.exists():
+        print("[run.py] bootstrap.py not found — skipping setup.", flush=True)
+        return
+
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("bootstrap", str(bootstrap_py))
+    bm = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(bm)
+
+    print("[run.py] Running bootstrap setup...", flush=True)
+    bm.setup(skip_install=skip_install, skip_models=skip_models)
+    print("[run.py] Bootstrap complete. Loading environment...", flush=True)
+    _load_dotenv()
+
+if "--no-bootstrap" not in sys.argv:
+    _load_dotenv()
+    _first_run = not (Path(__file__).parent / ".env").exists()
+    _needs_setup = _first_run or not _services_healthy()
+    if _needs_setup:
+        _skip_install = "--skip-install" in sys.argv
+        _skip_models = "--skip-models" in sys.argv
+        _run_bootstrap(skip_install=_skip_install, skip_models=_skip_models)
+    else:
+        _load_dotenv()
 
 def _early_parse_args() -> tuple:
-    """
-    Pre-import scan of sys.argv for flags that must be set before module imports.
-    Returns (allow_cloud: bool, model_name_or_none: str|None).
-    """
     allow_cloud = "--allow-cloud" in sys.argv
 
-    # Also treat any anthropic:* or openai:* model as cloud-allowed.
     for arg in sys.argv[1:]:
         if not arg.startswith("--"):
             if arg.startswith("anthropic:") or arg.startswith("openai:"):
                 allow_cloud = True
             break
 
-    # Support --model <name> flag in addition to positional arg.
     model = None
     for i, arg in enumerate(sys.argv[1:], 1):
         if arg in ("--model", "-m") and i < len(sys.argv):
@@ -26,7 +68,6 @@ def _early_parse_args() -> tuple:
                 allow_cloud = True
 
     return allow_cloud, model
-
 
 _allow_cloud_early, _model_early = _early_parse_args()
 
@@ -40,7 +81,6 @@ else:
         file=sys.stderr,
     )
 
-
 import asyncio
 import threading
 from typing import Any
@@ -49,7 +89,6 @@ from adapters.factory import build_llm
 from adapters.cloud_adapter import is_cloud_model
 from main import main
 from config.timeouts import LLM_THREAD_TIMEOUT_SECONDS
-
 
 def _parse_args():
     args = sys.argv[1:]
@@ -61,7 +100,6 @@ def _parse_args():
 
     model: str | None = None
 
-    # --model <name> flag takes precedence over positional arg
     for i, arg in enumerate(args):
         if arg in ("--model", "-m") and i + 1 < len(args):
             model = args[i + 1].strip() or None
@@ -96,7 +134,6 @@ def _parse_args():
 
     return model, allow_cloud, interactive, status_only
 
-
 def _print_status() -> None:
     import json as _json
     import pathlib as _pathlib
@@ -105,7 +142,6 @@ def _print_status() -> None:
     _root = _pathlib.Path(__file__).resolve().parent
     _temp = _root / "temp"
 
-    # D-7 FIX: Intent file now lives in ~/.projectzeo/
     from core.intent_listener import IntentListener as _IL
     _intent_file = _pathlib.Path(_IL.INTENT_FILE)
     _arm_success = _pathlib.Path(_IL._SIDECAR_DIR) / "arm_success.json"
@@ -163,7 +199,6 @@ def _print_status() -> None:
     print(f"Intent file : {_intent_file}")
     print("Tip: write intent to the intent file above  OR  run with --interactive")
 
-
 def _run_coroutine_threadsafe(coro) -> Any:
     result_container: dict = {}
     error_container: dict = {}
@@ -188,20 +223,8 @@ def _run_coroutine_threadsafe(coro) -> Any:
 
     return result_container.get("result")
 
-
 def _make_llm_callable(adapter, model_name: str):
-    """
-    Build the llm_callable that is passed to main().
 
-    Cloud adapters (AnthropicCloudAdapter, OpenAICloudAdapter via _CloudCallable)
-    implement __call__(messages, objective, session_id) directly and do NOT have
-    an async get_next_action() method.  For these, call __call__ directly without
-    going through the async thread bounce.
-
-    Local Ollama adapters require the async get_next_action() + thread path.
-    """
-
-    # Cloud path: direct synchronous call.
     if is_cloud_model(model_name):
         def _cloud_call(messages, objective=None, session_id=None):
             try:
@@ -209,10 +232,6 @@ def _make_llm_callable(adapter, model_name: str):
             except Exception as e:
                 raise RuntimeError(f"Cloud LLM adapter invocation failed: {e}") from e
 
-            # Cloud adapters return a string; wrap in the list format expected by
-            # operate.py / plan parsing code that expects a list of operations.
-            # The per_step_reasoner and planner both handle str responses natively
-            # through their _parse_action / _parse_step_array methods.
             if isinstance(result, str):
                 return result
             if isinstance(result, list):
@@ -223,7 +242,6 @@ def _make_llm_callable(adapter, model_name: str):
 
         return _cloud_call
 
-    # Local Ollama path: async get_next_action() via thread.
     if not hasattr(adapter, "get_next_action"):
         raise RuntimeError(
             f"Adapter for model {model_name!r} is missing get_next_action(). "
@@ -273,7 +291,6 @@ def _make_llm_callable(adapter, model_name: str):
 
     return _ollama_call
 
-
 def _validate_runtime_dependencies(model_name: str) -> None:
     import shutil as _shutil
     import platform as _platform
@@ -292,12 +309,11 @@ def _validate_runtime_dependencies(model_name: str) -> None:
                 "Snapshot persistence and transition logging will be disabled."
             )
 
-    # Cloud models do not require Ollama; skip local Ollama checks entirely.
     _is_cloud = is_cloud_model(model_name)
 
     if not _is_cloud:
         try:
-            import psutil as _  # noqa: F401
+            import psutil as _
         except ImportError:
             errors.append(
                 "  [MISSING] psutil is not installed.\n"
@@ -351,7 +367,7 @@ def _validate_runtime_dependencies(model_name: str) -> None:
             _has_ydotool = _shutil.which("ydotool") is not None
             _has_pyatspi = False
             try:
-                import pyatspi  # noqa: F401
+                import pyatspi
                 _has_pyatspi = True
             except ImportError:
                 pass
@@ -386,7 +402,7 @@ def _validate_runtime_dependencies(model_name: str) -> None:
                     )
 
     try:
-        import yaml  # noqa: F401
+        import yaml
     except ImportError:
         warnings.append(
             "  [WARNING] pyyaml is not installed — policy.yaml will NOT be loaded.\n"
@@ -394,7 +410,7 @@ def _validate_runtime_dependencies(model_name: str) -> None:
         )
 
     try:
-        import playwright  # noqa: F401
+        import playwright
         _chromium_found = any(
             _shutil.which(b) is not None
             for b in ("chromium-browser", "chromium", "google-chrome", "google-chrome-stable")
@@ -410,11 +426,10 @@ def _validate_runtime_dependencies(model_name: str) -> None:
             "    Fix: pip install playwright && playwright install chromium"
         )
 
-    # Cloud adapter dependency checks
     if _is_cloud:
         if model_name.startswith("anthropic:"):
             try:
-                import anthropic  # noqa: F401
+                import anthropic
             except ImportError:
                 errors.append(
                     "  [MISSING] anthropic package not installed.\n"
@@ -427,7 +442,7 @@ def _validate_runtime_dependencies(model_name: str) -> None:
                 )
         elif model_name.startswith("openai:"):
             try:
-                import openai  # noqa: F401
+                import openai
             except ImportError:
                 errors.append(
                     "  [MISSING] openai package not installed.\n"
@@ -439,7 +454,6 @@ def _validate_runtime_dependencies(model_name: str) -> None:
                     "    Fix: export OPENAI_API_KEY=sk-..."
                 )
     else:
-        # Ollama checks
         _ollama_ok = False
         try:
             import ollama as _ollama
@@ -454,7 +468,7 @@ def _validate_runtime_dependencies(model_name: str) -> None:
 
         if _ollama_ok:
             try:
-                import ollama as _ollama  # noqa: F811
+                import ollama as _ollama
                 _existing_models = {m.model for m in _ollama.Client().list().models}
                 _base = model_name.split(":")[0]
                 _found = any(
@@ -471,7 +485,7 @@ def _validate_runtime_dependencies(model_name: str) -> None:
 
         if _ollama_ok:
             try:
-                import ollama as _ollama  # noqa: F811
+                import ollama as _ollama
                 _existing = {m.model for m in _ollama.Client().list().models}
                 _text_candidate = model_name.replace("-vl:", ":").replace("-vl", "")
                 _text_base = _text_candidate.split(":")[0]
@@ -497,9 +511,6 @@ def _validate_runtime_dependencies(model_name: str) -> None:
                     "(first inference loads weights; may take 1-5 min on cold start)...",
                     file=sys.stderr,
                 )
-                # AUDIT LOW FIX: Add 120s timeout to pre-warm call.
-                # Previously no timeout was set — if Ollama hung, the process
-                # hung indefinitely at startup with no user feedback.
                 import httpx as _httpx_pw
                 _pw_client = _ollama_prewarm.Client(
                     timeout=_httpx_pw.Timeout(
@@ -527,13 +538,9 @@ def _validate_runtime_dependencies(model_name: str) -> None:
                     file=sys.stderr,
                 )
 
-    # AUDIT LOW FIX: LlamaGuard Tier 4 status disclosure.
-    # Operators need to know whether Tier 4 content classification is active.
-    # Previously this was silently absent from the startup output — operators
-    # deploying without LlamaGuard could incorrectly assume Tier 4 was active.
     _llamaguard_active = False
     try:
-        from core.safety.llamaguard_classifier import classify_with_llamaguard as _lgc_check  # noqa
+        from core.safety.llamaguard_classifier import classify_with_llamaguard as _lgc_check
         _llamaguard_active = True
     except ImportError:
         _llamaguard_active = False
@@ -571,7 +578,6 @@ def _validate_runtime_dependencies(model_name: str) -> None:
             print(e, file=sys.stderr)
         print("", file=sys.stderr)
         sys.exit(1)
-
 
 if __name__ == "__main__":
     model_name, allow_cloud, interactive, status_only = _parse_args()

@@ -36,12 +36,9 @@ from restoration.restore_verifier import RestoreVerifier, RestorationVerificatio
 from core.planner.execution_planner import ExecutionPlanner
 from core.safety.runtime_watchdog import RuntimeWatchdog, WatchdogViolation
 
-# D-1 FIX: apply_patches was imported as uninstall_patches only; _apply_safety_patches
-# was called in main() but never defined, causing a silent NameError every run.
 from adapters.apis_safety_layer import apply_patches as _apply_safety_patches
 from adapters.apis_safety_layer import uninstall_patches
 from core.cognition.belief_state import BeliefState
-
 
 HEARTBEAT_INTERVAL = 0.25
 
@@ -49,8 +46,8 @@ _RAW_TASK_SECONDS = int(
     os.environ.get("PROJECTZEO_MAX_TASK_SECONDS", str(90 * 60))
 )
 
-_MIN_EFFECTIVE_TASK_SECONDS = 1_800   # 30 minutes (was: 86_400 = 24 hours)
-_MAX_EFFECTIVE_TASK_SECONDS = 28_800  # 8 hours hard cap
+_MIN_EFFECTIVE_TASK_SECONDS = 1_800
+_MAX_EFFECTIVE_TASK_SECONDS = 28_800
 MAX_TASK_SECONDS = (
     min(_RAW_TASK_SECONDS, _MAX_EFFECTIVE_TASK_SECONDS)
     if _RAW_TASK_SECONDS > 0
@@ -75,47 +72,29 @@ HEALTH_RETRY_MAX = 5
 HEALTH_RETRY_INTERVAL = 1.0
 VISION_RESTART_GRACE_SECONDS = 5.0
 
-
-# ------------------------------------------------------------------
-# MODULE-LEVEL STATE
-# ------------------------------------------------------------------
-
 _TASK_START: Optional[float] = None
 _TASK_LOCK = threading.Lock()
 _SHUTDOWN_EVENT = threading.Event()
-
-
-# ------------------------------------------------------------------
-# THREAD-SAFE TASK TIMING
-# ------------------------------------------------------------------
 
 def _set_task_start(ts: float) -> None:
     global _TASK_START
     with _TASK_LOCK:
         _TASK_START = ts
 
-
 def _clear_task_start() -> None:
     global _TASK_START
     with _TASK_LOCK:
         _TASK_START = None
 
-
 def _get_task_start() -> Optional[float]:
     with _TASK_LOCK:
         return _TASK_START
-
 
 def _safe_belief_snapshot(belief_state_out: list) -> dict:
     try:
         return belief_state_out[0] if belief_state_out else {}
     except Exception:
         return {}
-
-
-# ------------------------------------------------------------------
-# SAFE SHUTDOWN
-# ------------------------------------------------------------------
 
 def _force_safe_shutdown(os_backend, auth_state, reason: str) -> None:
     try:
@@ -128,10 +107,8 @@ def _force_safe_shutdown(os_backend, auth_state, reason: str) -> None:
         pass
     print(f"[SAFE-SHUTDOWN] {reason}", file=sys.stderr)
 
-
 def _signal_handler(signum, frame) -> None:
     _SHUTDOWN_EVENT.set()
-
 
 def _install_signal_handlers() -> None:
     signal.signal(signal.SIGINT, _signal_handler)
@@ -139,11 +116,9 @@ def _install_signal_handlers() -> None:
     if hasattr(signal, "SIGQUIT"):
         signal.signal(signal.SIGQUIT, _signal_handler)
 
-
 def _interactive_print(msg: str) -> None:
     if os.environ.get("PROJECTZEO_INTERACTIVE", "").strip() == "1":
         print(msg, flush=True)
-
 
 def _write_task_result(
     *,
@@ -176,7 +151,6 @@ def _write_task_result(
     except Exception as _e:
         print(f"[MAIN] Could not write task_result.json: {_e}", file=sys.stderr)
 
-
 def _ingest_latest_perception(observer, world_graph) -> bool:
     snap = observer.snapshot()
     if not isinstance(snap, dict):
@@ -189,14 +163,12 @@ def _ingest_latest_perception(observer, world_graph) -> bool:
     world_graph.ingest(perception)
     return True
 
-
 def _enforce_task_timeout() -> None:
     start = _get_task_start()
     if start is None:
         return
     if MAX_TASK_SECONDS > 0 and (time.time() - start) > MAX_TASK_SECONDS:
         raise RuntimeError("TASK_FAILED:timeout")
-
 
 def _safe_begin_restoration(mode: ModeController) -> bool:
     current = mode.mode
@@ -220,34 +192,25 @@ def _safe_begin_restoration(mode: ModeController) -> bool:
 
     return False
 
-
 def _shutdown_executor(executor, wait: bool = False) -> None:
     if sys.version_info >= (3, 9):
         executor.shutdown(wait=wait, cancel_futures=True)
     else:
         executor.shutdown(wait=wait)
 
-
 def _pause_observer_lightweight(observer_loop) -> None:
-    """
-    D-11 FIX: Replace full observer pause with lightweight mode during EXECUTING.
-    Falls back to full pause if the observer_loop doesn't support lightweight mode.
-    """
     if hasattr(observer_loop, "set_lightweight"):
         try:
             observer_loop.set_lightweight(True)
             return
         except Exception:
             pass
-    # Fallback: full pause (original behaviour)
     try:
         observer_loop.pause()
     except Exception:
         pass
 
-
 def _resume_observer_from_lightweight(observer_loop) -> None:
-    """Undo lightweight mode or full pause, whichever was applied."""
     if hasattr(observer_loop, "set_lightweight"):
         try:
             observer_loop.set_lightweight(False)
@@ -259,11 +222,6 @@ def _resume_observer_from_lightweight(observer_loop) -> None:
     except Exception:
         pass
 
-
-# ------------------------------------------------------------------
-# MAIN ENTRY
-# ------------------------------------------------------------------
-
 def main(llm_callable: Callable, model_name: str) -> None:
     if not callable(llm_callable):
         raise RuntimeError("llm_callable must be a callable")
@@ -271,7 +229,20 @@ def main(llm_callable: Callable, model_name: str) -> None:
     if not isinstance(model_name, str) or not model_name.strip():
         raise RuntimeError("model_name must be a non-empty string")
 
-    # D-1 FIX: apply_patches now correctly imported above; always call on startup.
+    import os as _os_defaults
+    _os_defaults.environ.setdefault("PROJECTZEO_REQUIRE_GII", "1")
+    _os_defaults.environ.setdefault("PROJECTZEO_REQUIRE_LLAMAGUARD", "1")
+    _os_defaults.environ.setdefault("PROJECTZEO_GII_MODE", "2")
+    _os_defaults.environ.setdefault("PROJECTZEO_USE_MILESTONES", "1")
+    _os_defaults.environ.setdefault("PROJECTZEO_USE_WORLD_MODEL", "1")
+    _os_defaults.environ.setdefault("PROJECTZEO_USE_SELF_MODEL", "1")
+    _os_defaults.environ.setdefault("PROJECTZEO_USE_LANGGRAPH", "1")
+    print(
+        "[main] Safety defaults: REQUIRE_GII=1, REQUIRE_LLAMAGUARD=1, GII_MODE=2 (FULL), "
+        "LANGGRAPH=1. Override with explicit env vars.",
+        file=sys.stderr,
+    )
+
     try:
         _apply_safety_patches()
     except Exception as _patch_err:
@@ -309,7 +280,6 @@ def main(llm_callable: Callable, model_name: str) -> None:
     vision_runtime = VisionRuntime(model_name=model_name)
     world_graph = WorldGraph()
 
-    
     _uitars_runtime = None
     _use_sglang = os.environ.get("PROJECTZEO_USE_SGLANG", "0").strip() in ("1", "true", "yes")
     if _use_sglang:
@@ -322,8 +292,6 @@ def main(llm_callable: Callable, model_name: str) -> None:
                 model_id=_vision_ep.model_id,
                 timeout_seconds=_vision_ep.timeout_seconds,
             )
-            # Perform a lightweight health check before declaring UITARSRuntime active.
-            # If the SGLang server is not yet up, we log a warning and fall back.
             if hasattr(_uitars_runtime, "is_healthy") and not _uitars_runtime.is_healthy():
                 print(
                     "[MAIN] UITARSRuntime: SGLang vision server not reachable at "
@@ -357,7 +325,7 @@ def main(llm_callable: Callable, model_name: str) -> None:
         observer=observer,
         vision_runtime=vision_runtime,
         world_graph=world_graph,
-        uitars_runtime=_uitars_runtime,   # VIS-1 FIX: primary vision; None on CPU
+        uitars_runtime=_uitars_runtime,
     )
 
     mode = ModeController()
@@ -404,8 +372,6 @@ def main(llm_callable: Callable, model_name: str) -> None:
         mode.force_observer()
 
     vision_runtime.start()
-    # VIS-1 FIX: Start UITARSRuntime if registered (GPU path).
-    # VisionRuntime is always started first as the fallback is guaranteed.
     if _uitars_runtime is not None and hasattr(_uitars_runtime, "start"):
         try:
             _uitars_runtime.start()
@@ -489,7 +455,6 @@ def main(llm_callable: Callable, model_name: str) -> None:
         authority_state=auth_state,
     )
 
-    
     snapshot_provider.set_browser_capture_fn(restore_provider.capture_browser_session)
     restore_verifier = RestoreVerifier(
         os_backend=os_backend,
@@ -529,7 +494,6 @@ def main(llm_callable: Callable, model_name: str) -> None:
                     try:
                         observer_loop.stop()
                         vision_runtime.stop()
-                        # VIS-1 FIX: also stop UITARSRuntime on restart if active
                         if _uitars_runtime is not None and hasattr(_uitars_runtime, "stop"):
                             try:
                                 _uitars_runtime.stop()
@@ -540,7 +504,6 @@ def main(llm_callable: Callable, model_name: str) -> None:
                         if _uitars_runtime is not None and hasattr(_uitars_runtime, "start"):
                             try:
                                 _uitars_runtime.start()
-                                # Re-enable UITARSRuntime in ObserverLoop after restart
                                 if hasattr(observer_loop, "reset_uitars"):
                                     observer_loop.reset_uitars()
                             except Exception as _u_restart_err:
@@ -575,8 +538,6 @@ def main(llm_callable: Callable, model_name: str) -> None:
 
                 snapshot_id = mode.consume_snapshot()
                 if not snapshot_id:
-                    # AUDIT FIX: If no snapshot exists at arm time, there is NO recovery
-                    # baseline. Warn loudly — restoration will be best-effort only.
                     print(
                         "\n[MAIN] ⚠  WARNING: No snapshot available at task start.\n"
                         "  Restoration after failure will be best-effort (cursor + window focus only).\n"
@@ -584,7 +545,6 @@ def main(llm_callable: Callable, model_name: str) -> None:
                         "  This is risky for tasks with irreversible side-effects.\n",
                         file=sys.stderr,
                     )
-                    # Attempt an emergency snapshot before proceeding
                     try:
                         _emergency_snap = snapshot_provider.take_snapshot()
                         if _emergency_snap:
@@ -681,8 +641,6 @@ def main(llm_callable: Callable, model_name: str) -> None:
                 mode.attach_execution_plan(f"plan_{int(time.time())}")
                 mode.mark_planning_complete()
 
-                # D-2 FIX: Create GIIController immediately after plan creation.
-                # Previously never instantiated; gii_controller=None in every run.
                 gii_controller = None
                 try:
                     from core.gii.gii_controller import GIIController
@@ -698,11 +656,6 @@ def main(llm_callable: Callable, model_name: str) -> None:
                         file=sys.stderr,
                     )
                 except Exception as _gii_err:
-                    # AUDIT FIX: Silent capability downgrade → loud degraded-mode warning.
-                    # The original message was logged to stderr and buried; make it
-                    # impossible to miss. Operating in scripted mode means all GII
-                    # capabilities (milestones, consequence reasoning, world model,
-                    # per-step adaptation) are absent.
                     _gii_degraded_msg = (
                         f"\n[MAIN] ⚠  CAPABILITY DEGRADED — GIIController FAILED TO INIT\n"
                         f"  Error: {_gii_err}\n"
@@ -713,14 +666,12 @@ def main(llm_callable: Callable, model_name: str) -> None:
                         f"  Resolve the error above and restart.\n"
                     )
                     print(_gii_degraded_msg, file=sys.stderr)
-                    # Hard guard: if PROJECTZEO_REQUIRE_GII=1, refuse to run without GII
                     if os.environ.get("PROJECTZEO_REQUIRE_GII", "0").strip() == "1":
                         raise RuntimeError(
                             "PROJECTZEO_REQUIRE_GII=1 — refusing to run in scripted fallback mode. "
                             f"GIIController init error: {_gii_err}"
                         )
 
-                # LAYER-2: Wire VeriSafe Agent
                 _vsa = None
                 try:
                     from core.safety.verisafe_agent import VeriSafeAgent
@@ -730,7 +681,6 @@ def main(llm_callable: Callable, model_name: str) -> None:
                 except Exception as _vsa_err:
                     _logger.warning("[MAIN] VSA init failed (non-fatal): %s", _vsa_err)
 
-                # LAYER-5: Wire PIGuard
                 _piguard = None
                 try:
                     from core.safety.piguard import create_piguard
@@ -739,7 +689,6 @@ def main(llm_callable: Callable, model_name: str) -> None:
                 except Exception as _pig_err:
                     _logger.warning("[MAIN] PIGuard init failed (non-fatal): %s", _pig_err)
 
-                # LAYER-4: Wire Graphiti store
                 _graphiti = None
                 try:
                     from core.memory.graphiti_store import GraphitiStore
@@ -748,7 +697,6 @@ def main(llm_callable: Callable, model_name: str) -> None:
                 except Exception as _gs_err:
                     _logger.warning("[MAIN] GraphitiStore init failed (non-fatal): %s", _gs_err)
 
-                # LAYER-6: Wire ARPO trainer
                 _arpo = None
                 try:
                     from core.learning.arpo_trainer import ARPOTrainer
@@ -757,7 +705,6 @@ def main(llm_callable: Callable, model_name: str) -> None:
                 except Exception as _ar_err:
                     _logger.debug("[MAIN] ARPO init: %s", _ar_err)
 
-                # LAYER-6: Wire UI-Evol
                 _ui_evol = None
                 try:
                     from core.learning.arpo_trainer import UIEvol
@@ -765,7 +712,6 @@ def main(llm_callable: Callable, model_name: str) -> None:
                 except Exception as _ue_err:
                     _logger.debug("[MAIN] UIEvol init: %s", _ue_err)
 
-                # LAYER-6b: Wire AgentQ for DPO pair collection
                 _agent_q = None
                 try:
                     from core.learning.agent_q import get_agent_q
@@ -774,16 +720,17 @@ def main(llm_callable: Callable, model_name: str) -> None:
                 except Exception as _aq_err:
                     _logger.debug("[MAIN] AgentQ init: %s", _aq_err)
 
-                # LAYER-6c: Wire nightly consolidation (starts daemon thread)
                 try:
                     from core.learning.nightly_consolidation import get_consolidator
-                    _consolidator = get_consolidator()
+                    _consolidator = get_consolidator(
+                        llm_callable=mode.get_llm_callable(),
+                        semantic_memory=getattr(mode, "_semantic_memory", None),
+                    )
                     _consolidator.start()
                     print("[MAIN] Nightly consolidation scheduler started.", file=sys.stderr)
                 except Exception as _nc_err:
                     _logger.debug("[MAIN] Consolidation init: %s", _nc_err)
 
-                # LAYER-6d: Wire HippoRAG
                 try:
                     from core.memory.hippo_rag import get_hippo_rag
                     _hippo = get_hippo_rag()
@@ -793,7 +740,6 @@ def main(llm_callable: Callable, model_name: str) -> None:
                 except Exception as _hr_err:
                     _logger.debug("[MAIN] HippoRAG init: %s", _hr_err)
 
-                # LAYER-6e: Wire UserModel
                 try:
                     from core.cognition.user_model import get_user_model
                     _user_model = get_user_model()
@@ -801,7 +747,6 @@ def main(llm_callable: Callable, model_name: str) -> None:
                 except Exception as _um_err:
                     _logger.debug("[MAIN] UserModel init: %s", _um_err)
 
-                # LAYER-6f: Wire SNN event processor
                 try:
                     from core.perception.snn_event_processor import get_snn_processor
                     _snn = get_snn_processor()
@@ -809,7 +754,6 @@ def main(llm_callable: Callable, model_name: str) -> None:
                 except Exception as _snn_err:
                     _logger.debug("[MAIN] SNN init: %s", _snn_err)
 
-                # LAYER-7: Wire MCP Tool Router
                 _mcp_router = None
                 try:
                     from core.tools.mcp_tool_router import MCPToolRouter
@@ -821,7 +765,6 @@ def main(llm_callable: Callable, model_name: str) -> None:
                 try:
                     observer_loop.resume()
                     time.sleep(0.5)
-                    # D-11 FIX: Lightweight mode instead of full pause during EXECUTING.
                     _pause_observer_lightweight(observer_loop)
                 except Exception:
                     pass
@@ -857,7 +800,6 @@ def main(llm_callable: Callable, model_name: str) -> None:
                                 if MAX_TASK_SECONDS > 0
                                 else (90 * 60)
                             )
-                            # D-2 FIX: Pass gii_controller to operate_main().
                             operate_main(
                                 terminal_prompt=intent,
                                 execution_plan=execution_plan,
@@ -876,7 +818,6 @@ def main(llm_callable: Callable, model_name: str) -> None:
                             _task_succeeded = True
                             _interactive_print(f"[MODE] TASK COMPLETED — {intent[:72]}")
 
-                            # Notify GIIController of completion for memory persistence.
                             if gii_controller is not None:
                                 try:
                                     _focused = (
@@ -893,8 +834,6 @@ def main(llm_callable: Callable, model_name: str) -> None:
                                 except Exception:
                                     pass
 
-                            # AUDIT FIX: Belief state persistence — guard against
-                            # lost episodic data if persist() raises.
                             _belief_for_persist = _safe_belief_snapshot(_belief_state_out)
                             if _belief_for_persist:
                                 try:
@@ -908,14 +847,12 @@ def main(llm_callable: Callable, model_name: str) -> None:
                                         _bs_persist_err,
                                     )
 
-                            # LAYER-6: ARPO finalization
                             if _arpo is not None:
                                 try:
                                     _arpo.finalize_trajectory(success=True, reason="task_complete")
                                 except Exception:
                                     pass
 
-                            # LAYER-6b: AgentQ — ingest LATS DPO pairs on task complete
                             if _agent_q is not None and gii_controller is not None:
                                 try:
                                     _lats = getattr(getattr(gii_controller, "_loop", None), "_lats", None)
@@ -927,7 +864,6 @@ def main(llm_callable: Callable, model_name: str) -> None:
                                 except Exception as _aq_ingest_err:
                                     _logger.debug("[MAIN] AgentQ ingest error: %s", _aq_ingest_err)
 
-                            # LAYER-6: UI-Evol post-task knowledge refinement
                             if _ui_evol is not None:
                                 try:
                                     _focused_app = (
@@ -944,7 +880,6 @@ def main(llm_callable: Callable, model_name: str) -> None:
                                 except Exception:
                                     pass
 
-                            # LAYER-4: Graphiti outcome storage for compound learning
                             if _graphiti is not None:
                                 try:
                                     _graphiti.store_task_outcome(
@@ -1023,7 +958,6 @@ def main(llm_callable: Callable, model_name: str) -> None:
                                 )
                                 mode.mark_planning_complete()
 
-                                # Rebuild GIIController with updated scaffold on replan.
                                 if gii_controller is not None:
                                     try:
                                         from core.gii.gii_controller import GIIController
@@ -1056,7 +990,6 @@ def main(llm_callable: Callable, model_name: str) -> None:
                 finally:
                     should_restore = _safe_begin_restoration(mode)
 
-                    # Notify GIIController of failure if task didn't succeed.
                     if not _task_succeeded and gii_controller is not None:
                         try:
                             gii_controller.on_task_complete(success=False)
@@ -1284,7 +1217,6 @@ def main(llm_callable: Callable, model_name: str) -> None:
             except Exception:
                 pass
 
-        # VIS-1 FIX: include UITARSRuntime in shutdown sequence when active.
         _shutdown_targets = [
             (intent_listener.stop, "intent_listener"),
             (observer_loop.stop, "observer_loop"),
