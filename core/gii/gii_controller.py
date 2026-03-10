@@ -94,7 +94,7 @@ class GIIController:
         self._mem0_store         = None
         self._cognee_store       = None
         self._episodic_synthesizer = None
-        self._memory_manager     = None  # GII-FIX: MemGPT-style tier manager
+        self._memory_manager     = None
 
         self._world_model        = None
         self._self_model         = None
@@ -108,6 +108,9 @@ class GIIController:
         self._trajectory_flywheel = None
         self._algorithm_distiller = None
         self._soar_chunker        = None
+
+        # ── DICP: Direct In-Context Policy (Blueprint §9.1) ───────────────────
+        self._dicp_engine        = None  # initialised in _initialise_phase3_components
 
         self._openmemory_store   = None
 
@@ -143,13 +146,15 @@ class GIIController:
             self._initialise_phase3_components()
         _logger.info(
             "[GIIController] Initialised. mode=%d enabled=%s consequence=%s "
-            "milestones=%s world_model=%s self_model=%s checkpoint_interval=%d",
+            "milestones=%s world_model=%s self_model=%s checkpoint_interval=%d "
+            "dicp=%s",
             gii_mode, self._enabled,
             self._consequence_reasoner is not None,
             self._milestones_active,
             self._world_model is not None,
             self._self_model is not None,
             _EPISODIC_CHECKPOINT_INTERVAL,
+            self._dicp_engine is not None,
         )
 
     @classmethod
@@ -204,6 +209,11 @@ class GIIController:
     def scaffold_audit(self):
         """ScaffoldAudit for live action path checking."""
         return getattr(self, "_scaffold_audit", None)
+
+    @property
+    def dicp_engine(self):
+        """DICP in-context policy engine (Blueprint §9.1)."""
+        return self._dicp_engine
 
     def _initialise_components(self, memory_dir: Optional[str]) -> None:
 
@@ -319,10 +329,6 @@ class GIIController:
         except Exception as exc:
             _logger.warning("[GIIController] EpisodicSynthesizer init failed: %s", exc)
 
-        # GII-FIX: MemGPT-style tiered memory manager (Blueprint §10.6)
-        # Absent in previous versions; now wires all four memory tiers into
-        # a unified manager that enforces working-memory budget, handles
-        # episodic→semantic promotion, and semantic→archive demotion.
         try:
             from core.memory.memory_manager import MemoryManager
             self._memory_manager = MemoryManager(
@@ -496,10 +502,9 @@ class GIIController:
         try:
             from core.cognition.global_workspace import (
                 GlobalWorkspace, PerceptionModule, MemoryModule, ReflectionModule,
-                PlanningModule, SafetyModule,  # WIRE: new modules from FILE 2
+                PlanningModule, SafetyModule,
             )
             self._global_workspace = GlobalWorkspace(objective=self._objective)
-            # ── GWT FIX: Register PerceptionModule with the active vision runtime ──
             _vision_rt = None
             try:
                 from core.vision.vision_runtime import get_vision_runtime
@@ -513,17 +518,12 @@ class GIIController:
             self._global_workspace.register(MemoryModule(self._openmemory_store))
             self._global_workspace.register(ReflectionModule(self._goal_repr))
 
-            # WIRE: PlanningModule — broadcasts HTN milestone transitions so GWT
-            # can interrupt PSR when the planner advances or stalls.
             try:
                 self._global_workspace.register(PlanningModule(self))
                 _logger.debug("[GIIController] PlanningModule registered in GWT.")
             except Exception as _pm_exc:
                 _logger.warning("[GIIController] PlanningModule registration failed (non-fatal): %s", _pm_exc)
 
-            # WIRE: SafetyModule — re-broadcasts ConsequenceReasoner deny/confirm
-            # results at high activation so safety signals win GWT competition
-            # before the next PSR reasoning cycle begins.
             try:
                 _cr = getattr(self, "_consequence_reasoner", None)
                 self._global_workspace.register(SafetyModule(_cr))
@@ -558,6 +558,37 @@ class GIIController:
         except Exception as exc:
             _logger.warning("[GIIController] AlgorithmDistiller init failed: %s", exc)
 
+        # ── DICP: Direct In-Context Policy (Blueprint §9.1) ───────────────────
+        # Accumulates within-task failure/success patterns and injects them as
+        # a "policy addendum" into LLM prompts during operator selection.
+        # Complements Algorithm Distillation: AD is cross-session/coarse-grained;
+        # DICP is intra-task/fine-grained (sub-goal resolution level).
+        self._dicp_engine = None
+        try:
+            from core.learning.dicp import DICPEngine
+            self._dicp_engine = DICPEngine(
+                objective=self._objective,
+                app_context="",
+                llm_caller=self._llm,
+            )
+            # Ingest any cross-session constraint patterns from AlgorithmDistiller
+            if self._algorithm_distiller is not None:
+                try:
+                    _ad_ctx = self._algorithm_distiller.get_context_string(
+                        self._objective, ""
+                    )
+                    n_ingested = self._dicp_engine.ingest_ad_constraints(_ad_ctx)
+                    if n_ingested:
+                        _logger.info(
+                            "[GIIController] DICP ingested %d cross-session AD constraints.",
+                            n_ingested,
+                        )
+                except Exception as _ad_exc:
+                    _logger.debug("[GIIController] DICP AD ingest skipped: %s", _ad_exc)
+            _logger.info("[GIIController] DICP Engine (in-context policy) active.")
+        except Exception as exc:
+            _logger.warning("[GIIController] DICP init failed: %s", exc)
+
         try:
             from core.learning.soar_chunking import SOARChunking as SOARChunker
             self._soar_chunker = SOARChunker(
@@ -569,7 +600,6 @@ class GIIController:
             _logger.warning("[GIIController] SOARChunker init failed: %s", exc)
 
         # ── AgentQ: MCTS trajectory collection + DPO pair generation ─────────
-        # Auto-triggers every PROJECTZEO_AGENT_Q_TRIGGER_INTERVAL tasks (default 50).
         self._agent_q = None
         self._agent_q_task_count: int = 0
         self._agent_q_trigger_interval: int = int(
@@ -585,7 +615,7 @@ class GIIController:
         except Exception as exc:
             _logger.warning("[GIIController] AgentQ init failed: %s", exc)
 
-        # ── Session Reflector: daily plan reflection at session start ─────────
+        # ── Session Reflector ─────────────────────────────────────────────────
         self._session_reflector = None
         try:
             from core.cognition.session_reflector import SessionReflector
@@ -595,7 +625,6 @@ class GIIController:
                 episodic_synthesizer=self._episodic_synthesizer,
                 semantic_memory=self._semantic_memory,
             )
-            # Run session-start reflection asynchronously (non-blocking)
             import threading as _thr
             _thr.Thread(
                 target=self._session_reflector.reflect_on_session_start,
@@ -606,7 +635,7 @@ class GIIController:
         except Exception as exc:
             _logger.warning("[GIIController] SessionReflector init failed: %s", exc)
 
-        # ── Progressive Neural Network (PNN): continual learning anti-forgetting
+        # ── Progressive Neural Network (PNN) ──────────────────────────────────
         self._pnn = None
         try:
             from core.learning.progressive_nn import ProgressiveNeuralNetwork
@@ -616,9 +645,6 @@ class GIIController:
             _logger.debug("[GIIController] PNN not available (non-fatal): %s", exc)
 
         # ── SPPO Trainer: Self-Play Policy Optimization (Blueprint §12.1) ─────
-        # Algorithm 19/19 — previously ZERO implementation; now wired.
-        # Compares current-policy trajectories against reference-policy snapshots
-        # and generates DPO preference pairs for nightly fine-tuning.
         self._sppo_trainer = None
         try:
             from core.learning.sppo_trainer import get_sppo_trainer
@@ -628,23 +654,20 @@ class GIIController:
             _logger.warning("[GIIController] SPPO Trainer init failed: %s", exc)
 
         # ── Six-Tier Grounding Stack (Blueprint §6.7) ─────────────────────────
-        # Previously: Grounding DINO + SAM2 existed but was never called from
-        # the main GII loop. Now wired as the unified grounding backend.
         self._grounding_stack = None
         try:
             from core.perception.grounding_stack import get_grounding_stack
             self._grounding_stack = get_grounding_stack(
                 atspi_bridge=self._atspi_bridge,
-                omniparser=None,      # lazy-init inside GroundingStack
-                uitars_runtime=None,  # lazy-init inside GroundingStack
+                omniparser=None,
+                uitars_runtime=None,
                 llm_callable=self._llm,
             )
             _logger.info("[GIIController] GroundingStack (6-tier) active.")
         except Exception as exc:
             _logger.warning("[GIIController] GroundingStack init failed: %s", exc)
 
-        # ── Scaffold Audit: arm it after components are ready ─────────────────
-        # Previously scaffold_audit.py existed but was never armed in the live path.
+        # ── Scaffold Audit ─────────────────────────────────────────────────────
         self._scaffold_audit = None
         try:
             from core.safety.scaffold_audit import ScaffoldAudit
@@ -656,8 +679,8 @@ class GIIController:
 
     def _on_task_complete(self, success: bool, objective: str, app_context: str = "") -> None:
         """
-        Called after every completed task. Triggers AgentQ auto-collection
-        every N tasks and updates PNN with new experience column if available.
+        Called after every completed task. Triggers AgentQ auto-collection,
+        PNN update, and DICP flush.
         """
         self._agent_q_task_count += 1
 
@@ -687,6 +710,16 @@ class GIIController:
                 )
             except Exception:
                 pass
+
+        # ── DICP flush: reset intra-task policy accumulator on task boundary ──
+        # Cross-session AD constraints are preserved; only within-task evidence
+        # (failure patterns, stagnation counters, discovered constraints) resets.
+        if self._dicp_engine is not None:
+            try:
+                self._dicp_engine.flush()
+                _logger.debug("[GIIController] DICP engine flushed for new task.")
+            except Exception as _dicp_flush_exc:
+                _logger.debug("[GIIController] DICP flush error: %s", _dicp_flush_exc)
 
     def decide_next_action_operator_cycle(
         self,
@@ -820,9 +853,6 @@ class GIIController:
             except Exception:
                 pass
 
-        # WIRE: AT-SPI screen state snapshot for WorldGUI-style completion check.
-        # Queries the AT-SPI bridge for the current focused app and top-level
-        # accessible text so the planner can cross-reference against the objective.
         try:
             from core.perception.atbridge import get_atbridge
             _bridge = get_atbridge()
@@ -835,7 +865,7 @@ class GIIController:
                         "entities_count": len(_snap.get("entities", [])),
                     }
         except Exception:
-            pass  # AT-SPI unavailable — non-fatal
+            pass
 
         return partial if partial else None
 
@@ -848,9 +878,6 @@ class GIIController:
         if not self._enabled or self._per_step_reasoner is None:
             return None, "GII disabled"
 
-        # ── PNN lateral context injection (Blueprint §11.3) ───────────────────
-        # Per-step reasoner has set_pnn_context() wired but it was never called.
-        # Inject lateral transfer before reasoning so PSR can leverage prior columns.
         if self._pnn is not None:
             try:
                 focused_app = str(world_state.get("focused_app", ""))
@@ -866,15 +893,13 @@ class GIIController:
 
         if self._active_inference is not None:
             try:
-                # WIRE: update belief from current world_state every decide cycle
                 self._active_inference.update_belief(world_state)
-
                 _candidates: List[Dict[str, Any]] = world_state.get("_candidate_actions", [])
                 if _candidates:
                     _ranked = self._active_inference.select_action(
                         _candidates,
                         world_state=world_state,
-                        goal_description=self._objective,  # FIX: was goal_desc
+                        goal_description=self._objective,
                     )
                     if _ranked:
                         world_state = dict(world_state)
@@ -893,7 +918,6 @@ class GIIController:
             except Exception:
                 pass
 
-        # WIRE: inject GWT broadcast context into world_state for PSR
         if self._global_workspace is not None:
             try:
                 gwt_ctx = self._global_workspace.get_context_for_psr()
@@ -902,6 +926,22 @@ class GIIController:
                     world_state["_gwt_context"] = gwt_ctx
             except Exception as _gwt_exc:
                 _logger.debug("[GIIController] GWT context injection failed (non-fatal): %s", _gwt_exc)
+
+        # ── DICP policy addendum injection into world_state ───────────────────
+        # The DICP addendum (failure patterns, stagnation warnings, discovered
+        # constraints) is injected here so PSR sees it via world_state keys.
+        # The loop also injects it directly before each decide call via
+        # world_state["_dicp_policy_addendum"].
+        if self._dicp_engine is not None:
+            try:
+                _dicp_addendum = self._dicp_engine.get_policy_addendum(
+                    context={"world_state": world_state, "goal": self._objective},
+                )
+                if _dicp_addendum and "_dicp_policy_addendum" not in world_state:
+                    world_state = dict(world_state) if not isinstance(world_state, dict) else world_state
+                    world_state["_dicp_policy_addendum"] = _dicp_addendum
+            except Exception as _dicp_exc:
+                _logger.debug("[GIIController] DICP addendum inject failed: %s", _dicp_exc)
 
         try:
             return self._per_step_reasoner.next_action(
@@ -926,11 +966,6 @@ class GIIController:
             self._denied_action_keys.add(action_key)
 
     def check_action_with_scaffold_audit(self, action: Dict[str, Any]) -> bool:
-        """
-        Run ScaffoldAudit pre-dispatch check. Returns True=ALLOW, False=BLOCK.
-        Blueprint §16 — wires ScaffoldAudit to the live action path.
-        Previously ScaffoldAudit was never called from the GII loop.
-        """
         if self._scaffold_audit is None:
             return True
         try:
@@ -1191,7 +1226,7 @@ class GIIController:
                 except Exception:
                     pass
 
-        # ── SPPO: record trajectory for self-play preference training ─────────
+        # ── SPPO trajectory recording ─────────────────────────────────────────
         if self._sppo_trainer is not None:
             try:
                 self._sppo_trainer.record_trajectory(
@@ -1204,9 +1239,7 @@ class GIIController:
             except Exception as _sppo_exc:
                 _logger.debug("[GIIController] SPPO record failed: %s", _sppo_exc)
 
-        # ── GRPO EWC sync: ensure GRPO uses latest Fisher from ARPO ──────────
-        # Previously sync_ewc_from_arpo() existed in GRPOTrainer but was never
-        # triggered from the task lifecycle. Now called at task completion.
+        # ── GRPO EWC sync ─────────────────────────────────────────────────────
         try:
             from core.learning.grpo_trainer import get_grpo_trainer
             _grpo = get_grpo_trainer()
@@ -1214,12 +1247,20 @@ class GIIController:
         except Exception as _grpo_exc:
             _logger.debug("[GIIController] GRPO EWC sync failed (non-fatal): %s", _grpo_exc)
 
-        # ── Grounding stack: update LLM callable if it changed ────────────────
         if self._grounding_stack is not None:
             try:
                 self._grounding_stack.update_llm(self._llm)
             except Exception:
                 pass
+
+        # ── DICP flush via _on_task_complete ──────────────────────────────────
+        # Flush DICP intra-task evidence so the next task starts clean.
+        # Cross-session AD constraints survive the flush.
+        self._on_task_complete(
+            success=success,
+            objective=self._objective,
+            app_context=focused_app or "",
+        )
 
         _logger.info("[GIIController] Task complete. success=%s mode=%d", success, self._gii_mode)
 
@@ -1395,4 +1436,8 @@ class GIIController:
             stats["scaffold_audit"] = self._scaffold_audit.get_stats()
         if getattr(self, "_pnn", None) is not None:
             stats["pnn_active"] = True
+        # ── DICP stats ────────────────────────────────────────────────────────
+        if self._dicp_engine is not None:
+            stats["dicp_active"] = True
+            stats["dicp"] = self._dicp_engine.get_stats()
         return stats
