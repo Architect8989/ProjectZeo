@@ -241,6 +241,33 @@ class SNNEventProcessor:
             self._buffer.clear()
             self._spike_log.clear()
 
+    def process_event(self, event_type: str, event_info: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """
+        Public bridge method — called by ATSPIBridge._on_event().
+
+        NEW in this patch: ATSPIBridge previously had no way to call the SNN
+        because the only API was ingest(ATSPIEvent). process_event() accepts
+        raw strings/dicts from the bridge callback path.
+        """
+        try:
+            ae = ATSPIEvent(
+                event_type=event_type,
+                source_name=str(event_info.get("source_name", "")),
+                source_role=str(event_info.get("source_role", "")),
+                window_id=event_info.get("window_id"),
+                ts=float(event_info.get("ts", 0.0)),
+            )
+            self.ingest(ae)
+            summary = self.summarise(window_sec=5.0)
+            return {
+                "spike_rate":     summary.spike_rate,
+                "dominant_event": summary.dominant_event_type,
+                "active_windows": summary.active_window_count,
+                "anomaly":        summary.spike_rate > 20.0,
+            }
+        except Exception:
+            return None
+
     def get_stats(self) -> Dict[str, Any]:
         with self._lock:
             return {
@@ -249,6 +276,55 @@ class SNNEventProcessor:
                 "sj_available":    _SJ_AVAILABLE,
                 "mode":            self._layer._mode,
             }
+
+    def should_interrupt(
+        self,
+        window_sec: float = 2.0,
+        spike_rate_threshold: float = 5.0,
+        activity_threshold: float = 0.4,
+    ) -> bool:
+        """
+        Leaky integrate-and-fire threshold check for AT-SPI interrupt decision.
+
+        Used by gii_loop WIRE-3: if this returns False, a burst of AT-SPI events
+        is suppressed (no re-observe). Returns True only when the SNN's spike
+        rate OR activity level exceeds thresholds, indicating a genuine UI change
+        that warrants interrupting the current execution.
+
+        Thresholds (tunable via env vars):
+          PROJECTZEO_SNN_SPIKE_THRESHOLD  — spikes/sec to trigger interrupt (default 5.0)
+          PROJECTZEO_SNN_ACTIVITY_THRESHOLD — activity level [0-1] threshold (default 0.4)
+
+        LIF decision rule:
+          interrupt = (spike_rate >= spike_threshold) OR
+                      (activity_level >= activity_threshold AND novel_ui_change)
+        """
+        import os as _os
+        _spike_thr = float(_os.environ.get("PROJECTZEO_SNN_SPIKE_THRESHOLD", str(spike_rate_threshold)))
+        _act_thr   = float(_os.environ.get("PROJECTZEO_SNN_ACTIVITY_THRESHOLD", str(activity_threshold)))
+
+        summary = self.summarise(window_sec=window_sec)
+        n_spikes = summary.spike_count
+
+        # Compute spike rate over window
+        spike_rate = n_spikes / max(window_sec, 0.001)
+
+        # LIF threshold check
+        if spike_rate >= _spike_thr:
+            _logger.debug(
+                "[SNN] Interrupt: spike_rate=%.1f >= threshold=%.1f",
+                spike_rate, _spike_thr,
+            )
+            return True
+
+        if summary.activity_level >= _act_thr and summary.novel_ui_change:
+            _logger.debug(
+                "[SNN] Interrupt: activity=%.2f >= threshold=%.2f + novel_ui_change",
+                summary.activity_level, _act_thr,
+            )
+            return True
+
+        return False
 
 
 _instance: Optional[SNNEventProcessor] = None
@@ -262,3 +338,27 @@ def get_snn_processor() -> SNNEventProcessor:
             if _instance is None:
                 _instance = SNNEventProcessor()
     return _instance
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Process singleton for ATSPIBridge auto-wiring
+# ─────────────────────────────────────────────────────────────────────────────
+
+import threading as _threading
+
+_global_snn: "Optional[SNNEventProcessor]" = None
+_global_snn_lock = _threading.Lock()
+
+
+def get_global_snn_processor() -> SNNEventProcessor:
+    """
+    Return the process-singleton SNNEventProcessor.
+
+    NEW in this patch — ATSPIBridge calls this in __init__ to auto-wire
+    the SNN without explicit dependency injection.
+    """
+    global _global_snn
+    if _global_snn is None:
+        with _global_snn_lock:
+            if _global_snn is None:
+                _global_snn = SNNEventProcessor()
+    return _global_snn
