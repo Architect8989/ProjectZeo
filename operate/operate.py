@@ -252,6 +252,18 @@ def operate_main(
                 f"[operate_main] policy.yaml loaded from {_os_mod.path.abspath(_policy_path)}",
                 file=sys.stderr,
             )
+            # GII-FIX: Start hot-reload file watcher for policy.yaml (Blueprint §12.3)
+            # Policy changes take effect within 30 seconds without agent restart.
+            try:
+                policy_engine.start_file_watcher(
+                    policy_yaml_path=_os_mod.path.abspath(_policy_path),
+                    poll_interval_seconds=30.0,
+                )
+            except Exception as _watcher_err:
+                print(
+                    f"[operate_main] Policy watcher start failed (non-fatal): {_watcher_err}",
+                    file=sys.stderr,
+                )
     except RuntimeError:
         raise
     except ImportError:
@@ -1297,10 +1309,25 @@ def _execute_autonomous_loop(
                 previous_perception = perception_snapshot
                 continue
 
+            # ── SAFETY FIX: Universal LlamaGuard Tier-4 Gate ───────────────────
+            # ORIGINAL BUG (Sin 2 residue): LlamaGuard was gated on operation
+            # type: in ("command","file_create","install","write","type").
+            # This left ALL click operations unscreened by LlamaGuard — a click
+            # on "Wipe All Data" or a UAC confirmation dialog bypassed Tier-4.
+            #
+            # FIX: Use the same _REVERSIBLE_FAST_PATH_OPS frozenset that
+            # ConsequenceReasoner uses. Only truly reversible / observational ops
+            # (scroll, move_mouse, focus, screenshot, observe, wait, done) are
+            # exempt. Everything else — including click, hotkey, press, navigate,
+            # fill — gets LlamaGuard Tier-4 multi-category classification.
+            # ────────────────────────────────────────────────────────────────────
+            _LG_FAST_PATH_OPS: frozenset = frozenset({
+                "scroll", "move_mouse", "focus", "screenshot",
+                "observe", "wait", "done",
+            })
             if (
                 _policy_decision != PolicyEngine.DENY
-                and str(selected_action.get("operation", "")).lower()
-                    in ("command", "file_create", "install", "write", "type")
+                and _op_for_cr not in _LG_FAST_PATH_OPS
             ):
                 try:
                     from core.safety.llamaguard_classifier import classify_with_llamaguard as _lgc
