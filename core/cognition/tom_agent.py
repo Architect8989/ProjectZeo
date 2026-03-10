@@ -122,9 +122,59 @@ Respond in JSON:
 # Data structures
 # ─────────────────────────────────────────────────────────────────────────────
 
+# ─────────────────────────────────────────────────────────────────────────────
+# GII-FIX: Discrete VAD (Valence-Arousal-Dominance) emotion model
+# Blueprint §3.3 — arXiv:2501.15355 recommends continuous emotion tracking
+# alongside BDI to detect frustration/satisfaction signals that change intent.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# VAD emotion vocabulary: (valence, arousal, dominance) ∈ [−1,+1]
+_VAD_LEXICON: Dict[str, Tuple[float, float, float]] = {
+    "frustration":   (-0.7,  0.5, -0.3),
+    "anger":         (-0.8,  0.8, -0.1),
+    "satisfaction":  ( 0.8, -0.2,  0.4),
+    "approval":      ( 0.7, -0.1,  0.3),
+    "confusion":     (-0.3,  0.3, -0.4),
+    "urgency":       ( 0.0,  0.8,  0.1),
+    "relief":        ( 0.8, -0.5,  0.2),
+    "disappointment":(-0.6,  0.2, -0.2),
+    "neutral":       ( 0.0,  0.0,  0.0),
+}
+
+def _infer_vad_from_events(events: List["_Event"]) -> Tuple[float, float, float]:
+    """
+    Heuristic VAD (Valence-Arousal-Dominance) inference from approval/denial events.
+    Returns (valence, arousal, dominance) ∈ [−1,+1].
+    """
+    if not events:
+        return (0.0, 0.0, 0.0)
+    recent = events[-10:]
+    denial_count = sum(1 for e in recent if e.event_type == "denial")
+    approval_count = sum(1 for e in recent if e.event_type == "approval")
+    failure_count = sum(1 for e in recent if e.event_type == "failure")
+    total = len(recent)
+    neg_ratio = (denial_count + failure_count) / max(total, 1)
+    valence  = max(-1.0, min(1.0, 0.5 - neg_ratio * 1.2 + approval_count * 0.15))
+    arousal  = max(-1.0, min(1.0, 0.3 + denial_count * 0.1 + failure_count * 0.08))
+    dominance = max(-1.0, min(1.0, 0.1 - neg_ratio * 0.5))
+    return (round(valence, 2), round(arousal, 2), round(dominance, 2))
+
+def _emotion_label_from_vad(vad: Tuple[float, float, float]) -> str:
+    """Map a VAD tuple to the closest emotion label in the lexicon."""
+    v, a, d = vad
+    best_label = "neutral"
+    best_dist = float("inf")
+    for label, (lv, la, ld) in _VAD_LEXICON.items():
+        dist = (v - lv)**2 + (a - la)**2 + (d - ld)**2
+        if dist < best_dist:
+            best_dist = dist
+            best_label = label
+    return best_label
+
+
 @dataclass
 class UserBDI:
-    """Model of the user's current Belief-Desire-Intention state."""
+    """Model of the user's current Belief-Desire-Intention state with VAD emotion.""",
     beliefs:              str = ""           # What the user believes about current state
     desires:              str = ""           # Ultimate outcome the user wants
     intentions:           List[str] = field(default_factory=list)  # Expected agent steps
@@ -132,9 +182,12 @@ class UserBDI:
     ambiguity:            str = ""           # Most important open question
     confidence:           float = 0.5
     last_updated:         float = field(default_factory=time.time)
+    # GII-FIX: VAD emotion model (Valence, Arousal, Dominance)
+    emotion_vad:          Tuple[float, float, float] = field(default=(0.0, 0.0, 0.0))
+    emotion_label:        str = "neutral"    # Closest emotion from _VAD_LEXICON
 
     def to_prompt_block(self) -> str:
-        """Format for PerStepReasoner context injection."""
+        """Format for PerStepReasoner context injection (includes VAD emotion)."""
         if self.confidence < 0.3:
             return ""
         lines = ["── User Intent Model (ToM) ──"]
@@ -146,6 +199,22 @@ class UserBDI:
             lines.append("Implicit constraints:")
             for c in self.implicit_constraints[:4]:
                 lines.append(f"  • {c}")
+        # GII-FIX: emit VAD emotion signal so the agent adapts to user state
+        v, a, d = self.emotion_vad
+        if abs(v) > 0.15 or abs(a) > 0.15:
+            _EMOTION_HINTS = {
+                "frustration": "User appears frustrated — slow down, confirm before acting.",
+                "anger": "User appears angry — be cautious and confirm every step.",
+                "disappointment": "User appears disappointed — acknowledge failure, pivot approach.",
+                "satisfaction": "User appears satisfied — continue current approach.",
+                "approval": "User approved — proceed confidently.",
+                "relief": "User signal: relief — task on track.",
+                "urgency": "User signal: urgency — prioritise speed.",
+                "confusion": "User appears confused — add brief explanation to next action.",
+            }
+            hint = _EMOTION_HINTS.get(self.emotion_label, "")
+            if hint:
+                lines.append(f"⚡ Emotion [{self.emotion_label} V={v:+.1f} A={a:+.1f}]: {hint}")
         if self.ambiguity and self.confidence < 0.6:
             lines.append(f"⚠ Ambiguity: {self.ambiguity}")
         lines.append("─" * 30)
@@ -411,6 +480,10 @@ class ToMAgent:
                 self._user_bdi.ambiguity            = str(parsed.get("ambiguity", ""))[:200]
                 self._user_bdi.confidence           = float(parsed.get("confidence", 0.5))
                 self._user_bdi.last_updated         = time.time()
+                # GII-FIX: Update VAD model after every LLM-based BDI update
+                vad = _infer_vad_from_events(self._events)
+                self._user_bdi.emotion_vad   = vad
+                self._user_bdi.emotion_label = _emotion_label_from_vad(vad)
             # Invalidate implicit constraints cache
             self._cache_ts = 0.0
             return True
@@ -419,7 +492,7 @@ class ToMAgent:
             return False
 
     def _heuristic_update_bdi(self) -> None:
-        """Update BDI heuristically from event history."""
+        """Update BDI heuristically from event history (includes VAD update)."""
         with self._lock:
             denial_count = sum(1 for e in self._events if e.event_type == "denial")
             approval_count = sum(1 for e in self._events if e.event_type == "approval")
@@ -432,6 +505,10 @@ class ToMAgent:
                     f"{denial_count} denials suggest the agent's approach doesn't match "
                     "user expectations — reconsider strategy."
                 )
+            # GII-FIX: Update VAD emotion model from event history
+            vad = _infer_vad_from_events(self._events)
+            self._user_bdi.emotion_vad = vad
+            self._user_bdi.emotion_label = _emotion_label_from_vad(vad)
 
     def _heuristic_counterfactual(
         self,
