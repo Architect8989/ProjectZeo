@@ -103,6 +103,32 @@ def _init_signal_dir() -> str:
 
 _SESSION_SIGNAL_DIR: str = _init_signal_dir()
 
+# ---------------------------------------------------------------------------
+# Module-level ConsequenceReasoner singleton for Sin-3 CR-first routing
+# ---------------------------------------------------------------------------
+_policy_cr_instance = None
+_policy_cr_lock = threading.Lock()
+
+
+def _get_policy_consequence_reasoner():
+    """Return a lazily-initialised ConsequenceReasoner for policy-level CR routing."""
+    global _policy_cr_instance
+    if _policy_cr_instance is not None:
+        return _policy_cr_instance
+    with _policy_cr_lock:
+        if _policy_cr_instance is not None:
+            return _policy_cr_instance
+        try:
+            from core.safety.consequence_reasoner import ConsequenceReasoner
+            _policy_cr_instance = ConsequenceReasoner()
+            _logger.info("[PolicyEngine] ConsequenceReasoner singleton initialised for CR-first routing.")
+        except Exception as exc:
+            _logger.warning(
+                "[PolicyEngine] ConsequenceReasoner init failed — CR-first routing unavailable: %s", exc
+            )
+            _policy_cr_instance = None
+    return _policy_cr_instance
+
 
 class PolicyViolationError(RuntimeError):
     pass
@@ -426,6 +452,92 @@ class PolicyEngine:
         return self.ALLOW, None
 
     # =========================================================================
+    # CONSEQUENCE-FIRST ROUTING (Blueprint §3 Sin-3 complete fix)
+    # =========================================================================
+
+    def _evaluate_unknown_app_via_consequence_reasoner(
+        self,
+        action: dict,
+        app: str,
+        op: str,
+    ) -> str:
+        """
+        Route unknown apps through ConsequenceReasoner BEFORE human escalation.
+
+        Returns one of: ALLOW, DENY, REQUIRE_HUMAN_CONFIRMATION
+
+        Logic:
+          - If CR returns SAFE + COHERENT → ALLOW (reversible low-risk action)
+          - If CR returns HARMFUL or score < 0.15 → DENY
+          - If CR returns UNCERTAIN or score in [0.15, 0.45) → REQUIRE_HUMAN_CONFIRMATION
+          - If CR is unavailable → REQUIRE_HUMAN_CONFIRMATION (fail-safe)
+          - High-risk operations (command, file_create, install) always → REQUIRE_HUMAN
+            unless score >= 0.75
+
+        This is the core GII architectural change: consequence reasoning as the
+        primary gate, human approval as the fallback, allowlist as the shortcut.
+        """
+        # Fast-path: high-risk operations always require human unless CR is very confident
+        _HIGH_RISK_OPS = frozenset({"command", "install", "file_create"})
+
+        try:
+            from core.safety.consequence_reasoner import (
+                ConsequenceReasoner,
+                SafetyDecision,
+            )
+        except ImportError:
+            _logger.debug(
+                "[PolicyEngine] ConsequenceReasoner not importable — "
+                "falling back to REQUIRE_HUMAN_CONFIRMATION for unknown app %r.", app
+            )
+            return self.REQUIRE_HUMAN_CONFIRMATION
+
+        # Lazy-init a module-level CR instance for policy use
+        cr = _get_policy_consequence_reasoner()
+        if cr is None:
+            return self.REQUIRE_HUMAN_CONFIRMATION
+
+        try:
+            result = cr.evaluate(
+                action=action,
+                goal_description=f"Agent operating in unknown app: {app}",
+                world_state={"focused_app": app, "operation": op},
+            )
+
+            score = getattr(result, "numeric_score", 0.5)
+            decision = getattr(result, "decision", None)
+            decision_str = decision.value if hasattr(decision, "value") else str(decision)
+
+            _logger.debug(
+                "[PolicyEngine] CR-FIRST result: app=%r op=%r score=%.3f decision=%s",
+                app, op, score, decision_str,
+            )
+
+            if decision_str == SafetyDecision.DENY.value or score < 0.15:
+                return self.DENY
+
+            # High-risk operations require CR score >= 0.75 to auto-allow
+            if op in _HIGH_RISK_OPS:
+                if score >= 0.75 and decision_str == SafetyDecision.ALLOW.value:
+                    return self.ALLOW
+                return self.REQUIRE_HUMAN_CONFIRMATION
+
+            if decision_str == SafetyDecision.ALLOW.value and score >= 0.55:
+                return self.ALLOW
+
+            if score >= 0.45:
+                return self.REQUIRE_HUMAN_CONFIRMATION
+
+            return self.DENY
+
+        except Exception as exc:
+            _logger.warning(
+                "[PolicyEngine] CR-FIRST evaluation error for app=%r: %s — "
+                "falling back to REQUIRE_HUMAN_CONFIRMATION.", app, exc
+            )
+            return self.REQUIRE_HUMAN_CONFIRMATION
+
+    # =========================================================================
     # TRUSTED INSTALLER
     # =========================================================================
 
@@ -573,16 +685,34 @@ class PolicyEngine:
         with self._apps_lock:
             app_allowed = app in self._allowed_apps
 
-        # Step 2: unknown app → consequence evaluation required
+        # Step 2: unknown app → CONSEQUENCE-FIRST routing (Blueprint §3, Sin-3 complete fix)
+        # GII design: ConsequenceReasoner is the PRIMARY gate for unknown apps.
+        # Only escalate to human if CR deems action CRITICAL/UNCERTAIN/IRREVERSIBLE.
+        # ALLOW if CR returns COHERENT + SAFE (low-risk reversible).
+        # This replaces the old allowlist-as-primary-gate architecture.
         if not app_allowed:
-            reason = (
-                f"Unknown application {app!r}. Consequence evaluation required. "
-                "Approve or add to allowed_apps in policy.yaml to avoid this prompt."
-            )
-            _logger.warning(
-                "[PolicyEngine] REQUIRE_HUMAN_CONFIRMATION (unknown app): op=%r app=%r", op, app
-            )
-            return self.REQUIRE_HUMAN_CONFIRMATION, reason
+            cr_decision = self._evaluate_unknown_app_via_consequence_reasoner(action, app, op)
+            if cr_decision == self.ALLOW:
+                _logger.info(
+                    "[PolicyEngine] CR-FIRST: unknown app %r op=%r ALLOWED by ConsequenceReasoner.",
+                    app, op,
+                )
+                return self.ALLOW, None
+            elif cr_decision == self.DENY:
+                reason = (
+                    f"Unknown app {app!r} op={op!r}: ConsequenceReasoner assessed HIGH/CRITICAL risk. "
+                    "Add to policy.yaml allowed_apps if this is a legitimate application."
+                )
+                _logger.warning("[PolicyEngine] CR-FIRST DENY: app=%r op=%r", app, op)
+                return self.DENY, reason
+            else:
+                # REQUIRE_HUMAN_CONFIRMATION — CR said CRITICAL/IRREVERSIBLE or unavailable
+                reason = (
+                    f"Unknown app {app!r} op={op!r}: ConsequenceReasoner requires human review. "
+                    "Add to policy.yaml allowed_apps to suppress this prompt for trusted apps."
+                )
+                _logger.warning("[PolicyEngine] CR-FIRST CONFIRM: app=%r op=%r", app, op)
+                return self.REQUIRE_HUMAN_CONFIRMATION, reason
 
         # Step 3: high-risk apps → confirmation always
         if app in self._high_risk_apps:
