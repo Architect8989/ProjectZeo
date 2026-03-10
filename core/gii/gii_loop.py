@@ -612,11 +612,48 @@ class GIIGoalDirectedLoop:
             self._adapt_ai_precision()
 
             # ── WIRE-NEW: Inject DICP policy addendum into world_state ─────
-            # Failure patterns, stagnation warnings, and discovered constraints
-            # accumulated during this task are made visible to PSR/OperatorCycle
-            # before each decide call. Early iterations return empty addendum
-            # (< 2 steps observed) so there's zero overhead at task start.
             world_state = self._dicp_inject_addendum(world_state)
+
+            # ── WIRE-NL2GENSYM: Inject dynamic SOAR operator rules ─────────
+            # NL2GenSym generates task-specific SOAR operator selection rules
+            # from natural language. Injected before every decide call.
+            _nl2gensym = getattr(self._gii, "_nl2gensym", None)
+            if _nl2gensym is not None:
+                try:
+                    _rules = _nl2gensym.generate_operator_rules(
+                        objective   = self._current_milestone or self._objective,
+                        world_state = world_state,
+                        app_context = world_state.get("focused_app", ""),
+                    )
+                    if _rules:
+                        world_state["_nl2gensym_rules"] = _nl2gensym.rules_to_prompt_block(_rules)
+                except Exception as _nl2g_exc:
+                    _logger.debug("[GIILoop] NL2GenSym error: %s", _nl2g_exc)
+
+            # ── WIRE-TOM: Inject ToM user intent model ──────────────────────
+            _tom = getattr(self._gii, "_tom_agent", None)
+            if _tom is not None:
+                try:
+                    _tom_ctx = _tom.get_context_for_psr()
+                    if _tom_ctx:
+                        world_state["_tom_user_intent"] = _tom_ctx
+                except Exception as _tom_ctx_exc:
+                    _logger.debug("[GIILoop] ToM context error: %s", _tom_ctx_exc)
+
+            # ── WIRE-S2: Inject Agent S2 narrative memory ───────────────────
+            _agent_s2 = getattr(self._gii, "_agent_s2", None)
+            if _agent_s2 is not None:
+                try:
+                    _app = world_state.get("focused_app", "")
+                    if _app:
+                        _narrative = _agent_s2.get_narrative_context(_app)
+                        if _narrative:
+                            world_state["_app_narrative"] = _narrative
+                    _s2_last = _agent_s2.get_last_proactive_update()
+                    if _s2_last and _s2_last.next_milestone_guidance:
+                        world_state.setdefault("_agent_s2_guidance", _s2_last.to_prompt_block())
+                except Exception as _s2_ctx_exc:
+                    _logger.debug("[GIILoop] AgentS2 context error: %s", _s2_ctx_exc)
 
             try:
                 _screenshot_b64 = None
@@ -1006,10 +1043,45 @@ class GIIGoalDirectedLoop:
                 self._prev_world_state_for_ai = _next_ws
 
                 # WIRE-NEW: DICP observe — record outcome for in-context policy
-                # This happens AFTER execution so success/failure is known.
-                # Repeated failures auto-generate stagnation constraints inside
-                # DICPEngine.observe() once the same op fails >= 2 times.
                 self._dicp_observe(action, exec_success, exec_output)
+
+                # WIRE-AGENTQ-S2: Agent S2 proactive update after each step
+                # Agent S2 principle 1: update after EACH subtask, not just failure
+                _agent_s2 = getattr(self._gii, "_agent_s2", None)
+                if _agent_s2 is not None and self._current_milestone:
+                    try:
+                        _outcome_str = "success" if exec_success else f"failure: {exec_output[:60]}"
+                        _s2_update = _agent_s2.after_milestone_complete(
+                            milestone     = self._current_milestone,
+                            outcome       = _outcome_str,
+                            world_state   = _next_ws,
+                            next_milestone= self._current_milestone,
+                        )
+                        if _s2_update.next_milestone_guidance:
+                            world_state["_agent_s2_guidance"] = _s2_update.to_prompt_block()
+                    except Exception as _s2_exc:
+                        _logger.debug("[GIILoop] AgentS2 update error: %s", _s2_exc)
+
+                # WIRE-TOM: ToM counterfactual reflection on failure
+                _tom = getattr(self._gii, "_tom_agent", None)
+                if _tom is not None and not exec_success and exec_output:
+                    try:
+                        _cf = _tom.counterfactual_reflection(action, exec_output)
+                        if not _cf.would_still_instruct and _cf.violated_constraint:
+                            _logger.info(
+                                "[GIILoop] ToM counterfactual: violated=%r adjustment=%r",
+                                _cf.violated_constraint[:60],
+                                _cf.recommended_adjustment[:60],
+                            )
+                            if self._dicp is not None:
+                                self._dicp.add_constraint(
+                                    "avoid",
+                                    f"ToM: {_cf.violated_constraint[:100]} — {_cf.recommended_adjustment[:60]}",
+                                    confidence=_cf.confidence,
+                                    source="tom_counterfactual",
+                                )
+                    except Exception as _tom_exc:
+                        _logger.debug("[GIILoop] ToM counterfactual error: %s", _tom_exc)
 
             except Exception as exec_exc:
                 exec_success = False

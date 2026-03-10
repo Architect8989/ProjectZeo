@@ -215,7 +215,32 @@ class GIIController:
         """DICP in-context policy engine (Blueprint §9.1)."""
         return self._dicp_engine
 
-    def _initialise_components(self, memory_dir: Optional[str]) -> None:
+    @property
+    def nl2gensym(self):
+        """NL2GenSym dynamic SOAR rule generator (Blueprint §3.1)."""
+        return getattr(self, "_nl2gensym", None)
+
+    @property
+    def tom_agent(self):
+        """Theory of Mind agent with counterfactual reflection (Blueprint §3.3)."""
+        return getattr(self, "_tom_agent", None)
+
+    @property
+    def agent_s2(self):
+        """Agent S2 proactive planner with narrative memory (Blueprint §6.2)."""
+        return getattr(self, "_agent_s2", None)
+
+    @property
+    def aguvis(self):
+        """Aguvis pure-vision grounding adapter (Blueprint §6.4)."""
+        return getattr(self, "_aguvis", None)
+
+    @property
+    def ponder_press(self):
+        """Ponder & Press divide-and-conquer planner (Blueprint §6.5)."""
+        return getattr(self, "_ponder_press", None)
+
+
 
         try:
             from core.memory.semantic_memory import SemanticMemory
@@ -676,6 +701,60 @@ class GIIController:
             _logger.info("[GIIController] ScaffoldAudit ARMED.")
         except Exception as exc:
             _logger.warning("[GIIController] ScaffoldAudit init failed: %s", exc)
+
+        # ── NL2GenSym: Dynamic SOAR Rule Generation (Blueprint §3.1) ──────────
+        self._nl2gensym = None
+        try:
+            from core.cognition.nl2gensym import NL2GenSym
+            self._nl2gensym = NL2GenSym(llm_caller=self._llm)
+            _logger.info("[GIIController] NL2GenSym (dynamic SOAR rules from NL) active.")
+        except Exception as exc:
+            _logger.warning("[GIIController] NL2GenSym init failed: %s", exc)
+
+        # ── ToM-Agent: Theory of Mind (Blueprint §3.3) ────────────────────────
+        self._tom_agent = None
+        try:
+            from core.cognition.tom_agent import ToMAgent, reset_tom_agent
+            reset_tom_agent()  # Ensure fresh instance per task
+            from core.cognition.tom_agent import ToMAgent
+            self._tom_agent = ToMAgent(
+                original_instruction=self._objective,
+                llm_caller=self._llm,
+            )
+            _logger.info("[GIIController] ToMAgent (Theory of Mind + counterfactual) active.")
+        except Exception as exc:
+            _logger.warning("[GIIController] ToMAgent init failed: %s", exc)
+
+        # ── Agent S2 Planner (Blueprint §6.2) ─────────────────────────────────
+        self._agent_s2 = None
+        try:
+            from core.planner.agent_s2_planner import AgentS2Planner
+            self._agent_s2 = AgentS2Planner(
+                objective=self._objective,
+                llm_caller=self._llm,
+                htn_planner=self._htn_planner,
+            )
+            _logger.info("[GIIController] AgentS2Planner (proactive + narrative + MoG) active.")
+        except Exception as exc:
+            _logger.warning("[GIIController] AgentS2Planner init failed: %s", exc)
+
+        # ── Aguvis: Pure-Vision Fallback Grounding (Blueprint §6.4) ───────────
+        self._aguvis = None
+        try:
+            from core.vision.aguvis_adapter import AguvisAdapter
+            self._aguvis = AguvisAdapter(llm_caller=self._llm)
+            _logger.info("[GIIController] AguvisAdapter (pure-vision AT-SPI fallback) active.")
+        except Exception as exc:
+            _logger.warning("[GIIController] AguvisAdapter init failed: %s", exc)
+
+        # ── Ponder & Press: Divide-and-Conquer Planning (Blueprint §6.5) ──────
+        self._ponder_press = None
+        try:
+            from core.planner.ponder_press import PonderPress
+            self._ponder_press = PonderPress(llm_caller=self._llm)
+            _logger.info("[GIIController] PonderPress (divide-and-conquer reasoning) active.")
+        except Exception as exc:
+            _logger.warning("[GIIController] PonderPress init failed: %s", exc)
 
     def _on_task_complete(self, success: bool, objective: str, app_context: str = "") -> None:
         """
