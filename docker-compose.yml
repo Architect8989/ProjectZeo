@@ -1,0 +1,112 @@
+# ProjectZeo GII — Infrastructure Services
+# ─────────────────────────────────────────────────────────────────────────────
+# Blueprint §10: Memory backends (Qdrant vector DB + FalkorDB for Graphiti)
+# Blueprint §12: GRPO rollout sandbox (optional GPU service)
+#
+# QUICK START:
+#   docker-compose up -d
+#
+# Services:
+#   qdrant    — Vector database for semantic memory (OpenMemory, Cognee)
+#   falkordb  — Graph database for Graphiti bi-temporal knowledge graph
+#   redis     — Pub/sub for AT-SPI event streaming (optional)
+#
+# After starting:
+#   export PROJECTZEO_QDRANT_URL=http://localhost:6333
+#   export PROJECTZEO_FALKORDB_URL=redis://localhost:6379
+#
+# Volumes persist across restarts at ./data/ (create with: mkdir -p data/qdrant data/falkordb)
+# ─────────────────────────────────────────────────────────────────────────────
+
+version: "3.9"
+
+services:
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Qdrant — Vector Database
+  # Blueprint §10: Semantic memory embeddings (nomic-embed-text via Ollama)
+  # Used by: core/memory/openmemory_store.py, core/memory/cognee_store.py
+  # ──────────────────────────────────────────────────────────────────────────
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: projectzeo_qdrant
+    restart: unless-stopped
+    ports:
+      - "6333:6333"   # HTTP REST API
+      - "6334:6334"   # gRPC API
+    volumes:
+      - ./data/qdrant:/qdrant/storage:z
+    environment:
+      QDRANT__SERVICE__GRPC_PORT: "6334"
+      QDRANT__LOG_LEVEL: "WARN"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:6333/healthz || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # FalkorDB — Graph Database for Graphiti Temporal Knowledge Graph
+  # Blueprint §10: Bi-temporal knowledge graph (entity + relation storage)
+  # Used by: core/memory/graphiti_store.py
+  # Graphiti requires FalkorDB (Redis-protocol compatible graph DB)
+  # ──────────────────────────────────────────────────────────────────────────
+  falkordb:
+    image: falkordb/falkordb:latest
+    container_name: projectzeo_falkordb
+    restart: unless-stopped
+    ports:
+      - "6379:6379"   # Redis-compatible protocol
+      - "3000:3000"   # Web UI (optional)
+    volumes:
+      - ./data/falkordb:/data:z
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -p 6379 ping | grep PONG || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Redis — Pub/Sub for event streaming (optional, used by AT-SPI bridge)
+  # Used by: core/perception/atspi_bridge.py (event queue overflow protection)
+  # ──────────────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: projectzeo_redis
+    restart: unless-stopped
+    ports:
+      - "6380:6379"   # Offset from FalkorDB to avoid conflict
+    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru
+    volumes:
+      - ./data/redis:/data:z
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  qdrant_storage:
+  falkordb_data:
+  redis_data:
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Usage after docker-compose up -d:
+#
+#   Qdrant UI:   http://localhost:6333/dashboard
+#   FalkorDB UI: http://localhost:3000
+#   Redis:       redis-cli -p 6380 ping
+#
+# Verify health:
+#   docker-compose ps
+#   docker-compose logs qdrant --tail=20
+#   docker-compose logs falkordb --tail=20
+#
+# Stop all services:
+#   docker-compose down
+#
+# Remove all data (DESTRUCTIVE):
+#   docker-compose down -v && rm -rf data/
+# ─────────────────────────────────────────────────────────────────────────────
