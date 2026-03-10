@@ -12,11 +12,6 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 _logger = logging.getLogger(__name__)
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Task tree data structures
-# ─────────────────────────────────────────────────────────────────────────────
-
 class TaskStatus(str, Enum):
     PENDING    = "pending"
     ACTIVE     = "active"
@@ -24,30 +19,27 @@ class TaskStatus(str, Enum):
     FAILED     = "failed"
     SKIPPED    = "skipped"
 
-
 class TaskType(str, Enum):
-    ABSTRACT   = "abstract"    # Must be decomposed before execution
-    PRIMITIVE  = "primitive"   # Directly executable operator
-    METHOD     = "method"      # Collection of subtasks (HTN method)
-
+    ABSTRACT   = "abstract"
+    PRIMITIVE  = "primitive"
+    METHOD     = "method"
 
 @dataclass
 class Task:
-    """A node in the HTN task tree."""
     task_id:        str
     description:    str
     task_type:      TaskType
     status:         TaskStatus = TaskStatus.PENDING
     parent_id:      Optional[str] = None
-    children:       List[str] = field(default_factory=list)  # task_ids
+    children:       List[str] = field(default_factory=list)
     preconditions:  List[str] = field(default_factory=list)
     postconditions: List[str] = field(default_factory=list)
-    operator:       Optional[Dict[str, Any]] = None  # For primitive tasks
-    priority:       int = 50           # 0-100; higher = executed first among siblings
+    operator:       Optional[Dict[str, Any]] = None
+    priority:       int = 50
     created_at:     float = field(default_factory=time.time)
     completed_at:   Optional[float] = None
     failure_reason: str = ""
-    immutable:      bool = False       # True for root task
+    immutable:      bool = False
 
     def mark_complete(self) -> None:
         self.status = TaskStatus.COMPLETE
@@ -75,11 +67,6 @@ class Task:
             "operator":    self.operator,
             "failure":     self.failure_reason[:100] if self.failure_reason else "",
         }
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# LLM prompts
-# ─────────────────────────────────────────────────────────────────────────────
 
 _DECOMPOSE_SYSTEM = """\
 You are an HTN (Hierarchical Task Network) planner for a desktop GUI agent.
@@ -139,24 +126,7 @@ Propose an alternative decomposition for the failed subtask.
 Return ONLY a JSON array of replacement subtasks (same format as decompose).
 """
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# HTN Planner
-# ─────────────────────────────────────────────────────────────────────────────
-
 class HTNPlanner:
-    """
-    Hierarchical Task Network planner with mutable task tree and GoalAct
-    continuous goal alignment monitoring.
-
-    The task tree root is the user's original objective (immutable).
-    All other nodes can be modified, reordered, or replaced at runtime.
-
-    Integration points:
-      - Called by GIIController when milestones need decomposition
-      - Called by OperatorCycle when impasse requires structured replanning
-      - GoalAct anti-stall monitor runs every N cycles
-    """
 
     def __init__(
         self,
@@ -171,20 +141,14 @@ class HTNPlanner:
         self._lock = threading.RLock()
         self._cycle_count = 0
 
-        # Task tree: {task_id → Task}
         self._tasks: Dict[str, Task] = {}
         self._root_id: Optional[str] = None
 
-        # Execution queue (primitive tasks, ordered by priority)
         self._execution_queue: List[str] = []
 
         self._build_root(objective)
 
         _logger.info("[HTN] Initialized with objective: %r", objective[:60])
-
-    # ─────────────────────────────────────────────────────────────────────
-    # Tree construction
-    # ─────────────────────────────────────────────────────────────────────
 
     def _build_root(self, objective: str) -> None:
         root_id = str(uuid.uuid4())[:8]
@@ -204,10 +168,6 @@ class HTNPlanner:
         task_id: str,
         world_state: Optional[Dict[str, Any]] = None,
     ) -> List[Task]:
-        """
-        Decompose an abstract task into primitive/abstract subtasks.
-        Returns the newly created child tasks.
-        """
         with self._lock:
             parent = self._tasks.get(task_id)
         if parent is None:
@@ -215,7 +175,7 @@ class HTNPlanner:
             return []
 
         if parent.task_type == TaskType.PRIMITIVE:
-            return []  # Already primitive
+            return []
 
         world_summary = ""
         if world_state:
@@ -274,12 +234,7 @@ class HTNPlanner:
                      parent.description[:60], len(child_tasks))
         return child_tasks
 
-    # ─────────────────────────────────────────────────────────────────────
-    # Execution queue management
-    # ─────────────────────────────────────────────────────────────────────
-
     def _rebuild_execution_queue(self) -> None:
-        """Rebuild execution queue from pending primitive tasks (priority-ordered)."""
         primitives = [
             t for t in self._tasks.values()
             if (t.task_type == TaskType.PRIMITIVE
@@ -289,20 +244,17 @@ class HTNPlanner:
         self._execution_queue = [t.task_id for t in primitives]
 
     def next_executable(self) -> Optional[Task]:
-        """Return the highest-priority executable primitive task."""
         with self._lock:
             self._rebuild_execution_queue()
             for task_id in self._execution_queue:
                 task = self._tasks.get(task_id)
                 if task is None or task.status != TaskStatus.PENDING:
                     continue
-                # Check preconditions are met by parent's postconditions
                 if self._preconditions_met(task):
                     return task
         return None
 
     def _preconditions_met(self, task: Task) -> bool:
-        """Simple precondition check: parent must be active."""
         if not task.parent_id:
             return True
         parent = self._tasks.get(task.parent_id)
@@ -326,7 +278,6 @@ class HTNPlanner:
                 self._rebuild_execution_queue()
 
     def _propagate_completion(self, task: Task) -> None:
-        """If all siblings complete, mark parent complete."""
         if not task.parent_id:
             return
         parent = self._tasks.get(task.parent_id)
@@ -346,22 +297,13 @@ class HTNPlanner:
                 parent.mark_failed("A child task failed.")
             else:
                 parent.mark_complete()
-            # Recurse up the tree
             self._propagate_completion(parent)
-
-    # ─────────────────────────────────────────────────────────────────────
-    # Replanning
-    # ─────────────────────────────────────────────────────────────────────
 
     def replan(
         self,
         failed_task_id: str,
         world_state: Optional[Dict[str, Any]] = None,
     ) -> List[Task]:
-        """
-        Replan after a task failure: generate alternative subtasks to
-        replace the failed task and re-attach to its parent.
-        """
         with self._lock:
             failed = self._tasks.get(failed_task_id)
         if failed is None:
@@ -376,26 +318,40 @@ class HTNPlanner:
                 f"Failure reason: {failed.failure_reason[:200]}"
             )
 
-        messages = [
-            {"role": "system", "content": _REPLAN_SYSTEM},
-            {"role": "user", "content": (
-                f"FAILED TASK: {failed.description}\n"
-                f"FAILURE REASON: {failed.failure_reason[:300]}\n"
-                f"ORIGINAL OBJECTIVE: {self._objective[:300]}\n"
-                f"WORLD STATE:\n{world_summary or '(unknown)'}\n"
-                "Propose 1-3 alternative subtasks."
-            )},
-        ]
+        _N_BRANCHES = 3
+        _branch_results = []
+        for _branch in range(_N_BRANCHES):
+            messages = [
+                {"role": "system", "content": _REPLAN_SYSTEM},
+                {"role": "user", "content": (
+                    f"FAILED TASK: {failed.description}\n"
+                    f"FAILURE REASON: {failed.failure_reason[:300]}\n"
+                    f"ORIGINAL OBJECTIVE: {self._objective[:300]}\n"
+                    f"WORLD STATE:\n{world_summary or '(unknown)'}\n"
+                    f"BRANCH {_branch + 1}/{_N_BRANCHES}: "
+                    "Propose 1-3 alternative subtasks. "
+                    "Think independently and creatively — prefer a different "
+                    "approach from what may have failed before."
+                )},
+            ]
+            try:
+                raw = self._llm(messages, objective=self._objective)
+                parsed = self._parse_task_array(raw)
+                if parsed:
+                    score = sum(int(t.get("priority", 50)) for t in parsed) / max(len(parsed), 1)
+                    _branch_results.append((score, parsed))
+            except Exception as exc:
+                _logger.debug("[HTN] ToT branch %d failed: %s", _branch + 1, exc)
 
-        try:
-            raw = self._llm(messages, objective=self._objective)
-        except Exception as exc:
-            _logger.warning("[HTN] LLM replan failed: %s", exc)
+        if not _branch_results:
             return []
 
-        subtasks_data = self._parse_task_array(raw)
-        if not subtasks_data:
-            return []
+        _branch_results.sort(key=lambda x: x[0], reverse=True)
+        subtasks_data = _branch_results[0][1]
+        _logger.info(
+            "[HTN] Tree of Thoughts replan: %d branches evaluated, best score=%.1f, %d subtasks.",
+            len(_branch_results), _branch_results[0][0], len(subtasks_data),
+        )
 
         new_tasks: List[Task] = []
         with self._lock:
@@ -432,16 +388,7 @@ class HTNPlanner:
         _logger.info("[HTN] Replan: replaced failed task with %d alternatives.", len(new_tasks))
         return new_tasks
 
-    # ─────────────────────────────────────────────────────────────────────
-    # GoalAct: continuous goal alignment check (arXiv:2504.16563)
-    # ─────────────────────────────────────────────────────────────────────
-
     def goalact_check(self, world_state: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        """
-        GoalAct anti-stall monitor: detect if any active task is drifting
-        away from the overall objective (local-branch-stall).
-        Returns recommendation: continue | redirect | replan
-        """
         self._cycle_count += 1
         if self._cycle_count % self._goalact_interval != 0:
             return {"stall_detected": False, "recommendation": "continue", "reason": ""}
@@ -470,10 +417,6 @@ class HTNPlanner:
             _logger.debug("[HTN] GoalAct check error: %s", exc)
 
         return {"stall_detected": False, "recommendation": "continue", "reason": ""}
-
-    # ─────────────────────────────────────────────────────────────────────
-    # Tree inspection
-    # ─────────────────────────────────────────────────────────────────────
 
     def _format_tree_summary(self) -> str:
         lines = []
@@ -516,12 +459,7 @@ class HTNPlanner:
             root = self._tasks.get(self._root_id)
             return root is not None and root.status == TaskStatus.FAILED
 
-    # ─────────────────────────────────────────────────────────────────────
-    # Helpers
-    # ─────────────────────────────────────────────────────────────────────
-
     def _fallback_decompose(self, parent: Task) -> List[Task]:
-        """Minimal fallback: single primitive verify task."""
         child = Task(
             task_id=str(uuid.uuid4())[:8],
             description=f"Execute: {parent.description[:200]}",
