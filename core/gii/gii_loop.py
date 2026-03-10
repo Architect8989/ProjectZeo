@@ -17,13 +17,10 @@ March 2026 — Research integration patch:
   LAYER-5   : AT-SPI window registry for popup attack detection (Research §6.3)
   LAYER-7   : ProcessFence context manager wraps execute block (Research §8.1)
 
-March 2026 — GII completeness patch (this file):
-  CRITICAL-BUG : Fixed return-inside-while bug. Line 690 (old) had
-                 `return self._result(False, "Maximum iterations reached")`
-                 INSIDE the while loop body under on_action_executed callback.
-                 This caused the loop to return after the FIRST successful action
-                 execution instead of continuing to the next iteration.
-                 Fix: moved the max-iterations return OUTSIDE the while loop.
+March 2026 — GII completeness patch:
+  CRITICAL-BUG : Fixed return-inside-while bug that caused exit after first
+                 successful action. Max-iterations return now correctly placed
+                 outside the while loop.
 
   WIRE-1    : Active Inference (FEP) candidate generation wired.
               _generate_ai_candidates() builds candidate actions from world
@@ -48,6 +45,15 @@ March 2026 — GII completeness patch (this file):
 
   WIRE-6    : ActiveInferenceAgent.adapt_precision() called periodically
               based on stagnant_count / iteration ratio (success rate proxy).
+
+  WIRE-NEW  : DICP in-context policy wired (Blueprint §9.1).
+              DICPEngine.observe() called after each execution step to record
+              operator outcome (success/failure, error note).
+              DICPEngine.get_policy_addendum() injected into world_state before
+              each decide call so PSR/OperatorCycle see accumulated failure
+              patterns, stagnation warnings, and discovered constraints.
+              Cross-session AD constraints ingested at task start via
+              GIIController._dicp_engine.ingest_ad_constraints().
 """
 
 import logging
@@ -72,12 +78,10 @@ _POPUP_SUSPICIOUS_WINDOW_AGE_SEC: float = float(
     os.environ.get("PROJECTZEO_POPUP_AGE_SEC", "3.0")
 )
 
-# How many iterations between Active Inference precision adaptation calls
 _AI_PRECISION_ADAPT_INTERVAL: int = int(
     os.environ.get("PROJECTZEO_AI_ADAPT_INTERVAL", "10")
 )
 
-# How many candidate actions to generate for Active Inference ranking
 _AI_CANDIDATE_COUNT: int = int(
     os.environ.get("PROJECTZEO_AI_CANDIDATES", "4")
 )
@@ -125,6 +129,7 @@ class GIIGoalDirectedLoop:
         use_process_fence: bool = True,
     ) -> None:
         self._gii = gii_controller
+        self._gii_controller = gii_controller  # alias for scaffold audit access
         self._os_backend = os_backend
         self._world_graph = world_graph
         self._policy = policy_engine
@@ -155,8 +160,6 @@ class GIIGoalDirectedLoop:
         self._executed_operators: list = []
 
         # ── Active Inference (FEP) — WIRE-1 ───────────────────────────────────
-        # Pull active_inference from gii_controller so we can call
-        # select_action() to rank candidates by EFE before PSR reasoning.
         self._active_inference = getattr(gii_controller, "_active_inference", None)
         self._prev_world_state_for_ai: Optional[Dict[str, Any]] = None
 
@@ -227,6 +230,24 @@ class GIIGoalDirectedLoop:
         except Exception:
             self._grounding_trainer = None
 
+        # ── WIRE-NEW: DICP in-context policy ──────────────────────────────────
+        # Pull DICP engine from gii_controller (preferred — already initialised
+        # with AD constraints ingested). Fall back to global singleton if the
+        # controller doesn't have one yet (e.g. GIIMode.BASIC).
+        self._dicp = getattr(gii_controller, "_dicp_engine", None)
+        if self._dicp is None:
+            try:
+                from core.learning.dicp import get_dicp_engine
+                _llm_dicp = getattr(gii_controller, "_llm_callable", None)
+                self._dicp = get_dicp_engine(
+                    objective=objective,
+                    llm_caller=_llm_dicp,
+                )
+                _logger.info("[GIILoop] DICP: using global singleton (controller had no engine).")
+            except Exception as _dicp_init_exc:
+                _logger.debug("[GIILoop] DICP unavailable (non-fatal): %s", _dicp_init_exc)
+                self._dicp = None
+
         self._current_milestone: Optional[str] = None
         self._milestone_trajectory: List[Dict[str, Any]] = []
         self._milestone_start_world: Optional[Dict[str, Any]] = None
@@ -235,13 +256,14 @@ class GIIGoalDirectedLoop:
         _logger.info(
             "[GIILoop] Components wired: reflexion=%s bdi=%s lats=%s vault=%s "
             "monitor=%s safety=%s validator=%s grounding=%s "
-            "active_inference=%s global_workspace=%s snn=%s",
+            "active_inference=%s global_workspace=%s snn=%s dicp=%s",
             self._reflexion is not None, self._bdi_gate is not None,
             self._lats is not None, self._vault is not None,
             self._monitor is not None, self._safety_agent is not None,
             self._validator is not None, self._grounding_trainer is not None,
             self._active_inference is not None, self._global_workspace is not None,
             self._snn_processor is not None,
+            self._dicp is not None,
         )
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -251,17 +273,6 @@ class GIIGoalDirectedLoop:
     def _generate_ai_candidates(
         self, world_state: Dict[str, Any]
     ) -> List[Dict[str, Any]]:
-        """
-        Generate lightweight candidate actions from world state for Active
-        Inference EFE ranking.  These are heuristic candidates derived from
-        visible entities — the ranked winner is injected into world_state so
-        PSR can use it as a starting-point hint.
-
-        Candidate generation strategy:
-          1. For each visible entity, propose a click action.
-          2. Always include a verify and a done candidate.
-          3. Include LATS recovery action if present in world_state.
-        """
         candidates: List[Dict[str, Any]] = []
 
         entities = world_state.get("entities", []) or []
@@ -290,7 +301,6 @@ class GIIGoalDirectedLoop:
             "_ai_candidate": True,
         })
 
-        # Include LATS recovery action if available
         lats_action = world_state.get("_lats_recovery_action")
         if isinstance(lats_action, dict):
             candidates.append(dict(lats_action, _ai_candidate=True))
@@ -298,10 +308,6 @@ class GIIGoalDirectedLoop:
         return candidates
 
     def _run_active_inference(self, world_state: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Run Active Inference EFE ranking and inject top candidate.
-        Returns modified world_state dict (copy if modified).
-        """
         if self._active_inference is None:
             return world_state
 
@@ -334,7 +340,6 @@ class GIIGoalDirectedLoop:
         return world_state
 
     def _adapt_ai_precision(self) -> None:
-        """Periodically adapt Active Inference precision from success rate."""
         if self._active_inference is None:
             return
         if self._iteration % _AI_PRECISION_ADAPT_INTERVAL != 0:
@@ -354,7 +359,6 @@ class GIIGoalDirectedLoop:
         next_world: Dict[str, Any],
         success: bool,
     ) -> None:
-        """Update AIF generative model from executed transition."""
         if self._active_inference is None or prev_world is None:
             return
         try:
@@ -374,15 +378,6 @@ class GIIGoalDirectedLoop:
     def _run_global_workspace_cycle(
         self, world_state: Dict[str, Any]
     ) -> Dict[str, Any]:
-        """
-        Run one GWT competition cycle and inject broadcast winner into
-        world_state so PSR and SOAR cycle can observe it.
-
-        Winner types and their effects:
-          REFLECTION winner w/ is_complete=True → inject done signal
-          MEMORY winner → inject memories into _gwt_memories
-          PERCEPTION winner → inject updated entity count
-        """
         if self._global_workspace is None:
             return world_state
 
@@ -437,6 +432,57 @@ class GIIGoalDirectedLoop:
             return world_state
 
     # ─────────────────────────────────────────────────────────────────────────
+    # WIRE-NEW: DICP helpers
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _dicp_inject_addendum(self, world_state: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Inject DICP policy addendum into world_state before each decide call.
+        The addendum contains failure patterns, stagnation warnings, and
+        discovered constraints accumulated during the current task.
+        Returns modified world_state (copy if modified, original otherwise).
+        """
+        if self._dicp is None:
+            return world_state
+        try:
+            addendum = self._dicp.get_policy_addendum(
+                context={"world_state": world_state, "goal": self._objective},
+            )
+            if addendum:
+                ws = dict(world_state)
+                ws["_dicp_policy_addendum"] = addendum
+                return ws
+        except Exception as _dicp_exc:
+            _logger.debug("[GIILoop] DICP addendum inject failed: %s", _dicp_exc)
+        return world_state
+
+    def _dicp_observe(
+        self,
+        action: Dict[str, Any],
+        exec_success: bool,
+        exec_output: str,
+    ) -> None:
+        """
+        Record execution outcome in DICP engine after each action dispatch.
+        Called after both successful and failed executions.
+        """
+        if self._dicp is None:
+            return
+        try:
+            self._dicp.observe(
+                operator=str(action.get("operation", "unknown")),
+                args={
+                    k: v for k, v in action.items()
+                    if k not in ("operation", "thought", "_ai_candidate")
+                },
+                outcome="success" if exec_success else "failure",
+                reward=1.0 if exec_success else 0.0,
+                note=exec_output[:60] if not exec_success and exec_output else "",
+            )
+        except Exception as _dicp_obs_exc:
+            _logger.debug("[GIILoop] DICP observe error: %s", _dicp_obs_exc)
+
+    # ─────────────────────────────────────────────────────────────────────────
     # Main execution loop
     # ─────────────────────────────────────────────────────────────────────────
 
@@ -455,16 +501,18 @@ class GIIGoalDirectedLoop:
             "piguard_active": self._piguard is not None,
             "active_inference_active": self._active_inference is not None,
             "global_workspace_active": self._global_workspace is not None,
+            "dicp_active": self._dicp is not None,
         })
 
         _logger.info(
             "[GIILoop] Starting. objective=%r max_iter=%d vsa=%s piguard=%s "
-            "fence=%s aif=%s gwt=%s",
+            "fence=%s aif=%s gwt=%s dicp=%s",
             self._objective[:80], self._max_iterations,
             self._vsa is not None, self._piguard is not None,
             self._use_process_fence,
             self._active_inference is not None,
             self._global_workspace is not None,
+            self._dicp is not None,
         )
 
         self._current_milestone = self._objective
@@ -506,7 +554,6 @@ class GIIGoalDirectedLoop:
                                         source_id=interrupt.get("source_id", 0),
                                         timestamp=interrupt.get("timestamp", time.time()),
                                     )
-                                # Only re-observe if SNN fires (burst detected)
                                 if not self._snn_processor.should_interrupt():
                                     _logger.debug(
                                         "[GIILoop] SNN suppressed AT-SPI burst "
@@ -546,7 +593,6 @@ class GIIGoalDirectedLoop:
             # ── WIRE-2: Run Global Workspace cycle ─────────────────────────
             world_state = self._run_global_workspace_cycle(world_state)
 
-            # Check if GWT Reflection module declared goal complete
             if world_state.get("_gwt_goal_complete"):
                 self._journal.record({
                     "event": "gii_loop_gwt_goal_complete",
@@ -559,11 +605,18 @@ class GIIGoalDirectedLoop:
                 return self._result(True, "GWT Reflection: all goal conditions satisfied")
 
             # ── WIRE-1: Run Active Inference EFE ranking ───────────────────
-            _prev_ws = dict(world_state)  # save for AIF outcome update
+            _prev_ws = dict(world_state)
             world_state = self._run_active_inference(world_state)
 
-            # ── Adapt AIF precision periodically ──────────────────────────
+            # ── WIRE-6: Adapt AIF precision periodically ───────────────────
             self._adapt_ai_precision()
+
+            # ── WIRE-NEW: Inject DICP policy addendum into world_state ─────
+            # Failure patterns, stagnation warnings, and discovered constraints
+            # accumulated during this task are made visible to PSR/OperatorCycle
+            # before each decide call. Early iterations return empty addendum
+            # (< 2 steps observed) so there's zero overhead at task start.
+            world_state = self._dicp_inject_addendum(world_state)
 
             try:
                 _screenshot_b64 = None
@@ -610,9 +663,6 @@ class GIIGoalDirectedLoop:
                 self._journal.record({"event": "gii_goal_complete", "iteration": self._iteration, "summary": summary})
                 _logger.info("[GIILoop] Goal complete: %s (iter=%d)", summary, self._iteration)
 
-                # ── ValidatorAgent post-milestone verification ─────────────
-                # Independent validation prevents false-positive goal completion.
-                # If validator returns FAIL, we re-enter the loop with a hint.
                 if self._validator is not None:
                     try:
                         val_result = self._validator.verify_milestone(
@@ -637,14 +687,13 @@ class GIIGoalDirectedLoop:
                                 verdict_str,
                                 getattr(val_result, "confidence", 0.0),
                             )
-                            # Inject validation feedback and continue
                             world_state["_validator_feedback"] = (
                                 f"VALIDATION {verdict_str.upper()}: "
                                 f"{getattr(val_result, 'rationale', 'Milestone not confirmed')[:300]}. "
                                 "The task is NOT yet complete. Continue working."
                             )
-                            self._stagnant_count = 0  # Reset stagnant count
-                            self._iteration -= 1      # Don't count this as a wasted iteration
+                            self._stagnant_count = 0
+                            self._iteration -= 1
                             continue
                         _logger.info("[GIILoop] Validator confirmed PASS (conf=%.2f).", getattr(val_result, "confidence", 0.0))
                     except Exception as val_exc:
@@ -657,7 +706,6 @@ class GIIGoalDirectedLoop:
                     try: self._grounding_trainer.on_episode_complete(success=True)
                     except Exception: pass
 
-                # ── AgentQ task-completion hook ────────────────────────────
                 _gii_ctrl = self._gii
                 if hasattr(_gii_ctrl, "_on_task_complete"):
                     try:
@@ -670,7 +718,6 @@ class GIIGoalDirectedLoop:
                         pass
 
                 return self._result(True, summary)
-
 
             if self._piguard is not None and action.get("_external_content_source"):
                 external_content = str(action.get("content") or action.get("text") or "")
@@ -712,6 +759,18 @@ class GIIGoalDirectedLoop:
                 world_state["_gii_loop_note"] = (
                     f"WARNING: action {action_key!r} repeated {visit_count + 1} times. Choose DIFFERENT approach."
                 )
+                # ── WIRE-NEW: flag stagnation to DICP so it can generate constraint ──
+                if self._dicp is not None:
+                    try:
+                        self._dicp.add_constraint(
+                            "avoid",
+                            f"Action repeated {visit_count + 1}x without progress: "
+                            f"{action.get('operation','?')}({str(action.get('command', action.get('text', '')))[:40]}). "
+                            "Choose a different approach.",
+                            confidence=0.9,
+                        )
+                    except Exception:
+                        pass
                 continue
 
             focused_app = world_state.get("focused_app", "__unknown_app__")
@@ -779,6 +838,16 @@ class GIIGoalDirectedLoop:
                 self._gii.record_denial(action_key)
                 self._journal.record({"event": "gii_loop_policy_deny", "iteration": self._iteration, "action_key": action_key, "reason": policy_reason})
                 _logger.warning("[GIILoop] Policy DENY: %s | %s", action_key, policy_reason)
+                # ── WIRE-NEW: inject policy denial as DICP constraint ──────────
+                if self._dicp is not None:
+                    try:
+                        self._dicp.add_constraint(
+                            "avoid",
+                            f"Policy DENY: {action.get('operation','?')} — {policy_reason[:80]}",
+                            confidence=1.0,
+                        )
+                    except Exception:
+                        pass
                 self._stagnant_count += 1
                 if self._stagnant_count >= self._max_stagnant:
                     return self._result(False, "Stagnation: repeated policy denials")
@@ -837,9 +906,7 @@ class GIIGoalDirectedLoop:
                     self._journal.record({"event": "gii_loop_screen_diff_skip", "iteration": self._iteration, "phash_distance": dist})
                     continue
 
-            # ── Scaffold Audit pre-dispatch check (Blueprint §16 wire) ──────────
-            # ScaffoldAudit was initialised and armed but never called from
-            # the live execution path. Now wired here: BLOCK before dispatch.
+            # ── Scaffold Audit pre-dispatch check ─────────────────────────────
             if self._gii_controller is not None:
                 try:
                     _audit = self._gii_controller.scaffold_audit
@@ -911,7 +978,7 @@ class GIIGoalDirectedLoop:
                         "output": exec_output[:100],
                     })
 
-                # UI-AGILE Grounding Data Recording (Blueprint §9.5)
+                # UI-AGILE Grounding Data Recording
                 if self._grounding_trainer is not None:
                     _op = str(action.get("operation", "")).lower()
                     if _op in ("click", "navigate", "tap"):
@@ -938,10 +1005,19 @@ class GIIGoalDirectedLoop:
                 self._update_ai_from_outcome(_prev_ws, action, _next_ws, exec_success)
                 self._prev_world_state_for_ai = _next_ws
 
+                # WIRE-NEW: DICP observe — record outcome for in-context policy
+                # This happens AFTER execution so success/failure is known.
+                # Repeated failures auto-generate stagnation constraints inside
+                # DICPEngine.observe() once the same op fails >= 2 times.
+                self._dicp_observe(action, exec_success, exec_output)
+
             except Exception as exec_exc:
                 exec_success = False
                 exec_output = str(exec_exc)
                 _logger.warning("[GIILoop] Action execution failed: %s | %s", action_key, exec_exc)
+
+                # WIRE-NEW: Record execution exception as DICP failure
+                self._dicp_observe(action, False, exec_output)
 
                 if (
                     self._reflexion is not None
@@ -1073,16 +1149,7 @@ class GIIGoalDirectedLoop:
                 except Exception:
                     pass
 
-            # ── IMPORTANT: continue to next iteration — DO NOT return here ──
-            # The loop continues until: goal complete, timeout, stagnation,
-            # or max_iterations reached (handled BELOW, outside the while loop).
-            # BUG FIX: The original code had `return self._result(...)` here
-            # INSIDE the while loop, causing exit after the first successful
-            # action. This is now correctly placed outside the loop.
-
         # ── Loop exhausted (max_iterations reached) ────────────────────────
-        # This is the ONLY place max-iterations is returned.
-        # All other termination paths are returns INSIDE the loop above.
         _logger.info(
             "[GIILoop] Max iterations (%d) reached after %d stagnant cycles.",
             self._max_iterations, self._stagnant_count,
@@ -1259,4 +1326,5 @@ class GIIGoalDirectedLoop:
             "goal_progress": getattr(self._goal_repr, "progress", None),
             "active_inference_calls": getattr(self._active_inference, "_calls", 0) if self._active_inference else 0,
             "gwt_cycles": getattr(self._global_workspace, "_cycle", 0) if self._global_workspace else 0,
+            "dicp_stats": self._dicp.get_stats() if self._dicp is not None else {},
         }
