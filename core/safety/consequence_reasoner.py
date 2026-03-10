@@ -1015,6 +1015,22 @@ class ConsequenceReasoner:
                     action_snippet=snippet,
                 )
 
+        # ── WIRE-SICA: Propose policy rule for UNCERTAIN pattern ───────────────
+        # When consequence reasoning returns UNCERTAIN (not HARMFUL but not SAFE),
+        # SICA accumulates observations and proposes policy.yaml rules.
+        if consequence == ConsequenceVerdict.UNCERTAIN or coherence == CoherenceVerdict.UNCERTAIN:
+            try:
+                from core.safety.sica_policy_proposer import get_sica_proposer
+                _sica = get_sica_proposer(llm_callable=self._tier2_callable)
+                _sica.observe(
+                    action=action,
+                    objective=objective,
+                    verdict="UNCERTAIN",
+                    reason=f"coherence={coherence.value} consequence={consequence.value}",
+                )
+            except Exception as _sica_exc:
+                _logger.debug("[ConsequenceReasoner] SICA observe error: %s", _sica_exc)
+
         return ConsequenceResult(
             decision=SafetyDecision.ALLOW,
             reversibility=reversibility,
