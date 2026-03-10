@@ -378,9 +378,24 @@ class PerStepReasoner:
     def set_vault_context(self, context: str) -> None:
         self._vault_context = context or ""
 
+    def set_algorithm_distillation_context(self, context: str) -> None:
+        """
+        GII-FIX: Wire Algorithm Distillation cross-task patterns into PSR prompt.
+
+        AlgorithmDistiller extracts generalised operator patterns from completed
+        episodes. This method stores the extracted context so that
+        _build_user_message() injects it into the per-step decision prompt,
+        completing the in-context RL loop-back (Blueprint §9).
+
+        Called by GIIGoalDirectedLoop after finalize_episode() on each
+        successful or failed operator sequence.
+        """
+        self._algorithm_distillation_context = context or ""
+
     def clear_injected_contexts(self) -> None:
         self._reflexion_context = ""
         self._vault_context = ""
+        self._algorithm_distillation_context = ""
 
     def _enrich_world_state(
         self,
@@ -632,6 +647,15 @@ class PerStepReasoner:
 
         if hasattr(self, "_vault_context") and self._vault_context:
             msg += "\n\n" + self._vault_context
+
+        # ── GII-FIX: Algorithm Distillation in-context RL loop-back ──────────
+        # Cross-task operator patterns extracted by AlgorithmDistiller from
+        # prior successful episodes are injected here, completing the AD
+        # feedback loop (Blueprint §9: in-context self-improvement).
+        # This gives the per-step reasoner awareness of generalised strategies
+        # learned across all previous tasks, not just the current one.
+        if hasattr(self, "_algorithm_distillation_context") and self._algorithm_distillation_context:
+            msg += "\n\nIN-CONTEXT LEARNED PATTERNS (Algorithm Distillation):\n" + self._algorithm_distillation_context[:600]
 
         return msg
 
